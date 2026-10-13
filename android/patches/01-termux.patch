@@ -1,3 +1,16 @@
+diff --git a/crates/pi-builtins/src/lib.rs b/crates/pi-builtins/src/lib.rs
+index efde45a..34d62b9 100644
+--- a/crates/pi-builtins/src/lib.rs
++++ b/crates/pi-builtins/src/lib.rs
+@@ -341,7 +341,7 @@ pub use proc_snapshot::{ProcInfo, ProcessStatus};
+ /// implementation.
+ #[cfg(all(
+ 	feature = "util.procs",
+-	any(target_os = "linux", target_os = "macos", target_os = "windows")
++	any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")
+ ))]
+ pub use proc_snapshot::sys as proc_sys;
+ 
 diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/proc_snapshot.rs
 index 3703153..27b5817 100644
 --- a/crates/pi-builtins/src/proc_snapshot.rs
@@ -1005,7 +1018,7 @@ index 3299a32..120bfac 100644
  	const baseDir = getWorktreeDir(getTaskIsolationSegment(repoRoot, id));
  	const mergedDir = path.join(baseDir, TASK_ISOLATION_MOUNT_DIR);
 diff --git a/packages/coding-agent/src/tools/browser/launch.ts b/packages/coding-agent/src/tools/browser/launch.ts
-index 23ea8fd..60db11a 100644
+index 3ae33c2..7995303 100644
 --- a/packages/coding-agent/src/tools/browser/launch.ts
 +++ b/packages/coding-agent/src/tools/browser/launch.ts
 @@ -249,6 +249,10 @@ let chromiumExecutablePromise: Promise<string | undefined> | undefined;
