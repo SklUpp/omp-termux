@@ -38,6 +38,7 @@ const SUPPORTED_PLATFORMS = [
 	"darwin-arm64",
 	"win32-x64",
 	"win32-arm64",
+	"android-arm64",
 ];
 
 /**
