@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+unset LD_PRELOAD || true
 
 # One-command Termux installer. CI publishes one self-contained app archive.
 # Device installs only packaged Bun runtime; no bun install or source build.
