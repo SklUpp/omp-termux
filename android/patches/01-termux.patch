@@ -415,7 +415,7 @@ index 6ca937f..b18788e 100644
 +    }
  }
 diff --git a/crates/pi-natives/src/clipboard.rs b/crates/pi-natives/src/clipboard.rs
-index b88890c..73c48e6 100644
+index b88890c..cdeb80b 100644
 --- a/crates/pi-natives/src/clipboard.rs
 +++ b/crates/pi-natives/src/clipboard.rs
 @@ -5,9 +5,12 @@
@@ -486,7 +486,44 @@ index b88890c..73c48e6 100644
  fn set_clipboard_text(text: &str) -> Result<()> {
  	let mut clipboard = Clipboard::new()
  		.map_err(|err| Error::from_reason(format!("Failed to access clipboard: {err}")))?;
-@@ -254,6 +267,11 @@ fn png_image(bytes: Vec<u8>) -> ClipboardImage {
+@@ -215,6 +228,12 @@ fn set_clipboard_text(text: &str) -> Result<()> {
+ #[napi]
+ pub fn read_text_from_clipboard() -> task::Promise<Option<String>> {
+ 	task::blocking("clipboard.read_text", (), move |_| -> Result<Option<String>> {
++		#[cfg(target_os = "android")]
++		{
++			Err(Error::from_reason("Native arboard clipboard is unsupported on Android/Termux; use Termux/OSC52 clipboard helpers"))
++		}
++		#[cfg(not(target_os = "android"))]
++		{
+ 		let _access = CLIPBOARD_ACCESS.lock();
+ 		let mut clipboard = Clipboard::new()
+ 			.map_err(|err| Error::from_reason(format!("Failed to access clipboard: {err}")))?;
+@@ -223,6 +242,7 @@ pub fn read_text_from_clipboard() -> task::Promise<Option<String>> {
+ 			Err(ClipboardError::ContentNotAvailable) => Ok(None),
+ 			Err(err) => Err(Error::from_reason(format!("Failed to read clipboard text: {err}"))),
+ 		}
++		}
+ 	})
+ }
+ 
+@@ -230,6 +250,7 @@ pub fn read_text_from_clipboard() -> task::Promise<Option<String>> {
+ /// decoding run after [`CLIPBOARD_ACCESS`] is released: they only touch owned
+ /// buffers, and holding the lock through them would stall a synchronous copy
+ /// on the JS thread for the length of a large encode.
++#[cfg(not(target_os = "android"))]
+ enum ImageRead {
+ 	Image(ImageData<'static>),
+ 	/// arboard found no image, but a bitmap format is advertised; carries the
+@@ -241,6 +262,7 @@ enum ImageRead {
+ 	Failed(ClipboardError, Option<Vec<u8>>),
+ }
+ 
++#[cfg(not(target_os = "android"))]
+ fn png_image(bytes: Vec<u8>) -> ClipboardImage {
+ 	ClipboardImage { data: Uint8Array::from(bytes), mime_type: "image/png".to_string() }
+ }
+@@ -254,6 +276,11 @@ fn png_image(bytes: Vec<u8>) -> ClipboardImage {
  #[napi]
  pub fn read_image_from_clipboard() -> task::Promise<Option<ClipboardImage>> {
  	task::blocking("clipboard.read_image", (), move |_| -> Result<Option<ClipboardImage>> {
@@ -511,6 +548,46 @@ index e70775f..34b9825 100644
  		std::alloc::set_alloc_error_hook(|layout| {
  			// Print the canonical line before doing anything allocation-prone.
  			// If this is genuine process-wide OOM, report formatting/path work may
+diff --git a/crates/pi-natives/src/desktop/ax.rs b/crates/pi-natives/src/desktop/ax.rs
+index 80e1964..27269e2 100644
+--- a/crates/pi-natives/src/desktop/ax.rs
++++ b/crates/pi-natives/src/desktop/ax.rs
+@@ -20,6 +20,8 @@ pub enum AxHandle {
+ 	Uia(uiautomation::UIElement, Option<Box<[i32]>>),
+ 	#[cfg(target_os = "linux")]
+ 	AtSpi(atspi::ObjectRefOwned),
++	#[cfg(target_os = "android")]
++	AndroidUnused,
+ 	#[cfg(test)]
+ 	Test(u64),
+ 	/// A test element without an identity, like a UIA element whose
+@@ -40,6 +42,8 @@ impl AxHandle {
+ 			Self::Uia(_, runtime_id) => runtime_id.is_some(),
+ 			#[cfg(target_os = "linux")]
+ 			Self::AtSpi(_) => true,
++			#[cfg(target_os = "android")]
++			Self::AndroidUnused => false,
+ 			#[cfg(test)]
+ 			Self::Test(_) => true,
+ 			#[cfg(test)]
+@@ -60,6 +64,8 @@ impl PartialEq for AxHandle {
+ 			(Self::Uia(_, a), Self::Uia(_, b)) => a == b,
+ 			#[cfg(target_os = "linux")]
+ 			(Self::AtSpi(a), Self::AtSpi(b)) => a == b,
++			#[cfg(target_os = "android")]
++			(Self::AndroidUnused, Self::AndroidUnused) => true,
+ 			#[cfg(test)]
+ 			(Self::Test(a), Self::Test(b)) => a == b,
+ 			#[cfg(test)]
+@@ -81,6 +87,8 @@ impl Hash for AxHandle {
+ 			Self::Uia(_, runtime_id) => runtime_id.hash(state),
+ 			#[cfg(target_os = "linux")]
+ 			Self::AtSpi(object) => object.hash(state),
++			#[cfg(target_os = "android")]
++			Self::AndroidUnused => {},
+ 			#[cfg(test)]
+ 			Self::Test(id) => id.hash(state),
+ 			#[cfg(test)]
 diff --git a/crates/pi-natives/src/lib.rs b/crates/pi-natives/src/lib.rs
 index 5309483..5e9c853 100644
 --- a/crates/pi-natives/src/lib.rs
@@ -821,7 +898,7 @@ index fc1c1c8..c01d501 100644
  	use std::{
  		collections::HashSet,
 diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src/task/index.ts
-index 9f782bf..787208e 100644
+index 9f782bf..cdafc10 100644
 --- a/packages/coding-agent/src/task/index.ts
 +++ b/packages/coding-agent/src/task/index.ts
 @@ -294,6 +294,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
