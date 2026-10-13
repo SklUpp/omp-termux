@@ -1567,3 +1567,25 @@ index 75dcd5d..4767a95 100644
  		}
  	}
  	if (enums.length > 0) {
+diff --git a/packages/tui/src/tools/task.ts b/packages/tui/src/tools/task.ts
+index 2ab791a..a40e0da 100644
+--- a/packages/tui/src/tools/task.ts
++++ b/packages/tui/src/tools/task.ts
+@@ -2218,6 +2218,8 @@ export interface TaskItem {
+ 	tools?: string[];
+ 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
+ 	isolated?: boolean;
++	/** Optional explicit git repository root for task isolation. */
++	repoRoot?: string;
+ }
+ 
+ /**
+@@ -2249,6 +2251,8 @@ export interface TaskParams {
+ 	context?: string;
+ 	/** Run in an isolated worktree (flat form; per-item in batch form). */
+ 	isolated?: boolean;
++	/** Explicit repository root (flat form or batch context override). */
++	repoRoot?: string;
+ }
+ 
+ /**
