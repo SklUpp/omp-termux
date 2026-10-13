@@ -44,6 +44,17 @@ jobs:
             git update-ref refs/heads/upstream "$upstream_tip"
           fi
           git push origin refs/heads/upstream:refs/heads/upstream || echo "warning: could not push upstream branch (permissions)"
+          # Verify patch queue applies before advancing UPSTREAM_TRACKED on main
+          probe_dir=$(mktemp -d)
+          git archive "$upstream_tip" | tar -x -C "$probe_dir"
+          git -C "$probe_dir" init -q
+          if ! git -C "$probe_dir" apply --check --whitespace=nowarn android/patches/01-termux.patch 2>/dev/null; then
+            rm -rf "$probe_dir"
+            echo "::warning::Patches do not apply cleanly onto upstream tip $upstream_tip; skipping automatic update"
+            exit 0
+          fi
+          rm -rf "$probe_dir"
+
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           printf '%s\n' "$upstream_tip" > android/UPSTREAM_TRACKED
