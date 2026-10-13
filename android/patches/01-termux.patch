@@ -935,7 +935,7 @@ index 9f782bf..cdafc10 100644
  				invokedAt: launchTiming?.invokedAt,
  				acquiredAt: launchTiming?.acquiredAt,
 -				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
-+			...(params.isolated === true ? { isolation: { requested: true, repoRoot: params.repoRoot } } : {}),
++				...(params.isolated === true ? { isolation: { requested: true, repoRoot: params.repoRoot } } : {}),
  				blockedAgent: this.#blockedAgent,
  				enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
  				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
