@@ -1513,9 +1513,18 @@ index 05b086c..6030842 100644
  
  /**
 diff --git a/packages/natives/scripts/gen-enums.ts b/packages/natives/scripts/gen-enums.ts
-index 75dcd5d..4767a95 100644
+index 75dcd5d..cb28a7b 100644
 --- a/packages/natives/scripts/gen-enums.ts
 +++ b/packages/natives/scripts/gen-enums.ts
+@@ -82,7 +82,7 @@ function collectMatches(dts: string, re: RegExp): string[] {
+ 	return names;
+ }
+ 
+-function buildGeneratedBlock(dts: string): string {
++export function buildGeneratedBlock(dts: string): string {
+ 	const classes = collectMatches(dts, CLASS_RE);
+ 	const functions = collectMatches(dts, FUNCTION_RE);
+ 	const enums = collectEnums(dts);
 @@ -92,24 +92,41 @@ function buildGeneratedBlock(dts: string): string {
  	}
  
