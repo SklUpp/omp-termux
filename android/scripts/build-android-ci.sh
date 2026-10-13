@@ -280,6 +280,54 @@ fi
 "$NDK_STRIP" --strip-unneeded "$BUILT" 2>/dev/null || true
 cp "$BUILT" "$ADDON"
 
+# Post-link release stamp: upstream oh-my-pi >= 18.3.x requires the native addon
+# to be stamped with the package version (via VERSION_STAMP placeholder in lib.rs).
+# Without this stamp, loader-state.js rejects the addon with "reports no release version".
+if [ -f "$REPO_ROOT/scripts/stamp-native-version.ts" ] && command -v bun >/dev/null 2>&1; then
+	echo "==> Stamping native addon with bun scripts/stamp-native-version.ts"
+	bun "$REPO_ROOT/scripts/stamp-native-version.ts" "$ADDON" --no-sign || true
+fi
+
+# Fallback/verification: ensure the version stamp is present in the binary.
+python3 - <<'PY'
+import json, sys
+from pathlib import Path
+
+addon = Path("packages/natives/native/pi_natives.android-arm64.node")
+pkg_file = Path("packages/natives/package.json")
+if not addon.is_file() or not pkg_file.is_file():
+    sys.exit(0)
+
+version = json.loads(pkg_file.read_text(encoding="utf-8"))["version"]
+magic = b"PI_NATIVES_VERSION_STAMP:"
+expected = magic + version.encode("utf-8") + b"\x00"
+
+data = addon.read_bytes()
+if expected in data:
+    print(f"    version stamp verified: {version}")
+    sys.exit(0)
+
+idx = data.find(magic)
+if idx == -1:
+    print(f"    note: {magic.decode()} not present in binary (pre-stamp ABI)")
+    sys.exit(0)
+
+print(f"==> Applying Python fallback stamp for version {version}...")
+slot_len = 64
+payload = version.encode("utf-8")
+if len(magic) + len(payload) >= slot_len:
+    sys.exit(f"error: version {version} too long for stamp slot ({slot_len} bytes)")
+
+replacement = magic + payload + b"\x00" * (slot_len - len(magic) - len(payload))
+data = data[:idx] + replacement + data[idx + slot_len:]
+addon.write_bytes(data)
+
+# Re-check
+if expected not in addon.read_bytes():
+    sys.exit(f"error: failed to stamp {version} into {addon}")
+print(f"    version stamp successfully applied: {version}")
+PY
+
 # Verify
 file_type="$(file -b "$ADDON")"
 echo "==> Built: $ADDON"

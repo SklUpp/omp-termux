@@ -88,6 +88,15 @@ else
     }
 fi
 
+# Pre-swap native addon verification
+if [ -f "$LIB_DIR.new/node_modules/@oh-my-pi/pi-natives/native/loader-state.js" ]; then
+    (cd "$LIB_DIR.new" && env OMP_PLATFORM=android ${PRELOAD_PRE:+LD_PRELOAD="$PRELOAD_PRE"} "$LIB_DIR.new/bun" -e \
+        'import { loadNative } from "./node_modules/@oh-my-pi/pi-natives/native/loader-state.js"; loadNative();') >/dev/null 2>&1 || {
+        echo 'error: new OMP native addon failed load test (check release version stamp)' >&2
+        exit 1
+    }
+fi
+
 # Guarded two-rename swap
 if [ -d "$LIB_DIR" ]; then
     rm -rf "$LIB_DIR.old"
@@ -126,6 +135,19 @@ if [ -n "$PRELOAD_POST" ]; then
 else
     "$LIB_DIR/bun" "$LIB_DIR/cli.js" --version >/dev/null 2>&1 || {
         echo 'error: installed OMP bundle failed post-swap smoke test' >&2
+        rm -rf "$LIB_DIR"
+        if [ "$had_old" -eq 1 ]; then
+            mv "$LIB_DIR.old" "$LIB_DIR"
+        fi
+        exit 1
+    }
+fi
+
+# Post-swap native addon verification
+if [ -f "$LIB_DIR/node_modules/@oh-my-pi/pi-natives/native/loader-state.js" ]; then
+    (cd "$LIB_DIR" && env OMP_PLATFORM=android ${PRELOAD_POST:+LD_PRELOAD="$PRELOAD_POST"} "$LIB_DIR/bun" -e \
+        'import { loadNative } from "./node_modules/@oh-my-pi/pi-natives/native/loader-state.js"; loadNative();') >/dev/null 2>&1 || {
+        echo 'error: installed OMP native addon failed load test (check release version stamp)' >&2
         rm -rf "$LIB_DIR"
         if [ "$had_old" -eq 1 ]; then
             mv "$LIB_DIR.old" "$LIB_DIR"

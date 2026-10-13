@@ -162,6 +162,19 @@ jobs:
           test -s packages/natives/native/pi_natives.android-arm64.node
           test -s packages/natives/native/pi_natives.android-arm64.node.sha256
           (cd packages/natives/native && sha256sum -c pi_natives.android-arm64.node.sha256)
+          python3 - <<'PY'
+          import json, sys
+          from pathlib import Path
+          addon = Path("packages/natives/native/pi_natives.android-arm64.node")
+          pkg = json.loads(Path("packages/natives/package.json").read_text(encoding="utf-8"))
+          version = pkg["version"]
+          magic = b"PI_NATIVES_VERSION_STAMP:"
+          expected = magic + version.encode("utf-8") + b"\x00"
+          data = addon.read_bytes()
+          if magic in data and expected not in data:
+              sys.exit(f"error: {addon} is unstamped or mismatched for {version}")
+          print(f"Native addon version stamp verified: {version}")
+          PY
 
       - name: Upload native addon
         uses: actions/upload-artifact@v4
@@ -325,6 +338,21 @@ jobs:
           test -s termux-bundle/cli.js
           test -s termux-bundle/node_modules/@oh-my-pi/pi-natives/native/pi_natives.android-arm64.node
           test -s termux-bundle/libomp-compat.so
+
+          # Verify native addon version stamp in assembled bundle
+          python3 - <<'PY'
+          import json, sys
+          from pathlib import Path
+          addon = Path("termux-bundle/node_modules/@oh-my-pi/pi-natives/native/pi_natives.android-arm64.node")
+          pkg = json.loads(Path("termux-bundle/node_modules/@oh-my-pi/pi-natives/package.json").read_text(encoding="utf-8"))
+          version = pkg["version"]
+          magic = b"PI_NATIVES_VERSION_STAMP:"
+          expected = magic + version.encode("utf-8") + b"\x00"
+          data = addon.read_bytes()
+          if magic in data and expected not in data:
+              sys.exit(f"error: {addon} is unstamped or mismatched for {version}")
+          print(f"Bundle native addon version stamp verified: {version}")
+          PY
 
           # Android ARM64 Bun cannot execute on x86_64 GitHub runners; URL,
           # manifest version, SHA256, and ELF architecture verify asset identity.

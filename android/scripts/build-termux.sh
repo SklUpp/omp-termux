@@ -36,6 +36,44 @@ bash "$REPO_ROOT/android/scripts/apply-patches.sh"
 echo "==> Building pi-natives (release)"
 bun --cwd=packages/natives run build
 
+# Post-link release stamp: upstream oh-my-pi >= 18.3.x requires native addons
+# to carry the package version in VERSION_STAMP.
+if [ -f "$REPO_ROOT/scripts/stamp-native-version.ts" ]; then
+	bun "$REPO_ROOT/scripts/stamp-native-version.ts" "packages/natives/native/pi_natives.android-arm64.node" --no-sign || true
+fi
+
+python3 - <<'PY'
+import json, sys
+from pathlib import Path
+
+addon = Path("packages/natives/native/pi_natives.android-arm64.node")
+pkg_file = Path("packages/natives/package.json")
+if not addon.is_file() or not pkg_file.is_file():
+    sys.exit(0)
+
+version = json.loads(pkg_file.read_text(encoding="utf-8"))["version"]
+magic = b"PI_NATIVES_VERSION_STAMP:"
+expected = magic + version.encode("utf-8") + b"\x00"
+
+data = addon.read_bytes()
+if expected in data:
+    print(f"    version stamp verified: {version}")
+    sys.exit(0)
+
+idx = data.find(magic)
+if idx == -1:
+    sys.exit(0)
+
+slot_len = 64
+payload = version.encode("utf-8")
+if len(magic) + len(payload) >= slot_len:
+    sys.exit(f"error: version {version} too long for stamp slot ({slot_len} bytes)")
+
+replacement = magic + payload + b"\x00" * (slot_len - len(magic) - len(payload))
+data = data[:idx] + replacement + data[idx + slot_len:]
+addon.write_bytes(data)
+PY
+
 # --- verify ------------------------------------------------------------------
 addon="packages/natives/native/pi_natives.android-arm64.node"
 if [ ! -f "$addon" ]; then
