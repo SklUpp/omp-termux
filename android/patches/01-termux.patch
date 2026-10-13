@@ -415,7 +415,7 @@ index 6ca937f..b18788e 100644
 +    }
  }
 diff --git a/crates/pi-natives/src/clipboard.rs b/crates/pi-natives/src/clipboard.rs
-index b88890c..cdeb80b 100644
+index b88890c..c5f567b 100644
 --- a/crates/pi-natives/src/clipboard.rs
 +++ b/crates/pi-natives/src/clipboard.rs
 @@ -5,9 +5,12 @@
@@ -523,7 +523,7 @@ index b88890c..cdeb80b 100644
  fn png_image(bytes: Vec<u8>) -> ClipboardImage {
  	ClipboardImage { data: Uint8Array::from(bytes), mime_type: "image/png".to_string() }
  }
-@@ -254,6 +276,11 @@ fn png_image(bytes: Vec<u8>) -> ClipboardImage {
+@@ -254,6 +276,12 @@ fn png_image(bytes: Vec<u8>) -> ClipboardImage {
  #[napi]
  pub fn read_image_from_clipboard() -> task::Promise<Option<ClipboardImage>> {
  	task::blocking("clipboard.read_image", (), move |_| -> Result<Option<ClipboardImage>> {
@@ -532,9 +532,18 @@ index b88890c..cdeb80b 100644
 +			Err(Error::from_reason("Native arboard clipboard image read is unsupported on Android/Termux"))
 +		}
 +		#[cfg(not(target_os = "android"))]
++		{
  		let read = {
  			let _access = CLIPBOARD_ACCESS.lock();
  			let mut clipboard = Clipboard::new()
+@@ -297,6 +325,7 @@ pub fn read_image_from_clipboard() -> task::Promise<Option<ClipboardImage>> {
+ 				None => Err(Error::from_reason(format!("Failed to read clipboard image: {err}"))),
+ 			},
+ 		}
++		}
+ 	})
+ }
+ 
 diff --git a/crates/pi-natives/src/crash_handler.rs b/crates/pi-natives/src/crash_handler.rs
 index e70775f..34b9825 100644
 --- a/crates/pi-natives/src/crash_handler.rs
@@ -898,7 +907,7 @@ index fc1c1c8..c01d501 100644
  	use std::{
  		collections::HashSet,
 diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src/task/index.ts
-index 9f782bf..cdafc10 100644
+index 9f782bf..5b31d51 100644
 --- a/packages/coding-agent/src/task/index.ts
 +++ b/packages/coding-agent/src/task/index.ts
 @@ -294,6 +294,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
