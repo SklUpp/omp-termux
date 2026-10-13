@@ -1,0 +1,150 @@
+name: Port patches and release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tip:
+        description: "Upstream SHA to port (default: android/UPSTREAM_TRACKED from main)"
+        required: false
+  workflow_run:
+    workflows: ["Sync upstream"]
+    types: [completed]
+permissions:
+  contents: write
+  actions: write
+  issues: write
+concurrency:
+  group: port-patches
+  cancel-in-progress: false
+
+# Applies the Android patch queue onto the tracked upstream tip,
+# builds Android ARM64 release, and publishes release on GitHub.
+jobs:
+  port:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+      - name: Port patch queue onto tracked upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/can1357/oh-my-pi.git 2>/dev/null || git remote set-url upstream https://github.com/can1357/oh-my-pi.git
+          git fetch --no-tags upstream main
+          git fetch --no-tags origin main mod || true
+          if [[ -n "${PORT_TIP:-}" ]]; then
+            tracked_tip="$PORT_TIP"
+          elif [[ -f android/UPSTREAM_TRACKED ]]; then
+            tracked_tip=$(tr -d '[:space:]' < android/UPSTREAM_TRACKED)
+          else
+            tracked_tip=$(git rev-parse upstream/main)
+          fi
+          if [[ ! "$tracked_tip" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: invalid tracked upstream tip: $tracked_tip" >&2
+            exit 1
+          fi
+          git cat-file -e "$tracked_tip^{commit}" || {
+            echo "error: tracked tip is not reachable locally: $tracked_tip" >&2
+            exit 1
+          }
+
+          metadata_dir="$RUNNER_TEMP/android-metadata"
+          mkdir -p "$metadata_dir"
+          tar -C . -czf "$metadata_dir/metadata.tar.gz" android .github install.sh
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          # Keep generated mod descendants of prior mod; never force-push.
+          git switch --detach "$tracked_tip"
+          if git show-ref --verify --quiet refs/remotes/origin/mod; then
+            git merge --no-ff -s ours refs/remotes/origin/mod -m "chore: merge upstream for Android mod regeneration" || true
+          fi
+          git clean -ffdx
+          # Remove upstream .github files before restoring repository metadata.
+          git rm -r --ignore-unmatch .github
+          tar -C . -xzf "$metadata_dir/metadata.tar.gz"
+          printf '%s\n' "$tracked_tip" > android/UPSTREAM_COMMIT
+          bash android/scripts/apply-patches.sh 2>&1 | tee "$RUNNER_TEMP/port-patches.log"
+        env:
+          PORT_TIP: ${{ inputs.tip }}
+      - name: Verify generated patched tree
+        run: |
+          set -euo pipefail
+          git diff --check
+          test -f package.json
+          test -f bun.lock
+          test -f crates/pi-natives/Cargo.toml
+          test -f packages/natives/native/loader-state.js
+          git status --short
+      - name: Validate release inputs
+        run: python3 android/scripts/check-release-inputs.py
+      - name: Setup Bun and verify lockfile consistency
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - name: Verify frozen lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile || bun install
+          rm -rf .bun-cache node_modules
+      - name: Commit and publish generated mod tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c "import json; print(json.load(open('packages/coding-agent/package.json'))['version'])")
+          base_tag="v${version}-termux"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "chore: generate Android mod ${version}" || true
+          current_commit=$(git rev-parse HEAD)
+          git push origin HEAD:refs/heads/mod
+
+          tag="$base_tag"
+          if git ls-remote --exit-code origin "refs/tags/$base_tag" >/dev/null; then
+            git fetch --no-tags origin "+refs/tags/$base_tag:refs/tags/$base_tag"
+            tag_commit=$(git rev-parse "refs/tags/$base_tag^{commit}")
+            if [ "$tag_commit" != "$current_commit" ]; then
+              tag="${base_tag}-r${current_commit:0:12}"
+              echo "base release tag points to $tag_commit; using collision-safe tag $tag"
+            fi
+          fi
+
+          if git ls-remote --exit-code origin "refs/tags/$tag" >/dev/null; then
+            echo "release tag already exists: $tag"
+          else
+            git tag "$tag"
+            git push origin "refs/tags/$tag"
+          fi
+          echo "dispatching Android release for $tag"
+          gh workflow run android-release.yml --repo "${{ github.repository }}" --ref "$tag" -f tag="$tag"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Notify port failure
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "Patch port failed on run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
+            echo
+            echo "Tracked tip: $(tr -d '[:space:]' < android/UPSTREAM_TRACKED 2>/dev/null || echo unknown)"
+            echo "Recorded pin: $(tr -d '[:space:]' < android/UPSTREAM_COMMIT 2>/dev/null || echo unknown)"
+            if [[ -f "$RUNNER_TEMP/port-patches.log" ]]; then
+              echo
+              echo '```'
+              tail -30 "$RUNNER_TEMP/port-patches.log"
+              echo '```'
+            fi
+          } > "$RUNNER_TEMP/port-failure.md"
+          issue_num=$(gh issue list --repo "${{ github.repository }}" --state open --search "Patch port failure" --json number --jq '.[0].number // empty' || echo "")
+          if [ -n "$issue_num" ]; then
+            gh issue comment "$issue_num" --repo "${{ github.repository }}" --body-file "$RUNNER_TEMP/port-failure.md" || true
+          else
+            gh issue create --repo "${{ github.repository }}" --title "Patch port failure" --body-file "$RUNNER_TEMP/port-failure.md" || true
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
