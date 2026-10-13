@@ -82,7 +82,7 @@ function collectMatches(dts: string, re: RegExp): string[] {
 	return names;
 }
 
-function buildGeneratedBlock(dts: string): string {
+export function buildGeneratedBlock(dts: string): string {
 	const classes = collectMatches(dts, CLASS_RE);
 	const functions = collectMatches(dts, FUNCTION_RE);
 	const enums = collectEnums(dts);
@@ -92,24 +92,41 @@ function buildGeneratedBlock(dts: string): string {
 	}
 
 	const lines: string[] = [];
+	const androidUnsupported = new Set([
+		"AudioCapture",
+		"AudioPlayback",
+		"LiveWebRtcPeer",
+		"copyToClipboard",
+		"readImageFromClipboard",
+	]);
+	const androidStub = (name: string) =>
+		`(() => { const v = nativeBindings.${name}; if (v !== undefined) return v; const err = () => { throw new Error("Native ${name} is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p) { if (p === "then") return undefined; return err; } }); })()`;
 	if (classes.length > 0) {
 		lines.push("// classes");
 		for (const name of classes) {
-			const binding =
-				name === "DesktopSession" ? `adaptDesktopSession(nativeBindings.${name})` : `nativeBindings.${name}`;
-			lines.push(`export const ${name} = ${binding};`);
+			if (androidUnsupported.has(name)) {
+				const binding =
+					name === "DesktopSession" ? `adaptDesktopSession(nativeBindings.${name})` : `nativeBindings.${name}`;
+				lines.push(
+					`export const ${name} = (() => { const v = ${binding}; if (v !== undefined) return v; const err = () => { throw new Error("Native ${name} is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })();`,
+				);
+			} else {
+				const binding =
+					name === "DesktopSession" ? `adaptDesktopSession(nativeBindings.${name})` : `nativeBindings.${name}`;
+				lines.push(`export const ${name} = ${binding};`);
+			}
 		}
 	}
 	if (functions.length > 0) {
 		if (lines.length > 0) lines.push("");
 		lines.push("// functions");
 		for (const name of functions) {
-			// `missingNativeExport` returns `undefined` on a current addon and a
-			// throwing stub on a stale one, so capability probes
-			// (`typeof native.x === "function"`) keep their meaning and only the
-			// stale case gains an actionable failure. See `loader-state.js`.
-			const fallback = RELEASE_IDENTITY_NAME_RE.test(name) ? "" : ` ?? missingNativeExport("${name}")`;
-			lines.push(`export const ${name} = nativeBindings.${name}${fallback};`);
+			if (androidUnsupported.has(name)) {
+				lines.push(`export const ${name} = ${androidStub(name)};`);
+			} else {
+				const fallback = RELEASE_IDENTITY_NAME_RE.test(name) ? "" : ` ?? missingNativeExport("${name}")`;
+				lines.push(`export const ${name} = nativeBindings.${name}${fallback};`);
+			}
 		}
 	}
 	if (enums.length > 0) {

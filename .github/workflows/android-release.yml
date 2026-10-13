@@ -1,0 +1,373 @@
+name: Android release
+
+on:
+  push:
+    tags:
+      - "v*-termux"
+      - "v*-termux-r*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach to"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  native-addon:
+    name: Build Android ARM64 native addon
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Free runner disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Prepare clean upstream and apply Android patch queue
+        shell: bash
+        run: bash android/scripts/prepare-clean-upstream.sh
+
+      - name: Load Android manifest environment
+        run: |
+          set -euo pipefail
+          grep -v '^#' android/versions.env >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          timeout 300 sudo apt-get update -qq
+          timeout 300 sudo apt-get install -y ninja-build cmake python3 unzip
+
+      - name: Verify Android overlay and release tag
+        run: python3 android/scripts/verify-overlay.py
+
+      - name: Validate release inputs
+        run: python3 android/scripts/check-release-inputs.py
+
+      - name: Verify browser prerequisite metadata (no bundle)
+        run: |
+          set -euo pipefail
+          # Pinned Termux:X11 chromium 149.0.7827.155 — metadata only, no binary bundled
+          grep -q '149.0.7827.155' android/scripts/verify-browser.sh
+          grep -q '36500e23ad23bf2616bb4f215a297ba5a2b9e625992362b9b9c6bd05e0a27272' android/scripts/verify-browser.sh
+          grep -q 'packages.termux.dev/apt/termux-x11' android/scripts/verify-browser.sh
+          grep -q '\$PREFIX/lib/chromium/chrome' android/scripts/verify-browser.sh
+          bash -n android/scripts/verify-browser.sh
+          bash -n android/scripts/smoke-browser.sh
+          bash android/scripts/verify-browser.sh --help >/dev/null
+          bash android/scripts/smoke-browser.sh --help >/dev/null
+          # Ensure release docs reference same pin
+          grep -q '149.0.7827.155' android/docs/verification.md
+          grep -q '36500e23ad23bf2616bb4f215a297ba5a2b9e625992362b9b9c6bd05e0a27272' android/docs/verification.md
+          echo "browser metadata OK — external Termux:X11, not bundled"
+
+      - name: Install Rust target
+        run: |
+          set -euo pipefail
+          source android/versions.env
+          rustup toolchain install "$RUST_TOOLCHAIN"
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add aarch64-linux-android
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+
+      - name: Make CMake find Ninja
+        run: |
+          set -euo pipefail
+          ninja=$(command -v ninja || command -v ninja-build)
+          cmake_bin=$(command -v cmake)
+          mkdir -p "$RUNNER_TEMP/bin"
+          cat > "$RUNNER_TEMP/bin/cmake" <<EOF
+          #!/bin/sh
+          if [ "\$1" = "--build" ]; then
+            exec "$cmake_bin" "\$@"
+          fi
+          args=""
+          for arg in "\$@"; do
+            case "\$arg" in
+              -DCMAKE_SYSTEM_PROCESSOR=*) continue ;;
+            esac
+            args="\$args \"\$arg\""
+          done
+          eval exec "$cmake_bin" \$args -DCMAKE_MAKE_PROGRAM="$ninja" -DCMAKE_POLICY_DEFAULT_CMP0057=NEW
+          EOF
+          chmod +x "$RUNNER_TEMP/bin/cmake"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_BOOTSTRAP_VERSION }}
+
+      - name: Install JS dependencies
+        run: bun install --minimum-release-age 0
+      - name: Cross-compile native addon
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+          CARGO_BUILD_JOBS: 4
+          RAYON_NUM_THREADS: 4
+          MAKEFLAGS: "-j4"
+          NUM_JOBS: 4
+          CMAKE_BUILD_PARALLEL_LEVEL: 4
+          NINJAFLAGS: "-j4"
+          OPUS_NO_PKG_CONFIG: "1"
+          CMAKE_GENERATOR: Ninja
+          CARGO_INCREMENTAL: "false"
+          CARGO_TERM_COLOR: always
+          # Deterministic Android target toolchain for cmake/cc-rs (audiopus_sys/ring).
+          # build-android-ci.sh also exports these from the resolved NDK path, but
+          # seeding them here prevents setup-ndk PATH wrappers/host cc contamination
+          # before the script runs and documents the API-24 aarch64 contract.
+          CMAKE_C_COMPILER: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
+          CMAKE_CXX_COMPILER: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++
+          CMAKE_AR: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CMAKE_RANLIB: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
+          TARGET_CC: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
+          TARGET_CXX: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++
+          TARGET_AR: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          TARGET_RANLIB: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
+        run: bash android/scripts/build-android-ci.sh
+
+      - name: Build Android compatibility library (close_range seccomp fallback)
+        run: |
+          set -euo pipefail
+          ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang \
+            -shared -fPIC -O2 -ldl -o packages/natives/native/libomp-compat.so android/compat/libomp-compat.c
+          test -s packages/natives/native/libomp-compat.so
+
+      - name: Verify native addon artifact naming and checksum
+        run: |
+          set -euo pipefail
+          test -s packages/natives/native/pi_natives.android-arm64.node
+          test -s packages/natives/native/pi_natives.android-arm64.node.sha256
+          (cd packages/natives/native && sha256sum -c pi_natives.android-arm64.node.sha256)
+
+      - name: Upload native addon
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64-native
+          path: |
+            packages/natives/native/pi_natives.android-arm64.node
+            packages/natives/native/pi_natives.android-arm64.node.sha256
+            packages/natives/native/libomp-compat.so
+          if-no-files-found: error
+  js-bundle:
+    name: Build Termux JavaScript bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Prepare clean upstream and apply Android patch queue
+        shell: bash
+        run: bash android/scripts/prepare-clean-upstream.sh
+
+      - name: Load Android manifest environment
+        run: |
+          set -euo pipefail
+          grep -v '^#' android/versions.env >> "$GITHUB_ENV"
+
+      - name: Verify Android overlay and release tag
+        run: python3 android/scripts/verify-overlay.py
+
+      - name: Validate release inputs
+        run: python3 android/scripts/check-release-inputs.py
+
+      - name: Verify browser prerequisite metadata (no bundle)
+        run: |
+          set -euo pipefail
+          grep -q '149.0.7827.155' android/scripts/verify-browser.sh
+          grep -q '36500e23ad23bf2616bb4f215a297ba5a2b9e625992362b9b9c6bd05e0a27272' android/scripts/verify-browser.sh
+          bash -n android/scripts/verify-browser.sh
+          bash -n android/scripts/smoke-browser.sh
+          bash android/scripts/verify-browser.sh --help >/dev/null
+          # Bundle does not yet exist — metadata check only
+          echo "browser metadata OK"
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_BOOTSTRAP_VERSION }}
+
+      - name: Install JS dependencies
+        run: bun install --minimum-release-age 0
+
+      - name: Build JavaScript bundle
+        run: |
+          set -euo pipefail
+          # Lean path: no host linux-x64 natives, no stats vite pipeline.
+          # Full arm64 package still embeds docs + natives loader stubs.
+          bun android/scripts/build-termux-js.ts
+          test -s termux-js.tar.gz
+
+      - name: Verify JavaScript bundle archive contents
+        run: |
+          set -euo pipefail
+          test -s termux-js.tar.gz
+          tar -tzf termux-js.tar.gz | grep -Fx './cli.js'
+          tar -tzf termux-js.tar.gz | grep -F 'node_modules/@oh-my-pi/pi-natives/package.json'
+          tar -tzf termux-js.tar.gz | grep -F 'node_modules/@oh-my-pi/pi-natives/native/index.js'
+          # Browser bundle-absence gate (JS bundle stage)
+          ! tar -tzf termux-js.tar.gz | grep -qi chromium
+          ! tar -tzf termux-js.tar.gz | grep -q './chrome'
+
+      - name: Upload JavaScript bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-js-bundle
+          path: termux-js.tar.gz
+          if-no-files-found: error
+
+  package-release:
+    name: Package and publish GitHub Release
+    needs: [native-addon, js-bundle]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Load Android manifest environment
+        run: |
+          set -euo pipefail
+          grep -v '^#' android/versions.env >> "$GITHUB_ENV"
+      - name: Prepare clean upstream and apply Android patch queue
+        shell: bash
+        run: bash android/scripts/prepare-clean-upstream.sh
+
+      - name: Verify Android overlay and release tag
+        run: python3 android/scripts/verify-overlay.py
+
+      - name: Validate release inputs
+        run: python3 android/scripts/check-release-inputs.py
+
+      - name: Verify browser prerequisite metadata (no bundle)
+        run: |
+          set -euo pipefail
+          grep -q '149.0.7827.155' android/scripts/verify-browser.sh
+          grep -q '36500e23ad23bf2616bb4f215a297ba5a2b9e625992362b9b9c6bd05e0a27272' android/scripts/verify-browser.sh
+          grep -q 'packages.termux.dev/apt/termux-x11' android/scripts/verify-browser.sh
+          bash -n android/scripts/verify-browser.sh
+          bash -n android/scripts/smoke-browser.sh
+          bash android/scripts/verify-browser.sh --help >/dev/null
+          bash android/scripts/smoke-browser.sh --help >/dev/null
+          echo "browser metadata OK"
+
+      - name: Download native addon
+        uses: actions/download-artifact@v4
+        with:
+          name: android-arm64-native
+          path: packages/natives/native
+
+      - name: Download JavaScript bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: termux-js-bundle
+          path: .
+
+      - name: Download official stable Bun
+        run: |
+          set -euo pipefail
+          source android/versions.env
+          curl -fL --retry 5 --retry-all-errors --retry-delay 2 \
+            "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/${BUN_ARCHIVE_NAME}" \
+            -o /tmp/bun.zip
+          printf '%s  %s\n' "$BUN_SHA256" /tmp/bun.zip | sha256sum -c -
+          rm -rf /tmp/bun-extract
+          mkdir /tmp/bun-extract
+          unzip -q /tmp/bun.zip -d /tmp/bun-extract
+          BUN_BIN=$(find /tmp/bun-extract -type f -name bun -print -quit)
+          test -n "$BUN_BIN"
+          test -x "$BUN_BIN"
+          file "$BUN_BIN" | grep -q 'aarch64'
+          cp "$BUN_BIN" /tmp/bun-extract/bun
+          chmod 755 /tmp/bun-extract/bun
+
+      - name: Assemble and test release bundle
+        run: |
+          set -euo pipefail
+          source android/versions.env
+          test -s packages/natives/native/pi_natives.android-arm64.node
+          test -s packages/natives/native/pi_natives.android-arm64.node.sha256
+          (cd packages/natives/native && sha256sum -c pi_natives.android-arm64.node.sha256)
+          test -s termux-js.tar.gz
+          tar -tzf termux-js.tar.gz | grep -Fx './cli.js'
+          rm -rf termux-bundle
+          mkdir termux-bundle
+          tar -xzf termux-js.tar.gz -C termux-bundle
+          mkdir -p termux-bundle/node_modules/@oh-my-pi/pi-natives/native
+          cp packages/natives/native/pi_natives.android-arm64.node \
+            termux-bundle/node_modules/@oh-my-pi/pi-natives/native/
+          cp packages/natives/native/libomp-compat.so termux-bundle/libomp-compat.so
+          chmod 755 termux-bundle/libomp-compat.so
+          test -s termux-bundle/cli.js
+          test -s termux-bundle/node_modules/@oh-my-pi/pi-natives/native/pi_natives.android-arm64.node
+          test -s termux-bundle/libomp-compat.so
+
+          # Android ARM64 Bun cannot execute on x86_64 GitHub runners; URL,
+          # manifest version, SHA256, and ELF architecture verify asset identity.
+          test -x /tmp/bun-extract/bun
+          cp /tmp/bun-extract/bun termux-bundle/bun
+          chmod +x termux-bundle/bun
+          test -x termux-bundle/bun
+
+          tar -czf omp-termux.tar.gz -C termux-bundle .
+          sha256sum omp-termux.tar.gz > omp-termux.tar.gz.sha256
+          test -s omp-termux.tar.gz
+          test -s omp-termux.tar.gz.sha256
+          sha256sum -c omp-termux.tar.gz.sha256
+          tar -tzf omp-termux.tar.gz | grep -Fx './cli.js'
+          tar -tzf omp-termux.tar.gz | grep -Fx './bun'
+          tar -tzf omp-termux.tar.gz | grep -Fx './libomp-compat.so'
+          tar -tzf omp-termux.tar.gz | grep -F './node_modules/@oh-my-pi/pi-natives/native/pi_natives.android-arm64.node'
+          (cd packages/natives/native && sha256sum -c pi_natives.android-arm64.node.sha256)
+
+          # Browser bundle-absence gate — Chromium must NOT be in OMP bundle (external apt only)
+          echo "checking OMP bundle does not contain Chromium"
+          ! tar -tzf omp-termux.tar.gz | grep -qi chromium
+          ! tar -tzf omp-termux.tar.gz | grep -q './chrome'
+          ! tar -tzf omp-termux.tar.gz | grep -q 'headless_shell'
+          bash android/scripts/verify-browser.sh --check-bundle ./omp-termux.tar.gz
+          # Browser scripts metadata check on runner (no device binary)
+          bash -n android/scripts/verify-browser.sh
+          bash -n android/scripts/smoke-browser.sh
+          bash android/scripts/verify-browser.sh --help >/dev/null
+          bash android/scripts/smoke-browser.sh --help >/dev/null
+          # Probe dry-run without .deb cache (CI has no Termux chromium)
+          bash android/scripts/verify-browser.sh --help | grep -q '149.0.7827.155'
+          echo "browser bundle-absence OK"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            omp-termux.tar.gz
+            omp-termux.tar.gz.sha256
+            packages/natives/native/pi_natives.android-arm64.node
+            packages/natives/native/pi_natives.android-arm64.node.sha256
+            android/scripts/verify-browser.sh
+            android/scripts/smoke-browser.sh
+          fail_on_unmatched_files: true
