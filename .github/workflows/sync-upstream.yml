@@ -48,7 +48,7 @@ jobs:
           probe_dir=$(mktemp -d)
           git archive "$upstream_tip" | tar -x -C "$probe_dir"
           git -C "$probe_dir" init -q
-          if ! git -C "$probe_dir" apply --check --whitespace=nowarn android/patches/01-termux.patch 2>/dev/null; then
+          if ! git -C "$probe_dir" apply --check --whitespace=nowarn "$GITHUB_WORKSPACE/android/patches/01-termux.patch" 2>/dev/null; then
             rm -rf "$probe_dir"
             echo "::warning::Patches do not apply cleanly onto upstream tip $upstream_tip; skipping automatic update"
             exit 0
