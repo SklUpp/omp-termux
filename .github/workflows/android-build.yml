@@ -1,0 +1,121 @@
+name: Android build
+
+# Cross-compiles the pi-natives addon for aarch64-linux-android (Termux/bionic)
+# on a standard Ubuntu runner and uploads it as an artifact. This is the
+# release/prebuilt path; on-device builds use android/scripts/build-termux.sh.
+#
+# The cross-compile uses the Android NDK directly (NDK clang as both compiler
+# and linker) — cargo-zigbuild cannot provide bionic libc and is not a viable
+# path for Android. The build script calls `napi build --target ...` directly
+# so napi invokes `cargo build` (not cargo-zigbuild) with cargo/cc env pointing
+# at the NDK clang.
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "packages/natives/**"
+      - "android/**"
+      - ".github/workflows/android-build.yml"
+  workflow_dispatch:
+jobs:
+  build:
+    name: Cross-compile android-arm64 addon
+    runs-on: tenki-standard-medium-4c-8g
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare clean upstream and apply Android patch queue
+        shell: bash
+        run: bash android/scripts/prepare-clean-upstream.sh
+
+      - name: Load Android manifest environment
+        run: |
+          set -euo pipefail
+          grep -v '^#' android/versions.env >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake python3
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_BOOTSTRAP_VERSION }}
+
+      - name: Install Rust with Android target
+        run: |
+          set -euo pipefail
+          source android/versions.env
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN"
+          source "$HOME/.cargo/env"
+          rustup target add aarch64-linux-android
+      - name: Cache Rust artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: android-rust-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            android-rust-${{ runner.os }}-
+      - name: Install Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+      - name: Install JS dependencies
+        run: bun install --minimum-release-age 0
+
+      - name: Verify Android overlay
+        run: python3 android/scripts/verify-overlay.py
+
+      - name: Make CMake find Ninja
+        run: |
+          set -euo pipefail
+          ninja=$(command -v ninja || command -v ninja-build)
+          cmake_bin=$(command -v cmake)
+          mkdir -p "$RUNNER_TEMP/bin"
+          cat > "$RUNNER_TEMP/bin/cmake" <<EOF
+          #!/bin/sh
+          if [ "\$1" = "--build" ]; then
+            exec "$cmake_bin" "\$@"
+          fi
+          args=""
+          for arg in "\$@"; do
+            case "\$arg" in
+              -DCMAKE_SYSTEM_PROCESSOR=*) continue ;;
+            esac
+            args="\$args \"\$arg\""
+          done
+          eval exec "$cmake_bin" \$args -DCMAKE_MAKE_PROGRAM="$ninja" -DCMAKE_POLICY_DEFAULT_CMP0057=NEW
+          EOF
+          chmod +x "$RUNNER_TEMP/bin/cmake"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Cross-compile native addon (NDK clang)
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+          CARGO_BUILD_JOBS: 1
+          CARGO_PROFILE_CI_LTO: "false"
+          CARGO_PROFILE_CI_CODEGEN_UNITS: "16"
+          CARGO_PROFILE_CI_DEBUG: "false"
+          RUSTFLAGS: "-C debuginfo=0"
+          OPUS_NO_PKG_CONFIG: "1"
+          CMAKE_GENERATOR: Ninja
+          CMAKE_MAKE_PROGRAM: /usr/bin/ninja
+          CMAKE_ARGS: -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja
+          CARGO_INCREMENTAL: "0"
+        run: timeout 55m bash android/scripts/build-android-ci.sh
+
+      - name: Upload addon artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi_natives.android-arm64
+          path: |
+            packages/natives/native/pi_natives.android-arm64.node
+            packages/natives/native/pi_natives.android-arm64.node.sha256
+          if-no-files-found: error
