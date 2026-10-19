@@ -92,7 +92,7 @@ pub fn install() {
 				prev_panic(info);
 			},
 		}));
-
+#[cfg(not(target_os = "android"))]
 		std::alloc::set_alloc_error_hook(|layout| {
 			// Print the canonical line before doing anything allocation-prone.
 			// If this is genuine process-wide OOM, report formatting/path work may
