@@ -249,6 +249,10 @@ let chromiumExecutablePromise: Promise<string | undefined> | undefined;
 export async function ensureChromiumExecutable(): Promise<string | undefined> {
 	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
 	if (envPath) return envPath;
+	if (process.platform === "android") {
+		const sysChrome = await resolveSystemChromium();
+		return sysChrome;
+	}
 	// macOS: never route a background daemon through the user's GUI Chrome
 	// bundle; prefer the isolated Chrome for Testing binary instead (#8673).
 	const preferManagedChromium = process.platform === "darwin";
@@ -427,6 +431,24 @@ function systemChromiumCandidates(
 				"/usr/bin/ungoogled-chromium-browser",
 				`/var/lib/flatpak/exports/bin/${UNGOOGLED_CHROMIUM_FLATPAK_ID}`,
 				path.join(home, ".local/share/flatpak/exports/bin", UNGOOGLED_CHROMIUM_FLATPAK_ID),
+			);
+			break;
+		}
+		case "android": {
+			// Termux on Android: Chromium installed via pkg lives under $PREFIX
+			// (/data/data/com.termux/files/usr). Honor PUPPETEER_EXECUTABLE_PATH already
+			// handled above, then probe Termux pkg paths and PATH.
+			const prefix = process.env.PREFIX ?? "/data/data/com.termux/files/usr";
+			const names = ["chromium", "chromium-browser", "google-chrome", "chrome"];
+			for (const name of names) {
+				const found = which(name);
+				if (found) candidates.push(found);
+			}
+			candidates.push(
+				`${prefix}/bin/chromium`,
+				`${prefix}/bin/chromium-browser`,
+				`${prefix}/bin/google-chrome`,
+				"/data/data/com.termux/files/usr/bin/chromium",
 			);
 			break;
 		}
