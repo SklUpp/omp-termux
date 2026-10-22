@@ -1600,9 +1600,21 @@ index 2ab791a..a40e0da 100644
 diff --git a/crates/pi-natives/src/desktop/control.rs b/crates/pi-natives/src/desktop/control.rs
 --- a/crates/pi-natives/src/desktop/control.rs
 +++ b/crates/pi-natives/src/desktop/control.rs
-@@ -476,0 +477,2 @@
+@@ -474,6 +474,8 @@
+ 	_escape: Option<windows::EscapeMonitor>,
+ 	#[cfg(target_os = "linux")]
+ 	_escape: Option<linux::EscapeMonitor>,
 +	#[cfg(target_os = "android")]
 +	_escape: Option<()>,
-@@ -539,0 +542,2 @@
+ 	_kernel: KernelOwner,
+ 	running: AtomicBool,
+ }
+@@ -535,6 +537,8 @@
+ 			_escape: Some(escape),
+ 			#[cfg(target_os = "linux")]
+ 			_escape: escape,
 +			#[cfg(target_os = "android")]
 +			_escape: None,
+ 			_kernel: kernel,
+ 			running: AtomicBool::new(false),
+ 		})
