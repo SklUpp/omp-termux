@@ -1,4 +1,4 @@
-name: Generate Android release
+name: Generate release tree
 
 on:
   workflow_dispatch:

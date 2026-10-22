@@ -1,4 +1,4 @@
-name: Vouch (manage)
+name: Vouch management
 
 # Let maintainers vouch/denounce/unvouch by commenting on a Discussion:
 #   !vouch                 vouch the discussion author
@@ -29,7 +29,7 @@ permissions:
 jobs:
   vouch-update:
     name: Update vouch record
-    runs-on: tenki-standard-small-2c-4g
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 

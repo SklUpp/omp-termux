@@ -1,4 +1,4 @@
-name: CI
+name: Repository checks
 
 on:
   push:
@@ -24,7 +24,7 @@ permissions:
 jobs:
   quality-check:
     name: Type check and web build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +36,7 @@ jobs:
 
   android-overlay-check:
     name: Android overlay validation
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4

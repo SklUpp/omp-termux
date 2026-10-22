@@ -1,4 +1,4 @@
-name: Vouch (PR gate)
+name: Vouch PR gate
 
 # Auto-close PRs from unvouched or denounced users. Issues are left alone
 # (robomp triages those). Runs under `pull_request_target` so the token can
@@ -21,7 +21,7 @@ concurrency:
 jobs:
   vouch-check:
     name: Check PR approval
-    runs-on: tenki-standard-small-2c-4g
+    runs-on: ubuntu-latest
     steps:
       - id: vouch
         uses: mitchellh/vouch/action/check-pr@v1
