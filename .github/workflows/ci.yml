@@ -8,6 +8,7 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
 
 # Keep PR feedback current; never cancel main pushes or manual runs.
 concurrency:
@@ -21,7 +22,7 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  quality-check:
     name: Type check and web build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -33,7 +34,7 @@ jobs:
       - name: Build collab web
         run: bun run collab:web:build
 
-  android-overlay:
+  android-overlay-check:
     name: Android overlay validation
     runs-on: ubuntu-24.04
     timeout-minutes: 20

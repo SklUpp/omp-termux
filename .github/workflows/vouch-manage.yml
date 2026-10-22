@@ -27,7 +27,8 @@ permissions:
   discussions: write # read the comment / acknowledge
 
 jobs:
-  manage:
+  vouch-update:
+    name: Update vouch record
     runs-on: tenki-standard-small-2c-4g
     steps:
       - uses: actions/checkout@v4

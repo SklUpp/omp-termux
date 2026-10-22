@@ -16,7 +16,8 @@ concurrency:
 # the patch queue, mod, or tags. Porting happens in port-patches.yml, so a
 # red patch queue can never turn this workflow red.
 jobs:
-  track:
+  upstream-sync:
+    name: Sync upstream
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -22,8 +22,15 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
-  native-addon:
-    name: Build Android ARM64 native addon
+  preflight:
+    name: Release preflight
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  native-addon-build:
+    name: Android arm64 native addon
+    needs: [preflight]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -185,8 +192,9 @@ jobs:
             packages/natives/native/pi_natives.android-arm64.node.sha256
             packages/natives/native/libomp-compat.so
           if-no-files-found: error
-  js-bundle:
-    name: Build Termux JavaScript bundle
+  js-bundle-build:
+    name: Termux JS bundle
+    needs: [preflight]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -253,9 +261,9 @@ jobs:
           path: termux-js.tar.gz
           if-no-files-found: error
 
-  package-release:
-    name: Package and publish GitHub Release
-    needs: [native-addon, js-bundle]
+  release-publish:
+    name: Publish release
+    needs: [native-addon-build, js-bundle-build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

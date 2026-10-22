@@ -20,7 +20,7 @@ concurrency:
 # Applies the Android patch queue onto the tracked upstream tip,
 # builds Android ARM64 release, and publishes release on GitHub.
 jobs:
-  port:
+  release-tree:
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:

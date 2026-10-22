@@ -19,7 +19,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
+  vouch-check:
+    name: Check PR approval
     runs-on: tenki-standard-small-2c-4g
     steps:
       - id: vouch

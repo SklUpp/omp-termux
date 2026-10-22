@@ -1597,3 +1597,12 @@ index 2ab791a..a40e0da 100644
  }
  
  /**
+diff --git a/crates/pi-natives/src/desktop/control.rs b/crates/pi-natives/src/desktop/control.rs
+--- a/crates/pi-natives/src/desktop/control.rs
++++ b/crates/pi-natives/src/desktop/control.rs
+@@ -476,0 +477,2 @@
++	#[cfg(target_os = "android")]
++	_escape: Option<()>,
+@@ -539,0 +542,2 @@
++			#[cfg(target_os = "android")]
++			_escape: None,

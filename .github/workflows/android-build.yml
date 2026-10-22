@@ -19,8 +19,8 @@ on:
       - ".github/workflows/android-build.yml"
   workflow_dispatch:
 jobs:
-  build:
-    name: Cross-compile android-arm64 addon
+  android-addon-build:
+    name: Cross-compile Android arm64 addon
     runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 60
     steps:
