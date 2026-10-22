@@ -57,9 +57,9 @@ jobs:
           rm -rf "$probe_dir"
 
           git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           printf '%s\n' "$upstream_tip" > android/UPSTREAM_TRACKED
-          git add android/UPSTREAM_TRACKED
+          printf '%s\n' "$upstream_tip" > android/UPSTREAM_COMMIT
+          git add android/UPSTREAM_TRACKED android/UPSTREAM_COMMIT
           git commit -m "chore: track upstream ${upstream_tip:0:12}" || echo "already tracked: $upstream_tip"
           git push origin HEAD:refs/heads/main
         env:
