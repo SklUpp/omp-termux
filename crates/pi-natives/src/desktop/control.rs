@@ -1363,3 +1363,7 @@ mod tests {
 		remove_test_lock();
 	}
 }
+	#[cfg(target_os = "android")]
+	_escape: Option<()>,
+			#[cfg(target_os = "android")]
+			_escape: None,

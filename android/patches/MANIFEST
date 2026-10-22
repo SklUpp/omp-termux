@@ -1,0 +1,3 @@
+# Active patch order: clean upstream -> 01-termux
+# This manifest is validated by android/scripts/apply-patches.sh
+01-termux.patch
