@@ -1,4 +1,4 @@
-name: Port patches and release
+name: Generate Android release
 
 on:
   workflow_dispatch:
@@ -14,11 +14,8 @@ permissions:
   actions: write
   issues: write
 concurrency:
-  group: port-patches
+  group: release-tree
   cancel-in-progress: false
-
-# Applies the Android patch queue onto the tracked upstream tip,
-# builds Android ARM64 release, and publishes release on GitHub.
 jobs:
   release-tree:
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
