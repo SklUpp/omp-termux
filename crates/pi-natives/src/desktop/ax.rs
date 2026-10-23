@@ -21,6 +21,8 @@ pub enum AxHandle {
 	Uia(uiautomation::UIElement, Option<Box<[i32]>>),
 	#[cfg(target_os = "linux")]
 	AtSpi(atspi::ObjectRefOwned),
+	#[cfg(target_os = "android")]
+	AndroidUnused,
 	#[cfg(test)]
 	Test(u64),
 	/// A test element without an identity, like a UIA element whose
@@ -41,6 +43,8 @@ impl AxHandle {
 			Self::Uia(_, runtime_id) => runtime_id.is_some(),
 			#[cfg(target_os = "linux")]
 			Self::AtSpi(_) => true,
+			#[cfg(target_os = "android")]
+			Self::AndroidUnused => false,
 			#[cfg(test)]
 			Self::Test(_) => true,
 			#[cfg(test)]
@@ -61,6 +65,8 @@ impl PartialEq for AxHandle {
 			(Self::Uia(_, a), Self::Uia(_, b)) => a == b,
 			#[cfg(target_os = "linux")]
 			(Self::AtSpi(a), Self::AtSpi(b)) => a == b,
+			#[cfg(target_os = "android")]
+			(Self::AndroidUnused, Self::AndroidUnused) => true,
 			#[cfg(test)]
 			(Self::Test(a), Self::Test(b)) => a == b,
 			#[cfg(test)]
@@ -82,6 +88,8 @@ impl Hash for AxHandle {
 			Self::Uia(_, runtime_id) => runtime_id.hash(state),
 			#[cfg(target_os = "linux")]
 			Self::AtSpi(object) => object.hash(state),
+			#[cfg(target_os = "android")]
+			Self::AndroidUnused => {},
 			#[cfg(test)]
 			Self::Test(id) => id.hash(state),
 			#[cfg(test)]
