@@ -137,7 +137,7 @@ mod tests {
 		let mut prompt = Vec::new();
 		assert!(
 			approvals
-				.confirm("bash", Some("rm -rf build"), &mut input, &mut prompt)
+				.confirm("bash", false, Some("rm -rf build"), &mut input, &mut prompt)
 				.expect("confirm")
 		);
 		assert!(
@@ -150,7 +150,7 @@ mod tests {
 		let mut prompt = Vec::new();
 		assert!(
 			!approvals
-				.confirm("bash", None, &mut input, &mut prompt)
+				.confirm("bash", false, None, &mut input, &mut prompt)
 				.expect("confirm")
 		);
 	}
@@ -162,7 +162,7 @@ mod tests {
 		let mut prompt = Vec::new();
 		assert!(
 			approvals
-				.confirm("read", None, &mut input, &mut prompt)
+				.confirm("read", true, None, &mut input, &mut prompt)
 				.expect("confirm")
 		);
 	}

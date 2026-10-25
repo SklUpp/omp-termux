@@ -2,7 +2,7 @@
 //! runner seam accepts an implementation, and the binary fails honestly when
 //! its configuration is missing.
 
-use std::process::Command;
+use std::process::Command as ProcCommand;
 
 use clap::Parser;
 use omp_cli::{
@@ -17,8 +17,8 @@ fn parse(args: &[&str]) -> Cli {
 	Cli::try_parse_from(args).expect("parse")
 }
 
-fn omp() -> Command {
-	Command::new(env!("CARGO_BIN_EXE_omp"))
+fn omp() -> ProcCommand {
+	ProcCommand::new(env!("CARGO_BIN_EXE_omp"))
 }
 
 #[test]

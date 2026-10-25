@@ -327,14 +327,14 @@ mod tests {
 	fn plan_requires_base_url_and_api_key() {
 		let mut missing_url = request(yolo());
 		missing_url.config.providers.clear();
-		let err = RunPlan::resolve(&missing_url).expect_err("no baseUrl");
+		let err = RunPlan::resolve(&missing_url).err().expect("no baseUrl");
 		assert!(err.to_string().contains("has no baseUrl"));
 
 		let mut missing_key = request(yolo());
 		if let Some(provider) = missing_key.config.providers.get_mut("local") {
 			provider.api_key = None;
 		}
-		let err = RunPlan::resolve(&missing_key).expect_err("no apiKey");
+		let err = RunPlan::resolve(&missing_key).err().expect("no apiKey");
 		assert!(err.to_string().contains("has no apiKey"));
 
 		let mut no_model = request(yolo());
@@ -352,7 +352,8 @@ mod tests {
 	#[test]
 	fn always_ask_needs_an_explicit_allow() {
 		let err = RunPlan::resolve(&request(Approvals::new(ApprovalMode::AlwaysAsk, Vec::new())))
-			.expect_err("gating impossible");
+			.err()
+			.expect("gating impossible");
 		assert!(err.to_string().contains("approval gating requires --yolo"));
 
 		let allowed = Approvals::new(ApprovalMode::AlwaysAsk, ["bash".to_string()]);
