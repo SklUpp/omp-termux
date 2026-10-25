@@ -91,38 +91,63 @@ struct RunPlan {
 
 impl RunPlan {
 	fn resolve(request: &RunRequest) -> Result<Self> {
-		let model = request
+		let requested = request
 			.model
 			.clone()
 			.ok_or_else(|| Error::new("no model: pass --model or set defaultModel in config"))?;
-		let provider = request
-			.provider
-			.clone()
-			.or_else(|| request.catalog.provider_of(&model).map(str::to_string))
-			.ok_or_else(|| {
-				Error::new(format!(
-					"no provider for model `{model}`: pass --provider or add the model to models.json"
-				))
-			})?;
-		let base_url = request
+		// `provider/id` (first segment is the provider, as in TS model roles),
+		// `provider/id:effort`, or a bare id resolved through the catalog.
+		let (provider, model) = match request.provider.as_deref() {
+			Some(provider) => {
+				let prefix = format!("{provider}/");
+				let id = requested
+					.strip_prefix(prefix.as_str())
+					.unwrap_or(&requested);
+				(provider.to_string(), split_effort(id).to_string())
+			},
+			None => match requested.split_once('/') {
+				Some((provider, id)) if !provider.is_empty() && !id.is_empty() => {
+					(provider.to_string(), split_effort(id).to_string())
+				},
+				_ => {
+					let id = split_effort(&requested).to_string();
+					let provider = request
+						.catalog
+						.provider_of(&id)
+						.map(str::to_string)
+						.ok_or_else(|| {
+							Error::new(format!(
+								"no provider for model `{id}`: pass --provider or use `provider/{id}`"
+							))
+						})?;
+					(provider, id)
+				},
+			},
+		};
+		// Connection block: config.yml first, then models.yml providers.<id>.
+		let connection = request
 			.config
 			.providers
 			.get(&provider)
-			.and_then(|config| config.base_url.clone())
-			.ok_or_else(|| Error::new(format!("provider `{provider}` has no baseUrl in config")))?;
+			.cloned()
+			.or_else(|| request.catalog.connections.get(&provider).cloned());
+		let base_url = connection
+			.as_ref()
+			.and_then(|connection| connection.base_url.clone())
+			.ok_or_else(|| {
+				Error::new(format!("provider `{provider}` has no baseUrl in config.yml or models.yml"))
+			})?;
+		// A keyless provider (local gateway, `auth: none`) is legal: the OpenAI
+		// client sends an empty bearer token.
 		let api_key = request
 			.api_key
 			.clone()
-			.or_else(|| request.config.resolve_api_key(&provider))
-			.ok_or_else(|| {
-				Error::new(format!(
-					"provider `{provider}` has no apiKey in config and --api-key was not passed"
-				))
-			})?;
-		let model = model
-			.split_once('/')
-			.filter(|(prefix, _)| *prefix == provider.as_str())
-			.map_or_else(|| model.clone(), |(_, id)| id.to_string());
+			.or_else(|| {
+				connection
+					.as_ref()
+					.and_then(|connection| connection.resolve_api_key())
+			})
+			.unwrap_or_default();
 		let context_limit = request
 			.catalog
 			.context_window(&provider, &model)
@@ -137,6 +162,23 @@ impl RunPlan {
 			tools: allowed_tools(request)?,
 		})
 	}
+}
+
+/// Trailing `:effort` selector (`:high`, `:xhi`, …) is not part of the model id.
+const EFFORT_SELECTORS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+fn split_effort(model: &str) -> &str {
+	let Some((id, suffix)) = model.rsplit_once(':') else {
+		return model;
+	};
+	if id.is_empty() || suffix.len() < 2 {
+		return model;
+	}
+	let matching = EFFORT_SELECTORS
+		.iter()
+		.filter(|selector| selector.starts_with(suffix))
+		.count();
+	if matching == 1 { id } else { model }
 }
 
 /// Tools the model may call, derived from the approval matrix.
@@ -263,7 +305,20 @@ mod tests {
 			ModelInfo { provider: "local".to_string(), context_window: Some(8_192) },
 		);
 		providers.insert("local".to_string(), models);
-		Catalog { providers, source: PathBuf::from("test-models.json") }
+		Catalog { providers, connections: BTreeMap::new(), source: PathBuf::from("test-models.json") }
+	}
+
+	fn catalog_with_connection(provider: &str, base_url: &str, api_key: Option<&str>) -> Catalog {
+		let mut catalog = catalog();
+		catalog.connections.insert(
+			provider.to_string(),
+			ProviderConfig {
+				base_url: Some(base_url.to_string()),
+				api_key: api_key.map(str::to_string),
+				..ProviderConfig::default()
+			},
+		);
+		catalog
 	}
 
 	fn request(approvals: Approvals) -> RunRequest {
@@ -324,22 +379,73 @@ mod tests {
 	}
 
 	#[test]
-	fn plan_requires_base_url_and_api_key() {
+	fn plan_requires_a_connection_and_allows_keyless_providers() {
 		let mut missing_url = request(yolo());
 		missing_url.config.providers.clear();
 		let err = RunPlan::resolve(&missing_url).err().expect("no baseUrl");
 		assert!(err.to_string().contains("has no baseUrl"));
 
+		// Keyless local gateways are legal: the client sends an empty bearer.
 		let mut missing_key = request(yolo());
 		if let Some(provider) = missing_key.config.providers.get_mut("local") {
 			provider.api_key = None;
 		}
-		let err = RunPlan::resolve(&missing_key).err().expect("no apiKey");
-		assert!(err.to_string().contains("has no apiKey"));
+		let plan = RunPlan::resolve(&missing_key).expect("keyless provider");
+		assert_eq!(plan.api_key, "");
 
 		let mut no_model = request(yolo());
 		no_model.model = None;
 		assert!(RunPlan::resolve(&no_model).is_err());
+	}
+
+	#[test]
+	fn provider_prefixed_model_resolves_through_models_yml_connection() {
+		let mut nested = request(yolo());
+		nested.model = Some("9router/ocg/mimo-v2.6-pro:high".to_string());
+		nested.provider = None;
+		nested.config.providers.clear();
+		nested.catalog =
+			Arc::new(catalog_with_connection("9router", "http://127.0.0.1:20128/v1", None));
+		let plan = RunPlan::resolve(&nested).expect("plan");
+		assert_eq!(plan.model, "ocg/mimo-v2.6-pro");
+		assert_eq!(plan.base_url, "http://127.0.0.1:20128/v1");
+		assert_eq!(plan.api_key, "");
+
+		let mut explicit = request(yolo());
+		explicit.model = Some("ocg/mimo-v2.6-pro".to_string());
+		explicit.provider = Some("9router".to_string());
+		explicit.config.providers.clear();
+		explicit.catalog = Arc::new(catalog_with_connection(
+			"9router",
+			"http://127.0.0.1:20128/v1",
+			Some("sk-models-yml"),
+		));
+		let plan = RunPlan::resolve(&explicit).expect("plan");
+		assert_eq!(plan.model, "ocg/mimo-v2.6-pro");
+		assert_eq!(plan.api_key, "sk-models-yml");
+
+		// Explicit provider plus the fully prefixed form strips the prefix once.
+		let mut prefixed = request(yolo());
+		prefixed.model = Some("9router/ocg/mimo-v2.6-pro".to_string());
+		prefixed.provider = Some("9router".to_string());
+		prefixed.config.providers.clear();
+		prefixed.catalog =
+			Arc::new(catalog_with_connection("9router", "http://127.0.0.1:20128/v1", None));
+		let plan = RunPlan::resolve(&prefixed).expect("plan");
+		assert_eq!(plan.model, "ocg/mimo-v2.6-pro");
+	}
+
+	#[test]
+	fn config_connection_wins_over_models_yml() {
+		let mut request = request(yolo());
+		request.catalog = Arc::new(catalog_with_connection(
+			"local",
+			"http://models-yml.example/v1",
+			Some("sk-models-yml"),
+		));
+		let plan = RunPlan::resolve(&request).expect("plan");
+		assert_eq!(plan.base_url, "http://127.0.0.1:8080/v1");
+		assert_eq!(plan.api_key, "sk-test");
 	}
 
 	#[test]

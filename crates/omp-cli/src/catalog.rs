@@ -12,12 +12,16 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::config::{self, ProviderConfig};
 use crate::{Error, Result, dirs, yaml};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Catalog {
 	/// provider id -> model id -> definition subset the runtime consumes.
 	pub providers: BTreeMap<String, BTreeMap<String, ModelInfo>>,
+	/// Connection blocks from `models.yml` (`baseUrl`, `apiKey`, `api`, `auth`,
+	/// `headers`) — the same provider fields `docs/models.md` documents.
+	pub connections: BTreeMap<String, ProviderConfig>,
 	pub source: PathBuf,
 }
 
@@ -43,17 +47,35 @@ struct ModelEntry {
 impl Catalog {
 	pub fn load(cwd: &Path) -> Result<Self> {
 		let json_paths = json_candidates(cwd);
-		let yml_path = dirs::agent_dir().join("models.yml");
+		let agent = dirs::agent_dir();
+		let yml_path = ["models.yml", "models.yaml"]
+			.iter()
+			.map(|name| agent.join(name))
+			.find(|path| path.is_file())
+			.unwrap_or_else(|| agent.join("models.yml"));
 		Self::load_from(&json_paths, &yml_path)
 	}
 
-	/// Testable loader: first existing `models.json` wins; otherwise `models.yml`.
+	/// Testable loader: first existing `models.json` wins for model lists, while
+	/// `models.yml` still contributes provider connection blocks; without
+	/// `models.json`, `models.yml` providers are the model source.
 	pub fn load_from(json_paths: &[PathBuf], yml_path: &Path) -> Result<Self> {
-		if let Some(path) = json_paths.iter().find(|path| path.is_file()) {
-			return Self::from_json(path);
-		}
+		let mut connections = BTreeMap::new();
+		let mut yml_providers = None;
 		if yml_path.is_file() {
-			return Self::from_yml(yml_path);
+			let (providers, parsed) = yml_sections(yml_path)?;
+			connections = parsed;
+			yml_providers = Some((providers, yml_path.to_path_buf()));
+		}
+		if let Some(path) = json_paths.iter().find(|path| path.is_file()) {
+			let mut catalog = Self::from_json(path)?;
+			catalog.connections = connections;
+			return Ok(catalog);
+		}
+		if let Some((providers, path)) = yml_providers
+			&& !providers.is_empty()
+		{
+			return Ok(Self { providers, connections, source: path });
 		}
 		Err(Error::new(
 			"no models: expected models.json in the workspace, ~/.omp/agent, or share/omp \
@@ -84,51 +106,55 @@ impl Catalog {
 		if providers.is_empty() {
 			return Err(Error::new(format!("no models in {}", path.display())));
 		}
-		Ok(Self { providers, source: path.to_path_buf() })
+		Ok(Self { providers, connections: BTreeMap::new(), source: path.to_path_buf() })
 	}
+}
 
-	fn from_yml(path: &Path) -> Result<Self> {
-		let text = fs::read_to_string(path)
-			.map_err(|err| Error::with_source(format!("cannot read {}", path.display()), err))?;
-		let value =
-			yaml::parse(&text).map_err(|err| Error::new(format!("{}: {err}", path.display())))?;
-		let mut providers = BTreeMap::new();
-		if let Some(section) = value.get("providers") {
-			let Some(pairs) = section.as_map() else {
-				return Err(Error::new(format!("{}: `providers` must be a mapping", path.display())));
-			};
-			for (id, provider) in pairs {
-				let mut models = BTreeMap::new();
-				if let Some(list) = provider.get("models") {
-					let Some(items) = list.as_list() else {
-						return Err(Error::new(format!(
-							"{}: providers.{id}.models must be a sequence",
-							path.display()
-						)));
-					};
-					for item in items {
-						if let Some(model_id) = item.get("id").and_then(yaml::Value::as_str) {
-							let context_window = item
-								.get("contextWindow")
-								.and_then(yaml::Value::to_text)
-								.and_then(|window| window.parse::<usize>().ok())
-								.filter(|window| *window > 0);
-							models.insert(
-								model_id.to_string(),
-								ModelInfo { provider: id.clone(), context_window },
-							);
-						}
+/// Parse `models.yml`: provider model lists plus connection blocks.
+fn yml_sections(
+	path: &Path,
+) -> Result<(BTreeMap<String, BTreeMap<String, ModelInfo>>, BTreeMap<String, ProviderConfig>)> {
+	let text = fs::read_to_string(path)
+		.map_err(|err| Error::with_source(format!("cannot read {}", path.display()), err))?;
+	let value =
+		yaml::parse(&text).map_err(|err| Error::new(format!("{}: {err}", path.display())))?;
+	let mut providers = BTreeMap::new();
+	let mut connections = BTreeMap::new();
+	if let Some(section) = value.get("providers") {
+		let Some(pairs) = section.as_map() else {
+			return Err(Error::new(format!("{}: `providers` must be a mapping", path.display())));
+		};
+		for (id, provider) in pairs {
+			connections.insert(id.clone(), config::parse_provider(provider, id, path)?);
+			let mut models = BTreeMap::new();
+			if let Some(list) = provider.get("models") {
+				let Some(items) = list.as_list() else {
+					return Err(Error::new(format!(
+						"{}: providers.{id}.models must be a sequence",
+						path.display()
+					)));
+				};
+				for item in items {
+					if let Some(model_id) = item.get("id").and_then(yaml::Value::as_str) {
+						let context_window = item
+							.get("contextWindow")
+							.and_then(yaml::Value::to_text)
+							.and_then(|window| window.parse::<usize>().ok())
+							.filter(|window| *window > 0);
+						models.insert(
+							model_id.to_string(),
+							ModelInfo { provider: id.clone(), context_window },
+						);
 					}
 				}
-				providers.insert(id.clone(), models);
 			}
+			providers.insert(id.clone(), models);
 		}
-		if providers.is_empty() {
-			return Err(Error::new(format!("no models in {}", path.display())));
-		}
-		Ok(Self { providers, source: path.to_path_buf() })
 	}
+	Ok((providers, connections))
+}
 
+impl Catalog {
 	/// Provider that declares `model`, either `provider/model` or a bare id.
 	#[must_use]
 	pub fn provider_of(&self, model: &str) -> Option<&str> {
@@ -227,6 +253,26 @@ mod tests {
 		);
 		let catalog = Catalog::load_from(&[dir.join("missing.json")], &yml).expect("catalog");
 		assert_eq!(catalog.provider_of("llama3"), Some("ollama"));
+		let connection = catalog.connections.get("ollama").expect("connection block");
+		assert_eq!(connection.base_url.as_deref(), Some("http://localhost:11434"));
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn yml_connections_load_even_when_json_provides_models() {
+		let dir = temp_dir();
+		let json = dir.join("models.json");
+		write(&json, r#"{"local":{"m":{"id":"m","provider":"local"}}}"#);
+		let yml = dir.join("models.yml");
+		write(
+			&yml,
+			"providers:\n  local:\n    baseUrl: http://127.0.0.1:20128/v1\n    api: openai-completions\n    auth: none\n",
+		);
+		let catalog = Catalog::load_from(&[json.clone()], &yml).expect("catalog");
+		assert_eq!(catalog.source, json);
+		let connection = catalog.connections.get("local").expect("connection");
+		assert_eq!(connection.base_url.as_deref(), Some("http://127.0.0.1:20128/v1"));
+		assert_eq!(connection.api.as_deref(), Some("openai-completions"));
 		fs::remove_dir_all(dir).ok();
 	}
 

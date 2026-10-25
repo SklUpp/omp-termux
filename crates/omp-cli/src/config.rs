@@ -30,6 +30,14 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
+	/// Resolve `apiKey`: the stored value is an environment variable name when
+	/// that variable exists, otherwise the literal key.
+	#[must_use]
+	pub fn resolve_api_key(&self) -> Option<String> {
+		let value = self.api_key.as_deref()?;
+		Some(env::var(value).unwrap_or_else(|_| value.to_string()))
+	}
+
 	fn merge(&mut self, overlay: Self) {
 		if overlay.base_url.is_some() {
 			self.base_url = overlay.base_url;
@@ -149,12 +157,10 @@ impl Config {
 		Ok(config)
 	}
 
-	/// Resolve a provider API key: the stored value is an environment variable
-	/// name when that variable exists, otherwise the literal key.
+	/// Resolve a provider API key through its `config.yml` connection block.
 	#[must_use]
 	pub fn resolve_api_key(&self, provider: &str) -> Option<String> {
-		let value = self.providers.get(provider)?.api_key.as_deref()?;
-		Some(env::var(value).unwrap_or_else(|_| value.to_string()))
+		self.providers.get(provider)?.resolve_api_key()
 	}
 }
 
@@ -185,7 +191,7 @@ fn parse_providers(value: &Value, path: &Path) -> Result<BTreeMap<String, Provid
 	Ok(providers)
 }
 
-fn parse_provider(value: &Value, id: &str, path: &Path) -> Result<ProviderConfig> {
+pub(crate) fn parse_provider(value: &Value, id: &str, path: &Path) -> Result<ProviderConfig> {
 	if matches!(value, Value::Null) {
 		return Ok(ProviderConfig::default());
 	}
