@@ -97,7 +97,7 @@ struct Parser {
 
 impl Parser {
 	fn parse_node(&mut self, indent: usize) -> Result<Value> {
-		let content = strip_comment(&self.lines[self.pos]).trim_end().to_string();
+		let content = strip_comment(&self.lines[self.pos]).trim().to_string();
 		if content == "-" || content.starts_with("- ") {
 			return self.parse_seq(indent);
 		}
@@ -127,7 +127,7 @@ impl Parser {
 			if current > indent {
 				return Err(self.unexpected("unexpected indentation"));
 			}
-			let content = strip_comment(&self.lines[self.pos]).trim_end().to_string();
+			let content = strip_comment(&self.lines[self.pos]).trim().to_string();
 			let Some((raw_key, rest)) = split_key(&content) else {
 				return Err(self.unexpected("expected `key: value`"));
 			};
@@ -160,7 +160,7 @@ impl Parser {
 			if current > indent {
 				return Err(self.unexpected("unexpected indentation"));
 			}
-			let content = strip_comment(&self.lines[self.pos]).trim_end().to_string();
+			let content = strip_comment(&self.lines[self.pos]).trim().to_string();
 			if content != "-" && !content.starts_with("- ") {
 				break;
 			}
@@ -199,7 +199,7 @@ impl Parser {
 			if next > indent {
 				return self.parse_node(next);
 			}
-			let content = strip_comment(&self.lines[self.pos]).trim_end();
+			let content = strip_comment(&self.lines[self.pos]).trim();
 			if next == indent && (content == "-" || content.starts_with("- ")) {
 				return self.parse_seq(indent);
 			}
