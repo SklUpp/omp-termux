@@ -54,7 +54,10 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {
 	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-		self.source.as_ref().map(AsRef::as_ref)
+		self
+			.source
+			.as_deref()
+			.map(|source| source as &(dyn std::error::Error + 'static))
 	}
 }
 
