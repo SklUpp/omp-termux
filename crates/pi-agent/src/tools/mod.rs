@@ -22,6 +22,10 @@ const MAX_BASH_TIMEOUT_MS: u64 = 600_000;
 const MAX_READ_BYTES: usize = 256 * 1024;
 /// Bytes accepted by one `write` call.
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
+/// Bytes accepted by one `edit` call: the whole file is read and rewritten.
+const MAX_EDIT_BYTES: usize = 4 * 1024 * 1024;
+/// Characters of the search string echoed back in an `edit` error.
+const MAX_EDIT_PREVIEW_CHARS: usize = 120;
 /// Entries returned by `glob`.
 const MAX_GLOB_ENTRIES: usize = 1000;
 /// Files scanned and bytes read per file by `grep`.
@@ -331,6 +335,146 @@ impl Tool for WriteTool {
 	}
 }
 
+/// Builtin exact-match search/replace tool.
+pub struct EditTool;
+
+#[async_trait]
+impl Tool for EditTool {
+	fn name(&self) -> &'static str {
+		"edit"
+	}
+
+	fn description(&self) -> &'static str {
+		"Replace exact text in a file; the match must be unique unless replace_all is set"
+	}
+
+	fn schema(&self) -> Value {
+		serde_json::json!({
+			"type": "object",
+			"properties": {
+				"path": {
+					"type": "string",
+					"description": "Path to file to edit"
+				},
+				"old_string": {
+					"type": "string",
+					"description": "Exact text to replace"
+				},
+				"new_string": {
+					"type": "string",
+					"description": "Replacement text (empty string deletes the match)"
+				},
+				"replace_all": {
+					"type": "boolean",
+					"description": "Replace every occurrence instead of requiring a unique match"
+				}
+			},
+			"required": ["path", "old_string", "new_string"]
+		})
+	}
+
+	fn is_exclusive(&self) -> bool {
+		true
+	}
+
+	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+		let path = args
+			.get("path")
+			.and_then(Value::as_str)
+			.ok_or_else(|| ToolError::InvalidArguments("missing 'path' parameter".to_string()))?;
+		let search = args
+			.get("old_string")
+			.and_then(Value::as_str)
+			.ok_or_else(|| {
+				ToolError::InvalidArguments("missing 'old_string' parameter".to_string())
+			})?;
+		if search.is_empty() {
+			return Err(ToolError::InvalidArguments("'old_string' must not be empty".to_string()));
+		}
+		let replacement = args
+			.get("new_string")
+			.and_then(Value::as_str)
+			.ok_or_else(|| {
+				ToolError::InvalidArguments("missing 'new_string' parameter".to_string())
+			})?;
+		let replace_all = args
+			.get("replace_all")
+			.and_then(Value::as_bool)
+			.unwrap_or(false);
+
+		let target = ctx.cwd.join(path);
+		let meta = match tokio::fs::metadata(&target).await {
+			Ok(meta) => meta,
+			Err(err) => {
+				return Ok(tool_result(format!("Failed to edit {}: {err}", target.display()), true));
+			},
+		};
+		if !meta.is_file() {
+			return Ok(tool_result(format!("{} is not a regular file", target.display()), true));
+		}
+		if meta.len() > MAX_EDIT_BYTES as u64 {
+			return Ok(tool_result(
+				format!(
+					"{} is {} bytes, the edit limit is {MAX_EDIT_BYTES}",
+					target.display(),
+					meta.len()
+				),
+				true,
+			));
+		}
+
+		let (bytes, _size) = read_capped(&target, MAX_EDIT_BYTES)
+			.await
+			.map_err(|err| ToolError::ExecutionFailed(format!("{}: {err}", target.display())))?;
+		let content = String::from_utf8(bytes).map_err(|_| {
+			ToolError::ExecutionFailed(format!("{} is not valid UTF-8", target.display()))
+		})?;
+
+		let occurrences = content.matches(search).count();
+		if occurrences == 0 {
+			return Ok(tool_result(
+				format!("Not found in {}: \"{}\"", target.display(), preview(search)),
+				true,
+			));
+		}
+		if occurrences > 1 && !replace_all {
+			return Ok(tool_result(
+				format!(
+					"{} occurrences in {}; make the match unique or set replace_all",
+					occurrences,
+					target.display()
+				),
+				true,
+			));
+		}
+		if ctx.cancellation_token.is_cancelled() {
+			return Ok(tool_result(format!("Edit of {} cancelled", target.display()), true));
+		}
+
+		let (updated, replacements) = if replace_all {
+			(content.replace(search, replacement), occurrences)
+		} else {
+			(content.replacen(search, replacement, 1), 1)
+		};
+		match tokio::fs::write(&target, updated.as_bytes()).await {
+			Ok(()) => Ok(tool_result(
+				format!("Replaced {replacements} occurrence(s) in {}", target.display()),
+				false,
+			)),
+			Err(err) => Ok(tool_result(format!("Failed to write {}: {err}", target.display()), true)),
+		}
+	}
+}
+
+/// Short, single-line echo of a search string for error messages.
+fn preview(text: &str) -> String {
+	text
+		.chars()
+		.take(MAX_EDIT_PREVIEW_CHARS)
+		.collect::<String>()
+		.replace('\n', "\\n")
+}
+
 /// Builtin glob matching tool powered by pi-walker.
 pub struct GlobTool;
 
@@ -604,6 +748,7 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
 		Arc::new(BashTool),
 		Arc::new(ReadTool),
 		Arc::new(WriteTool),
+		Arc::new(EditTool),
 		Arc::new(GlobTool),
 		Arc::new(GrepTool),
 		Arc::new(TodoTool::new()),

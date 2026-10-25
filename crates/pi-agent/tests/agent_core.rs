@@ -9,8 +9,8 @@ use std::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use pi_agent::{
-	AgentConfig, AgentError, AgentError::Interrupted, AgentLoop, AgentState, ChunkStream, Message,
-	ModelProvider, OpenAiCompatibleProvider, ProviderError, ReadTool, Role, SteeringEvent,
+	AgentConfig, AgentError, AgentError::Interrupted, AgentLoop, AgentState, ChunkStream, EditTool,
+	Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, ReadTool, Role, SteeringEvent,
 	StreamAssembler, Tool, ToolCall, ToolRegistry, WriteTool, parse_sse_line, sse_stream,
 };
 use serde_json::json;
@@ -151,6 +151,14 @@ async fn tool_call_round_trip_feeds_result_back_to_the_model() {
 				arguments: json!({"path": "note.txt", "content": "hello"}),
 			}],
 		),
+		Message::assistant_with_tools(
+			"editing",
+			vec![ToolCall {
+				id: "call_edit".to_string(),
+				name: "edit".to_string(),
+				arguments: json!({"path": "note.txt", "old_string": "hello", "new_string": "world"}),
+			}],
+		),
 		Message::assistant("done"),
 	]);
 	let agent = AgentLoop::new(
@@ -165,29 +173,47 @@ async fn tool_call_round_trip_feeds_result_back_to_the_model() {
 		.await
 		.expect("dialog");
 
-	assert_eq!(turns.len(), 2);
+	assert_eq!(turns.len(), 3);
 	assert!(!turns[0].is_completed);
-	assert!(turns[1].is_completed);
+	assert!(!turns[1].is_completed);
+	assert!(turns[2].is_completed);
 	assert_eq!(turns[0].tool_results.len(), 1);
+	assert_eq!(turns[1].tool_results.len(), 1);
 
 	let roles: Vec<Role> = state.messages.iter().map(|message| message.role).collect();
-	assert_eq!(roles, vec![Role::System, Role::User, Role::Assistant, Role::Tool, Role::Assistant]);
-	assert!(
-		tool_messages(&state)[0]
-			.content
-			.contains("Successfully wrote")
+	assert_eq!(
+		roles,
+		vec![
+			Role::System,
+			Role::User,
+			Role::Assistant,
+			Role::Tool,
+			Role::Assistant,
+			Role::Tool,
+			Role::Assistant,
+		]
 	);
-	assert_eq!(std::fs::read_to_string(dir.path.join("note.txt")).expect("file"), "hello");
+	let tools = tool_messages(&state);
+	assert!(tools[0].content.contains("Successfully wrote"));
+	assert!(tools[1].content.contains("Replaced 1 occurrence(s)"));
+	assert_eq!(std::fs::read_to_string(dir.path.join("note.txt")).expect("file"), "world");
 	assert_no_orphan_tool_calls(&state);
 
-	// Second provider call saw the tool answer in history.
-	assert_eq!(state.total_turns, 2);
+	// Each later provider call saw the previous tool answers in history.
+	assert_eq!(state.total_turns, 3);
 	assert!(
 		state
 			.messages
 			.iter()
 			.any(|message| message.role == Role::Tool
 				&& message.tool_call_id.as_deref() == Some("call_write"))
+	);
+	assert!(
+		state
+			.messages
+			.iter()
+			.any(|message| message.role == Role::Tool
+				&& message.tool_call_id.as_deref() == Some("call_edit"))
 	);
 }
 
@@ -381,6 +407,111 @@ async fn write_rejects_oversized_content() {
 		.expect_err("must reject");
 
 	assert!(error.to_string().contains("the limit is 1048576"));
+}
+
+#[tokio::test]
+async fn edit_replaces_a_unique_match_and_reports_the_count() {
+	let dir = TempDir::new("edit-unique");
+	std::fs::write(dir.path.join("note.txt"), "one needle two\n").expect("write");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	let result = EditTool
+		.execute(&json!({"path": "note.txt", "old_string": "needle", "new_string": "thread"}), &ctx)
+		.await
+		.expect("edit");
+
+	assert!(!result.is_error);
+	assert!(result.content.contains("Replaced 1 occurrence(s)"));
+	assert_eq!(
+		std::fs::read_to_string(dir.path.join("note.txt")).expect("read"),
+		"one thread two\n"
+	);
+
+	let empty = EditTool
+		.execute(&json!({"path": "note.txt", "old_string": "", "new_string": "x"}), &ctx)
+		.await
+		.expect_err("empty search must be rejected");
+	assert!(empty.to_string().contains("must not be empty"));
+}
+
+#[tokio::test]
+async fn edit_rejects_an_ambiguous_match_without_touching_the_file() {
+	let dir = TempDir::new("edit-ambiguous");
+	std::fs::write(dir.path.join("note.txt"), "dup dup\n").expect("write");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	let result = EditTool
+		.execute(&json!({"path": "note.txt", "old_string": "dup", "new_string": "one"}), &ctx)
+		.await
+		.expect("edit");
+
+	assert!(result.is_error);
+	assert!(result.content.contains("2 occurrences"));
+	assert!(result.content.contains("set replace_all"));
+	assert_eq!(std::fs::read_to_string(dir.path.join("note.txt")).expect("read"), "dup dup\n");
+}
+
+#[tokio::test]
+async fn edit_replace_all_rewrites_every_occurrence() {
+	let dir = TempDir::new("edit-all");
+	std::fs::write(dir.path.join("note.txt"), "dup dup dup\n").expect("write");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	let result = EditTool
+		.execute(
+			&json!({
+				"path": "note.txt",
+				"old_string": "dup",
+				"new_string": "one",
+				"replace_all": true
+			}),
+			&ctx,
+		)
+		.await
+		.expect("edit");
+
+	assert!(!result.is_error);
+	assert!(result.content.contains("Replaced 3 occurrence(s)"));
+	assert_eq!(std::fs::read_to_string(dir.path.join("note.txt")).expect("read"), "one one one\n");
+}
+
+#[tokio::test]
+async fn edit_reports_missing_files_and_absent_matches() {
+	let dir = TempDir::new("edit-missing");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	let missing = EditTool
+		.execute(&json!({"path": "nope.txt", "old_string": "a", "new_string": "b"}), &ctx)
+		.await
+		.expect("edit");
+	assert!(missing.is_error);
+	assert!(missing.content.contains("Failed to edit"));
+
+	std::fs::write(dir.path.join("note.txt"), "present\n").expect("write");
+	let absent = EditTool
+		.execute(&json!({"path": "note.txt", "old_string": "absent", "new_string": "b"}), &ctx)
+		.await
+		.expect("edit");
+	assert!(absent.is_error);
+	assert!(absent.content.contains("Not found in"));
+	assert_eq!(std::fs::read_to_string(dir.path.join("note.txt")).expect("read"), "present\n");
+}
+
+#[test]
+fn registry_schemas_are_sorted_and_include_edit() {
+	let registry = ToolRegistry::with_builtins();
+	let names: Vec<String> = registry
+		.schemas()
+		.iter()
+		.map(|schema| {
+			schema["function"]["name"]
+				.as_str()
+				.unwrap_or_default()
+				.to_string()
+		})
+		.collect();
+
+	assert_eq!(names, vec!["bash", "edit", "glob", "grep", "read", "todo", "write"]);
 }
 
 #[tokio::test]

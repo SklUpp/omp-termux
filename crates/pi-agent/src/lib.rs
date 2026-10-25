@@ -17,6 +17,6 @@ pub use state::{
 };
 pub use tokenizer::Tokenizer;
 pub use tools::{
-	BashTool, GlobTool, GrepTool, ReadTool, TodoTool, Tool, ToolError, WriteTool,
+	BashTool, EditTool, GlobTool, GrepTool, ReadTool, TodoTool, Tool, ToolError, WriteTool,
 	registry::ToolRegistry, scheduler::ToolScheduler,
 };
