@@ -1,8 +1,7 @@
 //! `config.yml` loading and merge.
 //!
 //! Only the runtime subset the headless binary consumes is modelled; unknown
-//! root keys are hard errors so a typo cannot silently disable a setting
-//! (same posture as `models.yml` validation).
+//! root keys are ignored because the file is shared with the full TS app.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -141,12 +140,9 @@ impl Config {
 				},
 				"allow" => config.allow = expect_list_of_text(item, key, path)?,
 				"providers" => config.providers = parse_providers(item, path)?,
-				other => {
-					return Err(Error::new(format!(
-						"unknown config key `{other}` in {}",
-						path.display()
-					)));
-				},
+				// Unknown keys are ignored: the config file is shared with the
+				// full TS app, which carries extra keys (setupVersion etc.).
+				_ => {},
 			}
 		}
 		config.sources.push(path.to_path_buf());
@@ -298,12 +294,11 @@ mod tests {
 	}
 
 	#[test]
-	fn unknown_root_key_is_an_error() {
-		let err = parse_config("defualtModel: typo\n").expect_err("must reject");
-		assert!(
-			err.to_string()
-				.contains("unknown config key `defualtModel`")
-		);
+	fn unknown_root_keys_are_ignored() {
+		// The config file is shared with the full TS app; extra keys
+		// (setupVersion etc.) must not break the headless binary.
+		let config = parse_config("setupVersion: 3\ndefaultModel: m\n").expect("parse");
+		assert_eq!(config.default_model.as_deref(), Some("m"));
 	}
 
 	#[test]
