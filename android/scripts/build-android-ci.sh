@@ -128,12 +128,24 @@ if [ -f .cargo/config.toml ]; then
 	cp .cargo/config.toml "$CARGO_CONFIG_BACKUP"
 fi
 trap restore_cargo_config EXIT
-cat > .cargo/config.toml <<EOF
-[target.aarch64-linux-android]
-linker = "$NDK_CLANG"
-ar = "$NDK_AR"
-runner = "$NDK_CLANG"
-EOF
+python3 - "$NDK_CLANG" "$NDK_AR" <<'PY'
+import sys
+import re
+from pathlib import Path
+
+ndk_clang, ndk_ar = sys.argv[1], sys.argv[2]
+p = Path(".cargo/config.toml")
+text = p.read_text() if p.exists() else ""
+
+text = re.sub(r'(?ms)^\[target\.aarch64-linux-android\].*?(?=^\[|\Z)', '', text).strip()
+
+section = f"""[target.aarch64-linux-android]
+linker = "{ndk_clang}"
+ar = "{ndk_ar}"
+"""
+
+p.write_text((text + "\n\n" + section).strip() + "\n")
+PY
 
 # Locate the napi bin. The CLI is declared as a dev dependency in
 # packages/natives, so `bun install` should hoist `node_modules/.bin/napi` to

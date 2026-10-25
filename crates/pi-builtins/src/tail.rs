@@ -361,9 +361,9 @@ mod args {
 	
 	
 	pub fn uu_app() -> Command {
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		let polling_help = "Disable 'inotify' support and use polling instead";
-		#[cfg(all(unix, not(target_os = "linux")))]
+		#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 		let polling_help = "Disable 'kqueue' support and use polling instead";
 		#[cfg(target_os = "windows")]
 		let polling_help = "Disable 'ReadDirectoryChanges' support and use polling instead";
@@ -1592,7 +1592,7 @@ mod follow {
 			/// `path` if necessary.
 			fn watch_with_parent(&mut self, path: &Path) -> TailResult<()> {
 				let mut path = path.to_owned();
-				#[cfg(target_os = "linux")]
+				#[cfg(any(target_os = "linux", target_os = "android"))]
 				if path.is_file() {
 					/*
 					NOTE: Using the parent directory instead of the file is a workaround.
@@ -1832,7 +1832,7 @@ mod follow {
 						match input.kind() {
 							InputKind::Stdin => (),
 							InputKind::File(path) => {
-								#[cfg(all(unix, not(target_os = "linux")))]
+								#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 								if !path.is_file() {
 									continue;
 								}
@@ -2792,9 +2792,9 @@ mod text {
 	#[cfg(not(target_os = "macos"))]
 	pub const FD0: &str = "/dev/fd/0";
 	
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	pub const BACKEND: &str = "inotify";
-	#[cfg(all(unix, not(target_os = "linux")))]
+	#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 	pub const BACKEND: &str = "kqueue";
 	#[cfg(target_os = "windows")]
 	pub const BACKEND: &str = "ReadDirectoryChanges";

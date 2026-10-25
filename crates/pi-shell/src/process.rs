@@ -16,12 +16,11 @@ pub use pi_builtins::ProcessStatus;
 
 use crate::cancel::CancelToken;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod platform {
+	use std::{collections::HashSet, ffi::OsStr, fs};
+	#[cfg(not(target_os = "android"))]
 	use std::{
-		collections::HashSet,
-		ffi::OsStr,
-		fs,
 		os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 		ptr,
 		sync::Arc,
@@ -33,6 +32,7 @@ mod platform {
 	#[derive(Clone)]
 	pub struct Process {
 		pid:        i32,
+		#[cfg(not(target_os = "android"))]
 		pidfd:      Arc<OwnedFd>,
 		start_time: u64,
 	}
@@ -42,10 +42,19 @@ mod platform {
 			if pid <= 0 {
 				return None;
 			}
+			#[cfg(not(target_os = "android"))]
 			let pidfd = open_pidfd(pid)?;
 			let start_time = read_start_time(pid)?;
-			Some(Self { pid, pidfd, start_time })
+			#[cfg(not(target_os = "android"))]
+			{
+				Some(Self { pid, pidfd, start_time })
+			}
+			#[cfg(target_os = "android")]
+			{
+				Some(Self { pid, start_time })
+			}
 		}
+
 
 		pub const fn pid(&self) -> i32 {
 			self.pid
@@ -155,21 +164,33 @@ mod platform {
 		}
 
 		pub fn kill(&self, signal: i32) -> bool {
-			// SAFETY: `self.pidfd` is an owned file descriptor returned by a successful
-			// `pidfd_open` call and remains open for the duration of this syscall. A null
-			// `siginfo_t` pointer is explicitly accepted by `pidfd_send_signal` and makes
-			// the kernel synthesize the same signal metadata as `kill(2)`. Flags are zero,
-			// which is the documented default behavior.
-			let ret = unsafe {
-				libc::syscall(
-					libc::SYS_pidfd_send_signal,
-					self.pidfd.as_raw_fd(),
-					signal,
-					ptr::null::<libc::siginfo_t>(),
-					0,
-				)
-			};
-			ret == 0
+			#[cfg(target_os = "android")]
+			{
+				// On Android Bionic: avoid pidfd syscalls (which can trigger seccomp SIGSYS).
+				// Validate identity with start_time before sending signal via libc::kill.
+				if !self.live_identity() {
+					return false;
+				}
+				unsafe { libc::kill(self.pid, signal) == 0 }
+			}
+			#[cfg(not(target_os = "android"))]
+			{
+				// SAFETY: `self.pidfd` is an owned file descriptor returned by a successful
+				// `pidfd_open` call and remains open for the duration of this syscall. A null
+				// `siginfo_t` pointer is explicitly accepted by `pidfd_send_signal` and makes
+				// the kernel synthesize the same signal metadata as `kill(2)`. Flags are zero,
+				// which is the documented default behavior.
+				let ret = unsafe {
+					libc::syscall(
+						libc::SYS_pidfd_send_signal,
+						self.pidfd.as_raw_fd(),
+						signal,
+						ptr::null::<libc::siginfo_t>(),
+						0,
+					)
+				};
+				ret == 0
+			}
 		}
 
 		pub fn group_id(&self) -> Option<i32> {
@@ -177,42 +198,53 @@ mod platform {
 				return None;
 			}
 
-			// SAFETY: `self.pid` names the process currently referenced by `self.pidfd`
-			// unless it exits concurrently. If it exits, `getpgid` reports failure rather
-			// than dereferencing caller-owned memory.
+			// SAFETY: `self.pid` names the process currently referenced unless it exits concurrently.
+			// If it exits, `getpgid` reports failure rather than dereferencing caller-owned memory.
 			let pgid = unsafe { libc::getpgid(self.pid) };
 			if pgid > 0 { Some(pgid) } else { None }
 		}
 
 		pub fn status(&self) -> ProcessStatus {
-			loop {
-				let mut pollfd =
-					libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-				// SAFETY: `pollfd` points to one initialized `pollfd` element, and the pidfd
-				// remains open for the duration of the call. Timeout zero makes this a
-				// non-blocking readiness probe.
-				let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
-				if ready < 0 {
-					// Retry on EINTR; for any other transient poll error treat the pidfd as
-					// still running. The pidfd is still owned and the kernel has not reported
-					// the process gone — a spurious `Exited` here makes every downstream
-					// signal/kill fall through silently.
-					if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-						continue;
+			#[cfg(target_os = "android")]
+			{
+				if read_start_time(self.pid) == Some(self.start_time) {
+					ProcessStatus::Running
+				} else {
+					ProcessStatus::Exited
+				}
+			}
+			#[cfg(not(target_os = "android"))]
+			{
+				loop {
+					let mut pollfd =
+						libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+					// SAFETY: `pollfd` points to one initialized `pollfd` element, and the pidfd
+					// remains open for the duration of the call. Timeout zero makes this a
+					// non-blocking readiness probe.
+					let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
+					if ready < 0 {
+						// Retry on EINTR; for any other transient poll error treat the pidfd as
+						// still running. The pidfd is still owned and the kernel has not reported
+						// the process gone — a spurious `Exited` here makes every downstream
+						// signal/kill fall through silently.
+						if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+							continue;
+						}
+						return ProcessStatus::Running;
+					}
+					if ready == 0 {
+						return ProcessStatus::Running;
+					}
+					if (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
+						!= 0
+					{
+						return ProcessStatus::Exited;
 					}
 					return ProcessStatus::Running;
 				}
-				if ready == 0 {
-					return ProcessStatus::Running;
-				}
-				if (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
-					!= 0
-				{
-					return ProcessStatus::Exited;
-				}
-				return ProcessStatus::Running;
 			}
 		}
+
 
 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
 		/// by PID so concurrent reparenting cannot trap us in a cycle.
@@ -268,6 +300,7 @@ mod platform {
 		rest.split_whitespace().nth(19)?.parse().ok()
 	}
 
+	#[cfg(not(target_os = "android"))]
 	fn open_pidfd(pid: i32) -> Option<Arc<OwnedFd>> {
 		// SAFETY: `pidfd_open` takes the PID by value and does not read caller-owned
 		// memory. Flags are zero, which is valid. On success the returned descriptor is

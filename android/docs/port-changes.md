@@ -31,7 +31,9 @@ are **not** claimed applied here.
 - bionic provides `forkpty`/`openpty` since API 23 → `portable-pty` works.
 - `pidfd_open`/`pidfd_send_signal`: API 34 capability floor; on API 31–33
   seccomp may SIGSYS-kill the syscall. **Only one API 34-class device tested;
-  no broad compatibility claim.** Binary floor is API 24.
+  no broad compatibility claim.** Binary floor is API 24. The port therefore
+  uses no pidfds on Android: signals go through `kill(2)` after a start-time
+  identity re-check (transforms 8–9).
 - bionic has no X11/Wayland/AppKit/Win32 surfaces for native code →
   `arboard` (clipboard) has no backend on Android (text-only fallback).
 - The `pi-voice` + webrtc/opus dependency graph OOM-kills free GitHub
@@ -52,7 +54,8 @@ checking out immutable release tag.
 
 ## Transformation catalog (current)
 
-The eight overlay transforms, one concern each:
+The ten overlay transforms, one concern each (7 in `01-termux.patch`,
+3 in `02-bionic-safety.patch`):
 
 ### 1. Cargo.toml — gate arboard + pi-voice off Android
 
@@ -100,3 +103,30 @@ and memory reporting native.
 
 `SUPPORTED_PLATFORMS` gains `"android-arm64"` so the loader accepts the
 addon at startup and maps the tag to `pi_natives.android-arm64.node`.
+
+Transforms 1–7 ship in `01-termux.patch`; 8–10 ship in
+`02-bionic-safety.patch` and deliberately avoid pidfd syscalls, which Android
+seccomp can kill with SIGSYS.
+
+### 8. process.rs (pi-shell) — pidfd-free signal path on Android
+
+`pidfd` (field, `open_pidfd`) is compiled out on Android and PID identity is
+pinned by the `/proc/<pid>/stat` start time instead. `kill()` re-validates that
+start time, then signals via `libc::kill`; `status()` reports `Exited` when the
+start time no longer matches; `exited()` polls the same check every 50 ms
+instead of awaiting pidfd readability. Linux keeps the pidfd path verbatim.
+
+### 9. proc_snapshot.rs — drop pidfd helpers on Android
+
+`sys::open_pidfd`, `sys::pidfd_send_signal` and their fd imports are
+`#[cfg(not(target_os = "android"))]`. `ProcInfo::signal` keeps the start-time
+re-check, then uses `libc::kill` (and `sigqueue` for queued values) on Android.
+`proc_match`'s pidfd wait loop was already Linux-gated, so Android falls back
+to its 50 ms status poll.
+
+### 10. tail.rs + kill.rs — inotify and SIGRTMAX on Android
+
+`tail` selects the inotify backend, its parent-directory watch workaround, and
+its `-disable-inotify` help text on Android (`notify` builds inotify there).
+`kill`/`pkill` validate numeric signals against `libc::SIGRTMAX()` on Android;
+bionic exports `__libc_current_sigrtmax`.

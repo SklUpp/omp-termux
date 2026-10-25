@@ -4,6 +4,7 @@
 //! lives in `pi_voice::audio`; these classes adapt its mono `f32` contract to
 //! TypeScript callbacks and `Float32Array` buffers.
 
+#[cfg(not(target_os = "android"))]
 use std::sync::Arc;
 
 use napi::{
@@ -11,18 +12,28 @@ use napi::{
 	threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue},
 };
 use napi_derive::napi;
+#[cfg(not(target_os = "android"))]
 use parking_lot::Mutex;
+#[cfg(not(target_os = "android"))]
 use pi_voice::audio::{CaptureStream, PlaybackState, PlaybackStream};
 
 type CaptureCallback = ThreadsafeFunction<Float32Array, UnknownReturnValue>;
 
 /// Default-microphone capture converted to mono `f32` at the requested sample
 /// rate.
+#[cfg(not(target_os = "android"))]
 #[napi]
 pub struct AudioCapture {
 	stream: Mutex<Option<CaptureStream>>,
 }
 
+#[cfg(target_os = "android")]
+#[napi]
+pub struct AudioCapture {
+	_private: (),
+}
+
+#[cfg(not(target_os = "android"))]
 #[napi]
 impl AudioCapture {
 	/// Open the default microphone and deliver low-latency mono PCM chunks.
@@ -51,13 +62,42 @@ impl AudioCapture {
 	}
 }
 
+#[cfg(target_os = "android")]
+#[napi]
+impl AudioCapture {
+	/// Open the default microphone and deliver low-latency mono PCM chunks.
+	#[napi(constructor)]
+	pub fn new(
+		sample_rate: u32,
+		#[napi(ts_arg_type = "(error: Error | null, samples: Float32Array) => void")]
+		on_audio: CaptureCallback,
+	) -> Result<Self> {
+		let _ = (sample_rate, on_audio);
+		Err(napi::Error::from_reason("audio/live unsupported on Android/Termux"))
+	}
+
+	/// Stop capture immediately and release the microphone.
+	#[napi]
+	pub fn stop(&self) -> Result<()> {
+		Ok(())
+	}
+}
+
 /// Gapless mono `f32` playback through the default speaker.
+#[cfg(not(target_os = "android"))]
 #[napi]
 pub struct AudioPlayback {
 	stream: Mutex<Option<PlaybackStream>>,
 	state:  Arc<PlaybackState>,
 }
 
+#[cfg(target_os = "android")]
+#[napi]
+pub struct AudioPlayback {
+	_private: (),
+}
+
+#[cfg(not(target_os = "android"))]
 #[napi]
 impl AudioPlayback {
 	/// Open the default speaker at the requested logical sample rate.
@@ -119,6 +159,44 @@ impl AudioPlayback {
 		if let Some(mut stream) = stream {
 			stream.stop().map_err(napi::Error::from_reason)?;
 		}
+		Ok(())
+	}
+}
+
+#[cfg(target_os = "android")]
+#[napi]
+impl AudioPlayback {
+	/// Open the default speaker at the requested logical sample rate.
+	#[napi(constructor)]
+	pub fn new(sample_rate: u32) -> Result<Self> {
+		let _ = sample_rate;
+		Err(napi::Error::from_reason("audio/live unsupported on Android/Termux"))
+	}
+
+	/// Queue mono floating-point PCM in playback order.
+	#[napi]
+	pub fn write(&self, samples: Float32Array) -> Result<()> {
+		let _ = samples;
+		Err(napi::Error::from_reason("audio/live unsupported on Android/Termux"))
+	}
+
+	/// Scale audio at render time so gain changes affect already queued samples.
+	#[napi]
+	pub fn set_gain(&self, gain: f64) -> Result<()> {
+		let _ = gain;
+		Err(napi::Error::from_reason("audio/live unsupported on Android/Termux"))
+	}
+
+	/// Close input, wait until queued samples reach the speaker, then release
+	/// it.
+	#[napi]
+	pub async fn end(&self) -> Result<()> {
+		Ok(())
+	}
+
+	/// Stop immediately and discard all queued samples.
+	#[napi]
+	pub fn stop(&self) -> Result<()> {
 		Ok(())
 	}
 }

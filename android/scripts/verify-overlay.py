@@ -42,6 +42,18 @@ for path, needle in checks.items():
         raise SystemExit(f"overlay verification failed: required file missing: {path}")
     require(path, needle)
 
+# 02-bionic-safety: Android must not use pidfd syscalls (seccomp SIGSYS), and
+# tail/kill must take the Android inotify / SIGRTMAX paths.
+bionic_checks = {
+    "crates/pi-builtins/src/proc_snapshot.rs": '#[cfg(not(target_os = "android"))]\n\tpub fn open_pidfd',
+    "crates/pi-shell/src/process.rs": "// Android seccomp can SIGSYS-kill the pidfd syscalls",
+    "crates/pi-builtins/src/kill.rs": '#[cfg(any(target_os = "linux", target_os = "android"))]\n\t\treturn (0..=libc::SIGRTMAX())',
+    "crates/pi-builtins/src/tail.rs": '#[cfg(any(target_os = "linux", target_os = "android"))]\n\tpub const BACKEND: &str = "inotify"',
+}
+for path, needle in bionic_checks.items():
+    if (ROOT / path).exists():
+        require(path, needle)
+
 browser_path = ROOT / "packages/coding-agent/src/tools/browser/launch.ts"
 if not browser_path.is_file():
     raise SystemExit("overlay verification failed: browser launch file missing")

@@ -1,0 +1,327 @@
+diff --git a/crates/pi-builtins/src/kill.rs b/crates/pi-builtins/src/kill.rs
+index 0d68284..ff6e8ca 100644
+--- a/crates/pi-builtins/src/kill.rs
++++ b/crates/pi-builtins/src/kill.rs
+@@ -692,7 +692,7 @@ pub(crate) fn signal_number(value: &str) -> Option<i32> {
+ 		.or_else(|| value.strip_prefix("sig"))
+ 		.unwrap_or(value);
+ 	if let Ok(number) = value.parse::<i32>() {
+-		#[cfg(target_os = "linux")]
++		#[cfg(any(target_os = "linux", target_os = "android"))]
+ 		return (0..=libc::SIGRTMAX()).contains(&number).then_some(number);
+ 		#[cfg(target_os = "macos")]
+ 		return (0..=31).contains(&number).then_some(number);
+diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/proc_snapshot.rs
+index 27b5817..e7e1c54 100644
+--- a/crates/pi-builtins/src/proc_snapshot.rs
++++ b/crates/pi-builtins/src/proc_snapshot.rs
+@@ -100,13 +100,18 @@ fn parse_procargs2(buffer: &[u8]) -> Vec<String> {
+ }
+ 
+ /// Linux process primitives: procfs and pidfds.
++///
++/// Android keeps the procfs primitives but drops the pidfd helpers: Bionic
++/// seccomp can SIGSYS-kill `pidfd_open`/`pidfd_send_signal`, so identity is
++/// pinned by start time and signals go through `kill(2)`.
+ #[cfg(any(target_os = "linux", target_os = "android"))]
+ pub mod sys {
+ 	use std::{
+ 		fs,
+-		os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+ 		str::{FromStr, SplitWhitespace},
+ 	};
++	#[cfg(not(target_os = "android"))]
++	use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+ 
+ 	/// Every pid `/proc` lists.
+ 	pub fn pids() -> impl Iterator<Item = i32> {
+@@ -119,6 +124,7 @@ pub mod sys {
+ 
+ 	/// Opens a pidfd on whichever process holds `pid` now; callers pin identity
+ 	/// by re-checking [`start_time`] after the open.
++	#[cfg(not(target_os = "android"))]
+ 	pub fn open_pidfd(pid: i32) -> Option<OwnedFd> {
+ 		// SAFETY: pidfd_open takes scalar arguments and returns a new owned fd.
+ 		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+@@ -129,6 +135,7 @@ pub mod sys {
+ 	}
+ 
+ 	/// Sends `signal` through `pidfd`, which can never reach a recycled pid.
++	#[cfg(not(target_os = "android"))]
+ 	pub fn pidfd_send_signal(pidfd: BorrowedFd<'_>, signal: i32) -> bool {
+ 		// SAFETY: pidfd is open for the call. A null siginfo makes the kernel
+ 		// fill in what kill(2) would, and zero flags is the default behavior.
+@@ -183,7 +190,9 @@ pub mod sys {
+ 
+ #[cfg(any(target_os = "linux", target_os = "android"))]
+ mod proc_snapshot {
+-	use std::{collections::HashMap, fs, os::fd::AsFd, time::Duration};
++	use std::{collections::HashMap, fs, time::Duration};
++	#[cfg(not(target_os = "android"))]
++	use std::os::fd::AsFd;
+ 
+ 	use super::{ProcessStatus, ThreadInfo, sys};
+ 
+@@ -347,6 +356,7 @@ mod proc_snapshot {
+ 			if signal == 0 {
+ 				return alive();
+ 			}
++			#[cfg(not(target_os = "android"))]
+ 			let Some(pidfd) = sys::open_pidfd(self.pid) else {
+ 				return false;
+ 			};
+@@ -362,7 +372,18 @@ mod proc_snapshot {
+ 					return libc::sigqueue(self.pid, signal, value_arg) == 0;
+ 				}
+ 			}
+-			sys::pidfd_send_signal(pidfd.as_fd(), signal)
++			#[cfg(target_os = "android")]
++			{
++				// No pidfd on Android (seccomp can SIGSYS it): deliver directly
++				// after the start-time re-check above closed the recycled-pid gap
++				// as far as `kill(2)` allows.
++				// SAFETY: `kill` takes integer identifiers by value.
++				unsafe { libc::kill(self.pid, signal) == 0 }
++			}
++			#[cfg(not(target_os = "android"))]
++			{
++				sys::pidfd_send_signal(pidfd.as_fd(), signal)
++			}
+ 		}
+ 
+ 		pub fn cpu_time(&self) -> Option<Duration> {
+diff --git a/crates/pi-builtins/src/tail.rs b/crates/pi-builtins/src/tail.rs
+index 10973e4..76c35b1 100644
+--- a/crates/pi-builtins/src/tail.rs
++++ b/crates/pi-builtins/src/tail.rs
+@@ -361,9 +361,9 @@ mod args {
+ 	
+ 	
+ 	pub fn uu_app() -> Command {
+-		#[cfg(target_os = "linux")]
++		#[cfg(any(target_os = "linux", target_os = "android"))]
+ 		let polling_help = "Disable 'inotify' support and use polling instead";
+-		#[cfg(all(unix, not(target_os = "linux")))]
++		#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+ 		let polling_help = "Disable 'kqueue' support and use polling instead";
+ 		#[cfg(target_os = "windows")]
+ 		let polling_help = "Disable 'ReadDirectoryChanges' support and use polling instead";
+@@ -1599,7 +1599,7 @@ mod follow {
+ 			/// `path` if necessary.
+ 			fn watch_with_parent(&mut self, path: &Path, fs: &BlockingFs) -> TailResult<()> {
+ 				let mut path = path.to_owned();
+-				#[cfg(target_os = "linux")]
++				#[cfg(any(target_os = "linux", target_os = "android"))]
+ 				if fs.is_file(&path) {
+ 					/*
+ 					NOTE: Using the parent directory instead of the file is a workaround.
+@@ -1848,7 +1848,7 @@ mod follow {
+ 						match input.kind() {
+ 							InputKind::Stdin => (),
+ 							InputKind::File(path) => {
+-								#[cfg(all(unix, not(target_os = "linux")))]
++								#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+ 								if !fs.is_file(path) {
+ 									continue;
+ 								}
+@@ -3043,9 +3043,9 @@ mod text {
+ 	pub const DASH: &str = "-";
+ 	pub const DEV_STDIN: &str = "/dev/stdin";
+ 	
+-	#[cfg(target_os = "linux")]
++	#[cfg(any(target_os = "linux", target_os = "android"))]
+ 	pub const BACKEND: &str = "inotify";
+-	#[cfg(all(unix, not(target_os = "linux")))]
++	#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+ 	pub const BACKEND: &str = "kqueue";
+ 	#[cfg(target_os = "windows")]
+ 	pub const BACKEND: &str = "ReadDirectoryChanges";
+diff --git a/crates/pi-shell/src/process.rs b/crates/pi-shell/src/process.rs
+index c01d501..61b9e95 100644
+--- a/crates/pi-shell/src/process.rs
++++ b/crates/pi-shell/src/process.rs
+@@ -18,9 +18,9 @@ use crate::cancel::CancelToken;
+ 
+ #[cfg(any(target_os = "linux", target_os = "android"))]
+ mod platform {
++	use std::{collections::HashSet, fs};
++	#[cfg(not(target_os = "android"))]
+ 	use std::{
+-		collections::HashSet,
+-		fs,
+ 		os::fd::{AsFd, AsRawFd, OwnedFd},
+ 		sync::Arc,
+ 	};
+@@ -29,10 +29,13 @@ mod platform {
+ 
+ 	use super::ProcessStatus;
+ 
+-	/// Stable Linux process reference backed by a pidfd.
++	/// Stable process reference. On Linux identity is pinned by a pidfd; on
++	/// Android — where `pidfd_open` may be blocked by seccomp (SIGSYS) — it is
++	/// pinned by the `/proc/<pid>/stat` start time instead.
+ 	#[derive(Clone)]
+ 	pub struct Process {
+ 		pid:        i32,
++		#[cfg(not(target_os = "android"))]
+ 		pidfd:      Arc<OwnedFd>,
+ 		start_time: u64,
+ 	}
+@@ -42,9 +45,17 @@ mod platform {
+ 			if pid <= 0 {
+ 				return None;
+ 			}
++			#[cfg(not(target_os = "android"))]
+ 			let pidfd = Arc::new(sys::open_pidfd(pid)?);
+ 			let start_time = sys::start_time(pid)?;
+-			Some(Self { pid, pidfd, start_time })
++			#[cfg(not(target_os = "android"))]
++			{
++				Some(Self { pid, pidfd, start_time })
++			}
++			#[cfg(target_os = "android")]
++			{
++				Some(Self { pid, start_time })
++			}
+ 		}
+ 
+ 		pub const fn pid(&self) -> i32 {
+@@ -148,7 +159,23 @@ mod platform {
+ 		}
+ 
+ 		pub fn kill(&self, signal: i32) -> bool {
+-			sys::pidfd_send_signal(self.pidfd.as_fd(), signal)
++			#[cfg(target_os = "android")]
++			{
++				// Android seccomp can SIGSYS-kill the pidfd syscalls, so signal
++				// through `kill(2)` after re-validating the pinned start time.
++				// That closes the recycled-pid window except for the instant
++				// between check and call, which `kill(2)` alone cannot avoid.
++				if !self.live_identity() {
++					return false;
++				}
++				// SAFETY: `kill` takes integer identifiers by value and does not
++				// access caller-owned memory.
++				unsafe { libc::kill(self.pid, signal) == 0 }
++			}
++			#[cfg(not(target_os = "android"))]
++			{
++				sys::pidfd_send_signal(self.pidfd.as_fd(), signal)
++			}
+ 		}
+ 
+ 		pub fn group_id(&self) -> Option<i32> {
+@@ -156,52 +183,79 @@ mod platform {
+ 				return None;
+ 			}
+ 
+-			// SAFETY: `self.pid` names the process currently referenced by
+-			// `self.pidfd` unless it exits concurrently. If it exits, `getpgid`
+-			// reports failure rather than dereferencing caller-owned memory.
++			// SAFETY: `self.pid` names the process currently referenced unless
++			// it exits concurrently. If it exits, `getpgid` reports failure
++			// rather than dereferencing caller-owned memory.
+ 			let pgid = unsafe { libc::getpgid(self.pid) };
+ 			if pgid > 0 { Some(pgid) } else { None }
+ 		}
+ 
+ 		pub fn status(&self) -> ProcessStatus {
+-			loop {
+-				let mut pollfd =
+-					libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+-				// SAFETY: `pollfd` points to one initialized `pollfd` element, and
+-				// the pidfd remains open for the duration of the call. Timeout
+-				// zero makes this a non-blocking readiness probe.
+-				let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
+-				if ready < 0 {
+-					// Retry on EINTR; for any other transient poll error treat the
+-					// pidfd as still running. The pidfd is still owned and the
+-					// kernel has not reported the process gone — a spurious
+-					// `Exited` here makes every downstream signal/kill fall
+-					// through silently.
+-					if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+-						continue;
+-					}
+-					return ProcessStatus::Running;
++			#[cfg(target_os = "android")]
++			{
++				// No pidfd: a live process still reports the pinned start time.
++				// A recycled pid carries a new one.
++				if sys::start_time(self.pid) == Some(self.start_time) {
++					ProcessStatus::Running
++				} else {
++					ProcessStatus::Exited
+ 				}
+-				if ready == 0 {
++			}
++			#[cfg(not(target_os = "android"))]
++			{
++				loop {
++					let mut pollfd =
++						libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
++					// SAFETY: `pollfd` points to one initialized `pollfd` element, and
++					// the pidfd remains open for the duration of the call. Timeout
++					// zero makes this a non-blocking readiness probe.
++					let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
++					if ready < 0 {
++						// Retry on EINTR; for any other transient poll error treat the
++						// pidfd as still running. The pidfd is still owned and the
++						// kernel has not reported the process gone — a spurious
++						// `Exited` here makes every downstream signal/kill fall
++						// through silently.
++						if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
++							continue;
++						}
++						return ProcessStatus::Running;
++					}
++					if ready == 0 {
++						return ProcessStatus::Running;
++					}
++					if (pollfd.revents
++						& (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
++						!= 0
++					{
++						return ProcessStatus::Exited;
++					}
+ 					return ProcessStatus::Running;
+ 				}
+-				if (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
+-					!= 0
+-				{
+-					return ProcessStatus::Exited;
+-				}
+-				return ProcessStatus::Running;
+ 			}
+ 		}
+ 
+-		/// Resolves once the process exits: its pidfd becomes readable then.
++		/// Resolves once the process exits: its pidfd becomes readable then, or
++		/// on Android the pinned start time stops matching (polled).
+ 		pub async fn exited(&self) -> std::io::Result<()> {
+-			let pidfd = tokio::io::unix::AsyncFd::with_interest(
+-				self.pidfd.try_clone()?,
+-				tokio::io::Interest::READABLE,
+-			)?;
+-			let _ready = pidfd.readable().await?;
+-			Ok(())
++			#[cfg(target_os = "android")]
++			{
++				// 50 ms matches the poll fallback used elsewhere for platforms
++				// without an exit-notification primitive.
++				while sys::start_time(self.pid) == Some(self.start_time) {
++					tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++				}
++				Ok(())
++			}
++			#[cfg(not(target_os = "android"))]
++			{
++				let pidfd = tokio::io::unix::AsyncFd::with_interest(
++					self.pidfd.try_clone()?,
++					tokio::io::Interest::READABLE,
++				)?;
++				let _ready = pidfd.readable().await?;
++				Ok(())
++			}
+ 		}
+ 
+ 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
