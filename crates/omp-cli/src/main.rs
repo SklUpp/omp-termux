@@ -10,7 +10,7 @@ use omp_cli::{
 	Error, Result,
 	agent::{self, AgentRunner, RunRequest},
 	approve::Approvals,
-	args::{Cli, Command},
+	args::{ApprovalMode, Cli, Command},
 	catalog::Catalog,
 	config::Config,
 	dirs,
@@ -49,6 +49,7 @@ fn run() -> Result<()> {
 	let catalog = Arc::new(Catalog::load(&cwd)?);
 	let approvals = Approvals::new(
 		cli.approval_mode
+			.or_else(|| cli.yolo.then_some(ApprovalMode::Yolo))
 			.or(config.approval_mode)
 			.unwrap_or_default(),
 		cli.allow

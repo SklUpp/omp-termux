@@ -71,6 +71,10 @@ pub struct Cli {
 	#[arg(long = "approval-mode", value_enum, value_name = "MODE")]
 	pub approval_mode: Option<ApprovalMode>,
 
+	/// Auto-approve every tool (same as `--approval-mode yolo`).
+	#[arg(long = "yolo", alias = "auto-approve", conflicts_with = "approval_mode")]
+	pub yolo: bool,
+
 	/// Auto-approve a tool by name (repeatable).
 	#[arg(long = "allow", value_name = "TOOL")]
 	pub allow: Vec<String>,
@@ -215,6 +219,9 @@ mod tests {
 			assert_eq!(cli.approval_mode, Some(expected));
 		}
 		assert!(Cli::try_parse_from(["omp", "--approval-mode", "sometimes"]).is_err());
+		assert!(parse(&["omp", "--yolo"]).yolo);
+		assert!(parse(&["omp", "--auto-approve"]).yolo);
+		assert!(Cli::try_parse_from(["omp", "--yolo", "--approval-mode", "yolo"]).is_err());
 	}
 
 	#[test]
