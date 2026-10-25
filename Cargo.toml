@@ -4,6 +4,8 @@
 # because an ignored file stayed behind) is a hard error that fails the whole
 # workspace, not a skipped entry.
 members = [
+   "crates/omp-cli",
+   "crates/pi-agent",
    "crates/pi-ast",
    "crates/pi-builtins",
    "crates/pi-iso",
@@ -216,6 +218,7 @@ pi-vcs = { path = "crates/pi-vcs" }
 brush-core = { path = "crates/vendor/brush-core" }
 pi-builtins = { path = "crates/pi-builtins" }
 
+pi-agent = { path = "crates/pi-agent" }
 # ──────────────────────────────────────────────────────────────────────────────
 # Async Runtime & Concurrency
 # ──────────────────────────────────────────────────────────────────────────────
@@ -452,6 +455,19 @@ tree-sitter-vue = { version = "0.1.0", package = "tree-sitter-vue-next" }
 tree-sitter-xml = "0.7"
 tree-sitter-yaml = "0.7"
 tree-sitter-zig = "1.1"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HTTP Client
+# ──────────────────────────────────────────────────────────────────────────────
+# rustls only: this binary ships on Android/bionic where OpenSSL is not a usable
+# system dependency. `json`, `stream` (SSE bodies) and `gzip` are what the
+# OpenAI-compatible provider needs; everything else stays off.
+reqwest = { version = "0.12", default-features = false, features = [
+   "json",
+   "stream",
+   "gzip",
+   "rustls-tls",
+] }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Unsorted (added by `cargo add` - move into a section above)

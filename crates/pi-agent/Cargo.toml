@@ -1,0 +1,30 @@
+[package]
+name = "pi-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["full"] }
+flume = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+pi-shell = { workspace = true }
+pi-walker = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }

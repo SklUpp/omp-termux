@@ -1,0 +1,32 @@
+[package]
+name = "omp-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "omp_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "omp"
+path = "src/main.rs"
+
+[dependencies]
+# No YAML crate: config.yml/models.yml are read by the in-tree subset parser in
+# `src/yaml.rs` so the binary keeps a small, offline-buildable dependency set and
+# avoids the archived `serde_yaml`.
+clap.workspace = true
+globset.workspace = true
+pi-agent = { path = "../pi-agent" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+clap.workspace = true
