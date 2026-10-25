@@ -1,6 +1,6 @@
 //! `omp` binary entry point: resolve files, then hand turns to the runner.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,7 +101,7 @@ fn run() -> Result<()> {
 	let mut prompts_to_run = cli.prompt.clone();
 	if prompts_to_run.is_empty() {
 		let mut text = String::new();
-		io::stdin().lock().read_to_string(&mut text)?;
+		io::stdin().read_to_string(&mut text)?;
 		if text.trim().is_empty() {
 			return Err(Error::new("no prompt provided: pass a prompt argument or pipe one on stdin"));
 		}
