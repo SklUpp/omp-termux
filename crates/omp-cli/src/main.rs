@@ -9,8 +9,8 @@ use clap::Parser;
 use omp_cli::{
 	Error, Result,
 	agent::{self, AgentRunner, RunRequest},
-	approve::Approvals,
-	args::{ApprovalMode, Cli, Command},
+	approve::{ApprovalMode, Approvals},
+	args::{Cli, Command},
 	catalog::Catalog,
 	config::Config,
 	dirs,
