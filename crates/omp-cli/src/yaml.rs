@@ -178,9 +178,11 @@ impl Parser {
 				self.pos += 1;
 				items.push(self.parse_block_scalar(&rest, indent)?);
 			} else {
-				// `- key: value` / `- scalar`: re-indent the remainder and parse it
-				// as a node so compact mappings gain their continuation lines.
-				let child_indent = indent + 2;
+				// `- key: value` / `- scalar`: re-indent the remainder to the
+				// column it actually starts at (`-   key` puts it further right)
+				// and parse it as a node so compact mappings gain their
+				// continuation lines.
+				let child_indent = indent + 1 + content[1..].len() - content[1..].trim_start().len();
 				self.lines[self.pos] = format!("{}{rest}", " ".repeat(child_indent));
 				items.push(self.parse_node(child_indent)?);
 			}
@@ -325,12 +327,26 @@ fn fold_lines(lines: &[&str]) -> String {
 fn strip_comment(line: &str) -> &str {
 	let mut in_double = false;
 	let mut in_single = false;
+	let mut escaped = false;
 	let mut previous: Option<char> = None;
 	for (idx, ch) in line.char_indices() {
+		if in_double {
+			// `\"` is a literal quote, not the end of the scalar: YAML
+			// double-quoted scalars use backslash escapes.
+			if escaped {
+				escaped = false;
+			} else if ch == '\\' {
+				escaped = true;
+			} else if ch == '"' {
+				in_double = false;
+			}
+			previous = Some(ch);
+			continue;
+		}
 		match ch {
-			'"' if !in_single => in_double = !in_double,
-			'\'' if !in_double => in_single = !in_single,
-			'#' if !in_double && !in_single => {
+			'"' if !in_single => in_double = true,
+			'\'' => in_single = !in_single,
+			'#' if !in_single => {
 				if idx == 0 || previous.is_some_and(|p| p == ' ' || p == '\t') {
 					return &line[..idx];
 				}
@@ -510,6 +526,28 @@ cwd: /tmp/work
 		let value = parse("allow:\n- read\n- write\nnext: true\n").expect("parse");
 		assert_eq!(value.get("allow").and_then(Value::as_list).map(<[_]>::len), Some(2));
 		assert_eq!(value.get("next").and_then(Value::as_bool), Some(true));
+	}
+
+	#[test]
+	fn escaped_quote_does_not_start_a_comment() {
+		let value = parse("key: \"a\\\" #x\"\nnext: 1\n").expect("parse");
+		assert_eq!(value.get("key").and_then(Value::as_str), Some("a\" #x"));
+		assert_eq!(value.get("next").and_then(Value::as_bool), Some(true));
+		// A real comment after a closed double-quoted scalar is still stripped.
+		let value = parse("key: \"a\" # comment\n").expect("parse");
+		assert_eq!(value.get("key").and_then(Value::as_str), Some("a"));
+	}
+
+	#[test]
+	fn compact_sequence_items_keep_continuation_lines() {
+		let doc = "items:\n  -   name: one\n      kind: a\n  -   name: two\n      kind: b\n";
+		let value = parse(doc).expect("parse");
+		let items = value.get("items").and_then(Value::as_list).expect("items");
+		assert_eq!(items.len(), 2);
+		assert_eq!(items[0].get("name").and_then(Value::as_str), Some("one"));
+		assert_eq!(items[0].get("kind").and_then(Value::as_str), Some("a"));
+		assert_eq!(items[1].get("name").and_then(Value::as_str), Some("two"));
+		assert_eq!(items[1].get("kind").and_then(Value::as_str), Some("b"));
 	}
 
 	#[test]

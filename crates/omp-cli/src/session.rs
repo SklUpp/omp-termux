@@ -172,8 +172,11 @@ impl SessionStore {
 			}
 		}
 		let id = id.unwrap_or_else(output::session_id);
-		if id.contains(['/', '\\']) || id.is_empty() {
-			store.warn(format!("invalid session id `{id}`; session persistence disabled"));
+		if !valid_session_id(&id) {
+			store.warn(format!(
+				"invalid session id `{id}`: allowed characters are [A-Za-z0-9._-] and the id may \
+				 not be `.`/`..`; session persistence disabled"
+			));
 			return store;
 		}
 		let file = dir.join(format!("{id}.{LOG_EXTENSION}"));
@@ -266,7 +269,19 @@ impl SessionStore {
 	}
 }
 
-/// Newest `*.jsonl` in `dir`, by mtime (ties broken by path).
+/// Newest `*.jsonl` in `dir` by mtime; equal mtimes tie-break on the id.
+/// Session ids become file names, so only a conservative character set is
+/// accepted. `:` matters even off Windows: `C:` is drive-relative there, and
+/// `/`/`\` (or `..`) would escape the session directory everywhere.
+fn valid_session_id(id: &str) -> bool {
+	!id.is_empty()
+		&& id != "."
+		&& id != ".."
+		&& id
+			.chars()
+			.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 fn latest_session(dir: &Path) -> Result<Option<(String, PathBuf)>, String> {
 	let entries = fs::read_dir(dir)
 		.map_err(|err| format!("cannot read session directory {}: {err}", dir.display()))?;
@@ -286,7 +301,9 @@ fn latest_session(dir: &Path) -> Result<Option<(String, PathBuf)>, String> {
 			.unwrap_or(SystemTime::UNIX_EPOCH);
 		let replace = match &newest {
 			None => true,
-			Some((time, _, _)) => modified > *time,
+			// Equal mtimes (common on coarse filesystem clocks) tie-break on the
+			// id so `--continue` is deterministic regardless of readdir order.
+			Some((time, id, _)) => modified > *time || (modified == *time && stem > id.as_str()),
 		};
 		if replace {
 			newest = Some((modified, stem.to_string(), path));
@@ -410,6 +427,72 @@ mod tests {
 				is_error: false,
 			}],
 		}
+	}
+
+	#[test]
+	fn session_id_whitelist_rejects_path_characters() {
+		for bad in [":", "C:", "/", "a/b", "..", ".", "", "a\\b", "id space"] {
+			assert!(!valid_session_id(bad), "{bad:?} must be rejected");
+		}
+		for good in ["s1", "abc-DEF_1.2", "0f.3e-1"] {
+			assert!(valid_session_id(good), "{good:?} must be accepted");
+		}
+
+		let dir = temp_dir();
+		{
+			let store = SessionStore::open(&options(dir.clone(), Some("C:")));
+			assert!(!store.enabled, "invalid id must disable persistence");
+			assert!(store.file.is_none());
+			assert!(
+				store
+					.warnings
+					.iter()
+					.any(|warning| warning.contains("invalid session id"))
+			);
+		}
+		assert_eq!(fs::read_dir(&dir).expect("list").count(), 0, "nothing written");
+		fs::remove_dir_all(&dir).ok();
+	}
+
+	#[test]
+	fn latest_session_tie_breaks_on_id_not_readdir_order() {
+		let dir = temp_dir();
+		let stamp = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+		for id in ["z-old", "a-new"] {
+			let path = dir.join(format!("{id}.{LOG_EXTENSION}"));
+			fs::write(&path, "").expect("seed log");
+			let file = fs::File::options()
+				.write(true)
+				.open(&path)
+				.expect("open log");
+			file
+				.set_times(fs::FileTimes::new().set_modified(stamp))
+				.expect("same mtime");
+		}
+		let (id, path) = latest_session(&dir).expect("scan").expect("a session");
+		assert_eq!(id, "z-old");
+		assert_eq!(path, dir.join(format!("z-old.{LOG_EXTENSION}")));
+		fs::remove_dir_all(&dir).ok();
+	}
+
+	#[test]
+	fn latest_session_prefers_the_newer_mtime() {
+		let dir = temp_dir();
+		let old = dir.join(format!("a.{LOG_EXTENSION}"));
+		let new = dir.join(format!("z.{LOG_EXTENSION}"));
+		fs::write(&old, "").expect("old");
+		fs::write(&new, "").expect("new");
+		let file = fs::File::options().write(true).open(&old).expect("open");
+		file
+			.set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(10)))
+			.expect("stamp");
+		let file = fs::File::options().write(true).open(&new).expect("open");
+		file
+			.set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(20)))
+			.expect("stamp");
+		let (id, _) = latest_session(&dir).expect("scan").expect("a session");
+		assert_eq!(id, "z");
+		fs::remove_dir_all(&dir).ok();
 	}
 
 	#[test]

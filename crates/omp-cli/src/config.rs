@@ -309,7 +309,30 @@ mod tests {
 
 	#[test]
 	fn missing_overlay_is_a_hard_error() {
-		assert!(Config::load(&[PathBuf::from("/nonexistent/omp-config.yml")]).is_err());
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		// Isolate the base config too: a developer `~/.omp/agent/config.yml` or a
+		// shell-exported override must not change this test's inputs.
+		let empty = std::env::temp_dir().join(format!("omp-cli-config-{}", std::process::id()));
+		let previous_agent = env::var_os("PI_CODING_AGENT_DIR");
+		let previous_config = env::var_os("PI_CONFIG_DIR");
+		// SAFETY: guarded by TEST_ENV_LOCK, like the other env-mutating tests.
+		unsafe {
+			env::set_var("PI_CONFIG_DIR", &empty);
+			env::set_var("PI_CODING_AGENT_DIR", empty.join("agent"));
+		}
+		let result = Config::load(&[PathBuf::from("/nonexistent/omp-config.yml")]);
+		unsafe {
+			match previous_agent {
+				Some(value) => env::set_var("PI_CODING_AGENT_DIR", value),
+				None => env::remove_var("PI_CODING_AGENT_DIR"),
+			}
+			match previous_config {
+				Some(value) => env::set_var("PI_CONFIG_DIR", value),
+				None => env::remove_var("PI_CONFIG_DIR"),
+			}
+		}
+		let err = result.err().expect("missing overlay must fail");
+		assert!(err.to_string().contains("config file not found"), "error was {err}");
 	}
 
 	#[test]

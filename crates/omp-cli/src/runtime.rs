@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use pi_agent::{
-	AgentConfig, AgentLoop, AgentState, BashTool, GlobTool, GrepTool, ModelProvider,
+	AgentConfig, AgentLoop, AgentState, BashTool, EditTool, GlobTool, GrepTool, ModelProvider,
 	OpenAiCompatibleProvider, ReadTool, TodoTool, Tool, ToolRegistry, TurnResult, WriteTool,
 };
 
@@ -26,11 +26,12 @@ pub const DEFAULT_CONTEXT_LIMIT: usize = 32_768;
 /// `pi-agent` has no approval hook, so the registry *is* the approval gate:
 /// a tool is offered to the model only when the approval matrix would
 /// auto-approve it.
-const BUILTIN_TOOLS: [(&str, bool); 6] = [
+const BUILTIN_TOOLS: [(&str, bool); 7] = [
 	("read", true),
 	("glob", true),
 	("grep", true),
 	("write", false),
+	("edit", false),
 	("bash", false),
 	("todo", false),
 ];
@@ -53,7 +54,7 @@ impl PiAgentRunner {
 impl AgentRunner for PiAgentRunner {
 	fn run(&self, request: &RunRequest) -> Result<EventStream> {
 		let plan = RunPlan::resolve(request)?;
-		let registry = build_registry(&plan.tools);
+		let registry = build_registry(&plan.tools)?;
 		let cwd = request.cwd.clone();
 		let prompt = request.prompt.clone();
 		let mut messages = history_messages(&request.history);
@@ -62,7 +63,8 @@ impl AgentRunner for PiAgentRunner {
 		}
 		let dialog = async move {
 			let provider = OpenAiCompatibleProvider::new(plan.base_url, plan.api_key, plan.model)
-				.map_err(|err| Error::with_source("pi-agent provider setup failed", err))?;
+				.map_err(|err| Error::with_source("pi-agent provider setup failed", err))?
+				.with_effort(plan.effort);
 			let config = AgentConfig {
 				max_turns: plan.max_turns,
 				context_limit: plan.context_limit,
@@ -98,6 +100,7 @@ struct RunPlan {
 	base_url: String,
 	api_key: String,
 	model: String,
+	effort: Option<String>,
 	max_turns: usize,
 	context_limit: usize,
 	system_prompt: Option<String>,
@@ -112,30 +115,36 @@ impl RunPlan {
 			.ok_or_else(|| Error::new("no model: pass --model or set defaultModel in config"))?;
 		// `provider/id` (first segment is the provider, as in TS model roles),
 		// `provider/id:effort`, or a bare id resolved through the catalog.
+		let mut effort: Option<&str> = None;
 		let (provider, model) = match request.provider.as_deref() {
 			Some(provider) => {
 				let prefix = format!("{provider}/");
-				let id = requested
+				let raw = requested
 					.strip_prefix(prefix.as_str())
 					.unwrap_or(&requested);
-				(provider.to_string(), split_effort(id).to_string())
+				let (id, parsed) = split_effort(raw);
+				effort = parsed;
+				(provider.to_string(), id.to_string())
 			},
 			None => match requested.split_once('/') {
 				Some((provider, id)) if !provider.is_empty() && !id.is_empty() => {
-					(provider.to_string(), split_effort(id).to_string())
+					let (id, parsed) = split_effort(id);
+					effort = parsed;
+					(provider.to_string(), id.to_string())
 				},
 				_ => {
-					let id = split_effort(&requested).to_string();
+					let (id, parsed) = split_effort(&requested);
+					effort = parsed;
 					let provider = request
 						.catalog
-						.provider_of(&id)
+						.provider_of(id)
 						.map(str::to_string)
 						.ok_or_else(|| {
 							Error::new(format!(
 								"no provider for model `{id}`: pass --provider or use `provider/{id}`"
 							))
 						})?;
-					(provider, id)
+					(provider, id.to_string())
 				},
 			},
 		};
@@ -171,6 +180,7 @@ impl RunPlan {
 			base_url,
 			api_key,
 			model,
+			effort: effort.map(str::to_string),
 			max_turns: request.max_turns.max(1),
 			context_limit,
 			system_prompt: compose_system_prompt(request),
@@ -182,18 +192,24 @@ impl RunPlan {
 /// Trailing `:effort` selector (`:high`, `:xhi`, …) is not part of the model id.
 const EFFORT_SELECTORS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-fn split_effort(model: &str) -> &str {
+fn split_effort(model: &str) -> (&str, Option<&str>) {
 	let Some((id, suffix)) = model.rsplit_once(':') else {
-		return model;
+		return (model, None);
 	};
 	if id.is_empty() || suffix.len() < 2 {
-		return model;
+		return (model, None);
 	}
-	let matching = EFFORT_SELECTORS
+	let mut matching = EFFORT_SELECTORS
 		.iter()
 		.filter(|selector| selector.starts_with(suffix))
-		.count();
-	if matching == 1 { id } else { model }
+		.copied();
+	let Some(selector) = matching.next() else {
+		return (model, None);
+	};
+	if matching.next().is_some() {
+		return (model, None);
+	}
+	(id, Some(selector))
 }
 
 /// Tools the model may call, derived from the approval matrix.
@@ -216,7 +232,7 @@ fn allowed_tools(request: &RunRequest) -> Result<Vec<&'static str>> {
 	Ok(tools)
 }
 
-fn build_registry(tools: &[&'static str]) -> ToolRegistry {
+fn build_registry(tools: &[&'static str]) -> Result<ToolRegistry> {
 	let mut registry = ToolRegistry::new();
 	for name in tools {
 		let tool: Arc<dyn Tool> = match *name {
@@ -224,13 +240,18 @@ fn build_registry(tools: &[&'static str]) -> ToolRegistry {
 			"glob" => Arc::new(GlobTool),
 			"grep" => Arc::new(GrepTool),
 			"write" => Arc::new(WriteTool),
+			"edit" => Arc::new(EditTool),
 			"bash" => Arc::new(BashTool),
 			"todo" => Arc::new(TodoTool::new()),
-			_ => continue,
+			other => {
+				return Err(Error::new(format!(
+					"unknown builtin tool `{other}`: BUILTIN_TOOLS and build_registry drifted"
+				)));
+			},
 		};
 		registry.register(tool);
 	}
-	registry
+	Ok(registry)
 }
 
 /// File-resolved prompt pieces joined into one system message.
@@ -424,7 +445,8 @@ mod tests {
 		assert_eq!(plan.model, "llama3");
 		assert_eq!(plan.max_turns, 5);
 		assert_eq!(plan.context_limit, 8_192);
-		assert_eq!(plan.tools, ["bash", "glob", "grep", "read", "todo", "write"]);
+		assert_eq!(plan.tools, ["bash", "edit", "glob", "grep", "read", "todo", "write"]);
+		assert_eq!(plan.effort, None);
 		let system = plan.system_prompt.expect("system prompt");
 		for part in ["base prompt", "appended", "repo rules", "skill body"] {
 			assert!(system.contains(part), "system prompt is missing {part}");
@@ -452,6 +474,41 @@ mod tests {
 	}
 
 	#[test]
+	fn effort_suffix_is_split_from_the_model_id() {
+		assert_eq!(split_effort("llama3"), ("llama3", None));
+		assert_eq!(split_effort("llama3:high"), ("llama3", Some("high")));
+		assert_eq!(split_effort("llama3:hi"), ("llama3", Some("high")));
+		assert_eq!(split_effort("llama3:xhi"), ("llama3", Some("xhigh")));
+		assert_eq!(split_effort("llama3:max"), ("llama3", Some("max")));
+		// Not an effort selector: the suffix stays part of the id.
+		assert_eq!(split_effort("qwen:7b"), ("qwen:7b", None));
+		assert_eq!(split_effort("llama3:m"), ("llama3:m", None));
+		assert_eq!(split_effort(":high"), (":high", None));
+	}
+
+	#[test]
+	fn explicit_provider_still_parses_the_effort_suffix() {
+		let mut request = request(yolo());
+		request.model = Some("llama3:high".to_string());
+		request.provider = Some("local".to_string());
+		let plan = RunPlan::resolve(&request).expect("plan");
+		assert_eq!(plan.model, "llama3");
+		assert_eq!(plan.effort.as_deref(), Some("high"));
+
+		request.model = Some("llama3".to_string());
+		let plan = RunPlan::resolve(&request).expect("plan");
+		assert_eq!(plan.effort, None);
+	}
+
+	#[test]
+	fn registry_implements_every_builtin_tool_name() {
+		let names: Vec<&'static str> = BUILTIN_TOOLS.iter().map(|(name, _)| *name).collect();
+		build_registry(&names).expect("every BUILTIN_TOOLS entry is implemented");
+		let err = build_registry(&["nope"]).err().expect("unknown tool");
+		assert!(err.to_string().contains("unknown builtin tool `nope`"));
+	}
+
+	#[test]
 	fn provider_prefixed_model_resolves_through_models_yml_connection() {
 		let mut nested = request(yolo());
 		nested.model = Some("9router/ocg/mimo-v2.6-pro:high".to_string());
@@ -463,6 +520,9 @@ mod tests {
 		assert_eq!(plan.model, "ocg/mimo-v2.6-pro");
 		assert_eq!(plan.base_url, "http://127.0.0.1:20128/v1");
 		assert_eq!(plan.api_key, "");
+		// `:high` is a reasoning-effort selector, not part of the model id; it is
+		// normalized to the full selector and carried to the provider builder.
+		assert_eq!(plan.effort.as_deref(), Some("high"));
 
 		let mut explicit = request(yolo());
 		explicit.model = Some("ocg/mimo-v2.6-pro".to_string());
