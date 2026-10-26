@@ -8,6 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use pi_agent::provider::OpenAiChatRequest;
 use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
 	ChunkStream, EditTool, Message, ModelProvider, OpenAiCompatibleProvider, ProviderError,
@@ -756,4 +757,69 @@ async fn streaming_keeps_tool_calls_finalized_across_turns() {
 	assert_no_orphan_tool_calls(&state);
 	assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
 	assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn edit_refuses_files_above_the_cap_without_touching_them() {
+	// Mirrors `MAX_EDIT_BYTES`; the limit is enforced on the bytes actually read,
+	// so a file that grew after `metadata` cannot lose its tail to a rewrite.
+	const EDIT_CAP: usize = 4 * 1024 * 1024;
+	let dir = TempDir::new("edit-cap");
+	let path = dir.path.join("big.txt");
+	std::fs::write(&path, "a".repeat(EDIT_CAP + 1)).expect("write");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	let result = EditTool
+		.execute(&json!({"path": "big.txt", "old_string": "a", "new_string": "b"}), &ctx)
+		.await
+		.expect("edit");
+
+	assert!(result.is_error);
+	assert!(result.content.contains("edit limit"), "got: {}", result.content);
+	let bytes = std::fs::read(&path).expect("read");
+	assert_eq!(bytes.len(), EDIT_CAP + 1);
+	assert!(bytes.iter().all(|byte| *byte == b'a'), "file content must be untouched");
+}
+
+#[test]
+fn reasoning_effort_is_serialized_only_when_set() {
+	let without = OpenAiChatRequest {
+		model: "model-x".to_string(),
+		messages: Vec::new(),
+		tools: Vec::new(),
+		stream: false,
+		reasoning_effort: None,
+	};
+	let payload = serde_json::to_value(&without).expect("serialize");
+	assert!(payload.get("reasoning_effort").is_none(), "got: {payload}");
+
+	let with = OpenAiChatRequest { reasoning_effort: Some("high".to_string()), ..without };
+	let payload = serde_json::to_value(&with).expect("serialize");
+	assert_eq!(payload["reasoning_effort"], json!("high"));
+}
+
+#[test]
+fn effort_builder_normalizes_blank_values() {
+	let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "key", "model-x")
+		.expect("build")
+		.with_effort(Some("   ".to_string()));
+	assert_eq!(provider.effort(), None);
+
+	let provider = provider.with_effort(Some("high".to_string()));
+	assert_eq!(provider.effort(), Some("high"));
+
+	let provider = provider.with_effort(None);
+	assert_eq!(provider.effort(), None);
+}
+
+#[test]
+fn message_name_reaches_the_openai_payload() {
+	let mut message = Message::user("hello");
+	message.name = Some("alice".to_string());
+
+	let payload = pi_agent::to_openai_messages(std::slice::from_ref(&message));
+	let json = serde_json::to_value(&payload[0]).expect("serialize");
+
+	assert_eq!(json["role"], json!("user"));
+	assert_eq!(json["name"], json!("alice"));
 }

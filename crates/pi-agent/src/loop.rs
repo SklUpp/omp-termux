@@ -7,7 +7,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	compaction::Compactor,
 	provider::{ModelProvider, ProviderError, StreamAssembler},
-	state::{AgentConfig, AgentContext, AgentState, Message, ToolCall, ToolResult, TurnResult},
+	state::{
+		AgentConfig, AgentContext, AgentState, Message, Role, ToolCall, ToolResult, TurnResult,
+	},
 	tools::{registry::ToolRegistry, scheduler::ToolScheduler},
 };
 
@@ -129,10 +131,15 @@ impl AgentLoop {
 		mut steering_rx: Option<mpsc::Receiver<SteeringEvent>>,
 		events: Option<mpsc::Sender<AgentEvent>>,
 	) -> Result<Vec<TurnResult>, AgentError> {
-		if state.messages.is_empty()
-			&& let Some(system) = &self.config.system_prompt
+		// The configured prompt belongs at the head of the history; resumed
+		// sessions may already carry messages, so test for the role, not emptiness.
+		if let Some(system) = &self.config.system_prompt
+			&& state
+				.messages
+				.first()
+				.is_none_or(|message| message.role != Role::System)
 		{
-			state.messages.push(Message::system(system.clone()));
+			state.messages.insert(0, Message::system(system.clone()));
 		}
 		state.messages.push(Message::user(user_input));
 

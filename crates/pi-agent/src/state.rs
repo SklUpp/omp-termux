@@ -22,6 +22,9 @@ pub struct ToolCall {
 }
 
 /// A tool execution response.
+///
+/// Tools fill `content`/`is_error` and leave `tool_call_id` empty; the scheduler
+/// stamps the id of the call it ran, so a tool cannot mislabel its own result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
 	pub tool_call_id: String,

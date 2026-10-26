@@ -108,6 +108,15 @@ async fn read_capped(path: &Path, cap: usize) -> std::io::Result<(Vec<u8>, u64)>
 	Ok((bytes, size))
 }
 
+/// Append the skipped-file count to a grep result, when there is one.
+fn skip_note(base: &str, skipped: usize) -> String {
+	if skipped == 0 {
+		base.to_string()
+	} else {
+		format!("{base} ({skipped} file(s) skipped: unreadable or above the size limit)")
+	}
+}
+
 fn tool_result(content: impl Into<String>, is_error: bool) -> ToolResult {
 	ToolResult { tool_call_id: String::new(), content: content.into(), is_error }
 }
@@ -190,7 +199,12 @@ impl Tool for BashTool {
 
 		let outcome = pi_shell::execute_shell(options, Some(tx), cancel_token).await;
 		watcher.abort();
-		let captured = drain.await.unwrap_or_default();
+		let captured = match drain.await {
+			Ok(captured) => captured,
+			Err(err) => {
+				return Ok(tool_result(format!("bash output collector failed: {err}"), true));
+			},
+		};
 
 		let result = match outcome {
 			Ok(result) => result,
@@ -210,7 +224,8 @@ impl Tool for BashTool {
 		} else {
 			format!("{captured}\n[{status}]")
 		};
-		let is_error = result.exit_code.unwrap_or(0) != 0 || result.cancelled || result.timed_out;
+		// A missing exit code means the child was killed, never success.
+		let is_error = result.exit_code != Some(0) || result.cancelled || result.timed_out;
 		Ok(tool_result(content, is_error))
 	}
 }
@@ -412,20 +427,18 @@ impl Tool for EditTool {
 		if !meta.is_file() {
 			return Ok(tool_result(format!("{} is not a regular file", target.display()), true));
 		}
-		if meta.len() > MAX_EDIT_BYTES as u64 {
+		// The size decision is taken on the read result, never on an earlier
+		// `metadata` call: the file can grow in between, and rewriting a capped
+		// buffer would silently drop the tail. One limit, one code path.
+		let (bytes, size) = read_capped(&target, MAX_EDIT_BYTES)
+			.await
+			.map_err(|err| ToolError::ExecutionFailed(format!("{}: {err}", target.display())))?;
+		if size > bytes.len() as u64 {
 			return Ok(tool_result(
-				format!(
-					"{} is {} bytes, the edit limit is {MAX_EDIT_BYTES}",
-					target.display(),
-					meta.len()
-				),
+				format!("{} is {size} bytes, the edit limit is {MAX_EDIT_BYTES}", target.display()),
 				true,
 			));
 		}
-
-		let (bytes, _size) = read_capped(&target, MAX_EDIT_BYTES)
-			.await
-			.map_err(|err| ToolError::ExecutionFailed(format!("{}: {err}", target.display())))?;
 		let content = String::from_utf8(bytes).map_err(|_| {
 			ToolError::ExecutionFailed(format!("{} is not valid UTF-8", target.display()))
 		})?;
@@ -536,7 +549,10 @@ impl Tool for GlobTool {
 					.into_iter()
 					.map(|entry| entry.path)
 					.collect();
-				Ok(tool_result(serde_json::to_string_pretty(&paths).unwrap_or_default(), false))
+				match serde_json::to_string_pretty(&paths) {
+					Ok(body) => Ok(tool_result(body, false)),
+					Err(err) => Ok(tool_result(format!("Failed to format glob result: {err}"), true)),
+				}
 			},
 			Err(err) => Ok(tool_result(format!("Glob scan error: {err}"), true)),
 		}
@@ -608,13 +624,21 @@ impl Tool for GrepTool {
 
 		let mut sink = BoundedText::new(MAX_GREP_OUTPUT_BYTES);
 		let mut matches = 0usize;
+		let mut skipped = 0usize;
 		for path in candidates {
 			if ctx.cancellation_token.is_cancelled() || matches >= MAX_GREP_MATCHES {
 				break;
 			}
-			let Ok((bytes, _size)) = read_capped(&path, MAX_GREP_FILE_BYTES).await else {
+			let Ok((bytes, size)) = read_capped(&path, MAX_GREP_FILE_BYTES).await else {
+				skipped += 1;
 				continue;
 			};
+			// Re-check the real size: a file can grow after the walk saw it, and a
+			// truncated buffer would report misleading matches.
+			if size > MAX_GREP_FILE_BYTES as u64 {
+				skipped += 1;
+				continue;
+			}
 			let text = String::from_utf8_lossy(&bytes);
 			let display = path
 				.strip_prefix(&ctx.cwd)
@@ -638,7 +662,10 @@ impl Tool for GrepTool {
 		}
 
 		if matches == 0 {
-			return Ok(tool_result("No matches found", false));
+			return Ok(tool_result(skip_note("No matches found", skipped), false));
+		}
+		if skipped > 0 {
+			sink.push(&format!("[{skipped} file(s) skipped: unreadable or above the size limit]"));
 		}
 		Ok(tool_result(sink.finish(), false))
 	}
@@ -693,11 +720,14 @@ impl Tool for TodoTool {
 		true
 	}
 
-	async fn execute(&self, args: &Value, _ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
 		let action = args
 			.get("action")
 			.and_then(Value::as_str)
 			.ok_or_else(|| ToolError::InvalidArguments("missing 'action'".to_string()))?;
+		if ctx.cancellation_token.is_cancelled() {
+			return Ok(tool_result("Todo update cancelled", true));
+		}
 
 		match action {
 			"add" => {

@@ -88,6 +88,7 @@ pub struct OpenAiCompatibleProvider {
 	base_url: String,
 	api_key: String,
 	model: String,
+	effort: Option<String>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -111,7 +112,27 @@ impl OpenAiCompatibleProvider {
 		api_key: impl Into<String>,
 		model: impl Into<String>,
 	) -> Self {
-		Self { http, base_url: base_url.into(), api_key: api_key.into(), model: model.into() }
+		Self {
+			http,
+			base_url: base_url.into(),
+			api_key: api_key.into(),
+			model: model.into(),
+			effort: None,
+		}
+	}
+
+	/// Set the reasoning effort sent as `reasoning_effort`.
+	///
+	/// `None` and blank strings both mean "let the endpoint decide", so the field
+	/// is omitted from the request instead of being sent empty.
+	pub fn with_effort(mut self, effort: Option<String>) -> Self {
+		self.effort = effort.filter(|value| !value.trim().is_empty());
+		self
+	}
+
+	/// Reasoning effort currently configured for this provider.
+	pub fn effort(&self) -> Option<&str> {
+		self.effort.as_deref()
 	}
 
 	/// `{base_url}/chat/completions`, tolerating a trailing slash in `base_url`.
@@ -130,6 +151,7 @@ impl OpenAiCompatibleProvider {
 			messages: to_openai_messages(messages),
 			tools: tools.to_vec(),
 			stream,
+			reasoning_effort: self.effort.clone(),
 		}
 	}
 }
@@ -187,8 +209,13 @@ impl ModelProvider for OpenAiCompatibleProvider {
 
 		let status = response.status();
 		if !status.is_success() {
-			let text = response.text().await.unwrap_or_default();
-			return Err(ProviderError::HttpStatus(status.as_u16(), snippet(&text)));
+			// The error body is diagnostics only; a failed read must still surface
+			// the status instead of looking like a transport error.
+			let body = match response.text().await {
+				Ok(text) => snippet(&text),
+				Err(err) => format!("<failed to read error body: {err}>"),
+			};
+			return Err(ProviderError::HttpStatus(status.as_u16(), body));
 		}
 
 		let body = response
@@ -270,11 +297,16 @@ pub struct OpenAiChatRequest {
 	pub tools: Vec<serde_json::Value>,
 	#[serde(default)]
 	pub stream: bool,
+	/// OpenAI-compatible `reasoning_effort`; omitted when unset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiMessage {
 	pub role: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub name: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub content: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -301,24 +333,16 @@ pub struct OpenAiFunctionCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiChatResponse {
 	#[serde(default)]
-	pub id: String,
-	#[serde(default)]
 	pub choices: Vec<OpenAiChoice>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiChoice {
-	#[serde(default)]
-	pub index: usize,
 	pub message: OpenAiResponseMessage,
-	#[serde(default)]
-	pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiResponseMessage {
-	#[serde(default)]
-	pub role: String,
 	#[serde(default)]
 	pub content: Option<String>,
 	#[serde(default)]
@@ -329,24 +353,16 @@ pub struct OpenAiResponseMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiStreamChunk {
 	#[serde(default)]
-	pub id: String,
-	#[serde(default)]
 	pub choices: Vec<OpenAiStreamChoice>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiStreamChoice {
-	#[serde(default)]
-	pub index: usize,
 	pub delta: OpenAiDelta,
-	#[serde(default)]
-	pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiDelta {
-	#[serde(default)]
-	pub role: Option<String>,
 	#[serde(default)]
 	pub content: Option<String>,
 	#[serde(default)]
@@ -402,6 +418,7 @@ pub fn to_openai_messages(messages: &[Message]) -> Vec<OpenAiMessage> {
 
 			OpenAiMessage {
 				role: role.to_string(),
+				name: m.name.clone(),
 				content: if m.content.is_empty() && tool_calls.is_some() {
 					None
 				} else {
