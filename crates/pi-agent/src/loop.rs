@@ -118,7 +118,9 @@ impl AgentLoop {
 	/// every text delta is forwarded as [`AgentEvent::MessageUpdate`] the moment
 	/// it arrives; tool calls still arrive only in the returned [`TurnResult`].
 	/// The channel is bounded by the caller, so a slow consumer applies
-	/// backpressure instead of growing memory.
+	/// backpressure instead of growing memory. The consumer must therefore
+	/// drain the channel concurrently (or size it for a full turn): a stalled
+	/// consumer blocks the turn.
 	///
 	/// History invariants: every assistant `tool_call` is followed by exactly one
 	/// tool message with the same id, and injected user messages are appended
@@ -293,6 +295,7 @@ impl AgentLoop {
 
 		let mut stream = self.provider.stream(messages, schemas).await?;
 		let mut assembler = StreamAssembler::new();
+		let mut done = false;
 		while let Some(chunk) = stream.next().await {
 			let chunk = chunk?;
 			if let Some(delta) = &chunk.content
@@ -304,11 +307,14 @@ impl AgentLoop {
 					.send(AgentEvent::MessageUpdate { delta: delta.clone() })
 					.await;
 			}
-			let done = chunk.is_done;
+			done = chunk.is_done;
 			assembler.push(&chunk);
 			if done {
 				break;
 			}
+		}
+		if !done {
+			return Err(ProviderError::Protocol("stream ended before completion".to_string()).into());
 		}
 		Ok(assembler.finish())
 	}

@@ -676,14 +676,21 @@ fn done_chunk() -> StreamChunk {
 	StreamChunk { content: None, tool_call_deltas: Vec::new(), is_done: true }
 }
 
-fn drain_events(rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>) -> Vec<String> {
-	let mut deltas = Vec::new();
-	while let Ok(event) = rx.try_recv() {
-		match event {
-			AgentEvent::MessageUpdate { delta } => deltas.push(delta),
+/// Drains the event channel concurrently with the dialog: `run_dialog_with`
+/// sends with backpressure, so a consumer must keep up or size the channel.
+fn spawn_drainer(
+	rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+) -> tokio::task::JoinHandle<Vec<String>> {
+	tokio::spawn(async move {
+		let mut deltas = Vec::new();
+		let mut rx = rx;
+		while let Some(event) = rx.recv().await {
+			match event {
+				AgentEvent::MessageUpdate { delta } => deltas.push(delta),
+			}
 		}
-	}
-	deltas
+		deltas
+	})
 }
 
 #[tokio::test]
@@ -698,14 +705,15 @@ async fn streaming_emits_text_deltas_in_arrival_order() {
 	let agent =
 		AgentLoop::new(config(&dir.path, 3), provider.clone(), ToolRegistry::with_builtins());
 	let mut state = AgentState::default();
-	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(8);
+	let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
+	let drainer = spawn_drainer(events_rx);
 
 	let turns = agent
 		.run_dialog_with("hi", &mut state, None, Some(events_tx))
 		.await
 		.expect("dialog");
 
-	assert_eq!(drain_events(&mut events_rx), vec!["Hel", "lo", ", world"]);
+	assert_eq!(drainer.await.expect("drainer"), vec!["Hel", "lo", ", world"]);
 	assert_eq!(turns.len(), 1);
 	assert!(turns[0].is_completed);
 	assert_eq!(turns[0].message.content, "Hello, world");
@@ -735,7 +743,8 @@ async fn streaming_keeps_tool_calls_finalized_across_turns() {
 	let agent =
 		AgentLoop::new(config(&dir.path, 3), provider.clone(), ToolRegistry::with_builtins());
 	let mut state = AgentState::default();
-	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(8);
+	let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
+	let drainer = spawn_drainer(events_rx);
 
 	let turns = agent
 		.run_dialog_with("go", &mut state, None, Some(events_tx))
@@ -743,7 +752,7 @@ async fn streaming_keeps_tool_calls_finalized_across_turns() {
 		.expect("dialog");
 
 	// Only text travels as events; tool calls arrive finalized in the turn result.
-	assert_eq!(drain_events(&mut events_rx), vec!["Checking", "Done"]);
+	assert_eq!(drainer.await.expect("drainer"), vec!["Checking", "Done"]);
 	assert_eq!(turns.len(), 2);
 	assert_eq!(turns[0].message.tool_calls.len(), 1);
 	assert_eq!(turns[0].message.tool_calls[0].id, "call_todo");
