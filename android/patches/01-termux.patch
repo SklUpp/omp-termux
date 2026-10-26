@@ -1786,3 +1786,25 @@ index 097aec7..e9d147c 100644
  describe("isMounted", () => {
  	it("detects a macOS mount point when mountpoint is unavailable", async () => {
  		const parentPath = import.meta.dir;
+
+diff --git a/crates/pi-natives/src/desktop/control.rs b/crates/pi-natives/src/desktop/control.rs
+--- a/crates/pi-natives/src/desktop/control.rs
++++ b/crates/pi-natives/src/desktop/control.rs
+@@ -474,6 +474,8 @@
+ 	_escape: Option<windows::EscapeMonitor>,
+ 	#[cfg(target_os = "linux")]
+ 	_escape: Option<linux::EscapeMonitor>,
++	#[cfg(target_os = "android")]
++	_escape: Option<()>,
+ 	_kernel: KernelOwner,
+ 	running: AtomicBool,
+ }
+@@ -535,6 +537,8 @@
+ 			_escape: Some(escape),
+ 			#[cfg(target_os = "linux")]
+ 			_escape: escape,
++			#[cfg(target_os = "android")]
++			_escape: None,
+ 			_kernel: kernel,
+ 			running: AtomicBool::new(false),
+ 		})
