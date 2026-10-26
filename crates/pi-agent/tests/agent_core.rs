@@ -13,7 +13,7 @@ use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
 	ChunkStream, EditTool, Message, ModelProvider, OpenAiCompatibleProvider, ProviderError,
 	ReadTool, Role, SteeringEvent, StreamAssembler, StreamChunk, Tool, ToolCall, ToolCallDelta,
-	ToolRegistry, WriteTool, parse_sse_line, sse_stream,
+	ToolRegistry, TurnStatus, WriteTool, parse_sse_line, sse_stream,
 };
 use serde_json::json;
 
@@ -586,7 +586,7 @@ async fn sse_stream_handles_records_split_across_transport_chunks() {
 	}
 
 	assert!(saw_done);
-	let message = assembler.finish();
+	let message = assembler.finish().expect("assembler finish");
 	assert_eq!(message.content, "done");
 	assert_eq!(message.tool_calls.len(), 1);
 	assert_eq!(message.tool_calls[0].id, "call_1");
@@ -687,6 +687,7 @@ fn spawn_drainer(
 		while let Some(event) = rx.recv().await {
 			match event {
 				AgentEvent::MessageUpdate { delta } => deltas.push(delta),
+				_ => {},
 			}
 		}
 		deltas
@@ -767,6 +768,59 @@ async fn streaming_keeps_tool_calls_finalized_across_turns() {
 	assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
 	assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 0);
 }
+#[tokio::test]
+async fn streaming_rejects_missing_tool_name() {
+	let mut assembler = StreamAssembler::new();
+	assembler.push(&StreamChunk {
+		content: Some("text".to_string()),
+		tool_call_deltas: vec![ToolCallDelta {
+			index: 0,
+			id: Some("call_abc".to_string()),
+			name: None,
+			arguments_delta: Some("{\"path\":\"x\"}".to_string()),
+		}],
+		is_done: true,
+	});
+
+	let result = assembler.finish();
+	assert!(result.is_err(), "StreamAssembler::finish must reject tool call without name");
+	let err = result.unwrap_err();
+	assert!(
+		matches!(err, ProviderError::Protocol(_)),
+		"Expected ProviderError::Protocol, got: {:?}",
+		err
+	);
+}
+
+#[tokio::test]
+async fn streaming_dialog_fails_on_missing_tool_name() {
+	let dir = TempDir::new("missing-name");
+	let tools = ToolRegistry::new();
+
+	let provider = StreamingProvider::new(vec![vec![
+		text_chunk("running tool"),
+		tool_delta(0, Some("call_missing"), None, Some("{\"path\":\"x\"}")),
+		done_chunk(),
+	]]);
+
+	let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
+	let _drainer = spawn_drainer(events_rx);
+
+	let agent = AgentLoop::new(config(&dir.path, 2), std::sync::Arc::new(provider), tools);
+	let mut state = AgentState::default();
+	let result = agent
+		.run_dialog_with("go", &mut state, None, Some(events_tx))
+		.await;
+
+	assert!(result.is_err(), "Dialog must fail when streamed tool call has no name");
+	let err = result.unwrap_err();
+	assert!(
+		matches!(err, pi_agent::AgentError::Provider(ProviderError::Protocol(_))),
+		"Expected AgentError::Provider(Protocol), got: {:?}",
+		err
+	);
+}
+
 
 #[tokio::test]
 async fn edit_refuses_files_above_the_cap_without_touching_them() {
@@ -831,4 +885,487 @@ fn message_name_reaches_the_openai_payload() {
 
 	assert_eq!(json["role"], json!("user"));
 	assert_eq!(json["name"], json!("alice"));
+}
+
+/// Stream provider that yields chunks from a channel.
+struct ChannelProvider {
+	stream: Mutex<Option<ChunkStream>>,
+}
+
+impl ChannelProvider {
+	fn new(stream: ChunkStream) -> Self {
+		Self { stream: Mutex::new(Some(stream)) }
+	}
+}
+
+#[async_trait]
+impl ModelProvider for ChannelProvider {
+	async fn complete(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+	) -> Result<Message, ProviderError> {
+		Err(ProviderError::Protocol("streaming only".to_string()))
+	}
+
+	async fn stream(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+	) -> Result<ChunkStream, ProviderError> {
+		self
+			.stream
+			.lock()
+			.expect("stream lock")
+			.take()
+			.ok_or_else(|| ProviderError::Protocol("exhausted".to_string()))
+	}
+}
+
+struct StalledStreamProvider;
+
+#[async_trait]
+impl ModelProvider for StalledStreamProvider {
+	async fn complete(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+	) -> Result<Message, ProviderError> {
+		futures::future::pending().await
+	}
+
+	async fn stream(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+	) -> Result<ChunkStream, ProviderError> {
+		futures::future::pending().await
+	}
+}
+
+#[tokio::test]
+async fn interrupt_stalled_provider_stream_setup() {
+	let dir = TempDir::new("interrupt-stalled-stream");
+	let provider = Arc::new(StalledStreamProvider);
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, ToolRegistry::with_builtins());
+	let mut state = AgentState::default();
+	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
+	let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
+
+	let mut dialog_task = tokio::spawn(async move {
+		agent
+			.run_dialog_with("hi", &mut state, Some(steering_rx), Some(events_tx))
+			.await
+	});
+
+	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+	steering_tx.send(SteeringEvent::Interrupt).await.unwrap();
+
+	let res = tokio::time::timeout(std::time::Duration::from_secs(2), &mut dialog_task)
+		.await
+		.expect("dialog hung instead of interrupting stalled stream setup")
+		.unwrap();
+
+	assert!(matches!(res, Err(AgentError::Interrupted)));
+}
+
+#[tokio::test]
+async fn first_message_update_readable_before_done() {
+	let dir = TempDir::new("live-first-chunk");
+	let (chunk_tx, chunk_rx) = futures::channel::mpsc::unbounded();
+	let provider = Arc::new(ChannelProvider::new(Box::pin(chunk_rx)));
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, ToolRegistry::with_builtins());
+	let mut state = AgentState::default();
+	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(8);
+
+	// Provider emits first text chunk, but has NOT emitted done_chunk().
+	chunk_tx
+		.unbounded_send(Ok(text_chunk("first chunk")))
+		.unwrap();
+
+	let dialog_task = tokio::spawn(async move {
+		agent
+			.run_dialog_with("hi", &mut state, None, Some(events_tx))
+			.await
+	});
+
+	// Expect the first message_update event while [DONE] has NOT been sent.
+	let first_event = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv())
+		.await
+		.expect("timeout waiting for live event")
+		.expect("events channel closed");
+	assert_eq!(first_event, AgentEvent::MessageUpdate { delta: "first chunk".to_string() });
+
+	// Now finish the stream with done_chunk()
+	chunk_tx.unbounded_send(Ok(done_chunk())).unwrap();
+	drop(chunk_tx);
+
+	let res = dialog_task.await.unwrap();
+	assert!(res.is_ok());
+}
+
+#[tokio::test]
+async fn interrupt_pending_provider_stream() {
+	let dir = TempDir::new("interrupt-stream");
+	let (chunk_tx, chunk_rx) = futures::channel::mpsc::unbounded();
+	let provider = Arc::new(ChannelProvider::new(Box::pin(chunk_rx)));
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, ToolRegistry::with_builtins());
+	let mut state = AgentState::default();
+	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
+	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(8);
+
+	// Provider emits partial chunk and then stays open/pending without finishing.
+	chunk_tx
+		.unbounded_send(Ok(text_chunk("partial text")))
+		.unwrap();
+
+	let mut dialog_task = tokio::spawn(async move {
+		agent
+			.run_dialog_with("hi", &mut state, Some(steering_rx), Some(events_tx))
+			.await
+	});
+
+	// Wait until the partial event is observed
+	let first_event = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv())
+		.await
+		.expect("timeout waiting for live event")
+		.expect("events channel closed");
+	assert_eq!(first_event, AgentEvent::MessageUpdate { delta: "partial text".to_string() });
+
+	// Now interrupt the pending stream via steering channel
+	steering_tx.send(SteeringEvent::Interrupt).await.unwrap();
+
+	// The dialog task must return Err(AgentError::Interrupted) promptly without hanging!
+	let res = tokio::time::timeout(std::time::Duration::from_secs(2), &mut dialog_task)
+		.await
+		.expect("dialog hung instead of interrupting pending stream")
+		.unwrap();
+
+	assert!(matches!(res, Err(AgentError::Interrupted)));
+}
+
+#[tokio::test]
+async fn interrupt_two_tool_batch_without_orphan() {
+	let dir = TempDir::new("interrupt-tools");
+	let path1 = dir.path.join("file1.txt");
+	let path2 = dir.path.join("file2.txt");
+	std::fs::write(&path1, "content 1").unwrap();
+	std::fs::write(&path2, "content 2").unwrap();
+
+	// Provider requests 2 tools
+	let provider = Arc::new(StreamingProvider::new(vec![vec![
+		text_chunk("Calling tools"),
+		tool_delta(
+			0,
+			Some("call_1"),
+			Some("read"),
+			Some(&format!("{{\"path\": \"{}\"}}", path1.display())),
+		),
+		tool_delta(
+			1,
+			Some("call_2"),
+			Some("read"),
+			Some(&format!("{{\"path\": \"{}\"}}", path2.display())),
+		),
+		done_chunk(),
+	]]));
+
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, ToolRegistry::with_builtins());
+	let mut state = AgentState::default();
+	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
+	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
+
+	let dialog_task = tokio::spawn(async move {
+		let res = agent
+			.run_dialog_with("go", &mut state, Some(steering_rx), Some(events_tx))
+			.await;
+		(res, state)
+	});
+
+	let mut events = Vec::new();
+	while let Some(event) = events_rx.recv().await {
+		let is_tool_start = matches!(event, AgentEvent::ToolStart { .. });
+		events.push(event);
+		if is_tool_start {
+			let _ = steering_tx.send(SteeringEvent::Interrupt).await;
+			break;
+		}
+	}
+
+	while let Some(event) = events_rx.recv().await {
+		events.push(event);
+		if events
+			.iter()
+			.filter(|e| matches!(e, AgentEvent::ToolEnd { .. }))
+			.count()
+			>= 2
+		{
+			break;
+		}
+	}
+
+	let (res, state) = dialog_task.await.unwrap();
+	assert!(matches!(res, Err(AgentError::Interrupted)));
+	while let Ok(event) = events_rx.try_recv() {
+		events.push(event);
+	}
+
+	let tool_starts: Vec<_> = events
+		.iter()
+		.filter_map(|e| match e {
+			AgentEvent::ToolStart { id, name, .. } => Some((id.clone(), name.clone())),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(
+		tool_starts,
+		vec![("call_1".to_string(), "read".to_string()), ("call_2".to_string(), "read".to_string())]
+	);
+
+	let tool_ends: Vec<_> = events
+		.iter()
+		.filter_map(|e| match e {
+			AgentEvent::ToolEnd { id, name, is_error, .. } => {
+				Some((id.clone(), name.clone(), *is_error))
+			},
+			_ => None,
+		})
+		.collect();
+	assert_eq!(tool_ends.len(), 2);
+	assert_eq!(tool_ends[0].0, "call_1");
+	assert_eq!(tool_ends[1].0, "call_2");
+
+	// Verify no orphan tool calls in history
+	assert_no_orphan_tool_calls(&state);
+}
+
+#[tokio::test]
+async fn sse_toolbatch_ordering_message_end_before_tool_start_and_turn_end_status() {
+	let dir = TempDir::new("ordering-envelope");
+	let file = dir.path.join("data.txt");
+	std::fs::write(&file, "hello world").unwrap();
+
+	let provider = Arc::new(StreamingProvider::new(vec![
+		vec![
+			text_chunk("Calling read tool..."),
+			tool_delta(
+				0,
+				Some("call_1"),
+				Some("read"),
+				Some(&format!("{{\"path\": \"{}\"}}", file.display())),
+			),
+			done_chunk(),
+		],
+		vec![text_chunk("File content read successfully."), done_chunk()],
+	]));
+
+	let agent = AgentLoop::new(config(&dir.path, 5), provider, ToolRegistry::with_builtins());
+	let mut state = AgentState::default();
+	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+
+	let dialog_task = tokio::spawn(async move {
+		agent
+			.run_dialog_with("read file", &mut state, None, Some(events_tx))
+			.await
+	});
+
+	let mut events = Vec::new();
+	while let Some(event) = events_rx.recv().await {
+		events.push(event);
+	}
+
+	let res = dialog_task.await.unwrap();
+	assert!(res.is_ok());
+
+	// Find indexes of events
+	let msg_end_1 = events
+		.iter()
+		.position(|e| matches!(e, AgentEvent::MessageEnd { message, status: TurnStatus::ToolUse } if !message.tool_calls.is_empty()))
+		.expect("first MessageEnd");
+	let tool_start_1 = events
+		.iter()
+		.position(|e| matches!(e, AgentEvent::ToolStart { id, .. } if id == "call_1"))
+		.expect("ToolStart");
+	let tool_end_1 = events
+		.iter()
+		.position(|e| matches!(e, AgentEvent::ToolEnd { id, .. } if id == "call_1"))
+		.expect("ToolEnd");
+	let turn_end_1 = events
+		.iter()
+		.position(|e| matches!(e, AgentEvent::TurnEnd { status: TurnStatus::ToolUse, .. }))
+		.expect("TurnEnd ToolUse");
+
+	// MessageEnd MUST precede ToolStart
+	assert!(msg_end_1 < tool_start_1, "MessageEnd must be emitted before ToolStart");
+	assert!(tool_start_1 < tool_end_1, "ToolStart must be emitted before ToolEnd");
+	assert!(tool_end_1 < turn_end_1, "ToolEnd must be emitted before TurnEnd");
+
+	// Second turn: EndTurn
+	let msg_end_2 = events
+		.iter()
+		.position(|e| matches!(e, AgentEvent::MessageEnd { message, status: TurnStatus::EndTurn } if message.tool_calls.is_empty()))
+		.expect("second MessageEnd");
+	let turn_end_2 = events
+		.iter()
+		.position(|e| matches!(e, AgentEvent::TurnEnd { status: TurnStatus::EndTurn, .. }))
+		.expect("TurnEnd EndTurn");
+
+	assert!(turn_end_1 < msg_end_2);
+	assert!(msg_end_2 < turn_end_2);
+
+	// Exactly two MessageEnd and two TurnEnd
+	let message_ends = events
+		.iter()
+		.filter(|e| matches!(e, AgentEvent::MessageEnd { .. }))
+		.count();
+	let turn_ends = events
+		.iter()
+		.filter(|e| matches!(e, AgentEvent::TurnEnd { .. }))
+		.count();
+	assert_eq!(message_ends, 2);
+	assert_eq!(turn_ends, 2);
+}
+
+#[tokio::test]
+async fn mid_stream_abort_discards_incomplete_tool_calls() {
+	let dir = TempDir::new("mid-stream-abort");
+	let (chunk_tx, chunk_rx) = futures::channel::mpsc::unbounded();
+	let provider = Arc::new(ChannelProvider::new(Box::pin(chunk_rx)));
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, ToolRegistry::with_builtins());
+	let mut state = AgentState::default();
+	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
+	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
+
+	// Send partial text and partial tool call, but DO NOT finish the stream
+	chunk_tx
+		.unbounded_send(Ok(text_chunk("thinking about tool")))
+		.unwrap();
+	chunk_tx
+		.unbounded_send(Ok(tool_delta(0, Some("incomplete_call"), Some("read"), None)))
+		.unwrap();
+
+	let dialog_task = tokio::spawn(async move {
+		agent
+			.run_dialog_with("test abort", &mut state, Some(steering_rx), Some(events_tx))
+			.await
+	});
+
+	// Wait for the text delta
+	let first = events_rx.recv().await.expect("first event");
+	assert!(matches!(first, AgentEvent::MessageUpdate { .. }));
+
+	// Abort stream before done
+	steering_tx.send(SteeringEvent::Interrupt).await.unwrap();
+
+	let mut events = Vec::new();
+	while let Some(event) = events_rx.recv().await {
+		events.push(event);
+	}
+
+	let res = dialog_task.await.unwrap();
+	assert!(matches!(res, Err(AgentError::Interrupted)));
+
+	// Verify MessageEnd has tool_calls discarded
+	let msg_end = events
+		.iter()
+		.find_map(|e| match e {
+			AgentEvent::MessageEnd { message, status } => Some((message, status)),
+			_ => None,
+		})
+		.expect("MessageEnd event must be emitted on abort");
+	assert_eq!(msg_end.1, &TurnStatus::Aborted);
+	assert!(
+		msg_end.0.tool_calls.is_empty(),
+		"Incomplete tool calls must be discarded on mid-stream abort"
+	);
+	assert_eq!(msg_end.0.content, "thinking about tool");
+	// TurnEnd has Aborted status
+	let turn_end = events
+		.iter()
+		.find_map(|e| match e {
+			AgentEvent::TurnEnd { status, tool_results, .. } => Some((status, tool_results)),
+			_ => None,
+		})
+		.expect("TurnEnd event must be emitted on abort");
+	assert_eq!(turn_end.0, &TurnStatus::Aborted);
+	assert!(turn_end.1.is_empty());
+
+	// No ToolStart was emitted
+	assert!(
+		!events
+			.iter()
+			.any(|e| matches!(e, AgentEvent::ToolStart { .. }))
+	);
+}
+
+#[tokio::test]
+async fn batch_abort_paired_results_in_provider_context() {
+	let dir = TempDir::new("batch-abort-paired");
+	let f1 = dir.path.join("f1.txt");
+	let f2 = dir.path.join("f2.txt");
+	std::fs::write(&f1, "one").unwrap();
+	std::fs::write(&f2, "two").unwrap();
+
+	let provider = Arc::new(StreamingProvider::new(vec![vec![
+		text_chunk("running batch"),
+		tool_delta(0, Some("c1"), Some("read"), Some(&format!("{{\"path\":\"{}\"}}", f1.display()))),
+		tool_delta(1, Some("c2"), Some("read"), Some(&format!("{{\"path\":\"{}\"}}", f2.display()))),
+		done_chunk(),
+	]]));
+
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, ToolRegistry::with_builtins());
+	let mut state = AgentState::default();
+	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
+	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
+
+	let dialog_task = tokio::spawn(async move {
+		let res = agent
+			.run_dialog_with("go", &mut state, Some(steering_rx), Some(events_tx))
+			.await;
+		(res, state)
+	});
+
+	// Interrupt as soon as first tool start is seen
+	while let Some(event) = events_rx.recv().await {
+		if matches!(event, AgentEvent::ToolStart { .. }) {
+			let _ = steering_tx.send(SteeringEvent::Interrupt).await;
+			break;
+		}
+	}
+
+	let mut events = Vec::new();
+	while let Some(event) = events_rx.recv().await {
+		events.push(event);
+	}
+
+	let (res, state) = dialog_task.await.unwrap();
+	assert!(matches!(res, Err(AgentError::Interrupted)));
+
+	// TurnEnd has Aborted status and 2 paired results
+	let turn_end = events
+		.iter()
+		.find_map(|e| match e {
+			AgentEvent::TurnEnd { status, tool_results, .. } => Some((status, tool_results)),
+			_ => None,
+		})
+		.expect("TurnEnd on batch abort");
+	assert_eq!(turn_end.0, &TurnStatus::Aborted);
+	assert_eq!(turn_end.1.len(), 2);
+
+	// Replayed provider context in state has assistant message and paired tool responses
+	let assistant_msg = state
+		.messages
+		.iter()
+		.find(|m| m.role == Role::Assistant)
+		.expect("assistant message in state");
+	assert_eq!(assistant_msg.tool_calls.len(), 2);
+
+	let tool_msgs: Vec<_> = state
+		.messages
+		.iter()
+		.filter(|m| m.role == Role::Tool)
+		.collect();
+	assert_eq!(tool_msgs.len(), 2);
+	assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("c1"));
+	assert_eq!(tool_msgs[1].tool_call_id.as_deref(), Some("c2"));
 }

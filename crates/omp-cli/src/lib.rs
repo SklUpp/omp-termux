@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod config;
 pub mod deadline;
 pub mod dirs;
+pub mod foreign_session;
 pub mod output;
 pub mod prompts;
 pub mod repl;

@@ -87,6 +87,41 @@ pub struct Cli {
 	#[arg(short = 'c', long = "continue")]
 	pub continue_session: bool,
 
+	/// Resume a session (by ID prefix, path, or interactive picker if omitted).
+	#[arg(
+		short = 'r',
+		long = "resume",
+		alias = "session",
+		num_args = 0..=1,
+		default_missing_value = "",
+		value_name = "SELECTOR"
+	)]
+	pub resume: Option<String>,
+
+	/// Fork an existing session into a new session log.
+	#[arg(long = "fork", value_name = "SELECTOR")]
+	pub fork: Option<String>,
+
+	/// Import a Claude Code session into OMP.
+	#[arg(long = "from-claude")]
+	pub from_claude: bool,
+
+	/// Import an OpenAI Codex session into OMP.
+	#[arg(long = "from-codex")]
+	pub from_codex: bool,
+
+	/// Provider-specific session ID.
+	#[arg(long = "provider-session-id", value_name = "ID")]
+	pub provider_session_id: Option<String>,
+
+	/// Provider prompt cache key.
+	#[arg(long = "prompt-cache-key", value_name = "KEY")]
+	pub prompt_cache_key: Option<String>,
+
+	/// Disable session title generation.
+	#[arg(long = "no-title")]
+	pub no_title: bool,
+
 	/// Directory holding session logs (default: ~/.omp/agent/sessions/omp-cli).
 	#[arg(long = "session-dir", value_name = "DIR")]
 	pub session_dir: Option<PathBuf>,

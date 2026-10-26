@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -33,6 +33,16 @@ pub struct ToolResult {
 	pub is_error: bool,
 }
 
+/// Completion status of an assistant turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStatus {
+	EndTurn,
+	ToolUse,
+	Aborted,
+	Error(String),
+}
+
 /// A single message in the agent dialog history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
@@ -44,6 +54,8 @@ pub struct Message {
 	pub tool_calls: Vec<ToolCall>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub tool_call_id: Option<String>,
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub is_error: bool,
 }
 
 impl Message {
@@ -54,6 +66,7 @@ impl Message {
 			name: None,
 			tool_calls: Vec::new(),
 			tool_call_id: None,
+			is_error: false,
 		}
 	}
 
@@ -64,6 +77,7 @@ impl Message {
 			name: None,
 			tool_calls: Vec::new(),
 			tool_call_id: None,
+			is_error: false,
 		}
 	}
 
@@ -74,6 +88,7 @@ impl Message {
 			name: None,
 			tool_calls: Vec::new(),
 			tool_call_id: None,
+			is_error: false,
 		}
 	}
 
@@ -84,6 +99,7 @@ impl Message {
 			name: None,
 			tool_calls,
 			tool_call_id: None,
+			is_error: false,
 		}
 	}
 
@@ -94,6 +110,23 @@ impl Message {
 			name: None,
 			tool_calls: Vec::new(),
 			tool_call_id: Some(tool_call_id.into()),
+			is_error: false,
+		}
+	}
+
+	pub fn tool_with_status(
+		tool_call_id: impl Into<String>,
+		name: impl Into<String>,
+		content: impl Into<String>,
+		is_error: bool,
+	) -> Self {
+		Self {
+			role: Role::Tool,
+			content: content.into(),
+			name: Some(name.into()),
+			tool_calls: Vec::new(),
+			tool_call_id: Some(tool_call_id.into()),
+			is_error,
 		}
 	}
 }

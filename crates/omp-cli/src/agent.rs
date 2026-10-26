@@ -19,16 +19,89 @@ use crate::{
 pub const MISSING_RUNTIME: &str = "agent runtime not linked";
 
 /// One streamed event of an agent turn.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-	MessageStart { role: String },
-	MessageUpdate { delta: String },
-	MessageEnd { text: String },
-	ToolStart { id: String, tool: String, args: serde_json::Value },
-	ToolEnd { id: String, tool: String, result: String, error: Option<String> },
-	TurnEnd { stop_reason: String },
-	AgentEnd { text: String },
+	MessageStart {
+		role: String,
+	},
+	MessageUpdate {
+		delta: String,
+	},
+	MessageEnd {
+		message: pi_agent::Message,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		stop_reason: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		api: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		provider: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		model: Option<String>,
+	},
+	ToolStart {
+		id: String,
+		tool: String,
+		args: serde_json::Value,
+	},
+	ToolEnd {
+		id: String,
+		tool: String,
+		result: String,
+		error: Option<String>,
+	},
+	TurnEnd {
+		message: pi_agent::Message,
+		tool_results: Vec<pi_agent::ToolResult>,
+		stop_reason: String,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		api: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		provider: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		model: Option<String>,
+	},
+	AgentEnd {
+		messages: Vec<pi_agent::Message>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		api: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		provider: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		model: Option<String>,
+	},
+}
+
+impl Event {
+	pub fn message_end(message: pi_agent::Message) -> Self {
+		let stop = if message.tool_calls.is_empty() { "stop" } else { "toolUse" };
+		Self::MessageEnd {
+			message,
+			stop_reason: Some(stop.to_string()),
+			api: None,
+			provider: None,
+			model: None,
+		}
+	}
+
+	pub fn turn_end(
+		message: pi_agent::Message,
+		tool_results: Vec<pi_agent::ToolResult>,
+		stop_reason: impl Into<String>,
+	) -> Self {
+		Self::TurnEnd {
+			message,
+			tool_results,
+			stop_reason: stop_reason.into(),
+			api: None,
+			provider: None,
+			model: None,
+		}
+	}
+
+	pub fn agent_end(messages: Vec<pi_agent::Message>) -> Self {
+		Self::AgentEnd { messages, api: None, provider: None, model: None }
+	}
 }
 
 pub type EventStream = Box<dyn Iterator<Item = Result<Event>> + Send>;
@@ -57,6 +130,8 @@ pub struct RunRequest {
 	pub max_turns: usize,
 	/// `false` when `--no-tools` was passed.
 	pub tools_enabled: bool,
+	/// Optional cancellation trigger from the consumer.
+	pub cancellation_token: Option<pi_agent::CancellationToken>,
 }
 
 pub trait AgentRunner: Send + Sync {
@@ -87,9 +162,17 @@ mod tests {
 	fn event_json_matches_print_mode_shape() {
 		let json = serde_json::to_string(&Event::MessageUpdate { delta: "hi".into() }).expect("json");
 		assert_eq!(json, r#"{"type":"message_update","delta":"hi"}"#);
-		let end =
-			serde_json::to_string(&Event::TurnEnd { stop_reason: "end_turn".into() }).expect("json");
-		assert_eq!(end, r#"{"type":"turn_end","stop_reason":"end_turn"}"#);
+		let end = serde_json::to_string(&Event::TurnEnd {
+			message: pi_agent::Message::assistant("ok"),
+			tool_results: Vec::new(),
+			stop_reason: "end_turn".into(),
+			api: None,
+			provider: None,
+			model: None,
+		})
+		.expect("json");
+		assert!(end.contains(r#""type":"turn_end""#));
+		assert!(end.contains(r#""stop_reason":"end_turn""#));
 	}
 
 	#[test]

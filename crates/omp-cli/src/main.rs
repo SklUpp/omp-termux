@@ -1,7 +1,7 @@
 //! `omp` binary entry point: resolve files, then hand turns to the runner.
 
-use std::io::{self, BufRead, Read, Write};
-use std::path::PathBuf;
+use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,37 +15,117 @@ use omp_cli::{
 	config::Config,
 	deadline::{self, Deadline},
 	dirs,
-	output::{OutputMode, Reporter, session_id},
+	foreign_session::{self, ForeignSessionSource, ForeignSessionStore},
+	output::{self, OutputMode, Reporter, session_id},
 	prompts::{self, Prompts},
 	repl,
 	runtime::{self, PiAgentRunner},
-	session::{SessionOptions, SessionStore, TurnBuilder, TurnRecord},
+	session::{
+		self, ContentPart, MessageContent, MessageEntry, SessionHeader, SessionMessage,
+		SessionOptions, SessionStore, TurnBuilder, TurnRecord,
+	},
 	skills::{self, Skill},
 };
+
+struct CliError {
+	message: String,
+	code: u8,
+}
+
+impl CliError {
+	fn fail(msg: impl Into<String>) -> Self {
+		Self {
+			message: msg.into(),
+			code: omp_cli::EXIT_FAILURE,
+		}
+	}
+
+	fn usage(msg: impl Into<String>) -> Self {
+		Self {
+			message: msg.into(),
+			code: omp_cli::EXIT_USAGE,
+		}
+	}
+}
+
+impl From<Error> for CliError {
+	fn from(err: Error) -> Self {
+		let msg = err.to_string();
+		if msg.contains("legacy v1 session log: read-only")
+			|| msg.contains("cannot append to legacy v1 session log")
+		{
+			Self::usage(msg)
+		} else {
+			Self::fail(msg)
+		}
+	}
+}
+
+impl From<std::io::Error> for CliError {
+	fn from(err: std::io::Error) -> Self {
+		Self::fail(err.to_string())
+	}
+}
 
 fn main() -> std::process::ExitCode {
 	match run() {
 		Ok(()) => std::process::ExitCode::from(omp_cli::EXIT_SUCCESS),
 		Err(error) => {
-			eprintln!("{error}");
-			std::process::ExitCode::from(omp_cli::EXIT_FAILURE)
+			eprintln!("{}", error.message);
+			std::process::ExitCode::from(error.code)
 		},
 	}
 }
 
-fn run() -> Result<()> {
+fn run() -> std::result::Result<(), CliError> {
 	let cli = Cli::parse();
 	if agent::install(Box::new(PiAgentRunner::new()?)).is_err() {
-		return Err(Error::new("agent runtime already registered"));
+		return Err(CliError::fail("agent runtime already registered"));
 	}
-	// Unreachable in the binary (registration happens above); kept so a library
-	// caller that skips `install` still fails honestly instead of pretending.
 	let Some(runner) = agent::runner() else {
-		return Err(Error::new(agent::MISSING_RUNTIME));
+		return Err(CliError::fail(agent::MISSING_RUNTIME));
 	};
 
 	let config = Config::load(&cli.config)?;
 	let cwd = resolve_cwd(cli.cwd.clone(), config.cwd.clone())?;
+	if cli.resume.as_deref() == Some("")
+		&& (!io::stdin().is_terminal() || !io::stdout().is_terminal())
+	{
+		return Err(CliError::usage(
+			"Non-interactive environment cannot display session picker. Specify a session ID or file path with --resume <id>.",
+		));
+	}
+
+	// Foreign and session flags validation
+	if cli.from_claude && cli.from_codex {
+		return Err(CliError::usage(
+			"--from-claude and --from-codex cannot be used together",
+		));
+	}
+	let foreign_source = if cli.from_claude {
+		Some(foreign_session::ForeignSessionSource::Claude)
+	} else if cli.from_codex {
+		Some(foreign_session::ForeignSessionSource::Codex)
+	} else {
+		None
+	};
+	if let Some(src) = foreign_source {
+		let src_name = src.to_string().to_ascii_lowercase();
+		if cli.no_session {
+			return Err(CliError::usage(format!(
+				"--from-{src_name} requires session persistence"
+			)));
+		}
+		if cli.continue_session || cli.resume.is_some() || cli.fork.is_some() {
+			return Err(CliError::usage(format!(
+				"--from-{src_name} cannot be combined with --continue, --resume, or --fork"
+			)));
+		}
+	}
+	if cli.fork.is_some() && cli.no_session {
+		return Err(CliError::usage("--fork requires session persistence"));
+	}
+
 	let prompt_inputs = (cli.system_prompt.clone(), cli.append_system_prompt.clone());
 	let loaded_prompts =
 		prompts::resolve(prompt_inputs.0.as_deref(), prompt_inputs.1.as_deref(), &cwd)?;
@@ -70,10 +150,157 @@ fn run() -> Result<()> {
 		.session_dir
 		.as_ref()
 		.map(|dir| dirs::absolute(&cwd, dir));
+
+	// Pre-resolve session target
+	let mut chosen_file: Option<PathBuf> = None;
+
+	if let Some(src) = foreign_source {
+		let store = foreign_session::create_foreign_session_store(src, None);
+		let sessions = store
+			.list()
+			.map_err(|e| CliError::fail(format!("Failed to list {} sessions: {e}", src.name())))?;
+		if sessions.is_empty() {
+			eprintln!("No {} sessions found", src.name());
+			return Ok(());
+		}
+		if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+			eprintln!("No {} session selected", src.name());
+			return Ok(());
+		}
+		eprintln!("Import {} Session", src.name());
+		for (i, info) in sessions.iter().enumerate() {
+			let label = info
+				.title
+				.as_deref()
+				.or(info.first_message.as_deref())
+				.unwrap_or(&info.id);
+			eprintln!("{}. {} ({})", i + 1, label, info.created_iso());
+		}
+		eprint!("Select session (1-{}): ", sessions.len());
+		io::stderr().flush()?;
+		let mut line = String::new();
+		io::stdin().read_line(&mut line)?;
+		let idx: usize = line
+			.trim()
+			.parse()
+			.map_err(|_| CliError::fail(format!("No {} session selected", src.name())))?;
+		if idx < 1 || idx > sessions.len() {
+			eprintln!("No {} session selected", src.name());
+			return Ok(());
+		}
+		let selected_info = &sessions[idx - 1];
+		let loaded = store
+			.load(selected_info)
+			.map_err(|e| CliError::fail(format!("Failed to import {} session: {e}", src.name())))?;
+
+		let target_cwd = if loaded.cwd.as_os_str().is_empty() || !loaded.cwd.exists() {
+			cwd.clone()
+		} else {
+			loaded.cwd.clone()
+		};
+		let mut imported_store = SessionStore::open(&SessionOptions {
+			enabled: true,
+			cwd: target_cwd,
+			model: requested_model.clone().or_else(|| default_model.clone()),
+			provider: requested_provider.clone(),
+			dir: session_dir.clone(),
+			id: None,
+			continue_latest: false,
+		});
+		let prov = loaded.provenance_entry(selected_info);
+		let prov_entry: session::SessionEntry = serde_json::from_value(prov)
+			.map_err(|e| CliError::fail(format!("cannot parse provenance entry: {e}")))?;
+		imported_store
+			.append_entry(prov_entry)
+			.map_err(|e| CliError::fail(format!("cannot append provenance entry: {e}")))?;
+		for entry_val in &loaded.entries {
+			let entry: session::SessionEntry = serde_json::from_value(entry_val.clone())
+				.map_err(|e| CliError::fail(format!("cannot parse imported entry: {e}")))?;
+			imported_store
+				.append_entry(entry)
+				.map_err(|e| CliError::fail(format!("cannot append imported entry: {e}")))?;
+		}
+		chosen_file = imported_store.file().map(Path::to_path_buf);
+	} else if let Some(fork_arg) = &cli.fork {
+		let source_path = if fork_arg.contains('/') || fork_arg.contains('\\') || fork_arg.ends_with(".jsonl") {
+			dirs::absolute(&cwd, Path::new(fork_arg))
+		} else {
+			match session::resolve_resumable_session(fork_arg, &cwd, session_dir.as_deref(), true) {
+				Ok(Some(path)) => path,
+				_ => {
+					return Err(CliError::usage(format!(
+						"Session \"{fork_arg}\" not found.\nRun `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one."
+					)));
+				}
+			}
+		};
+		let new_file = session::fork_session(&source_path, Some(&cwd), session_dir.as_deref())
+			.map_err(CliError::usage)?;
+		chosen_file = Some(new_file);
+	} else if let Some(resume_arg) = &cli.resume {
+		if resume_arg.trim().is_empty() {
+			if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+				return Err(CliError::usage(
+					"Non-interactive environment cannot display session picker. Specify a session ID or file path with --resume <id>.",
+				));
+			}
+			let target_dir = session_dir
+				.clone()
+				.unwrap_or_else(|| session::compute_default_session_dir(&cwd, None));
+			let mut sessions = list_sessions_for_picker(&target_dir);
+			if sessions.is_empty() {
+				let global_root = SessionOptions::default_sessions_root();
+				if global_root != target_dir && global_root.is_dir() {
+					sessions = list_sessions_for_picker(&global_root);
+				}
+			}
+			if sessions.is_empty() {
+				eprintln!("No sessions found");
+				return Ok(());
+			}
+			for (i, (path, title, id, _)) in sessions.iter().enumerate() {
+				let name = title.as_deref().unwrap_or(id);
+				eprintln!("{}. {} ({})", i + 1, name, path.display());
+			}
+			eprint!("Select session (1-{}): ", sessions.len());
+			io::stderr().flush()?;
+			let mut line = String::new();
+			io::stdin().read_line(&mut line)?;
+			let idx: usize = line
+				.trim()
+				.parse()
+				.map_err(|_| CliError::fail("No session selected"))?;
+			if idx < 1 || idx > sessions.len() {
+				eprintln!("No session selected");
+				return Ok(());
+			}
+			chosen_file = Some(sessions[idx - 1].0.clone());
+		} else if resume_arg.contains('/') || resume_arg.contains('\\') || resume_arg.ends_with(".jsonl") {
+			let path = dirs::absolute(&cwd, Path::new(resume_arg));
+			if !path.exists() {
+				return Err(CliError::usage(format!(
+					"Session \"{resume_arg}\" not found.\nRun `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one."
+				)));
+			}
+			chosen_file = Some(path);
+		} else {
+			match session::resolve_resumable_session(resume_arg, &cwd, session_dir.as_deref(), true) {
+				Ok(Some(path)) => {
+					chosen_file = Some(path);
+				},
+				_ => {
+					return Err(CliError::usage(format!(
+						"Session \"{resume_arg}\" not found.\nRun `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one."
+					)));
+				}
+			}
+		}
+	}
+
 	let mut session = Session {
 		runner,
 		config,
-		cwd,
+		cwd: cwd.clone(),
 		prompts: loaded_prompts,
 		skills: loaded_skills,
 		catalog,
@@ -89,7 +316,7 @@ fn run() -> Result<()> {
 		skills_filter,
 		store: SessionStore::default(),
 		history: Vec::new(),
-		session_dir,
+		session_dir: session_dir.clone(),
 	};
 	if let Some(model) = requested_model.or(default_model) {
 		session.select_model(model);
@@ -102,17 +329,48 @@ fn run() -> Result<()> {
 		session.api_key = requested_api_key;
 	}
 
-	let mut store = SessionStore::open(&SessionOptions {
-		enabled: !cli.no_session,
-		cwd: session.cwd.clone(),
-		model: session.model.clone(),
-		provider: session.provider.clone(),
-		dir: session.session_dir.clone(),
-		id: cli.session_id.clone(),
-		continue_latest: cli.continue_session,
-	});
+	let mut explicitly_existing = chosen_file.is_some();
+	let open_opts = if let Some(target) = &chosen_file {
+		let dir = target.parent().map(PathBuf::from);
+		let id = target.file_stem().and_then(|s| s.to_str()).map(str::to_string);
+		SessionOptions {
+			enabled: !cli.no_session,
+			cwd: cwd.clone(),
+			model: session.model.clone(),
+			provider: session.provider.clone(),
+			dir,
+			id,
+			continue_latest: false,
+		}
+	} else {
+		if let Some(req_id) = &cli.session_id {
+			let check_dir = session_dir
+				.clone()
+				.unwrap_or_else(|| session::compute_default_session_dir(&cwd, None));
+			let direct_file = check_dir.join(format!("{req_id}.jsonl"));
+			if direct_file.is_file() {
+				explicitly_existing = true;
+			}
+		}
+		SessionOptions {
+			enabled: !cli.no_session,
+			cwd: cwd.clone(),
+			model: session.model.clone(),
+			provider: session.provider.clone(),
+			dir: session_dir,
+			id: cli.session_id.clone(),
+			continue_latest: cli.continue_session,
+		}
+	};
+
+	let mut store = SessionStore::open(&open_opts);
 	for warning in store.take_warnings() {
 		eprintln!("warning: {warning}");
+	}
+	if !cli.no_session && explicitly_existing && !store.enabled() {
+		return Err(CliError::usage(
+			"cannot open session log: persistence disabled due to format error",
+		));
 	}
 	session.history = store.history().to_vec();
 	session.store = store;
@@ -129,7 +387,7 @@ fn run() -> Result<()> {
 	let repl_mode = matches!(cli.command.as_ref(), Some(Command::Repl))
 		|| (cli.command.is_none() && cli.prompt.is_empty() && !cli.print);
 	if repl_mode {
-		return run_repl(&mut session, mode, &mut reporter);
+		return run_repl(&mut session, mode, &mut reporter).map_err(CliError::from);
 	}
 
 	let mut prompts_to_run = cli.prompt.clone();
@@ -138,19 +396,49 @@ fn run() -> Result<()> {
 		io::stdin().read_to_string(&mut text)?;
 		if text.trim().is_empty() {
 			// TS print mode with zero messages writes nothing and exits 0.
-			return reporter.finish();
+			return reporter.finish().map_err(CliError::from);
 		}
 		prompts_to_run.push(text);
 	}
 	for prompt in prompts_to_run {
 		if let Err(error) = session.turn(prompt, mode, &mut reporter) {
-			// Keep the partial answer visible before reporting the failure
-			// (deadline expiry, interrupted turn, provider error).
 			reporter.finish().ok();
-			return Err(error);
+			return Err(CliError::from(error));
 		}
 	}
-	reporter.finish()
+	reporter.finish().map_err(CliError::from)
+}
+
+fn list_sessions_for_picker(dir: &Path) -> Vec<(PathBuf, Option<String>, String, String)> {
+	let mut result = Vec::new();
+	let Ok(entries) = std::fs::read_dir(dir) else {
+		return result;
+	};
+	for entry in entries.flatten() {
+		let path = entry.path();
+		if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+			continue;
+		}
+		let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+			continue;
+		};
+		let id = stem.rfind('_').map_or(stem, |pos| &stem[pos + 1..]).to_string();
+		let mtime = entry
+			.metadata()
+			.and_then(|m| m.modified())
+			.unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+		let iso = output::iso8601(mtime);
+
+		let title = std::fs::read_to_string(&path).ok().and_then(|c| {
+			c.lines()
+				.next()
+				.and_then(session::parse_title_slot)
+				.map(|s| s.title)
+		});
+		result.push((path, title, id, iso));
+	}
+	result.sort_by(|a, b| b.3.cmp(&a.3));
+	result
 }
 
 fn run_repl<W: Write, E: Write>(
@@ -188,7 +476,8 @@ fn run_repl<W: Write, E: Write>(
 			repl::ReplCommand::Prompt(text) => {
 				if let Err(error) = session.turn(text, mode, reporter) {
 					reporter.finish().ok();
-					return Err(error);
+					eprintln!("{error}");
+					continue;
 				}
 			},
 		}
@@ -263,6 +552,7 @@ impl Session<'_> {
 			max_time: self.max_time,
 			max_turns: self.max_turns,
 			tools_enabled: self.tools_enabled,
+			cancellation_token: None,
 		}
 	}
 
@@ -272,26 +562,245 @@ impl Session<'_> {
 		mode: OutputMode,
 		reporter: &mut Reporter<W, E>,
 	) -> Result<()> {
+		if self.store.is_v1() {
+			return Err(Error::new(
+				"cannot append to legacy v1 session log: read-only; use import_legacy_v1",
+			));
+		}
 		reporter.begin_turn()?;
-		let request = self.request(prompt.clone(), mode);
+
+		let now_start = std::time::SystemTime::now();
+		let now_iso = output::iso8601(now_start);
+		let now_ms = now_start
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_millis() as u64;
+
+		let user_id = format!("msg-{}", output::session_id());
+		let parent_id = self
+			.store
+			.messages()
+			.last()
+			.map(|m| m.id.clone())
+			.filter(|id| !id.is_empty());
+
+		let user_entry = MessageEntry::new(
+			user_id.clone(),
+			parent_id,
+			&now_iso,
+			SessionMessage::user(MessageContent::Text(prompt.clone()), now_ms),
+		);
+		if self.store.enabled() {
+			if let Err(err) = user_entry.validate() {
+				eprintln!("warning: {err}");
+			} else if let Err(err) = self.store.append_message(&user_entry) {
+				eprintln!("warning: {err}");
+			}
+		}
+
+		let mut current_parent_id = Some(user_id);
+		let mut tool_name_by_id: std::collections::HashMap<String, String> =
+			std::collections::HashMap::new();
+
+		let cancel_token = pi_agent::CancellationToken::new();
+		let mut request = self.request(prompt.clone(), mode);
+		request.cancellation_token = Some(cancel_token.clone());
 		let started = std::time::Instant::now();
 		let mut builder = TurnBuilder::new(prompt);
-		let stream = self.runner.run(&request)?;
-		deadline::drive(
-			stream,
+		let mut stream = self.runner.run(&request)?;
+		let mut reporter_failed = false;
+
+		let session_config = &self.config;
+		let mut handle_event = |event: &agent::Event,
+		                        store: &mut SessionStore,
+		                        parent: &mut Option<String>,
+		                        tools: &mut std::collections::HashMap<String, String>,
+		                        model_fallback: Option<&str>,
+		                        provider_fallback: Option<&str>| {
+			match event {
+				agent::Event::ToolStart { id, tool, .. } => {
+					tools.insert(id.clone(), tool.clone());
+				},
+				agent::Event::TurnEnd {
+					message,
+					tool_results,
+					stop_reason,
+					api,
+					provider,
+					model,
+				} => {
+					let now_evt = std::time::SystemTime::now();
+					let evt_iso = output::iso8601(now_evt);
+					let evt_ms = now_evt
+						.duration_since(std::time::UNIX_EPOCH)
+						.unwrap_or_default()
+						.as_millis() as u64;
+
+					let mut parts = Vec::new();
+					if !message.content.is_empty() {
+						parts.push(ContentPart::text(message.content.clone()));
+					}
+					for tc in &message.tool_calls {
+						let mut part = ContentPart {
+							kind: "toolCall".to_string(),
+							text: None,
+							data: None,
+							mime_type: None,
+							extra: serde_json::Map::new(),
+						};
+						part.extra
+							.insert("id".to_string(), serde_json::json!(tc.id));
+						part.extra
+							.insert("name".to_string(), serde_json::json!(tc.name));
+						part.extra
+							.insert("arguments".to_string(), tc.arguments.clone());
+						parts.push(part);
+					}
+					let content = if parts.is_empty() {
+						MessageContent::Text(String::new())
+					} else {
+						MessageContent::Parts(parts)
+					};
+
+					let asst_api = api
+						.clone()
+						.or_else(|| {
+							provider
+								.as_deref()
+								.or(provider_fallback)
+								.and_then(|p| session_config.providers.get(p).and_then(|c| c.api.clone()))
+						})
+						.unwrap_or_default();
+					let asst_provider = provider
+						.clone()
+						.or_else(|| provider_fallback.map(str::to_string))
+						.unwrap_or_default();
+					let asst_model = model
+						.clone()
+						.or_else(|| model_fallback.map(str::to_string))
+						.unwrap_or_default();
+
+					let asst_id = format!("msg-{}", output::session_id());
+					let canon_stop = session::canonical_stop_reason(&stop_reason);
+					let mut asst_msg = SessionMessage::assistant(
+						content,
+						asst_api,
+						asst_provider,
+						asst_model,
+						None,
+						canon_stop,
+						evt_ms,
+					);
+					if canon_stop == "aborted" {
+						asst_msg.error_message = Some("Interrupted by user".to_string());
+					}
+					let asst_entry = MessageEntry::new(
+						asst_id.clone(),
+						parent.take(),
+						&evt_iso,
+						asst_msg,
+					);
+
+					let mut turn_entries = vec![asst_entry];
+					let mut prev_id = asst_id;
+
+					for tr in tool_results {
+						let res_id = format!("msg-{}", output::session_id());
+						let tool_name = tools
+							.get(&tr.tool_call_id)
+							.cloned()
+							.unwrap_or_default();
+						let tool_msg = SessionMessage::tool_result(
+							tr.tool_call_id.clone(),
+							tool_name,
+							MessageContent::Text(tr.content.clone()),
+							tr.is_error,
+							evt_ms,
+						);
+						let tool_entry = MessageEntry::new(
+							res_id.clone(),
+							Some(prev_id.clone()),
+							&evt_iso,
+							tool_msg,
+						);
+						turn_entries.push(tool_entry);
+						prev_id = res_id;
+					}
+
+					let mut valid_turn_entries = Vec::new();
+					for entry in turn_entries {
+						if let Err(err) = entry.validate() {
+							eprintln!("warning: {err}");
+						} else {
+							valid_turn_entries.push(entry);
+						}
+					}
+					if !valid_turn_entries.is_empty() {
+						if let Err(err) = store.append_messages(&valid_turn_entries) {
+							eprintln!("warning: {err}");
+						}
+					}
+					*parent = Some(prev_id);
+				},
+				_ => {},
+			}
+		};
+
+		let model_opt = self.model.clone();
+		let provider_opt = self.provider.clone();
+
+		let drive_result = deadline::drive(
+			&mut stream,
 			self.deadline,
 			|| started.elapsed(),
 			|event| {
-				reporter.event(event)?;
 				builder.observe(event);
+				handle_event(
+					event,
+					&mut self.store,
+					&mut current_parent_id,
+					&mut tool_name_by_id,
+					model_opt.as_deref(),
+					provider_opt.as_deref(),
+				);
+				if let Err(err) = reporter.event(event) {
+					reporter_failed = true;
+					return Err(err);
+				}
 				Ok(())
 			},
-		)?;
-		let record = builder.finish();
-		self.history.push(record.clone());
-		if let Err(err) = self.store.append_turn(&record) {
-			eprintln!("warning: {err}");
+		);
+
+		if drive_result.is_err() {
+			cancel_token.cancel();
+			for event in stream {
+				if let Ok(event) = event {
+					builder.observe(&event);
+					handle_event(
+						&event,
+						&mut self.store,
+						&mut current_parent_id,
+						&mut tool_name_by_id,
+						model_opt.as_deref(),
+						provider_opt.as_deref(),
+					);
+					if !reporter_failed {
+						let _ = reporter.event(&event);
+					}
+				}
+			}
 		}
+
+		let mut record = builder.finish();
+		if let Err(err) = drive_result {
+			let canon = session::canonical_stop_reason(&record.stop_reason);
+			if record.stop_reason.is_empty() || canon == "toolUse" {
+				record.stop_reason = "aborted".to_string();
+			}
+			self.history.push(record);
+			return Err(err);
+		}
+		self.history.push(record);
 		Ok(())
 	}
 }

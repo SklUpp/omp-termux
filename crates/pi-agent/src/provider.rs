@@ -268,10 +268,16 @@ impl StreamAssembler {
 	}
 
 	/// Finish the turn, producing an assistant message with reassembled tool calls.
-	pub fn finish(self) -> Message {
+	///
+	/// Returns a protocol error if any completed tool call lacks a name.
+	pub fn finish(self) -> Result<Message, ProviderError> {
 		let mut tool_calls = Vec::with_capacity(self.calls.len());
 		for (index, pending) in self.calls {
-			let Some(name) = pending.name else { continue }; // arguments without a name are unusable
+			let Some(name) = pending.name.filter(|n| !n.trim().is_empty()) else {
+				return Err(ProviderError::Protocol(format!(
+					"streamed tool call at index {index} is missing or has empty tool name"
+				)));
+			};
 			let arguments = if pending.arguments.trim().is_empty() {
 				serde_json::Value::Object(serde_json::Map::new())
 			} else {
@@ -284,7 +290,12 @@ impl StreamAssembler {
 				arguments,
 			});
 		}
-		Message::assistant_with_tools(self.content, tool_calls)
+		Ok(Message::assistant_with_tools(self.content, tool_calls))
+	}
+
+	/// Produce a partial assistant message (content only, no tool calls) for aborted or failed turns.
+	pub(crate) fn finish_partial(&self) -> Message {
+		Message::assistant(&self.content)
 	}
 }
 
@@ -568,4 +579,62 @@ fn network_error(err: reqwest::Error) -> ProviderError {
 
 fn snippet(text: &str) -> String {
 	text.chars().take(ERROR_BODY_CHARS).collect()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn finish_rejects_missing_tool_name() {
+		let mut assembler = StreamAssembler::new();
+		assembler.push(&StreamChunk {
+			content: Some("text".into()),
+			tool_call_deltas: vec![ToolCallDelta {
+				index: 0,
+				id: Some("call_1".into()),
+				name: None,
+				arguments_delta: Some("{}".into()),
+			}],
+			is_done: false,
+		});
+		let err = assembler.finish().unwrap_err();
+		assert!(matches!(err, ProviderError::Protocol(_)));
+	}
+
+	#[test]
+	fn finish_rejects_empty_or_whitespace_tool_name() {
+		let mut assembler = StreamAssembler::new();
+		assembler.push(&StreamChunk {
+			content: Some("text".into()),
+			tool_call_deltas: vec![ToolCallDelta {
+				index: 0,
+				id: Some("call_1".into()),
+				name: Some("   ".into()),
+				arguments_delta: Some("{}".into()),
+			}],
+			is_done: false,
+		});
+		let err = assembler.finish().unwrap_err();
+		assert!(matches!(err, ProviderError::Protocol(_)));
+	}
+
+	#[test]
+	fn finish_accepts_valid_tool_call() {
+		let mut assembler = StreamAssembler::new();
+		assembler.push(&StreamChunk {
+			content: Some("text".into()),
+			tool_call_deltas: vec![ToolCallDelta {
+				index: 0,
+				id: Some("call_1".into()),
+				name: Some("read".into()),
+				arguments_delta: Some("{}".into()),
+			}],
+			is_done: false,
+		});
+		let msg = assembler.finish().unwrap();
+		assert_eq!(msg.content, "text");
+		assert_eq!(msg.tool_calls.len(), 1);
+		assert_eq!(msg.tool_calls[0].name, "read");
+	}
 }

@@ -9,6 +9,7 @@ use crate::{
 	provider::{ModelProvider, ProviderError, StreamAssembler},
 	state::{
 		AgentConfig, AgentContext, AgentState, Message, Role, ToolCall, ToolResult, TurnResult,
+		TurnStatus,
 	},
 	tools::{registry::ToolRegistry, scheduler::ToolScheduler},
 };
@@ -20,7 +21,7 @@ const MIN_RECENT_MESSAGES: usize = 4;
 ///
 /// OpenAI history requires every `tool_call` to be answered, so an interrupted
 /// batch is closed with this marker instead of leaving orphan calls behind.
-const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution interrupted by user]";
+pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution interrupted by user]";
 
 /// Live event emitted while a dialog runs.
 ///
@@ -31,6 +32,14 @@ const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution interrupted by user]";
 pub enum AgentEvent {
 	/// Incremental assistant text, exactly as the provider streamed it.
 	MessageUpdate { delta: String },
+	/// Provider finalization (assembler.finish()), BEFORE tool batch runs. Once per assistant message.
+	MessageEnd { message: Message, status: TurnStatus },
+	/// Tool invocation started before batch execution.
+	ToolStart { id: String, name: String, arguments: serde_json::Value },
+	/// Tool invocation finished with result or error.
+	ToolEnd { id: String, name: String, result: String, is_error: bool },
+	/// After tool results resolved (or immediately when tool_calls empty / on abort). Once per assistant message.
+	TurnEnd { message: Message, tool_results: Vec<ToolResult>, status: TurnStatus },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -166,13 +175,43 @@ impl AgentLoop {
 				Compactor::compact(&state.messages, self.config.context_limit, MIN_RECENT_MESSAGES);
 
 			let schemas = self.registry.schemas();
+			let mut pending_injections = Vec::new();
 			let assistant = self
-				.next_assistant(&state.messages, &schemas, events.as_ref())
+				.next_assistant(
+					&state.messages,
+					&schemas,
+					events.as_ref(),
+					&cancellation_token,
+					steering_rx.as_mut(),
+					&mut pending_injections,
+				)
 				.await?;
 			state.messages.push(assistant.clone());
 			state.total_turns += 1;
+			if let Some(events_sink) = events.as_ref() {
+				let status = if assistant.tool_calls.is_empty() {
+					TurnStatus::EndTurn
+				} else {
+					TurnStatus::ToolUse
+				};
+				let _ = events_sink
+					.send(AgentEvent::MessageEnd { message: assistant.clone(), status })
+					.await;
+			}
 
 			if assistant.tool_calls.is_empty() {
+				for message in pending_injections {
+					state.messages.push(Message::user(message));
+				}
+				if let Some(events_sink) = events.as_ref() {
+					let _ = events_sink
+						.send(AgentEvent::TurnEnd {
+							message: assistant.clone(),
+							tool_results: Vec::new(),
+							status: TurnStatus::EndTurn,
+						})
+						.await;
+				}
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: Vec::new(),
@@ -181,18 +220,74 @@ impl AgentLoop {
 				return Ok(turn_results);
 			}
 
+			if let Some(events_sink) = events.as_ref() {
+				for call in &assistant.tool_calls {
+					let _ = events_sink
+						.send(AgentEvent::ToolStart {
+							id: call.id.clone(),
+							name: call.name.clone(),
+							arguments: call.arguments.clone(),
+						})
+						.await;
+				}
+			}
+
 			let outcome = self
 				.run_tools(&assistant.tool_calls, &ctx, &cancellation_token, steering_rx.as_mut())
 				.await;
 
+			if let Some(events_sink) = events.as_ref() {
+				let tool_names: std::collections::HashMap<&str, &str> = assistant
+					.tool_calls
+					.iter()
+					.map(|c| (c.id.as_str(), c.name.as_str()))
+					.collect();
+				for result in &outcome.results {
+					let name = tool_names
+						.get(result.tool_call_id.as_str())
+						.copied()
+						.unwrap_or("tool");
+					let _ = events_sink
+						.send(AgentEvent::ToolEnd {
+							id: result.tool_call_id.clone(),
+							name: name.to_string(),
+							result: result.content.clone(),
+							is_error: result.is_error,
+						})
+						.await;
+				}
+			}
+
+			let tool_names: std::collections::HashMap<&str, &str> = assistant
+				.tool_calls
+				.iter()
+				.map(|c| (c.id.as_str(), c.name.as_str()))
+				.collect();
 			for result in &outcome.results {
+				let name = tool_names.get(result.tool_call_id.as_str()).copied().unwrap_or("tool");
 				state
 					.messages
-					.push(Message::tool(&result.tool_call_id, &result.content));
+					.push(Message::tool_with_status(&result.tool_call_id, name, &result.content, result.is_error));
 			}
 			// Injected messages land after the tool responses, so the history stays valid.
-			for message in outcome.injections {
+			for message in pending_injections.into_iter().chain(outcome.injections) {
 				state.messages.push(Message::user(message));
+			}
+
+			let status = if outcome.interrupted {
+				TurnStatus::Aborted
+			} else {
+				TurnStatus::ToolUse
+			};
+
+			if let Some(events_sink) = events.as_ref() {
+				let _ = events_sink
+					.send(AgentEvent::TurnEnd {
+						message: assistant.clone(),
+						tool_results: outcome.results.clone(),
+						status,
+					})
+					.await;
 			}
 
 			turn_results.push(TurnResult {
@@ -200,6 +295,7 @@ impl AgentLoop {
 				tool_results: outcome.results,
 				is_completed: false,
 			});
+
 
 			if outcome.interrupted {
 				cancellation_token.cancel();
@@ -288,21 +384,183 @@ impl AgentLoop {
 		messages: &[Message],
 		schemas: &[serde_json::Value],
 		events: Option<&mpsc::Sender<AgentEvent>>,
+		cancellation_token: &CancellationToken,
+		mut steering_rx: Option<&mut mpsc::Receiver<SteeringEvent>>,
+		injections: &mut Vec<String>,
 	) -> Result<Message, AgentError> {
 		let Some(events) = events else {
-			return Ok(self.provider.complete(messages, schemas).await?);
+			let complete_fut = self.provider.complete(messages, schemas);
+			tokio::pin!(complete_fut);
+			loop {
+				match steering_rx.as_deref_mut() {
+					Some(rx) => {
+						tokio::select! {
+							_ = cancellation_token.cancelled() => return Err(AgentError::Interrupted),
+							event = rx.recv() => match event {
+								Some(SteeringEvent::Interrupt) => {
+									cancellation_token.cancel();
+									return Err(AgentError::Interrupted);
+								}
+								Some(SteeringEvent::InjectMessage(msg)) => {
+									injections.push(msg);
+								}
+								None => {
+									tokio::select! {
+										_ = cancellation_token.cancelled() => return Err(AgentError::Interrupted),
+										res = &mut complete_fut => return Ok(res?),
+									}
+								}
+							},
+							res = &mut complete_fut => return Ok(res?),
+						}
+					}
+					None => {
+						tokio::select! {
+							_ = cancellation_token.cancelled() => return Err(AgentError::Interrupted),
+							res = &mut complete_fut => return Ok(res?),
+						}
+					}
+				}
+			}
 		};
 
-		let mut stream = self.provider.stream(messages, schemas).await?;
+		let stream_fut = self.provider.stream(messages, schemas);
+		tokio::pin!(stream_fut);
+		let mut stream = loop {
+			match steering_rx.as_deref_mut() {
+				Some(rx) => {
+					tokio::select! {
+						_ = cancellation_token.cancelled() => {
+							let partial = Message::assistant("");
+							let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
+							let _ = events.send(AgentEvent::TurnEnd {
+								message: partial,
+								tool_results: Vec::new(),
+								status: TurnStatus::Aborted,
+							}).await;
+							return Err(AgentError::Interrupted);
+						},
+						event = rx.recv() => match event {
+							Some(SteeringEvent::Interrupt) => {
+								cancellation_token.cancel();
+								let partial = Message::assistant("");
+								let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
+								let _ = events.send(AgentEvent::TurnEnd {
+									message: partial,
+									tool_results: Vec::new(),
+									status: TurnStatus::Aborted,
+								}).await;
+								return Err(AgentError::Interrupted);
+							}
+							Some(SteeringEvent::InjectMessage(msg)) => {
+								injections.push(msg);
+							}
+							None => {
+								tokio::select! {
+									_ = cancellation_token.cancelled() => return Err(AgentError::Interrupted),
+									res = &mut stream_fut => break res?,
+								}
+							}
+						},
+						res = &mut stream_fut => break res?,
+					}
+				}
+				None => {
+					tokio::select! {
+						_ = cancellation_token.cancelled() => {
+							let partial = Message::assistant("");
+							let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
+							let _ = events.send(AgentEvent::TurnEnd {
+								message: partial,
+								tool_results: Vec::new(),
+								status: TurnStatus::Aborted,
+							}).await;
+							return Err(AgentError::Interrupted);
+						},
+						res = &mut stream_fut => break res?,
+					}
+				}
+			}
+		};
+
 		let mut assembler = StreamAssembler::new();
 		let mut done = false;
-		while let Some(chunk) = stream.next().await {
-			let chunk = chunk?;
+		let mut rx_open = steering_rx.is_some();
+
+		while !done {
+			let next_chunk = match steering_rx.as_deref_mut() {
+				Some(rx) if rx_open => {
+					tokio::select! {
+						_ = cancellation_token.cancelled() => {
+							let partial = assembler.finish_partial();
+							let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
+							let _ = events.send(AgentEvent::TurnEnd {
+								message: partial,
+								tool_results: Vec::new(),
+								status: TurnStatus::Aborted,
+							}).await;
+							return Err(AgentError::Interrupted);
+						},
+						event = rx.recv() => match event {
+							Some(SteeringEvent::Interrupt) => {
+								cancellation_token.cancel();
+								let partial = assembler.finish_partial();
+								let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
+								let _ = events.send(AgentEvent::TurnEnd {
+									message: partial,
+									tool_results: Vec::new(),
+									status: TurnStatus::Aborted,
+								}).await;
+								return Err(AgentError::Interrupted);
+							}
+							Some(SteeringEvent::InjectMessage(msg)) => {
+								injections.push(msg);
+								continue;
+							}
+							None => {
+								rx_open = false;
+								continue;
+							}
+						},
+						chunk = stream.next() => chunk,
+					}
+				}
+				_ => {
+					tokio::select! {
+						_ = cancellation_token.cancelled() => {
+							let partial = assembler.finish_partial();
+							let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
+							let _ = events.send(AgentEvent::TurnEnd {
+								message: partial,
+								tool_results: Vec::new(),
+								status: TurnStatus::Aborted,
+							}).await;
+							return Err(AgentError::Interrupted);
+						},
+						chunk = stream.next() => chunk,
+					}
+				}
+			};
+
+			let Some(chunk) = next_chunk else {
+				break;
+			};
+			let chunk = match chunk {
+				Ok(c) => c,
+				Err(err) => {
+					let partial = assembler.finish_partial();
+					let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err.to_string()) }).await;
+					let _ = events.send(AgentEvent::TurnEnd {
+						message: partial,
+						tool_results: Vec::new(),
+						status: TurnStatus::Error(err.to_string()),
+					}).await;
+					return Err(err.into());
+				}
+			};
 			if let Some(delta) = &chunk.content
 				&& !delta.is_empty()
 			{
-				// A closed receiver must not abort the turn: the assembled answer is
-				// still needed for history, so a failed send is ignored.
 				let _ = events
 					.send(AgentEvent::MessageUpdate { delta: delta.clone() })
 					.await;
@@ -313,9 +571,31 @@ impl AgentLoop {
 				break;
 			}
 		}
+
 		if !done {
-			return Err(ProviderError::Protocol("stream ended before completion".to_string()).into());
+			let partial = assembler.finish_partial();
+			let err_msg = "stream ended before completion".to_string();
+			let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err_msg.clone()) }).await;
+			let _ = events.send(AgentEvent::TurnEnd {
+				message: partial,
+				tool_results: Vec::new(),
+				status: TurnStatus::Error(err_msg.clone()),
+			}).await;
+			return Err(ProviderError::Protocol(err_msg).into());
 		}
-		Ok(assembler.finish())
+		let partial = assembler.finish_partial();
+		let message = match assembler.finish() {
+			Ok(message) => message,
+			Err(err) => {
+				let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err.to_string()) }).await;
+				let _ = events.send(AgentEvent::TurnEnd {
+					message: partial,
+					tool_results: Vec::new(),
+					status: TurnStatus::Error(err.to_string()),
+				}).await;
+				return Err(err.into());
+			}
+		};
+		Ok(message)
 	}
 }

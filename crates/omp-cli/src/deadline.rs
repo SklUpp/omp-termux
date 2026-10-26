@@ -62,7 +62,7 @@ mod tests {
 	use super::*;
 
 	fn event(text: &str) -> Result<Event> {
-		Ok(Event::MessageEnd { text: text.to_string() })
+		Ok(Event::message_end(pi_agent::Message::assistant(text)))
 	}
 
 	#[test]
@@ -81,8 +81,8 @@ mod tests {
 			deadline,
 			|| clock.pop_front().unwrap_or(Duration::from_secs(60)),
 			|event| {
-				if let Event::MessageEnd { text } = event {
-					observed.push(text.clone());
+				if let Event::MessageEnd { message, .. } = event {
+					observed.push(message.content.clone());
 				}
 				Ok(())
 			},

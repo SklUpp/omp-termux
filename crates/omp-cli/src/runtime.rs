@@ -4,12 +4,13 @@
 //! [`RunRequest`]; this module maps it onto `pi-agent`'s `AgentConfig` and
 //! converts the loop's turn results back into the CLI [`Event`] stream.
 
-use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use pi_agent::{
-	AgentConfig, AgentLoop, AgentState, BashTool, EditTool, GlobTool, GrepTool, ModelProvider,
-	OpenAiCompatibleProvider, ReadTool, TodoTool, Tool, ToolRegistry, TurnResult, WriteTool,
+	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, BashTool, EditTool, GlobTool,
+	GrepTool, ModelProvider, OpenAiCompatibleProvider, ReadTool, SteeringEvent, TodoTool, Tool,
+	ToolRegistry, WriteTool,
 };
 
 use crate::agent::{AgentRunner, Event, EventStream, RunRequest};
@@ -39,6 +40,7 @@ const BUILTIN_TOOLS: [(&str, bool); 7] = [
 /// Synchronous `AgentRunner` that drives `pi-agent` on its own tokio runtime.
 pub struct PiAgentRunner {
 	runtime: tokio::runtime::Runtime,
+	dispatcher: Arc<SignalDispatcher>,
 }
 
 impl PiAgentRunner {
@@ -47,7 +49,62 @@ impl PiAgentRunner {
 			.enable_all()
 			.build()
 			.map_err(|err| Error::with_source("cannot start tokio runtime for pi-agent", err))?;
-		Ok(Self { runtime })
+		let dispatcher = Arc::new(SignalDispatcher::start(&runtime));
+		Ok(Self { runtime, dispatcher })
+	}
+}
+
+struct SignalDispatcher {
+	active_turn: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SteeringEvent>>>>,
+	_handle: tokio::task::JoinHandle<()>,
+}
+
+struct TurnSignalRegistration {
+	active_turn: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SteeringEvent>>>>,
+}
+
+impl Drop for TurnSignalRegistration {
+	fn drop(&mut self) {
+		if let Ok(mut guard) = self.active_turn.lock() {
+			*guard = None;
+		}
+	}
+}
+
+impl SignalDispatcher {
+	fn start(runtime: &tokio::runtime::Runtime) -> Self {
+		let active_turn: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SteeringEvent>>>> =
+			Arc::new(std::sync::Mutex::new(None));
+		let active_turn_clone = Arc::clone(&active_turn);
+		let _handle = runtime.spawn(async move {
+			loop {
+				if tokio::signal::ctrl_c().await.is_err() {
+					break;
+				}
+				let maybe_tx = {
+					if let Ok(guard) = active_turn_clone.lock() {
+						guard.clone()
+					} else {
+						None
+					}
+				};
+				if let Some(tx) = maybe_tx {
+					let _ = tx.send(SteeringEvent::Interrupt).await;
+				} else {
+					std::process::exit(130);
+				}
+			}
+		});
+		Self { active_turn, _handle }
+	}
+
+	fn register(&self, tx: tokio::sync::mpsc::Sender<SteeringEvent>) -> TurnSignalRegistration {
+		if let Ok(mut guard) = self.active_turn.lock() {
+			*guard = Some(tx);
+		}
+		TurnSignalRegistration {
+			active_turn: Arc::clone(&self.active_turn),
+		}
 	}
 }
 
@@ -61,42 +118,340 @@ impl AgentRunner for PiAgentRunner {
 		if let Some(system) = plan.system_prompt {
 			messages.insert(0, pi_agent::Message::system(system));
 		}
-		let dialog = async move {
-			let provider = OpenAiCompatibleProvider::new(plan.base_url, plan.api_key, plan.model)
-				.map_err(|err| Error::with_source("pi-agent provider setup failed", err))?
-				.with_effort(plan.effort);
-			let config = AgentConfig {
-				max_turns: plan.max_turns,
-				context_limit: plan.context_limit,
-				system_prompt: None,
-				cwd,
-			};
-			let provider: Arc<dyn ModelProvider> = Arc::new(provider);
-			let agent = AgentLoop::new(config, provider, registry);
-			let mut state = AgentState { messages, total_turns: 0 };
-			let turns = agent
-				.run_dialog(&prompt, &mut state, None)
-				.await
-				.map_err(|err| Error::with_source("pi-agent run failed", err))?;
-			Ok::<_, Error>(events_from_turns(turns))
+		let plan_api = plan.api.clone();
+		let plan_provider = plan.provider.clone();
+		let plan_model = plan.model.clone();
+		let provider = OpenAiCompatibleProvider::new(plan.base_url, plan.api_key, plan.model)
+			.map_err(|err| Error::with_source("pi-agent provider setup failed", err))?
+			.with_effort(plan.effort);
+		let config = AgentConfig {
+			max_turns: plan.max_turns,
+			context_limit: plan.context_limit,
+			system_prompt: None,
+			cwd,
 		};
-		// Runtime-level bound: `pi-agent` has no cancellable deadline seam, so the
-		// whole dialog is wrapped in a tokio timeout. Stream-level enforcement in
-		// `deadline::drive` still preserves events that already arrived.
-		let events = if let Some(budget) = request.max_time {
-			// The timeout future must be built inside the runtime context:
-			// `tokio::time::timeout` captures the timer handle at construction.
-			match self
-				.runtime
-				.block_on(async move { tokio::time::timeout(budget, dialog).await })
-			{
-				Ok(result) => result?,
-				Err(_) => return Err(Error::new(crate::deadline::TIMEOUT_MESSAGE)),
+		let provider: Arc<dyn ModelProvider> = Arc::new(provider);
+		let agent = AgentLoop::new(config, provider, registry);
+		let mut state = AgentState { messages, total_turns: 0 };
+
+		let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<Event>>(64);
+		let (pi_events_tx, mut pi_events_rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
+		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel::<SteeringEvent>(8);
+		let completed = Arc::new(AtomicBool::new(false));
+		let completed_clone = Arc::clone(&completed);
+
+		let _guard = self.runtime.enter();
+
+		let cancellation_token = request.cancellation_token.clone().unwrap_or_default();
+		let cancel_watcher_token = cancellation_token.clone();
+		let steering_tx_cancel = steering_tx.clone();
+		let cancel_watcher = self.runtime.spawn(async move {
+			cancel_watcher_token.cancelled().await;
+			let _ = steering_tx_cancel.send(SteeringEvent::Interrupt).await;
+		});
+
+		let signal_reg = self.dispatcher.register(steering_tx.clone());
+
+		let timed_out = Arc::new(AtomicBool::new(false));
+		let timer_handle = if let Some(budget) = request.max_time {
+			let steering_tx_time = steering_tx.clone();
+			let timed_out_clone = Arc::clone(&timed_out);
+			Some(self.runtime.spawn(async move {
+				tokio::time::sleep(budget).await;
+				timed_out_clone.store(true, Ordering::SeqCst);
+				let _ = steering_tx_time.send(SteeringEvent::Interrupt).await;
+			}))
+		} else {
+			None
+		};
+
+		let dialog_prompt = prompt.clone();
+		let dialog_handle = self.runtime.spawn(async move {
+			agent
+				.run_dialog_with(&dialog_prompt, &mut state, Some(steering_rx), Some(pi_events_tx))
+				.await
+		});
+		let dialog_abort = dialog_handle.abort_handle();
+		let dialog_abort_clone = dialog_abort.clone();
+
+		let event_tx_clone = event_tx.clone();
+		let cancel_on_err = cancellation_token.clone();
+		let steering_tx_err = steering_tx.clone();
+		self.runtime.spawn(async move {
+			let mut message_started = false;
+			let abort_after_grace = |dialog_abort: tokio::task::AbortHandle| {
+				tokio::spawn(async move {
+					tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+					dialog_abort.abort();
+				});
+			};
+
+			while let Some(pi_event) = pi_events_rx.recv().await {
+				match pi_event {
+					AgentEvent::MessageUpdate { delta } => {
+						if !message_started {
+							if event_tx_clone
+								.send(Ok(Event::MessageStart { role: "assistant".to_string() }))
+								.await
+								.is_err()
+							{
+								cancel_on_err.cancel();
+								let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
+								abort_after_grace(dialog_abort_clone);
+								return;
+							}
+							message_started = true;
+						}
+						if event_tx_clone
+							.send(Ok(Event::MessageUpdate { delta }))
+							.await
+							.is_err()
+						{
+							cancel_on_err.cancel();
+							let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
+							abort_after_grace(dialog_abort_clone);
+							return;
+						}
+					},
+					AgentEvent::MessageEnd { message, status } => {
+						if !message_started {
+							if event_tx_clone
+								.send(Ok(Event::MessageStart { role: "assistant".to_string() }))
+								.await
+								.is_err()
+							{
+								cancel_on_err.cancel();
+								let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
+								abort_after_grace(dialog_abort_clone);
+								return;
+							}
+						}
+						message_started = false;
+						let stop_reason = match status {
+							pi_agent::TurnStatus::EndTurn => "stop",
+							pi_agent::TurnStatus::ToolUse => "toolUse",
+							pi_agent::TurnStatus::Aborted => "aborted",
+							pi_agent::TurnStatus::Error(_) => "error",
+						}
+						.to_string();
+						if event_tx_clone
+							.send(Ok(Event::MessageEnd {
+								message,
+								stop_reason: Some(stop_reason),
+								api: Some(plan_api.clone()),
+								provider: Some(plan_provider.clone()),
+								model: Some(plan_model.clone()),
+							}))
+							.await
+							.is_err()
+						{
+							cancel_on_err.cancel();
+							let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
+							abort_after_grace(dialog_abort_clone);
+							return;
+						}
+					},
+					AgentEvent::ToolStart { id, name, arguments } => {
+						if event_tx_clone
+							.send(Ok(Event::ToolStart { id, tool: name, args: arguments }))
+							.await
+							.is_err()
+						{
+							cancel_on_err.cancel();
+							let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
+							abort_after_grace(dialog_abort_clone);
+							return;
+						}
+					},
+					AgentEvent::ToolEnd { id, name, result, is_error } => {
+						let error = is_error.then(|| result.clone());
+						if event_tx_clone
+							.send(Ok(Event::ToolEnd { id, tool: name, result, error }))
+							.await
+							.is_err()
+						{
+							cancel_on_err.cancel();
+							let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
+							abort_after_grace(dialog_abort_clone);
+							return;
+						}
+					},
+					AgentEvent::TurnEnd { message, tool_results, status } => {
+						let stop_reason = match status {
+							pi_agent::TurnStatus::EndTurn => "stop",
+							pi_agent::TurnStatus::ToolUse => "toolUse",
+							pi_agent::TurnStatus::Aborted => "aborted",
+							pi_agent::TurnStatus::Error(_) => "error",
+						}
+						.to_string();
+						if event_tx_clone
+							.send(Ok(Event::TurnEnd {
+								message,
+								tool_results,
+								stop_reason,
+								api: Some(plan_api.clone()),
+								provider: Some(plan_provider.clone()),
+								model: Some(plan_model.clone()),
+							}))
+							.await
+							.is_err()
+						{
+							cancel_on_err.cancel();
+							let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
+							abort_after_grace(dialog_abort_clone);
+							return;
+						}
+					},
+				}
+			}
+
+			let dialog_result = match dialog_handle.await {
+				Ok(res) => res,
+				Err(join_err) => {
+					completed_clone.store(true, Ordering::SeqCst);
+					let _ = event_tx_clone
+						.send(Err(Error::with_source("dialog task panicked", join_err)))
+						.await;
+					return;
+				},
+			};
+
+			match dialog_result {
+				Ok(turns) => {
+					let mut new_messages = vec![pi_agent::Message::user(prompt.clone())];
+					for turn in turns {
+						let tool_names: std::collections::HashMap<String, String> = turn
+							.message
+							.tool_calls
+							.iter()
+							.map(|c| (c.id.clone(), c.name.clone()))
+							.collect();
+						new_messages.push(turn.message);
+						for result in turn.tool_results {
+							let name = tool_names
+								.get(&result.tool_call_id)
+								.cloned()
+								.unwrap_or_else(|| "tool".to_string());
+							new_messages.push(pi_agent::Message::tool_with_status(
+								result.tool_call_id,
+								name,
+								result.content,
+								result.is_error,
+							));
+						}
+					}
+					let _ = event_tx_clone
+						.send(Ok(Event::AgentEnd {
+							messages: new_messages,
+							api: Some(plan_api),
+							provider: Some(plan_provider),
+							model: Some(plan_model),
+						}))
+						.await;
+					completed_clone.store(true, Ordering::SeqCst);
+				},
+				Err(AgentError::Interrupted) => {
+					completed_clone.store(true, Ordering::SeqCst);
+					if timed_out.load(Ordering::SeqCst) {
+						let _ = event_tx_clone
+							.send(Err(Error::new(crate::deadline::TIMEOUT_MESSAGE)))
+							.await;
+					} else {
+						let _ = event_tx_clone.send(Err(Error::new("interrupted"))).await;
+					}
+				},
+				Err(err) => {
+					completed_clone.store(true, Ordering::SeqCst);
+					let _ = event_tx_clone
+						.send(Err(Error::with_source("pi-agent run failed", err)))
+						.await;
+				},
+			}
+		});
+
+		let runtime_handle = self.runtime.handle().clone();
+		let handles = Arc::new(StreamHandles {
+			cancellation_token,
+			steering_tx,
+			cancel_watcher,
+			dialog_abort,
+			timer_handle,
+			_signal_reg: signal_reg,
+			runtime_handle,
+		});
+
+		Ok(Box::new(BoundedEventStream {
+			rx: Arc::new(std::sync::Mutex::new(event_rx)),
+			completed,
+			yielded_closure_error: false,
+			_handles: handles,
+		}))
+	}
+}
+
+struct StreamHandles {
+	cancellation_token: pi_agent::CancellationToken,
+	steering_tx: tokio::sync::mpsc::Sender<SteeringEvent>,
+	cancel_watcher: tokio::task::JoinHandle<()>,
+	dialog_abort: tokio::task::AbortHandle,
+	timer_handle: Option<tokio::task::JoinHandle<()>>,
+	_signal_reg: TurnSignalRegistration,
+	runtime_handle: tokio::runtime::Handle,
+}
+
+impl Drop for StreamHandles {
+	fn drop(&mut self) {
+		self.cancellation_token.cancel();
+		let _ = self.steering_tx.try_send(SteeringEvent::Interrupt);
+		let dialog_abort = self.dialog_abort.clone();
+		self.runtime_handle.spawn(async move {
+			tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+			dialog_abort.abort();
+		});
+		self.cancel_watcher.abort();
+		if let Some(handle) = &self.timer_handle {
+			handle.abort();
+		}
+	}
+}
+
+struct BoundedEventStream {
+	rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<Event>>>>,
+	completed: Arc<AtomicBool>,
+	yielded_closure_error: bool,
+	_handles: Arc<StreamHandles>,
+}
+
+impl Iterator for BoundedEventStream {
+	type Item = Result<Event>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		let res = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+			match handle.runtime_flavor() {
+				tokio::runtime::RuntimeFlavor::MultiThread => {
+					tokio::task::block_in_place(|| self.rx.lock().expect("rx lock").blocking_recv())
+				},
+				_ => {
+					let rx = Arc::clone(&self.rx);
+					std::thread::spawn(move || rx.lock().expect("rx lock").blocking_recv())
+						.join()
+						.expect("join")
+				},
 			}
 		} else {
-			self.runtime.block_on(dialog)?
+			self.rx.lock().expect("rx lock").blocking_recv()
 		};
-		Ok(Box::new(events.into_iter().map(Ok::<Event, Error>)))
+		match res {
+			Some(item) => Some(item),
+			None => {
+				if !self.completed.load(Ordering::SeqCst) && !self.yielded_closure_error {
+					self.yielded_closure_error = true;
+					Some(Err(Error::new("dialog stream closed unexpectedly")))
+				} else {
+					None
+				}
+			},
+		}
 	}
 }
 
@@ -104,6 +459,8 @@ impl AgentRunner for PiAgentRunner {
 struct RunPlan {
 	base_url: String,
 	api_key: String,
+	api: String,
+	provider: String,
 	model: String,
 	effort: Option<String>,
 	max_turns: usize,
@@ -120,7 +477,7 @@ impl RunPlan {
 			.ok_or_else(|| Error::new("no model: pass --model or set defaultModel in config"))?;
 		// `provider/id` (first segment is the provider, as in TS model roles),
 		// `provider/id:effort`, or a bare id resolved through the catalog.
-		let mut effort: Option<&str> = None;
+		let effort: Option<&str>;
 		let (provider, model) = match request.provider.as_deref() {
 			Some(provider) => {
 				let prefix = format!("{provider}/");
@@ -181,9 +538,15 @@ impl RunPlan {
 			.catalog
 			.context_window(&provider, &model)
 			.unwrap_or(DEFAULT_CONTEXT_LIMIT);
+		let api = connection
+			.as_ref()
+			.and_then(|c| c.api.clone())
+			.unwrap_or_else(|| "openai-completions".to_string());
 		Ok(Self {
 			base_url,
 			api_key,
+			api,
+			provider,
 			model,
 			effort: effort.map(str::to_string),
 			max_turns: request.max_turns.max(1),
@@ -191,7 +554,7 @@ impl RunPlan {
 			system_prompt: compose_system_prompt(request),
 			tools: allowed_tools(request)?,
 		})
-	}
+}
 }
 
 /// Trailing `:effort` selector (`:high`, `:xhi`, …) is not part of the model id.
@@ -284,6 +647,31 @@ fn history_messages(history: &[crate::session::TurnRecord]) -> Vec<pi_agent::Mes
 	let mut messages = Vec::new();
 	for turn in history {
 		messages.push(pi_agent::Message::user(turn.prompt.clone()));
+		let stop_reason = crate::session::canonical_stop_reason(&turn.stop_reason);
+		if stop_reason == "aborted" {
+			if !turn.tool_calls.is_empty() {
+				let calls: Vec<pi_agent::ToolCall> = turn
+					.tool_calls
+					.iter()
+					.map(|call| pi_agent::ToolCall {
+						id: call.id.clone(),
+						name: call.name.clone(),
+						arguments: call.arguments.clone(),
+					})
+					.collect();
+				messages.push(pi_agent::Message::assistant_with_tools("", calls));
+				for call in &turn.tool_calls {
+					let name = if call.name.is_empty() { "tool" } else { &call.name };
+					messages.push(pi_agent::Message::tool_with_status(
+						call.id.clone(),
+						name,
+						call.result.clone(),
+						call.is_error,
+					));
+				}
+			}
+			continue;
+		}
 		if turn.tool_calls.is_empty() {
 			if !turn.assistant.is_empty() {
 				messages.push(pi_agent::Message::assistant(turn.assistant.clone()));
@@ -301,71 +689,26 @@ fn history_messages(history: &[crate::session::TurnRecord]) -> Vec<pi_agent::Mes
 			.collect();
 		messages.push(pi_agent::Message::assistant_with_tools(turn.assistant.clone(), calls));
 		for call in &turn.tool_calls {
-			messages.push(pi_agent::Message::tool(call.id.clone(), call.result.clone()));
+			let name = if call.name.is_empty() { "tool" } else { &call.name };
+			messages.push(pi_agent::Message::tool_with_status(
+				call.id.clone(),
+				name,
+				call.result.clone(),
+				call.is_error,
+			));
 		}
 	}
 	messages
 }
 
-/// Map `pi-agent` turn results onto the CLI event stream.
-fn events_from_turns(turns: Vec<TurnResult>) -> Vec<Event> {
-	let mut events = Vec::new();
-	let mut final_text = None;
-	for turn in turns {
-		let tool_names: BTreeMap<String, String> = turn
-			.message
-			.tool_calls
-			.iter()
-			.map(|call| (call.id.clone(), call.name.clone()))
-			.collect();
-		events.push(Event::MessageStart { role: "assistant".to_string() });
-		if !turn.message.content.is_empty() {
-			events.push(Event::MessageUpdate { delta: turn.message.content.clone() });
-		}
-		events.push(Event::MessageEnd { text: turn.message.content.clone() });
-		for call in &turn.message.tool_calls {
-			events.push(Event::ToolStart {
-				id: call.id.clone(),
-				tool: call.name.clone(),
-				args: call.arguments.clone(),
-			});
-		}
-		for result in &turn.tool_results {
-			let tool = tool_names
-				.get(&result.tool_call_id)
-				.cloned()
-				.unwrap_or_else(|| "tool".to_string());
-			let error = result.is_error.then(|| result.content.clone());
-			events.push(Event::ToolEnd {
-				id: result.tool_call_id.clone(),
-				tool,
-				result: result.content.clone(),
-				error,
-			});
-		}
-		let stop_reason = if turn.is_completed {
-			"end_turn"
-		} else {
-			"tool_use"
-		};
-		events.push(Event::TurnEnd { stop_reason: stop_reason.to_string() });
-		if turn.is_completed {
-			final_text = Some(turn.message.content);
-		}
-	}
-	if let Some(text) = final_text {
-		events.push(Event::AgentEnd { text });
-	}
-	events
-}
 
 #[cfg(test)]
 mod tests {
 	use std::collections::BTreeMap;
 	use std::path::PathBuf;
-	use std::sync::Arc;
 
-	use pi_agent::{Message, ToolCall, ToolResult};
+
+
 
 	use super::*;
 	use crate::approve::{ApprovalMode, Approvals};
@@ -435,6 +778,7 @@ mod tests {
 			tools_enabled: true,
 			max_turns: 5,
 			history: Vec::new(),
+			cancellation_token: None,
 		}
 	}
 
@@ -620,41 +964,347 @@ mod tests {
 	}
 
 	#[test]
-	fn turn_results_map_to_cli_events() {
-		let turn = TurnResult {
-			message: Message::assistant_with_tools(
-				"done",
-				vec![ToolCall {
-					id: "call-1".to_string(),
-					name: "read".to_string(),
-					arguments: serde_json::json!({"path": "a.txt"}),
-				}],
-			),
-			tool_results: vec![ToolResult {
-				tool_call_id: "call-1".to_string(),
-				content: "boom".to_string(),
+	fn history_messages_excludes_aborted_assistant_without_tools() {
+		let history = vec![crate::session::TurnRecord {
+			prompt: "fix".to_string(),
+			assistant: "partial output".to_string(),
+			stop_reason: "aborted".to_string(),
+			tool_calls: vec![],
+		}];
+		let messages = history_messages(&history);
+		assert_eq!(messages.len(), 1);
+		assert_eq!(messages[0].role, pi_agent::Role::User);
+		assert_eq!(messages[0].content, "fix");
+	}
+
+	#[test]
+	fn history_messages_keeps_aborted_assistant_with_tool_batch_results() {
+		let history = vec![crate::session::TurnRecord {
+			prompt: "fix".to_string(),
+			assistant: "partial answer that should be excluded".to_string(),
+			stop_reason: "aborted".to_string(),
+			tool_calls: vec![crate::session::ToolCallRecord {
+				id: "call-1".to_string(),
+				name: "read".to_string(),
+				arguments: serde_json::json!({"path": "a.txt"}),
+				result: "[Tool execution interrupted by user]".to_string(),
 				is_error: true,
 			}],
-			is_completed: true,
-		};
-		let events = events_from_turns(vec![turn]);
-		assert!(matches!(events.first(), Some(Event::MessageStart { .. })));
-		let tool_start = events
-			.iter()
-			.find_map(|event| match event {
-				Event::ToolStart { tool, .. } => Some(tool.as_str()),
-				_ => None,
-			})
-			.expect("tool start");
-		assert_eq!(tool_start, "read");
-		let tool_error = events.iter().find_map(|event| match event {
-			Event::ToolEnd { tool, error, .. } => Some((tool.as_str(), error.clone())),
-			_ => None,
+		}];
+		let messages = history_messages(&history);
+		assert_eq!(messages.len(), 3);
+		assert_eq!(messages[0].role, pi_agent::Role::User);
+		assert_eq!(messages[1].role, pi_agent::Role::Assistant);
+		assert_eq!(messages[1].content, "");
+		assert_eq!(messages[1].tool_calls.len(), 1);
+		assert_eq!(messages[2].role, pi_agent::Role::Tool);
+		assert_eq!(messages[2].content, "[Tool execution interrupted by user]");
+	}
+
+	#[test]
+	fn history_messages_preserves_failed_tool_status_and_name() {
+		let history = vec![crate::session::TurnRecord {
+			prompt: "run command".to_string(),
+			assistant: "running".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![crate::session::ToolCallRecord {
+				id: "call-err-1".to_string(),
+				name: "bash".to_string(),
+				arguments: serde_json::json!({"command": "false"}),
+				result: "exit code 1".to_string(),
+				is_error: true,
+			}],
+		}];
+		let messages = history_messages(&history);
+		assert_eq!(messages.len(), 3);
+		assert_eq!(messages[2].role, pi_agent::Role::Tool);
+		assert_eq!(messages[2].tool_call_id.as_deref(), Some("call-err-1"));
+		assert_eq!(messages[2].name.as_deref(), Some("bash"));
+		assert!(messages[2].is_error, "failed tool call must preserve is_error: true on replay");
+		assert_eq!(messages[2].content, "exit code 1");
+	}
+
+	#[test]
+	fn history_messages_preserves_aborted_failed_tool_status_and_name() {
+		let history = vec![crate::session::TurnRecord {
+			prompt: "run command".to_string(),
+			assistant: "running".to_string(),
+			stop_reason: "aborted".to_string(),
+			tool_calls: vec![crate::session::ToolCallRecord {
+				id: "call-err-2".to_string(),
+				name: "fetch".to_string(),
+				arguments: serde_json::json!({"url": "http://invalid"}),
+				result: "[Tool execution interrupted by user]".to_string(),
+				is_error: true,
+			}],
+		}];
+		let messages = history_messages(&history);
+		assert_eq!(messages.len(), 3);
+		assert_eq!(messages[2].role, pi_agent::Role::Tool);
+		assert_eq!(messages[2].tool_call_id.as_deref(), Some("call-err-2"));
+		assert_eq!(messages[2].name.as_deref(), Some("fetch"));
+		assert!(messages[2].is_error, "aborted failed tool call must preserve is_error: true on replay");
+		assert_eq!(messages[2].content, "[Tool execution interrupted by user]");
+	}
+
+	#[test]
+	fn interrupted_tool_batch_emits_turn_end_exactly_once() {
+		use std::io::{Read, Write};
+
+		let (addr_tx, addr_rx) = std::sync::mpsc::channel::<std::net::SocketAddr>();
+
+		std::thread::spawn(move || {
+			let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+			addr_tx.send(listener.local_addr().unwrap()).unwrap();
+			let (mut socket, _) = listener.accept().unwrap();
+			let mut buf = [0u8; 1024];
+			let _ = socket.read(&mut buf).unwrap();
+			socket
+				.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+				.unwrap();
+			socket
+				.write_all(
+					b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 5\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+				)
+				.unwrap();
+			socket.write_all(b"data: [DONE]\n\n").unwrap();
+			socket.flush().unwrap();
+			std::thread::sleep(std::time::Duration::from_millis(500));
 		});
-		assert_eq!(tool_error, Some(("read", Some("boom".to_string()))));
-		assert!(matches!(
-			events.last(),
-			Some(Event::AgentEnd { text }) if text == "done"
-		));
+
+		let addr = addr_rx.recv().unwrap();
+		let mut req = request(yolo());
+		req.cwd = std::env::temp_dir();
+		req.config.providers.insert(
+			"local".to_string(),
+			ProviderConfig {
+				base_url: Some(format!("http://{addr}/v1")),
+				api_key: Some("sk-test".to_string()),
+				..ProviderConfig::default()
+			},
+		);
+		req.max_time = Some(std::time::Duration::from_millis(150));
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let stream = runner.run(&req).expect("stream");
+		let mut turn_ends = Vec::new();
+		let mut tool_results = Vec::new();
+		for ev in stream {
+			match ev {
+				Ok(Event::TurnEnd { stop_reason, .. }) => turn_ends.push(stop_reason),
+				Ok(Event::ToolEnd { result, error, .. }) => tool_results.push((result, error)),
+				_ => {},
+			}
+		}
+		assert_eq!(turn_ends, vec!["aborted".to_string()]);
+		assert_eq!(tool_results.len(), 1);
+		assert!(tool_results[0].1.is_some(), "interrupted tool must report error status");
+	}
+	#[test]
+	fn live_events_stream_before_sse_done() {
+		use std::io::{Read, Write};
+
+		let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+		let (addr_tx, addr_rx) = std::sync::mpsc::channel::<std::net::SocketAddr>();
+
+		std::thread::spawn(move || {
+			let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+			addr_tx.send(listener.local_addr().unwrap()).unwrap();
+			let (mut socket, _) = listener.accept().unwrap();
+			let mut buf = [0u8; 1024];
+			let _ = socket.read(&mut buf).unwrap();
+			socket
+				.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+				.unwrap();
+			socket
+				.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"first live delta\"},\"finish_reason\":null}]}\n\n")
+				.unwrap();
+			socket.flush().unwrap();
+
+			let _ = done_rx.recv();
+			socket.write_all(b"data: [DONE]\n\n").unwrap();
+			socket.flush().unwrap();
+		});
+
+		let addr = addr_rx.recv().unwrap();
+		let mut req = request(yolo());
+		req.config.providers.insert(
+			"local".to_string(),
+			ProviderConfig {
+				base_url: Some(format!("http://{addr}/v1")),
+				api_key: Some("sk-test".to_string()),
+				..ProviderConfig::default()
+			},
+		);
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let mut stream = runner.run(&req).expect("stream");
+
+		let ev1 = stream.next().expect("first event").expect("ok");
+		assert_eq!(ev1, Event::MessageStart { role: "assistant".to_string() });
+
+		let ev2 = stream.next().expect("second event").expect("ok");
+		assert_eq!(ev2, Event::MessageUpdate { delta: "first live delta".to_string() });
+
+		let _ = done_tx.send(());
+
+		let ev3 = stream.next().expect("third event").expect("ok");
+		assert!(matches!(ev3, Event::MessageEnd { ref message, .. } if message.content == "first live delta"));
+
+		let ev4 = stream.next().expect("fourth event").expect("ok");
+		assert!(matches!(ev4, Event::TurnEnd { ref stop_reason, .. } if stop_reason == "stop"));
+
+		let ev5 = stream.next().expect("fifth event").expect("ok");
+		assert!(matches!(ev5, Event::AgentEnd { ref messages, .. } if messages.iter().any(|m| m.content == "first live delta")));
+
+		assert!(stream.next().is_none());
+	}
+
+	#[test]
+	fn live_runner_timeout_steers_interruption() {
+		use std::io::{Read, Write};
+
+		let (addr_tx, addr_rx) = std::sync::mpsc::channel::<std::net::SocketAddr>();
+
+		std::thread::spawn(move || {
+			let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+			addr_tx.send(listener.local_addr().unwrap()).unwrap();
+			let (mut socket, _) = listener.accept().unwrap();
+			let mut buf = [0u8; 1024];
+			let _ = socket.read(&mut buf).unwrap();
+			socket
+				.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+				.unwrap();
+			socket
+				.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"start\"},\"finish_reason\":null}]}\n\n")
+				.unwrap();
+			socket.flush().unwrap();
+			std::thread::sleep(std::time::Duration::from_secs(5));
+		});
+
+		let addr = addr_rx.recv().unwrap();
+		let mut req = request(yolo());
+		req.config.providers.insert(
+			"local".to_string(),
+			ProviderConfig {
+				base_url: Some(format!("http://{addr}/v1")),
+				api_key: Some("sk-test".to_string()),
+				..ProviderConfig::default()
+			},
+		);
+		req.max_time = Some(std::time::Duration::from_millis(150));
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let mut stream = runner.run(&req).expect("stream");
+
+		let ev1 = stream.next().expect("first event").expect("ok");
+		assert_eq!(ev1, Event::MessageStart { role: "assistant".to_string() });
+		let ev2 = stream.next().expect("second event").expect("ok");
+		assert_eq!(ev2, Event::MessageUpdate { delta: "start".to_string() });
+
+		let ev3 = stream.next().expect("third event").expect("ok");
+		assert!(matches!(ev3, Event::MessageEnd { ref message, .. } if message.content == "start"));
+		let ev4 = stream.next().expect("fourth event").expect("ok");
+		assert!(matches!(ev4, Event::TurnEnd { ref stop_reason, .. } if stop_reason == "aborted"));
+
+		let err = stream.next().expect("error event").err().expect("is error");
+		assert!(err.to_string().contains(crate::deadline::TIMEOUT_MESSAGE));
+	}
+
+	#[test]
+	fn stream_cancels_and_aborts_on_consumer_drop() {
+		use std::io::{Read, Write};
+
+		let (addr_tx, addr_rx) = std::sync::mpsc::channel::<std::net::SocketAddr>();
+
+		let server = std::thread::spawn(move || {
+			let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+			addr_tx.send(listener.local_addr().unwrap()).unwrap();
+			let (mut socket, _) = listener.accept().unwrap();
+			let mut buf = [0u8; 1024];
+			let _ = socket.read(&mut buf).unwrap();
+			socket
+				.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+				.unwrap();
+			socket
+				.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n")
+				.unwrap();
+			socket.flush().unwrap();
+			std::thread::sleep(std::time::Duration::from_secs(5));
+		});
+
+		let addr = addr_rx.recv().unwrap();
+		let mut req = request(yolo());
+		req.config.providers.insert(
+			"local".to_string(),
+			ProviderConfig {
+				base_url: Some(format!("http://{addr}/v1")),
+				api_key: Some("sk-test".to_string()),
+				..ProviderConfig::default()
+			},
+		);
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let mut stream = runner.run(&req).expect("stream");
+		let ev1 = stream.next().expect("first event").expect("ok");
+		assert_eq!(ev1, Event::MessageStart { role: "assistant".to_string() });
+
+		let start = std::time::Instant::now();
+		drop(stream);
+		assert!(start.elapsed() < std::time::Duration::from_millis(500));
+		drop(server);
+	}
+
+	#[test]
+	fn consumer_cancellation_token_interrupts_running_stream() {
+		use std::io::{Read, Write};
+
+		let (addr_tx, addr_rx) = std::sync::mpsc::channel::<std::net::SocketAddr>();
+
+		std::thread::spawn(move || {
+			let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+			addr_tx.send(listener.local_addr().unwrap()).unwrap();
+			let (mut socket, _) = listener.accept().unwrap();
+			let mut buf = [0u8; 1024];
+			let _ = socket.read(&mut buf).unwrap();
+			socket
+				.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+				.unwrap();
+			socket
+				.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n")
+				.unwrap();
+			socket.flush().unwrap();
+			std::thread::sleep(std::time::Duration::from_secs(5));
+		});
+
+		let addr = addr_rx.recv().unwrap();
+		let mut req = request(yolo());
+		req.config.providers.insert(
+			"local".to_string(),
+			ProviderConfig {
+				base_url: Some(format!("http://{addr}/v1")),
+				api_key: Some("sk-test".to_string()),
+				..ProviderConfig::default()
+			},
+		);
+		let cancel_token = pi_agent::CancellationToken::new();
+		req.cancellation_token = Some(cancel_token.clone());
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let mut stream = runner.run(&req).expect("stream");
+		let ev1 = stream.next().expect("first event").expect("ok");
+		assert_eq!(ev1, Event::MessageStart { role: "assistant".to_string() });
+		let ev2 = stream.next().expect("second event").expect("ok");
+		assert_eq!(ev2, Event::MessageUpdate { delta: "hello".to_string() });
+
+		cancel_token.cancel();
+
+		let ev3 = stream.next().expect("third event").expect("ok");
+		assert!(matches!(ev3, Event::MessageEnd { ref message, .. } if message.content == "hello"));
+		let ev4 = stream.next().expect("fourth event").expect("ok");
+		assert!(matches!(ev4, Event::TurnEnd { ref stop_reason, .. } if stop_reason == "aborted"));
+
+		let err = stream.next().expect("error event").err().expect("is error");
+		assert!(err.to_string().contains("interrupted"));
 	}
 }

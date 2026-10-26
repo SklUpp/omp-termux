@@ -1,0 +1,3 @@
+{"type":"session","version":3,"id":"s-malformed-entry","timestamp":"2026-10-26T10:00:00.000Z","cwd":"/work/test"}
+{NOT VALID JSON}
+{"type":"message","id":"msg-01","parentId":null,"timestamp":"2026-10-26T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
