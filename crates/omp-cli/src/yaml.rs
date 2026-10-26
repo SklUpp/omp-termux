@@ -530,7 +530,7 @@ cwd: /tmp/work
 
 	#[test]
 	fn escaped_quote_does_not_start_a_comment() {
-		let value = parse("key: \"a\\\" #x\"\nnext: 1\n").expect("parse");
+		let value = parse("key: \"a\\\" #x\"\nnext: true\n").expect("parse");
 		assert_eq!(value.get("key").and_then(Value::as_str), Some("a\" #x"));
 		assert_eq!(value.get("next").and_then(Value::as_bool), Some(true));
 		// A real comment after a closed double-quoted scalar is still stripped.
