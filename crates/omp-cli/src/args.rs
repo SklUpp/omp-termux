@@ -83,6 +83,22 @@ pub struct Cli {
 	#[arg(long, value_name = "PATH")]
 	pub config: Vec<PathBuf>,
 
+	/// Resume the newest session in the session directory.
+	#[arg(short = 'c', long = "continue")]
+	pub continue_session: bool,
+
+	/// Directory holding session logs (default: ~/.omp/agent/sessions/omp-cli).
+	#[arg(long = "session-dir", value_name = "DIR")]
+	pub session_dir: Option<PathBuf>,
+
+	/// Session id to create or resume.
+	#[arg(long = "session-id", value_name = "ID")]
+	pub session_id: Option<String>,
+
+	/// Do not read or write session logs.
+	#[arg(long = "no-session")]
+	pub no_session: bool,
+
 	/// Discover no skills.
 	#[arg(long = "no-skills")]
 	pub no_skills: bool,

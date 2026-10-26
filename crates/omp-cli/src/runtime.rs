@@ -56,18 +56,22 @@ impl AgentRunner for PiAgentRunner {
 		let registry = build_registry(&plan.tools);
 		let cwd = request.cwd.clone();
 		let prompt = request.prompt.clone();
+		let mut messages = history_messages(&request.history);
+		if let Some(system) = plan.system_prompt {
+			messages.insert(0, pi_agent::Message::system(system));
+		}
 		let events = self.runtime.block_on(async move {
 			let provider = OpenAiCompatibleProvider::new(plan.base_url, plan.api_key, plan.model)
 				.map_err(|err| Error::with_source("pi-agent provider setup failed", err))?;
 			let config = AgentConfig {
 				max_turns: plan.max_turns,
 				context_limit: plan.context_limit,
-				system_prompt: plan.system_prompt,
+				system_prompt: None,
 				cwd,
 			};
 			let provider: Arc<dyn ModelProvider> = Arc::new(provider);
 			let agent = AgentLoop::new(config, provider, registry);
-			let mut state = AgentState::default();
+			let mut state = AgentState { messages, total_turns: 0 };
 			let turns = agent
 				.run_dialog(&prompt, &mut state, None)
 				.await
@@ -238,6 +242,34 @@ fn compose_system_prompt(request: &RunRequest) -> Option<String> {
 	(!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
+/// Previous session turns as `pi-agent` history messages.
+fn history_messages(history: &[crate::session::TurnRecord]) -> Vec<pi_agent::Message> {
+	let mut messages = Vec::new();
+	for turn in history {
+		messages.push(pi_agent::Message::user(turn.prompt.clone()));
+		if turn.tool_calls.is_empty() {
+			if !turn.assistant.is_empty() {
+				messages.push(pi_agent::Message::assistant(turn.assistant.clone()));
+			}
+			continue;
+		}
+		let calls: Vec<pi_agent::ToolCall> = turn
+			.tool_calls
+			.iter()
+			.map(|call| pi_agent::ToolCall {
+				id: call.id.clone(),
+				name: call.name.clone(),
+				arguments: call.arguments.clone(),
+			})
+			.collect();
+		messages.push(pi_agent::Message::assistant_with_tools(turn.assistant.clone(), calls));
+		for call in &turn.tool_calls {
+			messages.push(pi_agent::Message::tool(call.id.clone(), call.result.clone()));
+		}
+	}
+	messages
+}
+
 /// Map `pi-agent` turn results onto the CLI event stream.
 fn events_from_turns(turns: Vec<TurnResult>) -> Vec<Event> {
 	let mut events = Vec::new();
@@ -255,7 +287,11 @@ fn events_from_turns(turns: Vec<TurnResult>) -> Vec<Event> {
 		}
 		events.push(Event::MessageEnd { text: turn.message.content.clone() });
 		for call in &turn.message.tool_calls {
-			events.push(Event::ToolStart { tool: call.name.clone(), args: call.arguments.clone() });
+			events.push(Event::ToolStart {
+				id: call.id.clone(),
+				tool: call.name.clone(),
+				args: call.arguments.clone(),
+			});
 		}
 		for result in &turn.tool_results {
 			let tool = tool_names
@@ -263,7 +299,12 @@ fn events_from_turns(turns: Vec<TurnResult>) -> Vec<Event> {
 				.cloned()
 				.unwrap_or_else(|| "tool".to_string());
 			let error = result.is_error.then(|| result.content.clone());
-			events.push(Event::ToolEnd { tool, error });
+			events.push(Event::ToolEnd {
+				id: result.tool_call_id.clone(),
+				tool,
+				result: result.content.clone(),
+				error,
+			});
 		}
 		let stop_reason = if turn.is_completed {
 			"end_turn"
@@ -356,6 +397,7 @@ mod tests {
 			max_time: None,
 			tools_enabled: true,
 			max_turns: 5,
+			history: Vec::new(),
 		}
 	}
 
@@ -476,6 +518,32 @@ mod tests {
 	}
 
 	#[test]
+	fn history_turns_become_pi_agent_messages() {
+		let history = vec![crate::session::TurnRecord {
+			prompt: "fix".to_string(),
+			assistant: "done".to_string(),
+			stop_reason: "end_turn".to_string(),
+			tool_calls: vec![crate::session::ToolCallRecord {
+				id: "call-1".to_string(),
+				name: "read".to_string(),
+				arguments: serde_json::json!({"path": "a.txt"}),
+				result: "contents".to_string(),
+				is_error: false,
+			}],
+		}];
+		let messages = history_messages(&history);
+		assert_eq!(messages.len(), 3);
+		assert_eq!(messages[0].role, pi_agent::Role::User);
+		assert_eq!(messages[0].content, "fix");
+		assert_eq!(messages[1].role, pi_agent::Role::Assistant);
+		assert_eq!(messages[1].tool_calls.len(), 1);
+		assert_eq!(messages[1].tool_calls[0].id, "call-1");
+		assert_eq!(messages[2].role, pi_agent::Role::Tool);
+		assert_eq!(messages[2].tool_call_id.as_deref(), Some("call-1"));
+		assert_eq!(messages[2].content, "contents");
+	}
+
+	#[test]
 	fn turn_results_map_to_cli_events() {
 		let turn = TurnResult {
 			message: Message::assistant_with_tools(
@@ -504,7 +572,7 @@ mod tests {
 			.expect("tool start");
 		assert_eq!(tool_start, "read");
 		let tool_error = events.iter().find_map(|event| match event {
-			Event::ToolEnd { tool, error } => Some((tool.as_str(), error.clone())),
+			Event::ToolEnd { tool, error, .. } => Some((tool.as_str(), error.clone())),
 			_ => None,
 		});
 		assert_eq!(tool_error, Some(("read", Some("boom".to_string()))));

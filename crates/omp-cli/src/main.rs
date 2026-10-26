@@ -18,6 +18,7 @@ use omp_cli::{
 	prompts::{self, Prompts},
 	repl,
 	runtime::{self, PiAgentRunner},
+	session::{SessionOptions, SessionStore, TurnBuilder, TurnRecord},
 	skills::{self, Skill},
 };
 
@@ -61,6 +62,10 @@ fn run() -> Result<()> {
 	let requested_model = cli.model.clone();
 	let requested_provider = cli.provider.clone();
 	let requested_api_key = cli.api_key.clone();
+	let session_dir = cli
+		.session_dir
+		.as_ref()
+		.map(|dir| dirs::absolute(&cwd, dir));
 	let mut session = Session {
 		runner,
 		config,
@@ -77,6 +82,9 @@ fn run() -> Result<()> {
 		tools_enabled: !cli.no_tools,
 		prompt_inputs,
 		skills_filter,
+		store: SessionStore::default(),
+		history: Vec::new(),
+		session_dir,
 	};
 	if let Some(model) = requested_model.or(default_model) {
 		session.select_model(model);
@@ -89,9 +97,29 @@ fn run() -> Result<()> {
 		session.api_key = requested_api_key;
 	}
 
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: !cli.no_session,
+		cwd: session.cwd.clone(),
+		model: session.model.clone(),
+		provider: session.provider.clone(),
+		dir: session.session_dir.clone(),
+		id: cli.session_id.clone(),
+		continue_latest: cli.continue_session,
+	});
+	for warning in store.take_warnings() {
+		eprintln!("warning: {warning}");
+	}
+	session.history = store.history().to_vec();
+	session.store = store;
+
 	let mode = cli.mode;
+	let reporter_id = if session.store.enabled() {
+		session.store.id().to_string()
+	} else {
+		session_id()
+	};
 	let mut reporter = Reporter::new(mode, io::stdout(), io::stderr());
-	reporter.session_header(&session_id(), &session.cwd)?;
+	reporter.session_header(&reporter_id, &session.cwd)?;
 
 	let repl_mode = matches!(cli.command.as_ref(), Some(Command::Repl))
 		|| (cli.command.is_none() && cli.prompt.is_empty() && !cli.print);
@@ -170,6 +198,9 @@ struct Session<'a> {
 	/// `/cwd` re-resolves the project files for the new directory.
 	prompt_inputs: (Option<String>, Option<String>),
 	skills_filter: (bool, Vec<String>),
+	store: SessionStore,
+	history: Vec<TurnRecord>,
+	session_dir: Option<PathBuf>,
 }
 
 impl Session<'_> {
@@ -208,6 +239,7 @@ impl Session<'_> {
 			append_system_prompt: self.prompts.append.clone(),
 			context_files: self.prompts.files.clone(),
 			skills: self.skills.clone(),
+			history: self.history.clone(),
 			config: self.config.clone(),
 			catalog: Arc::clone(&self.catalog),
 			approvals: self.approvals.clone(),
@@ -218,14 +250,23 @@ impl Session<'_> {
 	}
 
 	fn turn<W: Write, E: Write>(
-		&self,
+		&mut self,
 		prompt: String,
 		mode: OutputMode,
 		reporter: &mut Reporter<W, E>,
 	) -> Result<()> {
 		reporter.begin_turn()?;
-		for event in self.runner.run(&self.request(prompt, mode))? {
-			reporter.event(&event?)?;
+		let request = self.request(prompt.clone(), mode);
+		let mut builder = TurnBuilder::new(prompt);
+		for event in self.runner.run(&request)? {
+			let event = event?;
+			reporter.event(&event)?;
+			builder.observe(&event);
+		}
+		let record = builder.finish();
+		self.history.push(record.clone());
+		if let Err(err) = self.store.append_turn(&record) {
+			eprintln!("warning: {err}");
 		}
 		Ok(())
 	}

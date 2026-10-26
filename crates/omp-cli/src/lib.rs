@@ -15,6 +15,7 @@ pub mod output;
 pub mod prompts;
 pub mod repl;
 pub mod runtime;
+pub mod session;
 pub mod skills;
 pub mod yaml;
 

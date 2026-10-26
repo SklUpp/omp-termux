@@ -76,7 +76,7 @@ impl<W: Write, E: Write> Reporter<W, E> {
 					writeln!(self.err, "→ {tool}")?;
 				}
 			},
-			Event::ToolEnd { tool, error: Some(error) } => {
+			Event::ToolEnd { tool, error: Some(error), .. } => {
 				if self.mode == OutputMode::Text {
 					writeln!(self.err, "✗ {tool}: {error}")?;
 				}
@@ -180,7 +180,11 @@ mod tests {
 			let mut reporter = Reporter::new(OutputMode::Text, &mut out, &mut err);
 			reporter.begin_turn().expect("begin");
 			reporter
-				.event(&Event::ToolStart { tool: "read".into(), args: serde_json::json!({}) })
+				.event(&Event::ToolStart {
+					id: "call-1".into(),
+					tool: "read".into(),
+					args: serde_json::json!({}),
+				})
 				.expect("tool");
 			reporter
 				.event(&Event::AgentEnd { text: "answer".into() })

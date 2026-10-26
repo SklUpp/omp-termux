@@ -25,8 +25,8 @@ pub enum Event {
 	MessageStart { role: String },
 	MessageUpdate { delta: String },
 	MessageEnd { text: String },
-	ToolStart { tool: String, args: serde_json::Value },
-	ToolEnd { tool: String, error: Option<String> },
+	ToolStart { id: String, tool: String, args: serde_json::Value },
+	ToolEnd { id: String, tool: String, result: String, error: Option<String> },
 	TurnEnd { stop_reason: String },
 	AgentEnd { text: String },
 }
@@ -47,6 +47,8 @@ pub struct RunRequest {
 	pub append_system_prompt: Option<String>,
 	pub context_files: Vec<ContextFile>,
 	pub skills: Vec<Skill>,
+	/// Earlier turns of this session (`--continue`/`--session-id`), oldest first.
+	pub history: Vec<crate::session::TurnRecord>,
 	pub config: Config,
 	pub catalog: Arc<Catalog>,
 	pub approvals: Approvals,
