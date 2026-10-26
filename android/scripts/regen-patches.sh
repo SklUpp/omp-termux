@@ -71,12 +71,10 @@ termux_files = [
     "packages/coding-agent/src/tools/browser/registry.ts",
     "packages/coding-agent/src/tools/browser/shared-daemon.ts",
     "packages/coding-agent/src/utils/clipboard.ts",
-    "packages/coding-agent/test/tools/browser-android.test.ts",
     "packages/coding-agent/test/task/structured-subagent.test.ts",
     "packages/coding-agent/test/task/wire-schema.test.ts",
     "packages/natives/native/index.js",
     "packages/natives/native/loader-state.js",
-    "packages/utils/src/android-system.ts",
     "packages/utils/src/index.ts",
     "packages/utils/src/procmgr.ts",
     "packages/utils/src/temp.ts"
@@ -182,15 +180,8 @@ subprocess.check_call(["git", "-C", tmp_upstream, "clean", "-fd", "-q"])
 
 autolearn_files_no_schema = [
     "docs/autolearn.md",
-    "packages/coding-agent/src/autolearn/candidate-ledger.ts",
-    "packages/coding-agent/src/autolearn/config.ts",
     "packages/coding-agent/src/autolearn/controller.ts",
-    "packages/coding-agent/src/autolearn/index.ts",
-    "packages/coding-agent/src/autolearn/learn-db.ts",
     "packages/coding-agent/src/autolearn/managed-skills.ts",
-    "packages/coding-agent/src/autolearn/redact.ts",
-    "packages/coding-agent/src/autolearn/skill-writer.ts",
-    "packages/coding-agent/src/autolearn/verifier.ts",
     "packages/coding-agent/src/config/settings.ts",
     "packages/coding-agent/src/hindsight/bank.ts",
     "packages/coding-agent/src/memory-backend/runtime.ts",
@@ -204,7 +195,6 @@ autolearn_files_no_schema = [
     "packages/coding-agent/src/tools/learn.ts",
     "packages/coding-agent/src/tools/manage-skill.ts",
     "packages/coding-agent/test/autolearn-managed-skills.test.ts",
-    "packages/coding-agent/test/custom-autolearn.test.ts"
 ]
 
 for f in autolearn_files_no_schema:

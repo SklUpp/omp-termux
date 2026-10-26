@@ -51,8 +51,7 @@ bionic_checks = {
     "crates/pi-builtins/src/tail.rs": '#[cfg(any(target_os = "linux", target_os = "android"))]\n\tpub const BACKEND: &str = "inotify"',
 }
 for path, needle in bionic_checks.items():
-    if (ROOT / path).exists():
-        require(path, needle)
+    require(path, needle)
 
 browser_path = ROOT / "packages/coding-agent/src/tools/browser/launch.ts"
 if not browser_path.is_file():

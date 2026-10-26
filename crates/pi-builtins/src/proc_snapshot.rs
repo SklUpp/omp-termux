@@ -244,6 +244,7 @@ mod proc_snapshot {
 			if read_stat(self.pid).is_none_or(|stat| stat.start_time != self.stat.start_time) {
 				return false;
 			}
+			#[cfg(not(target_os = "android"))]
 			if let Some(value) = queue {
 				let mut value_arg = libc::sigval { sival_ptr: std::ptr::null_mut() };
 				// SAFETY: sigval is a C union; writing its integer member initializes
@@ -252,6 +253,12 @@ mod proc_snapshot {
 					(&raw mut value_arg).cast::<i32>().write(value);
 					return libc::sigqueue(self.pid, signal, value_arg) == 0;
 				}
+			}
+			#[cfg(target_os = "android")]
+			if queue.is_some() {
+				// rt_sigqueueinfo is outside the verified Android seccomp posture;
+				// refuse rather than risk a SIGSYS kill mid-signal.
+				return false;
 			}
 			#[cfg(target_os = "android")]
 			{

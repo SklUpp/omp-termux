@@ -130,3 +130,18 @@ to its 50 ms status poll.
 its `-disable-inotify` help text on Android (`notify` builds inotify there).
 `kill`/`pkill` validate numeric signals against `libc::SIGRTMAX()` on Android;
 bionic exports `__libc_current_sigrtmax`.
+
+### 11. proc_snapshot.rs — sigqueue refused on Android
+
+`libc::sigqueue` maps to bionic `rt_sigqueueinfo`, which is outside the
+verified seccomp posture (like the pidfd syscalls). The `queue`-valued signal
+path is now `cfg(not(target_os = "android"))`; on Android a queued signal
+returns `false` instead of risking a SIGSYS kill. Unreachable in practice
+today (`proc_match` gates `--queue`/`-q` behind `cfg!(target_os = "linux")`)
+— this closes the doctrine gap, not an observed crash.
+
+Note: commit `6bbbf67d62`'s message claims a `build-android-ci.sh` change
+("drop invalid clean-upstream cargo check of pi-agent") that its diff does not
+contain (that step was removed earlier in the pre-squash series; the file diff
+in the commit is the `.cargo/config.toml` python rewrite). Kept as-is: history
+is pushed; this note is the correction.

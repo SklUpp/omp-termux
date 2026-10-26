@@ -12,7 +12,7 @@ index 0d68284..ff6e8ca 100644
  		#[cfg(target_os = "macos")]
  		return (0..=31).contains(&number).then_some(number);
 diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/proc_snapshot.rs
-index 27b5817..e7e1c54 100644
+index 27b5817..66f4d50 100644
 --- a/crates/pi-builtins/src/proc_snapshot.rs
 +++ b/crates/pi-builtins/src/proc_snapshot.rs
 @@ -100,13 +100,18 @@ fn parse_procargs2(buffer: &[u8]) -> Vec<String> {
@@ -62,7 +62,7 @@ index 27b5817..e7e1c54 100644
  
  	use super::{ProcessStatus, ThreadInfo, sys};
  
-@@ -347,6 +356,7 @@ mod proc_snapshot {
+@@ -347,12 +356,14 @@ mod proc_snapshot {
  			if signal == 0 {
  				return alive();
  			}
@@ -70,11 +70,24 @@ index 27b5817..e7e1c54 100644
  			let Some(pidfd) = sys::open_pidfd(self.pid) else {
  				return false;
  			};
-@@ -362,7 +372,18 @@ mod proc_snapshot {
+ 			if !alive() {
+ 				return false;
+ 			}
++			#[cfg(not(target_os = "android"))]
+ 			if let Some(value) = queue {
+ 				let mut value_arg = libc::sigval { sival_ptr: std::ptr::null_mut() };
+ 				// SAFETY: sigval is a C union; writing its integer member initializes
+@@ -362,7 +373,24 @@ mod proc_snapshot {
  					return libc::sigqueue(self.pid, signal, value_arg) == 0;
  				}
  			}
 -			sys::pidfd_send_signal(pidfd.as_fd(), signal)
++			#[cfg(target_os = "android")]
++			if queue.is_some() {
++				// rt_sigqueueinfo is outside the verified Android seccomp posture;
++				// refuse rather than risk a SIGSYS kill mid-signal.
++				return false;
++			}
 +			#[cfg(target_os = "android")]
 +			{
 +				// No pidfd on Android (seccomp can SIGSYS it): deliver directly
