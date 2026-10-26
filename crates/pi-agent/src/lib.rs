@@ -1,4 +1,5 @@
 pub mod compaction;
+pub mod mcp;
 #[path = "loop.rs"]
 pub mod loop_module;
 pub mod provider;
