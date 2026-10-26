@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import * as connectionManager from "../../src/ssh/connection-manager";
-import { isMounted, mountRemote } from "../../src/ssh/sshfs-mount";
+import { buildSshfsArgs, isMounted, mountRemote } from "../../src/ssh/sshfs-mount";
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -26,5 +26,17 @@ describe("isMounted", () => {
 		const stat = async (filePath: string) => ({ dev: filePath === mountPath ? 2 : 1 });
 
 		await expect(isMounted(mountPath, { platform: "darwin", stat, which: () => null })).resolves.toBe(true);
+	});
+});
+
+describe("buildSshfsArgs", () => {
+	it("explicitly disables ControlMaster when master is unavailable", () => {
+		const disabledArgs = buildSshfsArgs({ name: "nixbox", host: "nixbox" }, false);
+		expect(disabledArgs).toContain("ControlMaster=no");
+		expect(disabledArgs).not.toContain("ControlMaster=auto");
+
+		const enabledArgs = buildSshfsArgs({ name: "nixbox", host: "nixbox" }, true);
+		expect(enabledArgs).toContain("ControlMaster=auto");
+		expect(enabledArgs).not.toContain("ControlMaster=no");
 	});
 });

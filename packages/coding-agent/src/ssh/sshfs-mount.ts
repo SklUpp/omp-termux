@@ -5,8 +5,8 @@ import { $ } from "bun";
 import {
 	ensureSshControlDir,
 	getControlPathTemplate,
+	shouldUseSshControlMaster,
 	type SSHConnectionTarget,
-	supportsSshControlMaster,
 } from "./connection-manager";
 import { buildSshTarget, sanitizeHostName } from "./utils";
 
@@ -42,7 +42,7 @@ function getMountPath(host: SSHConnectionTarget): string {
 	return path.join(REMOTE_DIR, getMountName(host));
 }
 
-function buildSshfsArgs(host: SSHConnectionTarget): string[] {
+export function buildSshfsArgs(host: SSHConnectionTarget, useMaster = shouldUseSshControlMaster()): string[] {
 	const args = [
 		"-o",
 		"reconnect",
@@ -56,8 +56,10 @@ function buildSshfsArgs(host: SSHConnectionTarget): string[] {
 		"StrictHostKeyChecking=accept-new",
 	];
 
-	if (supportsSshControlMaster()) {
+	if (useMaster) {
 		args.push("-o", "ControlMaster=auto", "-o", `ControlPath=${CONTROL_PATH}`, "-o", "ControlPersist=3600");
+	} else {
+		args.push("-o", "ControlMaster=no");
 	}
 
 	if (host.port) {

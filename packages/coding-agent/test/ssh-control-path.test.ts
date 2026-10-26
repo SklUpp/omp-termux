@@ -4,11 +4,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	assertOwnerPrivateDir,
+	buildRemoteCommand,
 	controlDirGuardError,
 	controlPathFitsBudget,
 	getControlDir,
 	getControlPathTemplate,
 	resolveSshControlDir,
+	shouldUseSshControlMaster,
 	sshControlFallbackDir,
 } from "../src/ssh/connection-manager";
 
@@ -109,6 +111,22 @@ describe("resolveSshControlDir", () => {
 			dir: canonicalDir,
 			shared: false,
 		});
+	});
+});
+
+describe("SSH master availability", () => {
+	it("uses direct SSH when the bounded fallback root is unavailable", () => {
+		expect(shouldUseSshControlMaster("linux", true, false)).toBe(false);
+		expect(shouldUseSshControlMaster("linux", true, true)).toBe(true);
+		expect(shouldUseSshControlMaster("linux", false, false)).toBe(true);
+		expect(shouldUseSshControlMaster("win32", false, false)).toBe(false);
+		expect(shouldUseSshControlMaster("win32", true, true)).toBe(false);
+	});
+
+	it("explicitly disables ControlMaster when master is unavailable", async () => {
+		const args = await buildRemoteCommand({ name: "srv", host: "10.0.0.1" }, "uptime", { platform: "win32" });
+		expect(args).toContain("ControlMaster=no");
+		expect(args).not.toContain("ControlMaster=auto");
 	});
 });
 

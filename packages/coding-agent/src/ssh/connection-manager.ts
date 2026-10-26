@@ -136,6 +136,35 @@ const { dir: CONTROL_DIR, shared: CONTROL_DIR_SHARED } = resolveSshControlDir({
 	platform: process.platform,
 	uid: process.getuid?.(),
 });
+
+export function isFallbackRootAvailable(tmpBase = "/tmp"): boolean {
+	try {
+		const st = fs.statSync(tmpBase);
+		if (!st.isDirectory()) return false;
+		fs.accessSync(tmpBase, fs.constants.W_OK);
+		return true;
+	} catch {
+		try {
+			const parent = path.dirname(tmpBase);
+			const st = fs.statSync(parent);
+			if (!st.isDirectory()) return false;
+			fs.accessSync(parent, fs.constants.W_OK);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+}
+
+export function shouldUseSshControlMaster(
+	platform: SshPlatform = process.platform,
+	needsFallback = CONTROL_DIR_SHARED,
+	fallbackAvailable = isFallbackRootAvailable(),
+): boolean {
+	if (!supportsSshControlMaster(platform)) return false;
+	if (needsFallback && !fallbackAvailable) return false;
+	return true;
+}
 const CONTROL_PATH = path.join(CONTROL_DIR, CONTROL_SOCKET_BASENAME);
 const HOST_INFO_DIR = getRemoteHostDir();
 const HOST_INFO_VERSION = 4;
@@ -158,6 +187,7 @@ interface SSHArgsOptions {
  * mode checks.
  */
 export function ensureSshControlDir(): void {
+	if (!shouldUseSshControlMaster()) return;
 	fs.mkdirSync(CONTROL_DIR, { recursive: true, mode: 0o700 });
 	if (CONTROL_DIR_SHARED) {
 		assertOwnerPrivateDir(CONTROL_DIR);
@@ -264,8 +294,10 @@ async function validateKeyPermissions(keyPath?: string, platform: SshPlatform = 
 function buildCommonArgs(host: SSHConnectionTarget, options?: SSHArgsOptions): string[] {
 	const args = options?.allowStdin ? [] : ["-n"];
 
-	if (supportsSshControlMaster(options?.platform)) {
+	if (shouldUseSshControlMaster(options?.platform)) {
 		args.push("-o", "ControlMaster=auto", "-o", `ControlPath=${CONTROL_PATH}`, "-o", "ControlPersist=3600");
+	} else {
+		args.push("-o", "ControlMaster=no");
 	}
 
 	args.push("-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new");
@@ -741,7 +773,9 @@ export async function ensureConnection(host: SSHConnectionTarget): Promise<void>
 
 	const promise = (async () => {
 		ensureSshBinary();
-		ensureSshControlDir();
+		if (shouldUseSshControlMaster()) {
+			ensureSshControlDir();
+		}
 		await validateKeyPermissions(host.keyPath);
 
 		if (!registered) {
@@ -752,7 +786,7 @@ export async function ensureConnection(host: SSHConnectionTarget): Promise<void>
 		}
 
 		const target = buildSshTarget(host.username, host.host);
-		if (!supportsSshControlMaster()) {
+		if (!shouldUseSshControlMaster()) {
 			activeHosts.set(key, host);
 			if (!hostInfoCache.has(key) && !(await loadHostInfoFromDisk(host))) {
 				await probeHostInfo(host);
@@ -807,7 +841,7 @@ export async function invalidateHostMetadata(hostNames: Iterable<string>): Promi
 }
 
 async function closeConnectionInternal(host: SSHConnectionTarget): Promise<void> {
-	if (!supportsSshControlMaster()) return;
+	if (!shouldUseSshControlMaster()) return;
 	const target = buildSshTarget(host.username, host.host);
 	await runSshSync(["-O", "exit", ...buildCommonArgs(host), target]);
 }
