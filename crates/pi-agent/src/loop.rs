@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
 	compaction::Compactor,
-	provider::{ModelProvider, ProviderError},
+	provider::{ModelProvider, ProviderError, StreamAssembler},
 	state::{AgentConfig, AgentContext, AgentState, Message, ToolCall, ToolResult, TurnResult},
 	tools::{registry::ToolRegistry, scheduler::ToolScheduler},
 };
@@ -18,6 +19,17 @@ const MIN_RECENT_MESSAGES: usize = 4;
 /// OpenAI history requires every `tool_call` to be answered, so an interrupted
 /// batch is closed with this marker instead of leaving orphan calls behind.
 const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution interrupted by user]";
+
+/// Live event emitted while a dialog runs.
+///
+/// Only assistant text is streamed: tool calls are delivered finalized, in the
+/// `TurnResult` that closes the turn. Consumers accumulate `delta` themselves,
+/// so no O(n²) full-text clones travel over the channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentEvent {
+	/// Incremental assistant text, exactly as the provider streamed it.
+	MessageUpdate { delta: String },
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -86,17 +98,36 @@ impl AgentLoop {
 		Self { config, provider, scheduler, registry }
 	}
 
+	/// Run turns without emitting live events.
+	pub async fn run_dialog(
+		&self,
+		user_input: &str,
+		state: &mut AgentState,
+		steering_rx: Option<mpsc::Receiver<SteeringEvent>>,
+	) -> Result<Vec<TurnResult>, AgentError> {
+		self
+			.run_dialog_with(user_input, state, steering_rx, None)
+			.await
+	}
+
 	/// Run turns until the assistant answers without tool calls or the turn budget runs out.
+	///
+	/// With `events` set, the assistant turn is requested as a provider stream and
+	/// every text delta is forwarded as [`AgentEvent::MessageUpdate`] the moment
+	/// it arrives; tool calls still arrive only in the returned [`TurnResult`].
+	/// The channel is bounded by the caller, so a slow consumer applies
+	/// backpressure instead of growing memory.
 	///
 	/// History invariants: every assistant `tool_call` is followed by exactly one
 	/// tool message with the same id, and injected user messages are appended
 	/// after a completed tool batch, never between an assistant call and its
 	/// results.
-	pub async fn run_dialog(
+	pub async fn run_dialog_with(
 		&self,
 		user_input: &str,
 		state: &mut AgentState,
 		mut steering_rx: Option<mpsc::Receiver<SteeringEvent>>,
+		events: Option<mpsc::Sender<AgentEvent>>,
 	) -> Result<Vec<TurnResult>, AgentError> {
 		if state.messages.is_empty()
 			&& let Some(system) = &self.config.system_prompt
@@ -126,7 +157,9 @@ impl AgentLoop {
 				Compactor::compact(&state.messages, self.config.context_limit, MIN_RECENT_MESSAGES);
 
 			let schemas = self.registry.schemas();
-			let assistant = self.provider.complete(&state.messages, &schemas).await?;
+			let assistant = self
+				.next_assistant(&state.messages, &schemas, events.as_ref())
+				.await?;
 			state.messages.push(assistant.clone());
 			state.total_turns += 1;
 
@@ -234,5 +267,42 @@ impl AgentLoop {
 		}
 		outcome.results = ordered;
 		outcome
+	}
+
+	/// Ask the provider for one assistant turn.
+	///
+	/// With an event sink the turn is streamed, so text reaches the consumer
+	/// before the turn finishes; without one it is a single completion request
+	/// and nothing but the final message is produced.
+	async fn next_assistant(
+		&self,
+		messages: &[Message],
+		schemas: &[serde_json::Value],
+		events: Option<&mpsc::Sender<AgentEvent>>,
+	) -> Result<Message, AgentError> {
+		let Some(events) = events else {
+			return Ok(self.provider.complete(messages, schemas).await?);
+		};
+
+		let mut stream = self.provider.stream(messages, schemas).await?;
+		let mut assembler = StreamAssembler::new();
+		while let Some(chunk) = stream.next().await {
+			let chunk = chunk?;
+			if let Some(delta) = &chunk.content
+				&& !delta.is_empty()
+			{
+				// A closed receiver must not abort the turn: the assembled answer is
+				// still needed for history, so a failed send is ignored.
+				let _ = events
+					.send(AgentEvent::MessageUpdate { delta: delta.clone() })
+					.await;
+			}
+			let done = chunk.is_done;
+			assembler.push(&chunk);
+			if done {
+				break;
+			}
+		}
+		Ok(assembler.finish())
 	}
 }

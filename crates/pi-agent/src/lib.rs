@@ -7,7 +7,7 @@ pub mod tokenizer;
 pub mod tools;
 
 pub use compaction::Compactor;
-pub use loop_module::{AgentError, AgentLoop, SteeringEvent};
+pub use loop_module::{AgentError, AgentEvent, AgentLoop, SteeringEvent};
 pub use provider::{
 	ChunkStream, ModelProvider, OpenAiCompatibleProvider, ProviderError, StreamAssembler,
 	StreamChunk, ToolCallDelta, parse_sse_line, sse_stream, to_openai_messages,

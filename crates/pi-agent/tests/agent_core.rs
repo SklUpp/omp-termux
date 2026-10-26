@@ -1,7 +1,7 @@
 use std::{
 	collections::VecDeque,
 	sync::{
-		Mutex,
+		Arc, Mutex,
 		atomic::{AtomicUsize, Ordering},
 	},
 };
@@ -9,9 +9,10 @@ use std::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use pi_agent::{
-	AgentConfig, AgentError, AgentError::Interrupted, AgentLoop, AgentState, ChunkStream, EditTool,
-	Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, ReadTool, Role, SteeringEvent,
-	StreamAssembler, Tool, ToolCall, ToolRegistry, WriteTool, parse_sse_line, sse_stream,
+	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
+	ChunkStream, EditTool, Message, ModelProvider, OpenAiCompatibleProvider, ProviderError,
+	ReadTool, Role, SteeringEvent, StreamAssembler, StreamChunk, Tool, ToolCall, ToolCallDelta,
+	ToolRegistry, WriteTool, parse_sse_line, sse_stream,
 };
 use serde_json::json;
 
@@ -597,4 +598,162 @@ fn provider_endpoint_tolerates_trailing_slash() {
 	let provider =
 		OpenAiCompatibleProvider::new("https://example.test/v1/", "key", "model-x").expect("build");
 	assert_eq!(provider.endpoint(), "https://example.test/v1/chat/completions");
+}
+
+/// Streams pre-scripted chunks, one at a time, with no timers: the loop must
+/// emit text deltas in arrival order.
+struct StreamingProvider {
+	turns: Mutex<VecDeque<Vec<StreamChunk>>>,
+	stream_calls: AtomicUsize,
+	complete_calls: AtomicUsize,
+}
+
+impl StreamingProvider {
+	fn new(turns: Vec<Vec<StreamChunk>>) -> Self {
+		Self {
+			turns: Mutex::new(turns.into()),
+			stream_calls: AtomicUsize::new(0),
+			complete_calls: AtomicUsize::new(0),
+		}
+	}
+}
+
+#[async_trait]
+impl ModelProvider for StreamingProvider {
+	async fn complete(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+	) -> Result<Message, ProviderError> {
+		self.complete_calls.fetch_add(1, Ordering::SeqCst);
+		Err(ProviderError::Protocol(
+			"complete() must not run when an event sink is attached".to_string(),
+		))
+	}
+
+	async fn stream(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+	) -> Result<ChunkStream, ProviderError> {
+		self.stream_calls.fetch_add(1, Ordering::SeqCst);
+		let chunks = self
+			.turns
+			.lock()
+			.expect("turn lock")
+			.pop_front()
+			.unwrap_or_default();
+		let items: Vec<Result<StreamChunk, ProviderError>> = chunks.into_iter().map(Ok).collect();
+		let stream: ChunkStream = Box::pin(futures::stream::iter(items));
+		Ok(stream)
+	}
+}
+
+fn text_chunk(delta: &str) -> StreamChunk {
+	StreamChunk { content: Some(delta.to_string()), tool_call_deltas: Vec::new(), is_done: false }
+}
+
+fn tool_delta(
+	index: usize,
+	id: Option<&str>,
+	name: Option<&str>,
+	arguments_delta: Option<&str>,
+) -> StreamChunk {
+	StreamChunk {
+		content: None,
+		tool_call_deltas: vec![ToolCallDelta {
+			index,
+			id: id.map(ToString::to_string),
+			name: name.map(ToString::to_string),
+			arguments_delta: arguments_delta.map(ToString::to_string),
+		}],
+		is_done: false,
+	}
+}
+
+fn done_chunk() -> StreamChunk {
+	StreamChunk { content: None, tool_call_deltas: Vec::new(), is_done: true }
+}
+
+fn drain_events(rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>) -> Vec<String> {
+	let mut deltas = Vec::new();
+	while let Ok(event) = rx.try_recv() {
+		match event {
+			AgentEvent::MessageUpdate { delta } => deltas.push(delta),
+		}
+	}
+	deltas
+}
+
+#[tokio::test]
+async fn streaming_emits_text_deltas_in_arrival_order() {
+	let dir = TempDir::new("streaming-text");
+	let provider = Arc::new(StreamingProvider::new(vec![vec![
+		text_chunk("Hel"),
+		text_chunk("lo"),
+		text_chunk(", world"),
+		done_chunk(),
+	]]));
+	let agent =
+		AgentLoop::new(config(&dir.path, 3), provider.clone(), ToolRegistry::with_builtins());
+	let mut state = AgentState::default();
+	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(8);
+
+	let turns = agent
+		.run_dialog_with("hi", &mut state, None, Some(events_tx))
+		.await
+		.expect("dialog");
+
+	assert_eq!(drain_events(&mut events_rx), vec!["Hel", "lo", ", world"]);
+	assert_eq!(turns.len(), 1);
+	assert!(turns[0].is_completed);
+	assert_eq!(turns[0].message.content, "Hello, world");
+	assert_eq!(
+		state
+			.messages
+			.last()
+			.map(|message| message.content.as_str()),
+		Some("Hello, world")
+	);
+	assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+	assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn streaming_keeps_tool_calls_finalized_across_turns() {
+	let dir = TempDir::new("streaming-tools");
+	let provider = Arc::new(StreamingProvider::new(vec![
+		vec![
+			text_chunk("Checking"),
+			tool_delta(0, Some("call_todo"), Some("todo"), Some("{\"action\":")),
+			tool_delta(0, None, None, Some("\"list\"}")),
+			done_chunk(),
+		],
+		vec![text_chunk("Done"), done_chunk()],
+	]));
+	let agent =
+		AgentLoop::new(config(&dir.path, 3), provider.clone(), ToolRegistry::with_builtins());
+	let mut state = AgentState::default();
+	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(8);
+
+	let turns = agent
+		.run_dialog_with("go", &mut state, None, Some(events_tx))
+		.await
+		.expect("dialog");
+
+	// Only text travels as events; tool calls arrive finalized in the turn result.
+	assert_eq!(drain_events(&mut events_rx), vec!["Checking", "Done"]);
+	assert_eq!(turns.len(), 2);
+	assert_eq!(turns[0].message.tool_calls.len(), 1);
+	assert_eq!(turns[0].message.tool_calls[0].id, "call_todo");
+	assert_eq!(turns[0].message.tool_calls[0].name, "todo");
+	assert_eq!(turns[0].message.tool_calls[0].arguments, json!({"action": "list"}));
+	assert_eq!(turns[0].tool_results.len(), 1);
+	assert_eq!(turns[0].tool_results[0].tool_call_id, "call_todo");
+	assert!(!turns[0].tool_results[0].is_error);
+	assert!(turns[1].is_completed);
+	assert_eq!(turns[1].message.content, "Done");
+	assert_no_orphan_tool_calls(&state);
+	assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
+	assert_eq!(provider.complete_calls.load(Ordering::SeqCst), 0);
 }
