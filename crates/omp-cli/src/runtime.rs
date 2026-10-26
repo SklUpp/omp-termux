@@ -84,7 +84,12 @@ impl AgentRunner for PiAgentRunner {
 		// whole dialog is wrapped in a tokio timeout. Stream-level enforcement in
 		// `deadline::drive` still preserves events that already arrived.
 		let events = if let Some(budget) = request.max_time {
-			match self.runtime.block_on(tokio::time::timeout(budget, dialog)) {
+			// The timeout future must be built inside the runtime context:
+			// `tokio::time::timeout` captures the timer handle at construction.
+			match self
+				.runtime
+				.block_on(async move { tokio::time::timeout(budget, dialog).await })
+			{
 				Ok(result) => result?,
 				Err(_) => return Err(Error::new(crate::deadline::TIMEOUT_MESSAGE)),
 			}
