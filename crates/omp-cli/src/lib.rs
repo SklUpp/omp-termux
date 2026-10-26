@@ -10,6 +10,7 @@ pub mod approve;
 pub mod args;
 pub mod catalog;
 pub mod config;
+pub mod deadline;
 pub mod dirs;
 pub mod output;
 pub mod prompts;
@@ -75,6 +76,12 @@ impl From<serde_json::Error> for Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+// Exit codes, matching the TS CLI: success 0, runtime/config failure 1, and the
+// conventional command-line usage error 2 (clap's default, `main.ts` exit(2)).
+pub const EXIT_SUCCESS: u8 = 0;
+pub const EXIT_FAILURE: u8 = 1;
+pub const EXIT_USAGE: u8 = 2;
 
 /// Serialises unit tests that mutate process-wide environment variables.
 #[cfg(test)]

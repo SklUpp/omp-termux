@@ -60,7 +60,7 @@ impl AgentRunner for PiAgentRunner {
 		if let Some(system) = plan.system_prompt {
 			messages.insert(0, pi_agent::Message::system(system));
 		}
-		let events = self.runtime.block_on(async move {
+		let dialog = async move {
 			let provider = OpenAiCompatibleProvider::new(plan.base_url, plan.api_key, plan.model)
 				.map_err(|err| Error::with_source("pi-agent provider setup failed", err))?;
 			let config = AgentConfig {
@@ -77,7 +77,18 @@ impl AgentRunner for PiAgentRunner {
 				.await
 				.map_err(|err| Error::with_source("pi-agent run failed", err))?;
 			Ok::<_, Error>(events_from_turns(turns))
-		})?;
+		};
+		// Runtime-level bound: `pi-agent` has no cancellable deadline seam, so the
+		// whole dialog is wrapped in a tokio timeout. Stream-level enforcement in
+		// `deadline::drive` still preserves events that already arrived.
+		let events = if let Some(budget) = request.max_time {
+			match self.runtime.block_on(tokio::time::timeout(budget, dialog)) {
+				Ok(result) => result?,
+				Err(_) => return Err(Error::new(crate::deadline::TIMEOUT_MESSAGE)),
+			}
+		} else {
+			self.runtime.block_on(dialog)?
+		};
 		Ok(Box::new(events.into_iter().map(Ok::<Event, Error>)))
 	}
 }

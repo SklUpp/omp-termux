@@ -13,6 +13,7 @@ use omp_cli::{
 	args::{Cli, Command},
 	catalog::Catalog,
 	config::Config,
+	deadline::{self, Deadline},
 	dirs,
 	output::{OutputMode, Reporter, session_id},
 	prompts::{self, Prompts},
@@ -22,10 +23,13 @@ use omp_cli::{
 	skills::{self, Skill},
 };
 
-fn main() {
-	if let Err(error) = run() {
-		eprintln!("{error}");
-		std::process::exit(1);
+fn main() -> std::process::ExitCode {
+	match run() {
+		Ok(()) => std::process::ExitCode::from(omp_cli::EXIT_SUCCESS),
+		Err(error) => {
+			eprintln!("{error}");
+			std::process::ExitCode::from(omp_cli::EXIT_FAILURE)
+		},
 	}
 }
 
@@ -78,6 +82,7 @@ fn run() -> Result<()> {
 		provider: None,
 		api_key: None,
 		max_time: cli.max_time,
+		deadline: Deadline::new(cli.max_time),
 		max_turns: runtime::DEFAULT_MAX_TURNS,
 		tools_enabled: !cli.no_tools,
 		prompt_inputs,
@@ -132,12 +137,18 @@ fn run() -> Result<()> {
 		let mut text = String::new();
 		io::stdin().read_to_string(&mut text)?;
 		if text.trim().is_empty() {
-			return Err(Error::new("no prompt provided: pass a prompt argument or pipe one on stdin"));
+			// TS print mode with zero messages writes nothing and exits 0.
+			return reporter.finish();
 		}
 		prompts_to_run.push(text);
 	}
 	for prompt in prompts_to_run {
-		session.turn(prompt, mode, &mut reporter)?;
+		if let Err(error) = session.turn(prompt, mode, &mut reporter) {
+			// Keep the partial answer visible before reporting the failure
+			// (deadline expiry, interrupted turn, provider error).
+			reporter.finish().ok();
+			return Err(error);
+		}
 	}
 	reporter.finish()
 }
@@ -174,7 +185,12 @@ fn run_repl<W: Write, E: Write>(
 				eprintln!("cwd: {}", session.cwd.display());
 			},
 			repl::ReplCommand::Cwd(None) => eprintln!("cwd: {}", session.cwd.display()),
-			repl::ReplCommand::Prompt(text) => session.turn(text, mode, reporter)?,
+			repl::ReplCommand::Prompt(text) => {
+				if let Err(error) = session.turn(text, mode, reporter) {
+					reporter.finish().ok();
+					return Err(error);
+				}
+			},
 		}
 	}
 	reporter.finish()
@@ -192,6 +208,7 @@ struct Session<'a> {
 	provider: Option<String>,
 	api_key: Option<String>,
 	max_time: Option<Duration>,
+	deadline: Option<Deadline>,
 	max_turns: usize,
 	tools_enabled: bool,
 	/// Raw `--system-prompt` / `--append-system-prompt` inputs, kept so a REPL
@@ -257,12 +274,19 @@ impl Session<'_> {
 	) -> Result<()> {
 		reporter.begin_turn()?;
 		let request = self.request(prompt.clone(), mode);
+		let started = std::time::Instant::now();
 		let mut builder = TurnBuilder::new(prompt);
-		for event in self.runner.run(&request)? {
-			let event = event?;
-			reporter.event(&event)?;
-			builder.observe(&event);
-		}
+		let stream = self.runner.run(&request)?;
+		deadline::drive(
+			stream,
+			self.deadline,
+			|| started.elapsed(),
+			|event| {
+				reporter.event(event)?;
+				builder.observe(event);
+				Ok(())
+			},
+		)?;
 		let record = builder.finish();
 		self.history.push(record.clone());
 		if let Err(err) = self.store.append_turn(&record) {

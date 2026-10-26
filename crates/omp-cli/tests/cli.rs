@@ -3,12 +3,12 @@
 //! its configuration is missing.
 
 use std::path::PathBuf;
-use std::process::Command as ProcCommand;
+use std::process::{Command as ProcCommand, Stdio};
 use std::sync::Arc;
 
 use clap::Parser;
 use omp_cli::{
-	Result,
+	EXIT_FAILURE, EXIT_SUCCESS, EXIT_USAGE, Result,
 	agent::{AgentRunner, Event, EventStream, RunRequest},
 	approve::{ApprovalMode, Approvals},
 	args::{Cli, Command},
@@ -120,9 +120,47 @@ fn missing_configuration_is_an_honest_failure() {
 		.output()
 		.expect("run omp");
 	std::fs::remove_dir_all(&isolated).ok();
-	assert_eq!(output.status.code(), Some(1));
+	assert_eq!(output.status.code(), Some(i32::from(EXIT_FAILURE)));
 	let stderr = String::from_utf8(output.stderr).expect("utf8");
 	assert!(stderr.contains("no model"), "stderr was {stderr:?}");
+	assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn version_and_help_exit_zero() {
+	for flag in ["--version", "--help"] {
+		let output = omp().arg(flag).output().expect("run omp");
+		assert_eq!(output.status.code(), Some(i32::from(EXIT_SUCCESS)), "{flag}");
+	}
+}
+
+#[test]
+fn print_mode_without_input_exits_zero() {
+	// TS print mode with zero messages writes nothing and exits 0; the binary
+	// must reach that path without inventing a turn.
+	let root = std::env::temp_dir().join(format!("omp-cli-empty-prompt-{}", std::process::id()));
+	let share = root.join("share");
+	let work = root.join("work");
+	std::fs::create_dir_all(&share).expect("share dir");
+	std::fs::create_dir_all(&work).expect("work dir");
+	std::fs::write(work.join("models.json"), r#"{"local":{"m":{"id":"m","provider":"local"}}}"#)
+		.expect("models fixture");
+	let output = omp()
+		.args(["--print", "--cwd"])
+		.arg(&work)
+		.env("PI_CONFIG_DIR", root.join("config"))
+		.env("PI_CODING_AGENT_DIR", root.join("config/agent"))
+		.env("OMP_SHARE_DIR", &share)
+		.stdin(Stdio::null())
+		.output()
+		.expect("run omp");
+	std::fs::remove_dir_all(&root).ok();
+	assert_eq!(
+		output.status.code(),
+		Some(i32::from(EXIT_SUCCESS)),
+		"stderr: {}",
+		String::from_utf8_lossy(&output.stderr)
+	);
 	assert!(output.stdout.is_empty());
 }
 
@@ -132,7 +170,7 @@ fn bad_max_time_is_a_usage_error() {
 		.args(["--max-time", "soon", "hi"])
 		.output()
 		.expect("run omp");
-	assert!(!output.status.success());
+	assert_eq!(output.status.code(), Some(i32::from(EXIT_USAGE)));
 	let stderr = String::from_utf8(output.stderr).expect("utf8");
 	assert!(stderr.contains("Invalid --max-time value"), "stderr was {stderr:?}");
 }
