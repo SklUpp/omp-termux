@@ -4,9 +4,15 @@
 //! [`RunRequest`]; this module maps it onto `pi-agent`'s `AgentConfig` and
 //! converts the loop's turn results back into the CLI [`Event`] stream.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use async_trait::async_trait;
+use pi_agent::mcp::{
+	connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key,
+	MCPContent, McpConnection, MCPServerConfig, McpToolOriginSource,
+};
 use pi_agent::{
 	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, BashTool, EditTool, GlobTool,
 	GrepTool, ModelProvider, OpenAiCompatibleProvider, ReadTool, SteeringEvent, TodoTool, Tool,
@@ -102,16 +108,57 @@ impl SignalDispatcher {
 		if let Ok(mut guard) = self.active_turn.lock() {
 			*guard = Some(tx);
 		}
-		TurnSignalRegistration {
-			active_turn: Arc::clone(&self.active_turn),
-		}
+		TurnSignalRegistration { active_turn: Arc::clone(&self.active_turn) }
 	}
 }
 
 impl AgentRunner for PiAgentRunner {
 	fn run(&self, request: &RunRequest) -> Result<EventStream> {
-		let plan = RunPlan::resolve(request)?;
-		let registry = build_registry(&plan.tools)?;
+		let cancellation_token = request.cancellation_token.clone().unwrap_or_default();
+		let timed_out = Arc::new(AtomicBool::new(false));
+
+		let (discovery_steering_tx, mut discovery_steering_rx) = tokio::sync::mpsc::channel(4);
+		let discovery_sig_reg = self.dispatcher.register(discovery_steering_tx);
+		let cancel_on_sig = cancellation_token.clone();
+		let sig_watcher = self.runtime.spawn(async move {
+			if let Some(SteeringEvent::Interrupt) = discovery_steering_rx.recv().await {
+				cancel_on_sig.cancel();
+			}
+		});
+
+		let timeout_cancel = cancellation_token.clone();
+		let timed_out_clone = Arc::clone(&timed_out);
+		let timer_handle = request.max_time.map(|budget| {
+			self.runtime.spawn(async move {
+				tokio::time::sleep(budget).await;
+				timed_out_clone.store(true, Ordering::SeqCst);
+				timeout_cancel.cancel();
+			})
+		});
+
+		let mcp_tools = if request.tools_enabled {
+			self.runtime.block_on(load_and_filter_mcp_tools(
+				&request.cwd,
+				&request.config,
+				&request.approvals,
+				&cancellation_token,
+			))?
+		} else {
+			Vec::new()
+		};
+
+		drop(discovery_sig_reg);
+		sig_watcher.abort();
+
+		if cancellation_token.is_cancelled() {
+			if timed_out.load(Ordering::SeqCst) {
+				return Err(Error::new("execution timed out during MCP discovery"));
+			}
+			return Err(Error::new("MCP discovery interrupted"));
+		}
+
+		let plan = RunPlan::resolve_with_mcp(request, !mcp_tools.is_empty())?;
+		let registry = build_registry_with_mcp(&plan.tools, mcp_tools)?;
 		let cwd = request.cwd.clone();
 		let prompt = request.prompt.clone();
 		let mut messages = history_messages(&request.history);
@@ -142,7 +189,6 @@ impl AgentRunner for PiAgentRunner {
 
 		let _guard = self.runtime.enter();
 
-		let cancellation_token = request.cancellation_token.clone().unwrap_or_default();
 		let cancel_watcher_token = cancellation_token.clone();
 		let steering_tx_cancel = steering_tx.clone();
 		let cancel_watcher = self.runtime.spawn(async move {
@@ -151,19 +197,6 @@ impl AgentRunner for PiAgentRunner {
 		});
 
 		let signal_reg = self.dispatcher.register(steering_tx.clone());
-
-		let timed_out = Arc::new(AtomicBool::new(false));
-		let timer_handle = if let Some(budget) = request.max_time {
-			let steering_tx_time = steering_tx.clone();
-			let timed_out_clone = Arc::clone(&timed_out);
-			Some(self.runtime.spawn(async move {
-				tokio::time::sleep(budget).await;
-				timed_out_clone.store(true, Ordering::SeqCst);
-				let _ = steering_tx_time.send(SteeringEvent::Interrupt).await;
-			}))
-		} else {
-			None
-		};
 
 		let dialog_prompt = prompt.clone();
 		let dialog_handle = self.runtime.spawn(async move {
@@ -470,7 +503,12 @@ struct RunPlan {
 }
 
 impl RunPlan {
-	fn resolve(request: &RunRequest) -> Result<Self> {
+	#[allow(dead_code)]
+	pub fn resolve(request: &RunRequest) -> Result<Self> {
+		Self::resolve_with_mcp(request, false)
+	}
+
+	pub fn resolve_with_mcp(request: &RunRequest, has_mcp_tools: bool) -> Result<Self> {
 		let requested = request
 			.model
 			.clone()
@@ -552,9 +590,9 @@ impl RunPlan {
 			max_turns: request.max_turns.max(1),
 			context_limit,
 			system_prompt: compose_system_prompt(request),
-			tools: allowed_tools(request)?,
+			tools: allowed_tools(request, has_mcp_tools)?,
 		})
-}
+	}
 }
 
 /// Trailing `:effort` selector (`:high`, `:xhi`, …) is not part of the model id.
@@ -581,7 +619,7 @@ fn split_effort(model: &str) -> (&str, Option<&str>) {
 }
 
 /// Tools the model may call, derived from the approval matrix.
-fn allowed_tools(request: &RunRequest) -> Result<Vec<&'static str>> {
+fn allowed_tools(request: &RunRequest, has_mcp_tools: bool) -> Result<Vec<&'static str>> {
 	if !request.tools_enabled {
 		return Ok(Vec::new());
 	}
@@ -590,7 +628,10 @@ fn allowed_tools(request: &RunRequest) -> Result<Vec<&'static str>> {
 		.filter(|(name, read_only)| request.approvals.decide(name, *read_only) == Decision::Auto)
 		.map(|(name, _)| *name)
 		.collect();
-	if tools.is_empty() {
+	if let Some(allowed) = &request.config.tools {
+		tools.retain(|name| allowed.iter().any(|a| a == *name));
+	}
+	if tools.is_empty() && !has_mcp_tools {
 		return Err(Error::new(
 			"approval gating requires --yolo in this build: pi-agent has no approval hook, so \
 			 --approval-mode always-ask needs --allow <tool> to offer any tool",
@@ -600,7 +641,14 @@ fn allowed_tools(request: &RunRequest) -> Result<Vec<&'static str>> {
 	Ok(tools)
 }
 
-fn build_registry(tools: &[&'static str]) -> Result<ToolRegistry> {
+pub fn build_registry(tools: &[&'static str]) -> Result<ToolRegistry> {
+	build_registry_with_mcp(tools, Vec::new())
+}
+
+pub fn build_registry_with_mcp(
+	tools: &[&'static str],
+	mcp_tools: Vec<McpTool>,
+) -> Result<ToolRegistry> {
 	let mut registry = ToolRegistry::new();
 	for name in tools {
 		let tool: Arc<dyn Tool> = match *name {
@@ -619,7 +667,331 @@ fn build_registry(tools: &[&'static str]) -> Result<ToolRegistry> {
 		};
 		registry.register(tool);
 	}
+	for mcp_tool in mcp_tools {
+		registry.register(Arc::new(mcp_tool));
+	}
 	Ok(registry)
+}
+
+/// Dynamic MCP tool implementing pi-agent's `Tool` trait.
+#[derive(Clone)]
+pub struct McpTool {
+	name: String,
+	description: String,
+	server_name: String,
+	tool_name: String,
+	schema: serde_json::Value,
+	connection: Arc<McpConnection>,
+}
+
+impl std::fmt::Debug for McpTool {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("McpTool")
+			.field("name", &self.name)
+			.field("server_name", &self.server_name)
+			.field("tool_name", &self.tool_name)
+			.field("description", &self.description)
+			.finish()
+	}
+}
+
+impl McpTool {
+	pub fn new(
+		server_name: &str,
+		tool_name: &str,
+		description: &str,
+		schema: serde_json::Value,
+		connection: Arc<McpConnection>,
+	) -> Self {
+		let name = create_mcp_tool_name(server_name, tool_name);
+		Self {
+			name,
+			description: description.to_string(),
+			server_name: server_name.to_string(),
+			tool_name: tool_name.to_string(),
+			schema,
+			connection,
+		}
+	}
+
+	pub fn name(&self) -> &str {
+		&self.name
+	}
+
+	pub fn server_name(&self) -> &str {
+		&self.server_name
+	}
+
+	pub fn tool_name(&self) -> &str {
+		&self.tool_name
+	}
+}
+
+impl McpToolOriginSource for McpTool {
+	fn name(&self) -> &str {
+		&self.name
+	}
+
+	fn origin_key(&self) -> Option<String> {
+		Some(get_mcp_tool_origin_key(&self.server_name, &self.tool_name))
+	}
+}
+
+#[async_trait]
+impl Tool for McpTool {
+	fn name(&self) -> &str {
+		&self.name
+	}
+
+	fn description(&self) -> &str {
+		&self.description
+	}
+
+	fn schema(&self) -> serde_json::Value {
+		self.schema.clone()
+	}
+
+	async fn execute(
+		&self,
+		args: &serde_json::Value,
+		ctx: &pi_agent::AgentContext,
+	) -> std::result::Result<pi_agent::ToolResult, pi_agent::ToolError> {
+		if ctx.cancellation_token.is_cancelled() {
+			return Ok(pi_agent::ToolResult {
+				tool_call_id: String::new(),
+				content: format!("MCP tool {} cancelled", self.name),
+				is_error: true,
+			});
+		}
+
+		tokio::select! {
+			_ = ctx.cancellation_token.cancelled() => {
+				Ok(pi_agent::ToolResult {
+					tool_call_id: String::new(),
+					content: format!("MCP tool {} cancelled", self.name),
+					is_error: true,
+				})
+			}
+			res = self.connection.call_tool(&self.tool_name, args.clone()) => {
+				match res {
+					Ok(call_result) => {
+						let mut content = String::new();
+						for item in call_result.content {
+							match item {
+								MCPContent::Text { text } => {
+									if !content.is_empty() {
+										content.push_str("\n\n");
+									}
+									content.push_str(&text);
+								},
+								MCPContent::Image { data, mime_type } => {
+									if !content.is_empty() {
+										content.push_str("\n\n");
+									}
+									content.push_str(&format!("[Image: {mime_type}; base64={data}]"));
+								},
+								MCPContent::Resource { uri, text, blob } => {
+									if !content.is_empty() {
+										content.push_str("\n\n");
+									}
+									if let Some(t) = text {
+										content.push_str(&format!("[Resource: {uri}]\n{t}"));
+									} else if let Some(b) = blob {
+										content.push_str(&format!("[Resource: {uri}; base64={b}]"));
+									} else {
+										content.push_str(&format!("[Resource: {uri}]"));
+									}
+								},
+							}
+						}
+						let is_error = call_result.is_error.unwrap_or(false);
+						Ok(pi_agent::ToolResult { tool_call_id: String::new(), content, is_error })
+					},
+					Err(err) => Ok(pi_agent::ToolResult {
+						tool_call_id: String::new(),
+						content: format!("MCP error: {err}"),
+						is_error: true,
+					}),
+				}
+			}
+		}
+	}
+}
+
+pub fn deduplicate_mcp_tools_with_warnings(tools: Vec<McpTool>) -> (Vec<McpTool>, Vec<String>) {
+	let mut deduplicated: Vec<McpTool> = Vec::new();
+	let mut warnings: Vec<String> = Vec::new();
+	let mut registered: std::collections::HashMap<String, (McpTool, String, usize)> =
+		std::collections::HashMap::new();
+
+	for tool in tools {
+		let origin_key = match tool.origin_key() {
+			Some(k) => k,
+			None => {
+				deduplicated.push(tool);
+				continue;
+			},
+		};
+
+		if let Some((existing_tool, existing_origin_key, idx)) = registered.get_mut(tool.name()) {
+			if *existing_origin_key == origin_key {
+				continue;
+			}
+			let keep_existing = *existing_origin_key < origin_key;
+			let (winner, loser) = if keep_existing {
+				(&*existing_tool, &tool)
+			} else {
+				(&tool, &*existing_tool)
+			};
+
+			let msg = format!(
+				"MCP tool name collision; keeping stable winner: name=\"{}\", kept=\"{}/{}\", ignored=\"{}/{}\"",
+				tool.name(),
+				winner.server_name(),
+				winner.tool_name(),
+				loser.server_name(),
+				loser.tool_name(),
+			);
+			eprintln!("{msg}");
+			warnings.push(msg);
+
+			if !keep_existing {
+				deduplicated[*idx] = tool.clone();
+				*existing_tool = tool;
+				*existing_origin_key = origin_key;
+			}
+		} else {
+			let idx = deduplicated.len();
+			registered.insert(tool.name().to_string(), (tool.clone(), origin_key, idx));
+			deduplicated.push(tool);
+		}
+	}
+
+	(deduplicated, warnings)
+}
+
+pub fn deduplicate_mcp_tools_with_warning(tools: Vec<McpTool>) -> Vec<McpTool> {
+	let (dedup, _) = deduplicate_mcp_tools_with_warnings(tools);
+	dedup
+}
+
+pub async fn filter_and_spawn_mcp_servers(
+	discovered: Vec<crate::config::DiscoveredMcpServer>,
+	cwd: &Path,
+	config: &crate::config::Config,
+	approvals: &crate::approve::Approvals,
+	cancel_token: &pi_agent::CancellationToken,
+) -> Result<Vec<McpTool>> {
+	let mut all_tools = Vec::new();
+
+	for server in discovered {
+		if cancel_token.is_cancelled() {
+			break;
+		}
+
+		let mut server_config = server.config;
+		if let MCPServerConfig::Stdio(stdio) = &mut server_config {
+			if stdio.cwd.is_none() {
+				stdio.cwd = Some(cwd.to_string_lossy().to_string());
+			}
+		}
+
+		let connect_fut = connect_to_server(&server.name, server_config);
+		let conn = tokio::select! {
+			_ = cancel_token.cancelled() => break,
+			res = connect_fut => match res {
+				Ok(connection) => Arc::new(connection),
+				Err(err) => {
+					eprintln!("Failed to connect to MCP server \"{}\": {err}", server.name);
+					continue;
+				}
+			}
+		};
+
+		let list_fut = conn.list_tools();
+		let tool_defs = tokio::select! {
+			_ = cancel_token.cancelled() => break,
+			res = list_fut => match res {
+				Ok(defs) => defs,
+				Err(err) => {
+					eprintln!("Failed to list tools from MCP server \"{}\": {err}", server.name);
+					continue;
+				}
+			}
+		};
+
+		for def in tool_defs {
+			let desc = def.description.as_deref().unwrap_or("");
+			let mcp_tool = McpTool::new(
+				&server.name,
+				&def.name,
+				desc,
+				def.input_schema,
+				Arc::clone(&conn),
+			);
+			all_tools.push(mcp_tool);
+		}
+	}
+
+	let mut unique_tools = deduplicate_mcp_tools_with_warning(all_tools);
+
+	if let Some(requested_tools) = &config.tools {
+		let mut known_tools: Vec<String> =
+			BUILTIN_TOOLS.iter().map(|(n, _)| n.to_string()).collect();
+		for tool in &unique_tools {
+			known_tools.push(tool.name().to_string());
+		}
+		let unknown: Vec<String> = requested_tools
+			.iter()
+			.filter(|r| !known_tools.iter().any(|k| k == *r))
+			.cloned()
+			.collect();
+		if !unknown.is_empty() {
+			let plural = if unknown.len() == 1 { "" } else { "s" };
+			return Err(Error::new(format!(
+				"Unknown tool{} in --tools: {}. Valid tools: {}.",
+				plural,
+				unknown.join(", "),
+				known_tools.join(", ")
+			)));
+		}
+
+		unique_tools.retain(|tool| requested_tools.iter().any(|allowed| allowed == tool.name()));
+	}
+
+	unique_tools.retain(|tool| approvals.decide(tool.name(), false) == Decision::Auto);
+
+	Ok(unique_tools)
+}
+
+pub async fn load_and_filter_mcp_tools(
+	cwd: &Path,
+	config: &crate::config::Config,
+	approvals: &crate::approve::Approvals,
+	cancel_token: &pi_agent::CancellationToken,
+) -> Result<Vec<McpTool>> {
+	let discovered = match crate::config::discover_mcp_servers(cwd) {
+		Ok(s) => s,
+		Err(err) => {
+			eprintln!("Error discovering MCP servers: {err}");
+			Vec::new()
+		},
+	};
+	filter_and_spawn_mcp_servers(discovered, cwd, config, approvals, cancel_token).await
+}
+
+pub async fn load_and_filter_mcp_tools_with_paths(
+	cwd: &Path,
+	agent_dir: &Path,
+	config: &crate::config::Config,
+	approvals: &crate::approve::Approvals,
+	cancel_token: &pi_agent::CancellationToken,
+) -> Result<Vec<McpTool>> {
+	let report = crate::config::discover_mcp_servers_with_paths(cwd, agent_dir);
+	for warning in &report.warnings {
+		eprintln!("{warning}");
+	}
+	filter_and_spawn_mcp_servers(report.servers, cwd, config, approvals, cancel_token).await
 }
 
 /// File-resolved prompt pieces joined into one system message.
@@ -661,7 +1033,11 @@ fn history_messages(history: &[crate::session::TurnRecord]) -> Vec<pi_agent::Mes
 					.collect();
 				messages.push(pi_agent::Message::assistant_with_tools("", calls));
 				for call in &turn.tool_calls {
-					let name = if call.name.is_empty() { "tool" } else { &call.name };
+					let name = if call.name.is_empty() {
+						"tool"
+					} else {
+						&call.name
+					};
 					messages.push(pi_agent::Message::tool_with_status(
 						call.id.clone(),
 						name,
@@ -689,7 +1065,11 @@ fn history_messages(history: &[crate::session::TurnRecord]) -> Vec<pi_agent::Mes
 			.collect();
 		messages.push(pi_agent::Message::assistant_with_tools(turn.assistant.clone(), calls));
 		for call in &turn.tool_calls {
-			let name = if call.name.is_empty() { "tool" } else { &call.name };
+			let name = if call.name.is_empty() {
+				"tool"
+			} else {
+				&call.name
+			};
 			messages.push(pi_agent::Message::tool_with_status(
 				call.id.clone(),
 				name,
@@ -701,14 +1081,10 @@ fn history_messages(history: &[crate::session::TurnRecord]) -> Vec<pi_agent::Mes
 	messages
 }
 
-
 #[cfg(test)]
 mod tests {
 	use std::collections::BTreeMap;
 	use std::path::PathBuf;
-
-
-
 
 	use super::*;
 	use crate::approve::{ApprovalMode, Approvals};
@@ -1043,7 +1419,10 @@ mod tests {
 		assert_eq!(messages[2].role, pi_agent::Role::Tool);
 		assert_eq!(messages[2].tool_call_id.as_deref(), Some("call-err-2"));
 		assert_eq!(messages[2].name.as_deref(), Some("fetch"));
-		assert!(messages[2].is_error, "aborted failed tool call must preserve is_error: true on replay");
+		assert!(
+			messages[2].is_error,
+			"aborted failed tool call must preserve is_error: true on replay"
+		);
 		assert_eq!(messages[2].content, "[Tool execution interrupted by user]");
 	}
 
@@ -1060,7 +1439,9 @@ mod tests {
 			let mut buf = [0u8; 1024];
 			let _ = socket.read(&mut buf).unwrap();
 			socket
-				.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+				.write_all(
+					b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+				)
 				.unwrap();
 			socket
 				.write_all(
@@ -1149,13 +1530,17 @@ mod tests {
 		let _ = done_tx.send(());
 
 		let ev3 = stream.next().expect("third event").expect("ok");
-		assert!(matches!(ev3, Event::MessageEnd { ref message, .. } if message.content == "first live delta"));
+		assert!(
+			matches!(ev3, Event::MessageEnd { ref message, .. } if message.content == "first live delta")
+		);
 
 		let ev4 = stream.next().expect("fourth event").expect("ok");
 		assert!(matches!(ev4, Event::TurnEnd { ref stop_reason, .. } if stop_reason == "stop"));
 
 		let ev5 = stream.next().expect("fifth event").expect("ok");
-		assert!(matches!(ev5, Event::AgentEnd { ref messages, .. } if messages.iter().any(|m| m.content == "first live delta")));
+		assert!(
+			matches!(ev5, Event::AgentEnd { ref messages, .. } if messages.iter().any(|m| m.content == "first live delta"))
+		);
 
 		assert!(stream.next().is_none());
 	}

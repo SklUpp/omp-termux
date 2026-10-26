@@ -86,7 +86,16 @@ fn run() -> std::result::Result<(), CliError> {
 		return Err(CliError::fail(agent::MISSING_RUNTIME));
 	};
 
-	let config = Config::load(&cli.config)?;
+	let mut config = Config::load(&cli.config)?;
+	if let Some(tools) = cli.tools {
+		let normalized: Vec<String> = tools
+			.iter()
+			.flat_map(|s| s.split(','))
+			.map(|s| s.trim().to_string())
+			.filter(|s| !s.is_empty())
+			.collect();
+		config.tools = Some(normalized);
+	}
 	let cwd = resolve_cwd(cli.cwd.clone(), config.cwd.clone())?;
 	if cli.resume.as_deref() == Some("")
 		&& (!io::stdin().is_terminal() || !io::stdout().is_terminal())

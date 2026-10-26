@@ -5719,6 +5719,7 @@ dependencies = [
 name = "omp-cli"
 version = "18.0.9"
 dependencies = [
+ "async-trait",
  "clap",
  "globset",
  "pi-agent",

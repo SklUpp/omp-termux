@@ -21,6 +21,7 @@ path = "src/main.rs"
 # No YAML crate: config.yml/models.yml are read by the in-tree subset parser in
 # `src/yaml.rs` so the binary keeps a small, offline-buildable dependency set and
 # avoids the archived `serde_yaml`.
+async-trait.workspace = true
 clap.workspace = true
 globset.workspace = true
 pi-agent = { path = "../pi-agent" }

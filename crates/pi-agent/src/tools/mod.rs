@@ -48,8 +48,8 @@ pub enum ToolError {
 /// Dynamic trait implemented by all agent tools.
 #[async_trait]
 pub trait Tool: Send + Sync {
-	fn name(&self) -> &'static str;
-	fn description(&self) -> &'static str;
+	fn name(&self) -> &str;
+	fn description(&self) -> &str;
 	fn schema(&self) -> Value;
 	fn is_exclusive(&self) -> bool {
 		false
@@ -126,11 +126,11 @@ pub struct BashTool;
 
 #[async_trait]
 impl Tool for BashTool {
-	fn name(&self) -> &'static str {
+	fn name(&self) -> &str {
 		"bash"
 	}
 
-	fn description(&self) -> &'static str {
+	fn description(&self) -> &str {
 		"Execute a shell command within the working directory"
 	}
 
@@ -235,11 +235,11 @@ pub struct ReadTool;
 
 #[async_trait]
 impl Tool for ReadTool {
-	fn name(&self) -> &'static str {
+	fn name(&self) -> &str {
 		"read"
 	}
 
-	fn description(&self) -> &'static str {
+	fn description(&self) -> &str {
 		"Read the contents of a regular file"
 	}
 
@@ -289,11 +289,11 @@ pub struct WriteTool;
 
 #[async_trait]
 impl Tool for WriteTool {
-	fn name(&self) -> &'static str {
+	fn name(&self) -> &str {
 		"write"
 	}
 
-	fn description(&self) -> &'static str {
+	fn description(&self) -> &str {
 		"Write content to a file, creating parent directories if necessary"
 	}
 
@@ -355,11 +355,11 @@ pub struct EditTool;
 
 #[async_trait]
 impl Tool for EditTool {
-	fn name(&self) -> &'static str {
+	fn name(&self) -> &str {
 		"edit"
 	}
 
-	fn description(&self) -> &'static str {
+	fn description(&self) -> &str {
 		"Replace exact text in a file; the match must be unique unless replace_all is set"
 	}
 
@@ -493,11 +493,11 @@ pub struct GlobTool;
 
 #[async_trait]
 impl Tool for GlobTool {
-	fn name(&self) -> &'static str {
+	fn name(&self) -> &str {
 		"glob"
 	}
 
-	fn description(&self) -> &'static str {
+	fn description(&self) -> &str {
 		"Find files matching a glob pattern"
 	}
 
@@ -564,11 +564,11 @@ pub struct GrepTool;
 
 #[async_trait]
 impl Tool for GrepTool {
-	fn name(&self) -> &'static str {
+	fn name(&self) -> &str {
 		"grep"
 	}
 
-	fn description(&self) -> &'static str {
+	fn description(&self) -> &str {
 		"Search for a regex pattern across regular files"
 	}
 
@@ -690,11 +690,11 @@ impl TodoTool {
 
 #[async_trait]
 impl Tool for TodoTool {
-	fn name(&self) -> &'static str {
+	fn name(&self) -> &str {
 		"todo"
 	}
 
-	fn description(&self) -> &'static str {
+	fn description(&self) -> &str {
 		"Manage task todo list: add, list, or clear items"
 	}
 

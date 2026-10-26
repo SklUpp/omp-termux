@@ -67,6 +67,10 @@ pub struct Cli {
 	#[arg(long = "no-tools")]
 	pub no_tools: bool,
 
+	/// Only enable these tools (comma-separated or repeatable).
+	#[arg(long, value_delimiter = ',', value_name = "TOOLS")]
+	pub tools: Option<Vec<String>>,
+
 	/// When to ask before running a tool.
 	#[arg(long = "approval-mode", value_enum, value_name = "MODE")]
 	pub approval_mode: Option<ApprovalMode>,
