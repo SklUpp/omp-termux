@@ -11,9 +11,10 @@ use futures::StreamExt;
 use pi_agent::provider::OpenAiChatRequest;
 use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
-	ChunkStream, EditTool, Message, ModelProvider, OpenAiCompatibleProvider, ProviderError,
-	ReadTool, Role, SteeringEvent, StreamAssembler, StreamChunk, Tool, ToolCall, ToolCallDelta,
-	ToolRegistry, TurnStatus, WriteTool, parse_sse_line, sse_stream,
+	CancellationToken, ChunkStream, EditTool, Message, ModelProvider,
+	OpenAiCompatibleProvider, ProviderError, ReadTool, Role, SteeringEvent,
+	StreamAssembler, StreamChunk, Tool, ToolCall, ToolCallDelta, ToolRegistry, TurnStatus,
+	WriteTool, parse_sse_line, sse_stream,
 };
 use serde_json::json;
 
@@ -497,6 +498,340 @@ async fn edit_reports_missing_files_and_absent_matches() {
 	assert!(absent.is_error);
 	assert!(absent.content.contains("Not found in"));
 	assert_eq!(std::fs::read_to_string(dir.path.join("note.txt")).expect("read"), "present\n");
+}
+
+#[tokio::test]
+async fn edit_preserves_original_bytes_and_cleans_temp_on_cancellation() {
+	let dir = TempDir::new("edit-abort");
+	let target = dir.path.join("file.txt");
+	let original = "sensitive original content\n";
+	std::fs::write(&target, original).expect("write original");
+
+	let token = CancellationToken::new();
+	token.cancel();
+	let ctx = pi_agent::AgentContext::with_cancellation(dir.path.clone(), token);
+
+	let result = EditTool
+		.execute(
+			&json!({
+				"path": "file.txt",
+				"old_string": "sensitive",
+				"new_string": "corrupted"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("edit");
+
+	assert!(result.is_error);
+	assert!(result.content.contains("Edit of"));
+	assert!(result.content.contains("cancelled"));
+
+	let content = std::fs::read_to_string(&target).expect("read");
+	assert_eq!(content, original);
+
+	let entries: Vec<_> = std::fs::read_dir(&dir.path)
+		.expect("read dir")
+		.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+		.collect();
+	assert_eq!(entries, vec!["file.txt"]);
+}
+
+#[tokio::test]
+async fn write_preserves_original_bytes_and_cleans_temp_on_cancellation() {
+	let dir = TempDir::new("write-abort");
+	let target = dir.path.join("file.txt");
+	let original = "existing user file content\n";
+	std::fs::write(&target, original).expect("write original");
+
+	let token = CancellationToken::new();
+	token.cancel();
+	let ctx = pi_agent::AgentContext::with_cancellation(dir.path.clone(), token);
+
+	let result = WriteTool
+		.execute(
+			&json!({
+				"path": "file.txt",
+				"content": "replacement that got cancelled\n"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("write");
+
+	assert!(result.is_error);
+	assert!(result.content.contains("Write to"));
+	assert!(result.content.contains("cancelled"));
+
+	let content = std::fs::read_to_string(&target).expect("read");
+	assert_eq!(content, original);
+
+	let entries: Vec<_> = std::fs::read_dir(&dir.path)
+		.expect("read dir")
+		.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+		.collect();
+	assert_eq!(entries, vec!["file.txt"]);
+}
+
+#[tokio::test]
+async fn write_aborted_during_actual_write_cleans_temp_and_preserves_target() {
+	let dir = TempDir::new("write-abort-inflight");
+	let target = dir.path.join("file.txt");
+	let original = "sensitive original content\n";
+	std::fs::write(&target, original).expect("write original");
+
+	let token = CancellationToken::new();
+	let ctx = pi_agent::AgentContext::with_cancellation(dir.path.clone(), token.clone());
+
+	let payload = "A".repeat(1024 * 1024);
+	let args = json!({
+		"path": "file.txt",
+		"content": payload,
+	});
+
+	let task = tokio::spawn(async move {
+		WriteTool.execute(&args, &ctx).await
+	});
+
+	for _ in 0..1000 {
+		let has_temp = std::fs::read_dir(&dir.path)
+			.expect("read dir")
+			.any(|e| {
+				e.ok()
+					.map(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+					.unwrap_or(false)
+			});
+		if has_temp {
+			break;
+		}
+		tokio::task::yield_now().await;
+	}
+
+	token.cancel();
+
+	let result = task.await.expect("join").expect("execute");
+	if result.is_error && result.content.contains("cancelled") {
+		assert_eq!(std::fs::read_to_string(&target).expect("read"), original);
+	}
+
+	let entries: Vec<_> = std::fs::read_dir(&dir.path)
+		.expect("read dir")
+		.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+		.filter(|name| name.contains(".tmp-"))
+		.collect();
+	assert!(entries.is_empty(), "no temp file may remain after abort: {entries:?}");
+}
+
+#[tokio::test]
+async fn write_aborted_by_task_abort_cleans_temp_and_prevents_rename() {
+	let dir = TempDir::new("write-abort-task");
+	let target = dir.path.join("file.txt");
+	let original = "sensitive original content\n";
+	std::fs::write(&target, original).expect("write original");
+
+	let token = CancellationToken::new();
+	let ctx = pi_agent::AgentContext::with_cancellation(dir.path.clone(), token);
+
+	let payload = "A".repeat(1024 * 1024);
+	let args = json!({
+		"path": "file.txt",
+		"content": payload,
+	});
+
+	let task = tokio::spawn(async move {
+		WriteTool.execute(&args, &ctx).await
+	});
+
+	for _ in 0..1000 {
+		let has_temp = std::fs::read_dir(&dir.path)
+			.expect("read dir")
+			.any(|e| {
+				e.ok()
+					.map(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+					.unwrap_or(false)
+			});
+		if has_temp {
+			break;
+		}
+		tokio::task::yield_now().await;
+	}
+
+	task.abort();
+	match task.await {
+		Ok(_) => {
+			let content = std::fs::read_to_string(&target).expect("read");
+			assert!(
+				content == original || content == payload,
+				"target must be either original or full payload, never partial"
+			);
+		},
+		Err(e) if e.is_cancelled() => {
+			for _ in 0..100 {
+				let entries: Vec<_> = std::fs::read_dir(&dir.path)
+					.expect("read dir")
+					.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+					.filter(|name| name.contains(".tmp-"))
+					.collect();
+				if entries.is_empty() {
+					break;
+				}
+				tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+			}
+			let content = std::fs::read_to_string(&target).expect("read");
+			assert!(
+				content == original || content == payload,
+				"target must be either original or full payload, never partial"
+			);
+		},
+		Err(e) => panic!("unexpected join error: {e}"),
+	}
+
+	let entries: Vec<_> = std::fs::read_dir(&dir.path)
+		.expect("read dir")
+		.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+		.filter(|name| name.contains(".tmp-"))
+		.collect();
+	assert!(entries.is_empty(), "no temp file may remain after task.abort: {entries:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn write_follows_dangling_symlink_preserving_symlink() {
+	let dir = TempDir::new("dangling-symlink");
+	let target_file = dir.path.join("created_by_link.txt");
+	let link_file = dir.path.join("dangling_link.txt");
+	std::os::unix::fs::symlink(&target_file, &link_file).expect("symlink");
+
+	let symlink_meta = std::fs::symlink_metadata(&link_file).expect("symlink metadata");
+	assert!(symlink_meta.file_type().is_symlink());
+	assert!(!target_file.exists());
+
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+	let result = WriteTool
+		.execute(
+			&json!({
+				"path": "dangling_link.txt",
+				"content": "written through dangling link\n"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("write");
+
+	assert!(!result.is_error);
+	assert!(target_file.exists());
+	assert_eq!(
+		std::fs::read_to_string(&target_file).expect("read target"),
+		"written through dangling link\n"
+	);
+
+	let symlink_meta_after = std::fs::symlink_metadata(&link_file).expect("symlink metadata after");
+	assert!(symlink_meta_after.file_type().is_symlink(), "symlink must not be replaced by regular file");
+	assert_eq!(
+		std::fs::read_to_string(&link_file).expect("read through link"),
+		"written through dangling link\n"
+	);
+}
+
+#[tokio::test]
+async fn write_fails_when_target_is_directory() {
+	let dir = TempDir::new("target-is-dir");
+	let subdir = dir.path.join("subfolder");
+	std::fs::create_dir_all(&subdir).expect("mkdir");
+
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+	let result = WriteTool
+		.execute(
+			&json!({
+				"path": "subfolder",
+				"content": "cannot overwrite directory\n"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("write");
+
+	assert!(result.is_error);
+	assert!(result.content.contains("is a directory") || result.content.contains("Failed to write"));
+	assert!(subdir.is_dir());
+
+	let entries: Vec<_> = std::fs::read_dir(&dir.path)
+		.expect("read dir")
+		.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+		.collect();
+	assert_eq!(entries, vec!["subfolder"]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn edit_preserves_symlink_structure_and_permissions() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let dir = TempDir::new("edit-symlink-perms");
+	let real_file = dir.path.join("real_script.sh");
+	let original = "#!/bin/sh\necho original\n";
+	std::fs::write(&real_file, original).expect("write real");
+	std::fs::set_permissions(&real_file, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+	let link_file = dir.path.join("link_script.sh");
+	std::os::unix::fs::symlink(&real_file, &link_file).expect("symlink");
+
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+	let result = EditTool
+		.execute(
+			&json!({
+				"path": "link_script.sh",
+				"old_string": "original",
+				"new_string": "updated"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("edit");
+
+	assert!(!result.is_error);
+	assert_eq!(
+		std::fs::read_to_string(&real_file).expect("read real"),
+		"#!/bin/sh\necho updated\n"
+	);
+
+	let symlink_meta = std::fs::symlink_metadata(&link_file).expect("symlink metadata");
+	assert!(symlink_meta.file_type().is_symlink());
+
+	let real_meta = std::fs::metadata(&real_file).expect("real metadata");
+	assert_eq!(real_meta.permissions().mode() & 0o777, 0o755);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn write_preserves_restrictive_mode_on_existing_file() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let dir = TempDir::new("write-mode-0600");
+	let target = dir.path.join("secret.key");
+	std::fs::write(&target, "old secret\n").expect("write secret");
+	std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+	let result = WriteTool
+		.execute(
+			&json!({
+				"path": "secret.key",
+				"content": "new secret content\n"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("write");
+
+	assert!(!result.is_error);
+	assert_eq!(
+		std::fs::read_to_string(&target).expect("read secret"),
+		"new secret content\n"
+	);
+
+	let meta = std::fs::metadata(&target).expect("metadata");
+	assert_eq!(meta.permissions().mode() & 0o777, 0o600);
 }
 
 #[test]

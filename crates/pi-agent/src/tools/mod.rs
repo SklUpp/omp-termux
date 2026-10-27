@@ -2,14 +2,19 @@ pub mod registry;
 pub mod scheduler;
 
 use std::{
+	io::Write,
 	path::{Path, PathBuf},
-	sync::Arc,
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicU64, Ordering},
+	},
 };
 
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::state::{AgentContext, ToolResult};
 
@@ -284,6 +289,236 @@ impl Tool for ReadTool {
 	}
 }
 
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Guard that removes a temporary file on drop unless disarmed.
+struct TempFileGuard {
+	path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+	fn new(path: PathBuf) -> Self {
+		Self { path: Some(path) }
+	}
+
+	fn disarm(&mut self) {
+		self.path = None;
+	}
+}
+
+impl Drop for TempFileGuard {
+	fn drop(&mut self) {
+		if let Some(path) = self.path.take() {
+			let _ = std::fs::remove_file(path);
+		}
+	}
+}
+
+#[derive(Default)]
+struct CommitState {
+	cancelled: bool,
+	committed: bool,
+}
+
+/// Drops the write token on future cancellation/drop so detached workers cannot rename.
+struct AbortGuard {
+	token: Option<CancellationToken>,
+	state: Option<Arc<Mutex<CommitState>>>,
+}
+
+impl AbortGuard {
+	fn new(token: CancellationToken, state: Arc<Mutex<CommitState>>) -> Self {
+		Self {
+			token: Some(token),
+			state: Some(state),
+		}
+	}
+
+	fn disarm(&mut self) {
+		self.token = None;
+		self.state = None;
+	}
+}
+
+impl Drop for AbortGuard {
+	fn drop(&mut self) {
+		if let Some(token) = self.token.take() {
+			token.cancel();
+		}
+		if let Some(state) = self.state.take() {
+			let mut lock = state.lock().unwrap_or_else(|p| p.into_inner());
+			if lock.committed {
+				return;
+			}
+			lock.cancelled = true;
+		}
+	}
+}
+
+async fn resolve_symlink_target(mut path: PathBuf) -> std::io::Result<PathBuf> {
+	for _ in 0..32 {
+		match tokio::fs::symlink_metadata(&path).await {
+			Ok(meta) if meta.file_type().is_symlink() => {
+				let link = tokio::fs::read_link(&path).await?;
+				path = if link.is_relative() {
+					match path.parent() {
+						Some(p) => p.join(link),
+						None => link,
+					}
+				} else {
+					link
+				};
+			},
+			_ => return Ok(path),
+		}
+	}
+	Err(std::io::Error::new(
+		std::io::ErrorKind::Other,
+		"too many levels of symbolic links",
+	))
+}
+
+fn create_exclusive_temp(
+	target: &Path,
+	existing_permissions: &Option<std::fs::Permissions>,
+) -> std::io::Result<(PathBuf, std::fs::File)> {
+	let dir = target
+		.parent()
+		.filter(|p| !p.as_os_str().is_empty())
+		.unwrap_or_else(|| Path::new("."));
+	let base = target
+		.file_name()
+		.and_then(|n| n.to_str())
+		.unwrap_or("file");
+
+	#[cfg(unix)]
+	let mode = match existing_permissions {
+		Some(perms) => {
+			use std::os::unix::fs::PermissionsExt;
+			perms.mode() & 0o777
+		},
+		None => 0o666,
+	};
+
+	for _ in 0..64 {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_or(0, |d| d.as_nanos() as u64);
+		let tag = nanos
+			.wrapping_mul(0x517c_c1b7_2722_0a95)
+			.wrapping_add(TEMP_COUNTER.fetch_add(1, Ordering::Relaxed))
+			.wrapping_add((std::process::id() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+		let path = dir.join(format!(".{base}.tmp-{tag:016x}"));
+
+		let mut options = std::fs::OpenOptions::new();
+		options.write(true).create_new(true);
+
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::OpenOptionsExt;
+			options.mode(mode);
+		}
+
+		match options.open(&path) {
+			Ok(file) => return Ok((path, file)),
+			Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+			Err(err) => return Err(err),
+		}
+	}
+
+	Err(std::io::Error::new(
+		std::io::ErrorKind::AlreadyExists,
+		"could not create temporary file after retries",
+	))
+}
+
+fn write_atomic_sync(
+	real_target: &Path,
+	bytes: &[u8],
+	token: &CancellationToken,
+	commit_state: &Arc<Mutex<CommitState>>,
+	existing_permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
+	if token.is_cancelled() {
+		return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+	}
+
+	let (temp_path, mut temp_file) = create_exclusive_temp(real_target, &existing_permissions)?;
+	let mut guard = TempFileGuard::new(temp_path.clone());
+
+	for chunk in bytes.chunks(64 * 1024) {
+		if token.is_cancelled() {
+			return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+		}
+		temp_file.write_all(chunk)?;
+	}
+	temp_file.flush()?;
+
+	if token.is_cancelled() {
+		return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+	}
+
+	if let Some(perms) = existing_permissions {
+		std::fs::set_permissions(&temp_path, perms)?;
+	}
+
+	{
+		let mut lock = commit_state.lock().unwrap_or_else(|p| p.into_inner());
+		if lock.cancelled || token.is_cancelled() {
+			return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+		}
+
+		std::fs::rename(&temp_path, real_target)?;
+		guard.disarm();
+		lock.committed = true;
+	}
+	Ok(())
+}
+
+async fn write_atomic(target: &Path, bytes: &[u8], token: &CancellationToken) -> std::io::Result<()> {
+	if token.is_cancelled() {
+		return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+	}
+
+	let real_target = resolve_symlink_target(target.to_path_buf()).await?;
+
+	if let Ok(meta) = tokio::fs::metadata(&real_target).await {
+		if meta.is_dir() {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::IsADirectory,
+				format!("{} is a directory", real_target.display()),
+			));
+		}
+	}
+
+	if let Some(parent) = real_target.parent() {
+		tokio::fs::create_dir_all(parent).await?;
+	}
+
+	let existing_permissions = tokio::fs::metadata(&real_target).await.ok().map(|m| m.permissions());
+
+	let write_token = token.child_token();
+	let commit_state = Arc::new(Mutex::new(CommitState::default()));
+	let mut abort_guard = AbortGuard::new(write_token.clone(), commit_state.clone());
+	let bytes_vec = bytes.to_vec();
+	let target_clone = real_target.clone();
+
+	tokio::task::spawn_blocking(move || {
+		write_atomic_sync(
+			&target_clone,
+			&bytes_vec,
+			&write_token,
+			&commit_state,
+			existing_permissions,
+		)
+	})
+	.await
+	.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+
+	abort_guard.disarm();
+	Ok(())
+}
+
 /// Builtin file writing tool.
 pub struct WriteTool;
 
@@ -335,16 +570,25 @@ impl Tool for WriteTool {
 		}
 
 		let target = ctx.cwd.join(path);
+		if ctx.cancellation_token.is_cancelled() {
+			return Ok(tool_result(format!("Write to {} cancelled", target.display()), true));
+		}
 		if let Some(parent) = target.parent() {
 			tokio::fs::create_dir_all(parent)
 				.await
 				.map_err(|err| ToolError::ExecutionFailed(format!("{}: {err}", parent.display())))?;
 		}
-		match tokio::fs::write(&target, content).await {
+		match write_atomic(&target, content.as_bytes(), &ctx.cancellation_token).await {
 			Ok(()) => Ok(tool_result(
 				format!("Successfully wrote {} bytes to {}", content.len(), target.display()),
 				false,
 			)),
+			Err(err)
+				if err.kind() == std::io::ErrorKind::Interrupted
+					|| ctx.cancellation_token.is_cancelled() =>
+			{
+				Ok(tool_result(format!("Write to {} cancelled", target.display()), true))
+			},
 			Err(err) => Ok(tool_result(format!("Failed to write {}: {err}", target.display()), true)),
 		}
 	}
@@ -469,11 +713,17 @@ impl Tool for EditTool {
 		} else {
 			(content.replacen(search, replacement, 1), 1)
 		};
-		match tokio::fs::write(&target, updated.as_bytes()).await {
+		match write_atomic(&target, updated.as_bytes(), &ctx.cancellation_token).await {
 			Ok(()) => Ok(tool_result(
 				format!("Replaced {replacements} occurrence(s) in {}", target.display()),
 				false,
 			)),
+			Err(err)
+				if err.kind() == std::io::ErrorKind::Interrupted
+					|| ctx.cancellation_token.is_cancelled() =>
+			{
+				Ok(tool_result(format!("Edit of {} cancelled", target.display()), true))
+			},
 			Err(err) => Ok(tool_result(format!("Failed to write {}: {err}", target.display()), true)),
 		}
 	}
