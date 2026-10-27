@@ -32,6 +32,8 @@ pub struct ModelInfo {
 	pub provider: String,
 	/// `contextWindow` when the definition declares one.
 	pub context_window: Option<usize>,
+	/// Input modalities (`["text"]`, `["text", "image"]`) when declared by catalog.
+	pub input: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -42,6 +44,8 @@ struct ModelEntry {
 	provider: Option<String>,
 	#[serde(default, rename = "contextWindow")]
 	context_window: Option<u64>,
+	#[serde(default)]
+	input: Option<Vec<String>>,
 }
 
 impl Catalog {
@@ -99,7 +103,7 @@ impl Catalog {
 					.context_window
 					.and_then(|window| usize::try_from(window).ok())
 					.filter(|window| *window > 0);
-				entries.insert(id, ModelInfo { provider, context_window });
+				entries.insert(id, ModelInfo { provider, context_window, input: entry.input });
 			}
 			providers.insert(provider_id, entries);
 		}
@@ -141,9 +145,17 @@ fn yml_sections(
 							.and_then(yaml::Value::to_text)
 							.and_then(|window| window.parse::<usize>().ok())
 							.filter(|window| *window > 0);
+						let input = item
+							.get("input")
+							.and_then(yaml::Value::as_list)
+							.map(|list| {
+								list.iter()
+									.filter_map(yaml::Value::to_text)
+									.collect()
+							});
 						models.insert(
 							model_id.to_string(),
-							ModelInfo { provider: id.clone(), context_window },
+							ModelInfo { provider: id.clone(), context_window, input },
 						);
 					}
 				}
@@ -182,7 +194,21 @@ impl Catalog {
 		self.providers.get(provider)?.get(model)?.context_window
 	}
 
+	/// Declared input modalities for a model, if known in catalog.
 	#[must_use]
+	pub fn model_input(&self, provider: &str, model: &str) -> Option<&[String]> {
+		self.providers.get(provider)?.get(model)?.input.as_deref()
+	}
+
+	/// Image support status from catalog:
+	/// - `Some(true)`: model explicitly declares `"image"` input modality.
+	/// - `Some(false)`: model explicitly declares inputs, but `"image"` is absent (fail-closed explicit text-only).
+	/// - `None`: capabilities unknown (model unlisted or omitted `input` field in catalog).
+	#[must_use]
+	pub fn supports_images(&self, provider: &str, model: &str) -> Option<bool> {
+		let input = self.model_input(provider, model)?;
+		Some(input.iter().any(|m| m == "image"))
+	}
 	pub fn model_count(&self) -> usize {
 		self.providers.values().map(BTreeMap::len).sum()
 	}

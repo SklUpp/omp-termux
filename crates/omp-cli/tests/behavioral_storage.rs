@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
+use omp_cli::output;
 use omp_cli::session::{
-	SessionOptions, SessionStore, TurnRecord, create_session_log_exclusive, import_legacy_v1,
-	sanitize_terminal_id,
+	ContentPart, MessageContent, MessageEntry, SessionMessage, SessionOptions, SessionStore,
+	TurnRecord, create_session_log_exclusive, import_legacy_v1, sanitize_terminal_id,
 };
 
 static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -44,7 +46,10 @@ fn read_real_ts_v3_session_and_preserve_typed_content() {
 	assert_eq!(history.len(), 1, "history must contain 1 turn from v3 session");
 	assert_eq!(history[0].prompt, "hello from test user");
 	assert_eq!(history[0].assistant, "calling tool");
-
+	assert_eq!(history[0].images().len(), 1, "history turn must preserve user image parts from TS fixture");
+	assert_eq!(history[0].images()[0].mime_type, "image/png");
+	assert_eq!(history[0].images()[0].data_base64, "aGVsbG8=");
+	assert_eq!(history[0].parts.len(), 2, "history turn must preserve all ordered parts [text, image]");
 	// P1: Assert image content is preserved in typed session entries
 	assert!(store.has_image_content(), "must preserve image content block");
 
@@ -54,6 +59,7 @@ fn read_real_ts_v3_session_and_preserve_typed_content() {
 		assistant: "looks good".to_string(),
 		stop_reason: "aborted".to_string(),
 		tool_calls: Vec::new(),
+		parts: Vec::new(),
 	};
 	store.append_turn(&turn).expect("append turn");
 
@@ -113,6 +119,7 @@ fn v1_legacy_log_rejects_append_and_stays_immutable() {
 		assistant: "done".to_string(),
 		stop_reason: "end_turn".to_string(),
 		tool_calls: Vec::new(),
+		parts: Vec::new(),
 	};
 
 	let result = store.append_turn(&new_turn);
@@ -156,7 +163,8 @@ fn malformed_tail_refuses_append() {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
 		stop_reason: "end_turn".into(),
-		tool_calls: vec![],
+		tool_calls: Vec::new(),
+		parts: Vec::new(),
 	};
 	let result = store.append_turn(&turn);
 	assert!(result.is_err(), "append_turn on malformed tail session must return Err");
@@ -207,7 +215,8 @@ fn malformed_entry_refuses_append() {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
 		stop_reason: "end_turn".into(),
-		tool_calls: vec![],
+		tool_calls: Vec::new(),
+		parts: Vec::new(),
 	};
 	let result = store.append_turn(&turn);
 	assert!(result.is_err(), "append_turn on malformed entry session must return Err");
@@ -405,7 +414,8 @@ fn parse_error_does_not_leak_raw_line_secrets() {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
 		stop_reason: "end_turn".into(),
-		tool_calls: vec![],
+		tool_calls: Vec::new(),
+		parts: Vec::new(),
 	};
 	let append_res = store.append_turn(&turn);
 	assert!(append_res.is_err());
@@ -454,7 +464,8 @@ fn parse_error_field_type_mismatch_does_not_leak_field_value_secret() {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
 		stop_reason: "end_turn".into(),
-		tool_calls: vec![],
+		tool_calls: Vec::new(),
+		parts: Vec::new(),
 	};
 	let append_res = store.append_turn(&turn);
 	assert!(append_res.is_err());
@@ -503,7 +514,8 @@ fn parse_error_untyped_record_is_rejected_without_secret_leak() {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
 		stop_reason: "end_turn".into(),
-		tool_calls: vec![],
+		tool_calls: Vec::new(),
+		parts: Vec::new(),
 	};
 	let append_res = store.append_turn(&turn);
 	assert!(append_res.is_err());
@@ -553,7 +565,8 @@ fn parse_v1_log_field_type_mismatch_does_not_leak_field_value_secret() {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
 		stop_reason: "end_turn".into(),
-		tool_calls: vec![],
+		tool_calls: Vec::new(),
+		parts: Vec::new(),
 	};
 	let append_res = store.append_turn(&turn);
 	assert!(append_res.is_err());
@@ -572,6 +585,287 @@ fn parse_v1_log_field_type_mismatch_does_not_leak_field_value_secret() {
 		!import_err.contains(secret_marker),
 		"import error must never leak v1 secret: {import_err}"
 	);
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn raw_content_with_secret_does_not_leak_into_diagnostics_or_warnings() {
+	let temp = temp_dir("secret-leak-raw-content");
+	let bad_file = temp.join("s-secret-raw.jsonl");
+	let secret_marker = "SUPER_SECRET_RAW_TOKEN_DO_NOT_LEAK_IN_DIAGNOSTICS_12345";
+	let content = format!(
+		"{{\"type\":\"session\",\"version\":3,\"id\":\"s-secret-raw\",\"timestamp\":\"2026-10-26T10:00:00.000Z\",\"cwd\":\"/work\"}}\n\
+		 {{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-26T10:00:01.000Z\",\"message\":{{\"role\":\"user\",\"content\":{{\"custom_field\":\"{secret_marker}\"}}}}}}\n"
+	);
+	fs::write(&bad_file, &content).expect("write bad file");
+
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("s-secret-raw".to_string()),
+		continue_latest: false,
+	});
+
+	assert!(!store.enabled());
+	let reason = store.corrupt_reason().expect("corrupt_reason");
+	assert!(
+		!reason.contains(secret_marker),
+		"corrupt_reason must never leak secret: {reason}"
+	);
+	for warning in store.take_warnings() {
+		assert!(
+			!warning.contains(secret_marker),
+			"warning message must never leak secret: {warning}"
+		);
+	}
+
+	let turn = TurnRecord {
+		prompt: "hi".to_string(),
+		assistant: "hello".to_string(),
+		stop_reason: "stop".to_string(),
+		tool_calls: vec![],
+		parts: vec![],
+	};
+	let err = store.append_turn(&turn).unwrap_err();
+	assert!(
+		!err.contains(secret_marker),
+		"append error must never leak secret: {err}"
+	);
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn deserialize_turn_parts_does_not_leak_secret() {
+	let secret_marker = "SUPER_SECRET_TURN_RECORD_PART_PAYLOAD_999";
+	let raw_json = format!(
+		"{{\"prompt\":\"hello\",\"parts\":[{{\"unsupported_plugin_block\":\"{secret_marker}\"}}]}}"
+	);
+	let err = serde_json::from_str::<TurnRecord>(&raw_json).unwrap_err().to_string();
+	assert!(
+		!err.contains(secret_marker),
+		"TurnRecord deserialization error must never leak secret payload: {err}"
+	);
+	assert!(err.contains("index 0"), "error should identify part position: {err}");
+}
+
+#[test]
+fn deserialize_turn_parts_with_unknown_type_does_not_leak_secret() {
+	let secret_marker = "SUPER_SECRET_TURN_RECORD_PART_TYPE_888";
+	let raw_json = format!(
+		"{{\"prompt\":\"hello\",\"parts\":[{{\"type\":\"{secret_marker}\"}}]}}"
+	);
+	let err = serde_json::from_str::<TurnRecord>(&raw_json).unwrap_err().to_string();
+	assert!(
+		!err.contains(secret_marker),
+		"TurnRecord deserialization error must never leak secret part type: {err}"
+	);
+	assert!(
+		err.contains("unsupported content part kind in turn record at index 0"),
+		"must match branch at session.rs:608: {err}"
+	);
+}
+
+#[test]
+fn part_type_secret_does_not_leak_into_diagnostics_or_warnings() {
+	let temp = temp_dir("secret-leak-part-type");
+	let bad_file = temp.join("s-secret-part.jsonl");
+	let secret_marker = "SUPER_SECRET_PART_KIND_TOKEN_999";
+	let content = format!(
+		"{{\"type\":\"session\",\"version\":3,\"id\":\"s-secret-part\",\"timestamp\":\"2026-10-26T10:00:00.000Z\",\"cwd\":\"/work\"}}\n\
+		 {{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-26T10:00:01.000Z\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"{secret_marker}\"}}]}}}}\n"
+	);
+	fs::write(&bad_file, &content).expect("write bad file");
+
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("s-secret-part".to_string()),
+		continue_latest: false,
+	});
+
+	assert!(!store.enabled());
+	let reason = store.corrupt_reason().expect("corrupt_reason");
+	assert!(
+		!reason.contains(secret_marker),
+		"corrupt_reason must never leak secret part kind: {reason}"
+	);
+	for warning in store.take_warnings() {
+		assert!(
+			!warning.contains(secret_marker),
+			"warning message must never leak secret part kind: {warning}"
+		);
+	}
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn typed_part_with_unknown_type_and_image_fields_is_rejected_without_fallback() {
+	let raw_json = r#"{
+		"prompt": "hello",
+		"parts": [
+			{"type": "future_video", "data": "aW1n", "mimeType": "image/png"}
+		]
+	}"#;
+	let err = serde_json::from_str::<TurnRecord>(raw_json).unwrap_err().to_string();
+	assert!(
+		err.contains("unsupported content part kind in turn record at index 0"),
+		"typed unknown kind must be rejected without fallback to ImagePart: {err}"
+	);
+	assert!(!err.contains("future_video"), "error must not leak kind value: {err}");
+
+	// Also verify pi_agent::Message rejection
+	let msg_json = r#"{
+		"role": "user",
+		"parts": [
+			{"type": "future_video", "data": "aW1n", "mimeType": "image/png"}
+		]
+	}"#;
+	let msg_err = serde_json::from_str::<pi_agent::Message>(msg_json).unwrap_err().to_string();
+	assert!(
+		msg_err.contains("unsupported message content part at index 0"),
+		"pi_agent::Message must reject unknown typed part without fallback: {msg_err}"
+	);
+}
+
+#[test]
+fn typed_part_with_malformed_text_and_image_fields_is_rejected_without_fallback() {
+	let raw_json = r#"{
+		"prompt": "hello",
+		"parts": [
+			{"type": "text", "data": "aW1n", "mimeType": "image/png"}
+		]
+	}"#;
+	let err = serde_json::from_str::<TurnRecord>(raw_json).unwrap_err().to_string();
+	assert!(
+		err.contains("malformed text part in turn record at index 0: missing text"),
+		"malformed text part must be rejected without fallback to ImagePart: {err}"
+	);
+
+	// Also verify pi_agent::Message rejection
+	let msg_json = r#"{
+		"role": "user",
+		"parts": [
+			{"type": "text", "data": "aW1n", "mimeType": "image/png"}
+		]
+	}"#;
+	let msg_err = serde_json::from_str::<pi_agent::Message>(msg_json).unwrap_err().to_string();
+	assert!(
+		msg_err.contains("unsupported message content part at index 0"),
+		"pi_agent::Message must reject malformed text part without fallback: {msg_err}"
+	);
+}
+
+#[test]
+fn session_store_open_with_malformed_text_and_image_disables_store_and_preserves_file() {
+	let temp = temp_dir("open-malformed-text-and-image");
+	let bad_file = temp.join("s-malformed-text.jsonl");
+	let content = format!(
+		"{{\"type\":\"session\",\"version\":3,\"id\":\"s-malformed-text\",\"timestamp\":\"2026-10-26T10:00:00.000Z\",\"cwd\":\"/work\"}}\n\
+		 {{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-26T10:00:01.000Z\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"image\",\"data\":\"aW1n\",\"mimeType\":\"image/png\"}},{{\"type\":\"text\"}}]}}}}\n"
+	);
+	fs::write(&bad_file, &content).expect("write bad file");
+
+	let file_content_before = fs::read_to_string(&bad_file).expect("read before");
+	let file_size_before = fs::metadata(&bad_file).expect("metadata before").len();
+
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("s-malformed-text".to_string()),
+		continue_latest: false,
+	});
+
+	assert!(!store.enabled(), "store must be disabled on malformed text part in log");
+	let reason = store.corrupt_reason().expect("corrupt_reason");
+	assert!(
+		reason.contains("missing text"),
+		"corrupt_reason must mention missing text: {reason}"
+	);
+
+	let file_content_after = fs::read_to_string(&bad_file).expect("read after");
+	assert_eq!(file_content_before, file_content_after, "session file must remain 100% intact");
+	let file_size_after = fs::metadata(&bad_file).expect("metadata after").len();
+	assert_eq!(file_size_before, file_size_after, "session file size must not change");
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn direct_append_message_with_malformed_text_and_image_fails_preflight_and_preserves_file_and_memory() {
+	let temp = temp_dir("append-malformed-text-and-image");
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("s-direct-malformed-text".to_string()),
+		continue_latest: false,
+	});
+	assert!(store.enabled());
+
+	// Initial baseline turn
+	let initial_turn = TurnRecord {
+		prompt: "initial turn".to_string(),
+		assistant: "initial reply".to_string(),
+		stop_reason: "stop".to_string(),
+		tool_calls: vec![],
+		parts: vec![],
+	};
+	store.append_turn(&initial_turn).expect("append initial turn");
+	let file = store.file().expect("file").to_path_buf();
+
+	let file_content_before = fs::read_to_string(&file).expect("read before");
+	let file_size_before = fs::metadata(&file).expect("metadata before").len();
+	let messages_len_before = store.messages().len();
+	let entries_len_before = store.entries().len();
+	let history_len_before = store.history().len();
+
+	// Direct MessageEntry with parts: valid image + malformed text (text: None)
+	let bad_entry = MessageEntry::new(
+		"msg-bad-text".to_string(),
+		store.messages().last().map(|m| m.id.clone()),
+		"2026-10-26T10:00:02.000Z".to_string(),
+		SessionMessage::user(
+			MessageContent::Parts(vec![
+				ContentPart::image("aW1n", "image/png"),
+				ContentPart {
+					kind: "text".to_string(),
+					text: None,
+					data: None,
+					mime_type: None,
+					extra: serde_json::Map::new(),
+				},
+			]),
+			99999,
+		),
+	);
+
+	let res = store.append_message(&bad_entry);
+	assert!(res.is_err(), "append_message must fail on text part missing text");
+	let err = res.unwrap_err();
+	assert!(err.contains("missing text"), "error must mention missing text: {err}");
+
+	// Verify exact equality of file and in-memory state
+	let file_content_after = fs::read_to_string(&file).expect("read after");
+	assert_eq!(file_content_before, file_content_after, "session file must remain 100% identical");
+	let file_size_after = fs::metadata(&file).expect("metadata after").len();
+	assert_eq!(file_size_before, file_size_after, "session file size must not change");
+	assert_eq!(store.messages().len(), messages_len_before, "messages must not mutate");
+	assert_eq!(store.entries().len(), entries_len_before, "entries must not mutate");
+	assert_eq!(store.history().len(), history_len_before, "history must not mutate");
 
 	fs::remove_dir_all(temp).ok();
 }

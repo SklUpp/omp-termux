@@ -227,13 +227,32 @@ impl ContentPart {
 
 	#[must_use]
 	pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+		let data = data.into();
+		let mime = mime_type.into();
+		let (clean_data, norm_mime) = match pi_agent::state::normalize_image_payload(&data, &mime) {
+			Ok((clean_b64, m)) => (clean_b64, m),
+			Err(_) => (data, mime),
+		};
 		Self {
 			kind: "image".to_string(),
 			text: None,
-			data: Some(data.into()),
-			mime_type: Some(mime_type.into()),
+			data: Some(clean_data),
+			mime_type: Some(norm_mime),
 			extra: serde_json::Map::new(),
 		}
+	}
+
+	pub fn try_image(data: impl Into<String>, mime_type: impl Into<String>) -> Result<Self, String> {
+		let data = data.into();
+		let mime = mime_type.into();
+		let (clean_b64, norm_mime) = pi_agent::state::normalize_image_payload(&data, &mime)?;
+		Ok(Self {
+			kind: "image".to_string(),
+			text: None,
+			data: Some(clean_b64),
+			mime_type: Some(norm_mime),
+			extra: serde_json::Map::new(),
+		})
 	}
 
 	#[must_use]
@@ -460,6 +479,24 @@ impl SessionMessage {
 				if ts_missing {
 					return Err("cannot persist user message: timestamp unavailable".to_string());
 				}
+				if let MessageContent::Parts(parts) = &self.content {
+					for (index, p) in parts.iter().enumerate() {
+						if p.is_image() {
+							if p.data.is_none() {
+								return Err(format!("cannot persist message: image part missing data at index {index}"));
+							}
+							if p.mime_type.is_none() {
+								return Err(format!("cannot persist message: image part missing mimeType at index {index}"));
+							}
+						} else if p.kind == "text" {
+							if p.text.is_none() {
+								return Err(format!("cannot persist message: text part missing text at index {index}"));
+							}
+						} else {
+							return Err(format!("cannot persist message: unsupported content part kind at index {index}"));
+						}
+					}
+				}
 			},
 			"assistant" => {
 				if ts_missing {
@@ -565,6 +602,57 @@ pub struct ToolCallRecord {
 	pub is_error: bool,
 }
 
+fn deserialize_turn_parts<'de, D>(deserializer: D) -> Result<Vec<ContentPart>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	let value = serde_json::Value::deserialize(deserializer)?;
+	if value.is_null() {
+		return Ok(Vec::new());
+	}
+	if let Some(arr) = value.as_array() {
+		if arr.is_empty() {
+			return Ok(Vec::new());
+		}
+		let mut parts = Vec::new();
+		for (index, item) in arr.iter().enumerate() {
+			if item.get("type").is_some() {
+				if let Ok(part) = serde_json::from_value::<ContentPart>(item.clone()) {
+					if part.is_image() {
+						if part.data.is_none() || part.mime_type.is_none() {
+							return Err(serde::de::Error::custom(format!(
+								"malformed image part in turn record at index {index}: missing data or mimeType"
+							)));
+						}
+					} else if part.kind != "text" {
+						return Err(serde::de::Error::custom(format!(
+							"unsupported content part kind in turn record at index {index}"
+						)));
+					} else if part.text.is_none() {
+						return Err(serde::de::Error::custom(format!(
+							"malformed text part in turn record at index {index}: missing text"
+						)));
+					}
+					parts.push(part);
+				} else {
+					return Err(serde::de::Error::custom(format!(
+						"unsupported or malformed content part in turn record at index {index}"
+					)));
+				}
+			} else if let Ok(img) = serde_json::from_value::<pi_agent::ImagePart>(item.clone()) {
+				parts.push(ContentPart::image(img.data_base64, img.mime_type));
+			} else {
+				return Err(serde::de::Error::custom(format!(
+					"unsupported or malformed content part in turn record at index {index}"
+				)));
+			}
+		}
+		return Ok(parts);
+	}
+	Err(serde::de::Error::custom(
+		"expected array of content parts"
+	))
+}
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TurnRecord {
 	pub prompt: String,
@@ -574,6 +662,28 @@ pub struct TurnRecord {
 	pub stop_reason: String,
 	#[serde(default)]
 	pub tool_calls: Vec<ToolCallRecord>,
+	#[serde(
+		default,
+		deserialize_with = "deserialize_turn_parts",
+		alias = "images",
+		alias = "image_parts",
+		skip_serializing_if = "Vec::is_empty"
+	)]
+	pub parts: Vec<ContentPart>,
+}
+
+impl TurnRecord {
+	pub fn images(&self) -> Vec<pi_agent::ImagePart> {
+		self.parts
+			.iter()
+			.filter(|p| p.is_image())
+			.filter_map(|p| {
+				let data = p.data.as_deref()?;
+				let mime = p.mime_type.as_deref()?;
+				Some(pi_agent::ImagePart::new(mime, data))
+			})
+			.collect()
+	}
 }
 
 /// Builds a [`TurnRecord`] from the runner's event stream.
@@ -587,11 +697,52 @@ impl TurnBuilder {
 	#[must_use]
 	pub fn new(prompt: impl Into<String>) -> Self {
 		Self {
-			record: TurnRecord { prompt: prompt.into(), ..TurnRecord::default() },
+			record: TurnRecord {
+				prompt: prompt.into(),
+				assistant: String::new(),
+				stop_reason: String::new(),
+				tool_calls: Vec::new(),
+				parts: Vec::new(),
+			},
 			pending: BTreeMap::new(),
 		}
 	}
 
+	#[must_use]
+	pub fn new_with_parts(prompt: impl Into<String>, parts: Vec<ContentPart>) -> Self {
+		Self {
+			record: TurnRecord {
+				prompt: prompt.into(),
+				assistant: String::new(),
+				stop_reason: String::new(),
+				tool_calls: Vec::new(),
+				parts,
+			},
+			pending: BTreeMap::new(),
+		}
+	}
+
+	#[must_use]
+	pub fn new_with_images(prompt: impl Into<String>, images: Vec<pi_agent::ImagePart>) -> Self {
+		let prompt = prompt.into();
+		let mut parts = Vec::new();
+		if !prompt.is_empty() {
+			parts.push(ContentPart::text(prompt.clone()));
+		}
+		for img in images {
+			parts.push(ContentPart::image(img.data_base64, img.mime_type));
+		}
+		Self {
+			record: TurnRecord {
+				prompt,
+				assistant: String::new(),
+				stop_reason: String::new(),
+				tool_calls: Vec::new(),
+				parts,
+			},
+			pending: BTreeMap::new(),
+		}
+	}
 	pub fn observe(&mut self, event: &Event) {
 		match event {
 			Event::MessageEnd { message, .. } => {
@@ -1018,6 +1169,14 @@ impl SessionStore {
 				entry.validate_compat()?;
 			}
 		}
+		// Preflight candidate history derivation before ANY disk or memory mutation
+		let candidate_history = {
+			let mut candidate_messages = Vec::with_capacity(self.messages.len() + entries.len());
+			candidate_messages.extend_from_slice(&self.messages);
+			candidate_messages.extend(entries.iter().cloned());
+			derive_turn_history(&candidate_messages)?
+		};
+
 		let lines: Vec<String> = entries
 			.iter()
 			.map(|entry| {
@@ -1027,6 +1186,7 @@ impl SessionStore {
 			})
 			.collect::<Result<_, _>>()?;
 		let Some(file) = self.file.clone() else {
+			self.history = candidate_history;
 			return Ok(());
 		};
 		self.append_lines_rolled_back(&file, &lines)?;
@@ -1036,7 +1196,7 @@ impl SessionStore {
 				self.entries.push(raw);
 			}
 		}
-		self.history = derive_turn_history(&self.messages);
+		self.history = candidate_history;
 		Ok(())
 	}
 
@@ -1145,12 +1305,45 @@ impl SessionStore {
 			.unwrap_or(0);
 
 		let mut entries = Vec::new();
+		let user_content = if !turn.parts.is_empty() {
+			let mut normalized = Vec::with_capacity(turn.parts.len());
+			for (index, part) in turn.parts.iter().enumerate() {
+				if part.is_image() {
+					let Some(data) = part.data.as_deref() else {
+						return Err(format!("cannot append turn with image part missing data at index {index}"));
+					};
+					let Some(mime) = part.mime_type.as_deref() else {
+						return Err(format!("cannot append turn with image part missing mimeType at index {index}"));
+					};
+					let (clean_b64, norm_mime) = pi_agent::state::normalize_image_payload(data, mime)
+						.map_err(|err| format!("cannot append turn with invalid image part at index {index}: {err}"))?;
+					let mut norm_part = part.clone();
+					norm_part.data = Some(clean_b64);
+					norm_part.mime_type = Some(norm_mime);
+					normalized.push(norm_part);
+				} else if part.kind == "text" {
+					if part.text.is_none() {
+						return Err(format!(
+							"cannot append turn with text part missing text at index {index}"
+						));
+					}
+					normalized.push(part.clone());
+				} else {
+					return Err(format!(
+						"cannot append turn with unsupported content part kind at index {index}"
+					));
+				}
+			}
+			MessageContent::Parts(normalized)
+		} else {
+			MessageContent::Text(turn.prompt.clone())
+		};
 		let user_id = format!("msg-{}", output::session_id());
 		entries.push(MessageEntry::new(
 			user_id.clone(),
 			self.messages.last().map(|last| last.id.clone()).filter(|id| !id.is_empty()),
 			now_iso.clone(),
-			SessionMessage::user(MessageContent::Text(turn.prompt.clone()), now_ms),
+			SessionMessage::user(user_content, now_ms),
 		));
 		let mut parent_id = Some(user_id);
 
@@ -1409,11 +1602,13 @@ fn parse_iso8601_ms(iso: &str) -> Option<u64> {
 	let (date, time) = iso.split_once('T')?;
 	let (year, month, day) = {
 		let mut parts = date.split('-');
-		(
-			parts.next()?.parse::<i64>().ok()?,
-			parts.next()?.parse::<u32>().ok()?,
-			parts.next()?.parse::<u32>().ok()?,
-		)
+		let y = parts.next()?.parse::<i64>().ok()?;
+		let m = parts.next()?.parse::<u32>().ok()?;
+		let d = parts.next()?.parse::<u32>().ok()?;
+		if parts.next().is_some() {
+			return None;
+		}
+		(y, m, d)
 	};
 	let time = time.strip_suffix('Z')?;
 	let (hms, frac) = match time.split_once('.') {
@@ -1424,6 +1619,9 @@ fn parse_iso8601_ms(iso: &str) -> Option<u64> {
 	let hour: u64 = parts.next()?.parse().ok()?;
 	let minute: u64 = parts.next()?.parse().ok()?;
 	let second: u64 = parts.next()?.parse().ok()?;
+	if parts.next().is_some() {
+		return None;
+	}
 	let millis: u64 = match frac {
 		Some(digits) if !digits.is_empty() && digits.len() <= 3 && digits.bytes().all(|b| b.is_ascii_digit()) => {
 			format!("{digits}000")[..3].parse().ok()?
@@ -1431,7 +1629,15 @@ fn parse_iso8601_ms(iso: &str) -> Option<u64> {
 		None => 0,
 		_ => return None,
 	};
-	if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+	let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+	let max_day = match month {
+		1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+		4 | 6 | 9 | 11 => 30,
+		2 if is_leap => 29,
+		2 => 28,
+		_ => return None,
+	};
+	if day < 1 || day > max_day || hour >= 24 || minute >= 60 || second >= 60 {
 		return None;
 	}
 	// Days from civil (Howard Hinnant).
@@ -1458,6 +1664,76 @@ pub fn file_safe_timestamp(iso: &str) -> String {
 	iso.replace([':', '.'], "-")
 }
 
+pub fn is_valid_file_safe_timestamp(s: &str) -> bool {
+	let Some((date, time)) = s.split_once('T') else {
+		return false;
+	};
+	let date_parts: Vec<&str> = date.split('-').collect();
+	let [y, m, d] = date_parts.as_slice() else {
+		return false;
+	};
+	if y.len() != 4 || !y.bytes().all(|b| b.is_ascii_digit()) {
+		return false;
+	}
+	if m.len() != 2 || !m.bytes().all(|b| b.is_ascii_digit()) {
+		return false;
+	}
+	if d.len() != 2 || !d.bytes().all(|b| b.is_ascii_digit()) {
+		return false;
+	}
+	if !matches!(m.parse::<u32>().ok(), Some(1..=12)) {
+		return false;
+	}
+	if !matches!(d.parse::<u32>().ok(), Some(1..=31)) {
+		return false;
+	}
+
+	let Some(time_no_z) = time.strip_suffix('Z').or_else(|| time.strip_suffix('z')) else {
+		return false;
+	};
+	let time_parts: Vec<&str> = time_no_z.split('-').collect();
+	let (h, min, sec, ms) = match time_parts.as_slice() {
+		[h, min, sec] if h.len() == 2 && min.len() == 2 && sec.len() == 2 => (*h, *min, *sec, None),
+		[h, min, sec, ms]
+			if h.len() == 2 && min.len() == 2 && sec.len() == 2 && !ms.is_empty() && ms.len() <= 3 =>
+		{
+			(*h, *min, *sec, Some(*ms))
+		},
+		_ => return false,
+	};
+
+	if !h.bytes().all(|b| b.is_ascii_digit())
+		|| !min.bytes().all(|b| b.is_ascii_digit())
+		|| !sec.bytes().all(|b| b.is_ascii_digit())
+	{
+		return false;
+	}
+	if let Some(ms_str) = ms {
+		if !ms_str.bytes().all(|b| b.is_ascii_digit()) {
+			return false;
+		}
+	}
+
+	let hour: u32 = match h.parse().ok() {
+		Some(h) if h < 24 => h,
+		_ => return false,
+	};
+	let minute: u32 = match min.parse().ok() {
+		Some(m) if m < 60 => m,
+		_ => return false,
+	};
+	let second: u32 = match sec.parse().ok() {
+		Some(s) if s < 60 => s,
+		_ => return false,
+	};
+	let _ = (hour, minute, second);
+
+	let iso = match ms {
+		Some(ms_val) => format!("{date}T{h}:{min}:{sec}.{ms_val}Z"),
+		None => format!("{date}T{h}:{min}:{sec}Z"),
+	};
+	parse_iso8601_ms(&iso).is_some()
+}
 pub fn valid_session_id(id: &str) -> bool {
 	!id.is_empty()
 		&& id != "."
@@ -1598,15 +1874,17 @@ struct ParsedSession {
 /// Derive the read-view `TurnRecord` sequence from typed message entries.
 /// `TurnRecord` is never a write source; this is a lossy view for callers that
 /// only need prompt/assistant/tool text.
-fn derive_turn_history(messages: &[MessageEntry]) -> Vec<TurnRecord> {
+fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnRecord>, String> {
 	let mut turns = Vec::new();
 	let mut current_prompt: Option<String> = None;
+	let mut current_parts: Vec<ContentPart> = Vec::new();
 	let mut current_asst = String::new();
 	let mut current_stop = String::new();
 	let mut current_tool_calls: Vec<ToolCallRecord> = Vec::new();
 
 	let flush =
 		|prompt: &mut Option<String>,
+		 parts: &mut Vec<ContentPart>,
 		 asst: &mut String,
 		 stop: &mut String,
 		 calls: &mut Vec<ToolCallRecord>,
@@ -1621,6 +1899,7 @@ fn derive_turn_history(messages: &[MessageEntry]) -> Vec<TurnRecord> {
 						canonical_stop_reason(stop).to_string()
 					},
 					tool_calls: std::mem::take(calls),
+					parts: std::mem::take(parts),
 				});
 			}
 		};
@@ -1630,12 +1909,49 @@ fn derive_turn_history(messages: &[MessageEntry]) -> Vec<TurnRecord> {
 			"user" => {
 				flush(
 					&mut current_prompt,
+					&mut current_parts,
 					&mut current_asst,
 					&mut current_stop,
 					&mut current_tool_calls,
 					&mut turns,
 				);
-				current_prompt = Some(entry.message.content.text());
+				match &entry.message.content {
+					MessageContent::Text(text) => {
+						current_prompt = Some(text.clone());
+						current_parts = Vec::new();
+					}
+					MessageContent::Parts(parts) => {
+						let mut text_parts = Vec::new();
+						for (index, p) in parts.iter().enumerate() {
+							if p.is_image() {
+								let Some(data) = p.data.as_deref() else {
+									return Err(format!("image part missing data payload at index {index}"));
+								};
+								let Some(mime) = p.mime_type.as_deref() else {
+									return Err(format!("image part missing mimeType at index {index}"));
+								};
+								pi_agent::state::normalize_image_payload(data, mime)
+									.map_err(|err| format!("invalid image payload in session log at index {index}: {err}"))?;
+							} else if p.kind == "text" {
+								let Some(t) = p.text.as_deref() else {
+									return Err(format!(
+										"malformed text content part in session log at index {index}: missing text"
+									));
+								};
+								text_parts.push(t);
+							} else {
+								return Err(format!(
+									"unsupported content part kind in session log at index {index}"
+								));
+							}
+						}
+						current_prompt = Some(text_parts.join("\n"));
+						current_parts = parts.clone();
+					}
+					MessageContent::Raw(_) => {
+						return Err("unsupported or malformed raw message content shape in session log".to_string());
+					}
+				}
 			},
 			"assistant" => {
 				if let Some(stop) = &entry.message.stop_reason {
@@ -1689,12 +2005,13 @@ fn derive_turn_history(messages: &[MessageEntry]) -> Vec<TurnRecord> {
 
 	flush(
 		&mut current_prompt,
+		&mut current_parts,
 		&mut current_asst,
 		&mut current_stop,
 		&mut current_tool_calls,
 		&mut turns,
 	);
-	turns
+	Ok(turns)
 }
 
 fn format_safe_serde_error(err: &serde_json::Error) -> String {
@@ -1859,7 +2176,7 @@ fn parse_session_content(file: &Path, text: &str) -> Result<ParsedSession, Strin
 		}
 	}
 
-	let turns = derive_turn_history(&messages);
+	let turns = derive_turn_history(&messages)?;
 
 	Ok(ParsedSession {
 		header,
@@ -1955,7 +2272,9 @@ fn find_session_by_id_or_stem(dir: &Path, id_or_stem: &str) -> Result<Option<Pat
 			continue;
 		};
 		let is_match = stem == id_or_stem
-			|| stem.split_once('_').map_or(false, |(_, id)| id == id_or_stem);
+			|| stem
+				.split_once('_')
+				.map_or(false, |(ts, id)| is_valid_file_safe_timestamp(ts) && id == id_or_stem);
 		if is_match {
 			let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
 			matches.push((mtime, path));
@@ -2807,6 +3126,7 @@ mod tests {
 				result: "contents".to_string(),
 				is_error: false,
 			}],
+			parts: Vec::new(),
 		}
 	}
 
@@ -2895,6 +3215,7 @@ mod tests {
 			assistant: "ok".to_string(),
 			stop_reason: "stop".to_string(),
 			tool_calls: Vec::new(),
+			parts: Vec::new(),
 		};
 		reopened.append_turn(&second).expect("append");
 		drop(reopened);
@@ -3178,6 +3499,395 @@ mod tests {
 		let content = fs::read_to_string(&file).expect("read str");
 		let parsed = parse_title_slot(content.lines().next().unwrap()).expect("parse");
 		assert_eq!(parsed.title, "Initial Title");
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn legacy_stem_negative_collision_and_exact_match() {
+		let dir = temp_dir();
+		let legacy_file = dir.join("team_alpha_beta.jsonl");
+		fs::write(&legacy_file, "").expect("create legacy file");
+
+		// 1. Searching for "alpha_beta" must NOT match "team_alpha_beta.jsonl" (no split_once collision)
+		let no_match = find_session_by_id_or_stem(&dir, "alpha_beta").expect("scan");
+		assert!(no_match.is_none(), "legacy team_alpha_beta.jsonl must NOT match alpha_beta");
+
+		// 2. Exact match for "team_alpha_beta" MUST find it
+		let exact = find_session_by_id_or_stem(&dir, "team_alpha_beta").expect("scan");
+		assert_eq!(exact, Some(legacy_file));
+
+		// 3. Direct timestamp validation unit assertions
+		assert!(is_valid_file_safe_timestamp("2026-10-27T17-50-31-850Z"));
+		assert!(is_valid_file_safe_timestamp("2026-10-27T17-50-31Z"));
+		assert!(!is_valid_file_safe_timestamp("team"));
+		assert!(!is_valid_file_safe_timestamp("team_alpha_beta"));
+		assert!(!is_valid_file_safe_timestamp("2026-10-27T25-00-00Z"));
+		assert!(!is_valid_file_safe_timestamp("2026-10-27T12-60-00Z"));
+		assert!(!is_valid_file_safe_timestamp("2026-10-27T12-00-60Z"));
+		assert!(!is_valid_file_safe_timestamp("2026-10-27-01T12-00-00Z"));
+		assert!(!is_valid_file_safe_timestamp("2026-02-31T12-00-00Z"));
+		assert!(!is_valid_file_safe_timestamp("2026-02-29T12-00-00Z"));
+		assert!(is_valid_file_safe_timestamp("2024-02-29T12-00-00Z"));
+		assert!(!is_valid_file_safe_timestamp("2026-04-31T12-00-00Z"));
+
+		// 4. Exact calendar validation in parse_iso8601_ms
+		assert!(parse_iso8601_ms("2026-02-31T12:00:00Z").is_none());
+		assert!(parse_iso8601_ms("2026-02-29T12:00:00Z").is_none());
+		assert!(parse_iso8601_ms("2024-02-29T12:00:00Z").is_some());
+		assert!(parse_iso8601_ms("2026-04-31T12:00:00Z").is_none());
+		assert!(parse_iso8601_ms("2026-01-31T12:00:00Z").is_some());
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn modern_session_with_underscore_id_resolves_cleanly() {
+		let dir = temp_dir();
+		let file = dir.join("2026-10-27T17-50-31-850Z_alpha_beta.jsonl");
+		fs::write(&file, "").expect("create session file");
+
+		let found = find_session_by_id_or_stem(&dir, "alpha_beta").expect("scan");
+		assert_eq!(found, Some(file));
+
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn session_with_image_parts_persists_and_resumes_without_loss() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("img-session")));
+		assert!(store.enabled());
+
+		let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+		let turn1 = TurnBuilder::new_with_images(
+			"look at this chart",
+			vec![pi_agent::ImagePart::new("image/png", image_data)],
+		)
+		.record;
+		let turn1 = TurnRecord {
+			assistant: "I see a trend line".to_string(),
+			stop_reason: "stop".to_string(),
+			..turn1
+		};
+
+		store.append_turn(&turn1).expect("append turn with image");
+		drop(store);
+
+		// Reopen / resume session
+		let mut reopened = SessionStore::open(&options(dir.clone(), Some("img-session")));
+		assert!(reopened.enabled());
+		assert_eq!(reopened.history().len(), 1);
+		let resumed_turn = &reopened.history()[0];
+		assert_eq!(resumed_turn.prompt, "look at this chart");
+		assert_eq!(resumed_turn.assistant, "I see a trend line");
+		assert_eq!(resumed_turn.images().len(), 1);
+		assert_eq!(resumed_turn.images()[0].mime_type, "image/png");
+		assert_eq!(resumed_turn.images()[0].data_base64, image_data);
+
+		// Append a second turn with another image
+		let turn2 = TurnBuilder::new_with_images(
+			"and this one",
+			vec![pi_agent::ImagePart::new("image/jpeg", "ZGF0YTI=")],
+		)
+		.record;
+		let turn2 = TurnRecord {
+			assistant: "all good".to_string(),
+			stop_reason: "stop".to_string(),
+			..turn2
+		};
+		reopened.append_turn(&turn2).expect("append turn 2");
+		drop(reopened);
+
+		// Reopen again and check both turns
+		let second_resumed = SessionStore::open(&options(dir.clone(), Some("img-session")));
+		assert_eq!(second_resumed.history().len(), 2);
+		assert_eq!(second_resumed.history()[0].images().len(), 1);
+		assert_eq!(second_resumed.history()[0].images()[0].mime_type, "image/png");
+		assert_eq!(second_resumed.history()[1].images().len(), 1);
+		assert_eq!(second_resumed.history()[1].images()[0].mime_type, "image/jpeg");
+		assert_eq!(second_resumed.history()[1].images()[0].data_base64, "ZGF0YTI=");
+
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn text_only_session_preserves_plain_text_wire_format() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("text-only-session")));
+		assert!(store.enabled());
+
+		let turn1 = TurnRecord {
+			prompt: "hello plain text".to_string(),
+			assistant: "hello human".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![],
+			parts: vec![],
+		};
+		store.append_turn(&turn1).expect("append turn");
+		let file = store.file().expect("file").to_path_buf();
+		drop(store);
+
+		let content = fs::read_to_string(&file).expect("read file");
+		// Ensure user message content is string, not array
+		let user_line = content
+			.lines()
+			.find(|l| l.contains(r#""role":"user""#))
+			.expect("user line");
+		let user_json: serde_json::Value = serde_json::from_str(user_line).expect("parse user json");
+		assert_eq!(
+			user_json["message"]["content"],
+			"hello plain text",
+			"plain text prompt must be serialized as string content, not array"
+		);
+
+		// Reopen and check history
+		let reopened = SessionStore::open(&options(dir.clone(), Some("text-only-session")));
+		assert_eq!(reopened.history().len(), 1);
+		assert_eq!(reopened.history()[0].prompt, "hello plain text");
+		assert!(reopened.history()[0].parts.is_empty());
+		assert!(reopened.history()[0].images().is_empty());
+
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn session_preserves_ordered_parts_and_data_uri_roundtrip_to_openai() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("ordered-session")));
+		assert!(store.enabled());
+
+		// Input with raw data URI directly in ContentPart (not through constructor), text, and raw base64
+		let parts = vec![
+			ContentPart {
+				kind: "image".to_string(),
+				text: None,
+				data: Some("data:image/png;base64,aW1nMQ==".to_string()),
+				mime_type: Some("image/png".to_string()),
+				extra: serde_json::Map::new(),
+			},
+			ContentPart::text("middle description"),
+			ContentPart::image("aW1nMg==", "image/jpeg"),
+		];
+		let turn = TurnRecord {
+			prompt: "unused-when-parts-present".to_string(),
+			assistant: "done".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![],
+			parts,
+		};
+
+		store.append_turn(&turn).expect("append ordered turn");
+		let file = store.file().expect("file").to_path_buf();
+		drop(store);
+
+		// 1. Verify JSONL on disk: data field must contain raw base64, NEVER full data: URI
+		let content = fs::read_to_string(&file).expect("read file");
+		let user_line = content
+			.lines()
+			.find(|l| l.contains(r#""role":"user""#))
+			.expect("user line");
+		let user_json: serde_json::Value = serde_json::from_str(user_line).expect("parse user line");
+		let disk_parts = user_json["message"]["content"].as_array().expect("parts array");
+		assert_eq!(disk_parts.len(), 3);
+		assert_eq!(disk_parts[0]["type"], "image");
+		assert_eq!(
+			disk_parts[0]["data"],
+			"aW1nMQ==",
+			"TS session log must store raw base64, NOT data: URI"
+		);
+		assert_eq!(disk_parts[0]["mimeType"], "image/png");
+		assert_eq!(disk_parts[1]["type"], "text");
+		assert_eq!(disk_parts[1]["text"], "middle description");
+		assert_eq!(disk_parts[2]["type"], "image");
+		assert_eq!(disk_parts[2]["data"], "aW1nMg==");
+		assert_eq!(disk_parts[2]["mimeType"], "image/jpeg");
+
+		// 2. Reopen / resume session and verify in-memory ordering
+		let reopened = SessionStore::open(&options(dir.clone(), Some("ordered-session")));
+		let hist = reopened.history();
+		assert_eq!(hist.len(), 1);
+		assert_eq!(hist[0].parts.len(), 3);
+		assert_eq!(hist[0].parts[0].data.as_deref(), Some("aW1nMQ=="));
+		assert_eq!(hist[0].parts[1].text.as_deref(), Some("middle description"));
+		assert_eq!(hist[0].parts[2].data.as_deref(), Some("aW1nMg=="));
+
+		// 3. Reconstruct pi_agent message history via REAL runtime::history_messages
+		let pi_messages = crate::runtime::history_messages(&reopened.history()).expect("history messages");
+		assert_eq!(pi_messages.len(), 2);
+		assert_eq!(pi_messages[0].parts.len(), 3);
+		let openai_msgs = pi_agent::to_openai_messages(&pi_messages).expect("to openai messages");
+		let wire_val = serde_json::to_value(&openai_msgs[0]).expect("serialize wire message");
+		let wire_parts = wire_val["content"].as_array().expect("wire content array");
+		assert_eq!(wire_parts.len(), 3);
+		assert_eq!(wire_parts[0]["type"], "image_url");
+		assert_eq!(wire_parts[0]["image_url"]["url"], "data:image/png;base64,aW1nMQ==");
+		assert_eq!(wire_parts[1]["type"], "text");
+		assert_eq!(wire_parts[1]["text"], "middle description");
+		assert_eq!(wire_parts[2]["type"], "image_url");
+		assert_eq!(wire_parts[2]["image_url"]["url"], "data:image/jpeg;base64,aW1nMg==");
+
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn append_turn_rejects_malformed_image_and_preserves_session_unmodified() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("safe-reject-session")));
+		assert!(store.enabled());
+
+		let initial_turn = TurnRecord {
+			prompt: "first prompt".to_string(),
+			assistant: "first reply".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![],
+			parts: vec![],
+		};
+		store.append_turn(&initial_turn).expect("append initial");
+		let file = store.file().expect("file").to_path_buf();
+		let size_before = fs::metadata(&file).expect("metadata").len();
+
+		// Attempt to append turn with an external URL image
+		let bad_turn = TurnRecord {
+			prompt: "bad".to_string(),
+			assistant: "no".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![],
+			parts: vec![ContentPart {
+				kind: "image".to_string(),
+				text: None,
+				data: Some("http://attacker.com/leak.png".to_string()),
+				mime_type: Some("image/png".to_string()),
+				extra: serde_json::Map::new(),
+			}],
+		};
+		let res = store.append_turn(&bad_turn);
+		assert!(res.is_err(), "append_turn must fail before mutation on invalid image");
+		let size_after = fs::metadata(&file).expect("metadata").len();
+		assert_eq!(size_before, size_after, "session file must remain unmodified on rejected turn");
+		assert_eq!(store.history().len(), 1, "in-memory history must not mutate on failure");
+
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn append_turn_rejects_unsupported_part_kind_and_preserves_session_unmodified() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("safe-reject-kind-session")));
+		assert!(store.enabled());
+
+		let bad_turn = TurnRecord {
+			prompt: "bad".to_string(),
+			assistant: "no".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![],
+			parts: vec![ContentPart {
+				kind: "audio".to_string(),
+				text: None,
+				data: Some("audio-stream".to_string()),
+				mime_type: Some("audio/mp3".to_string()),
+				extra: serde_json::Map::new(),
+			}],
+		};
+		let res = store.append_turn(&bad_turn);
+		let err = res.unwrap_err();
+		assert!(err.contains("unsupported content part kind at index 0"), "got: {err}");
+		assert_eq!(store.history().len(), 0, "session must remain empty on rejected turn");
+
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn unknown_content_shape_in_session_log_disables_persistence_without_data_loss_or_write() {
+		let dir = temp_dir();
+		let file = dir.join("2026-10-27T10-00-00-000Z_test-unknown-shape.jsonl");
+		let initial_log = concat!(
+			r#"{"type":"session","version":3,"id":"test-unknown-shape","timestamp":"2026-10-27T10:00:00.000Z","cwd":"/","model":"m","provider":"p"}"#,
+			"\n",
+			r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-10-27T10:00:01.000Z","message":{"role":"user","content":{"unsupported_custom_block":{"nested":"value"}}}}"#,
+			"\n"
+		);
+		fs::write(&file, initial_log).expect("write initial log");
+		let size_before = fs::metadata(&file).expect("metadata").len();
+
+		let mut store = SessionStore::open(&options(dir.clone(), Some("test-unknown-shape")));
+		assert!(!store.enabled(), "store must be disabled when unknown content shape is present");
+		let reason = store.corrupt_reason().expect("corrupt_reason must be populated");
+		assert!(
+			reason.contains("unsupported or malformed raw message content shape"),
+			"corrupt reason must report unsupported content shape, got: {reason}"
+		);
+
+		let dummy_turn = TurnRecord {
+			prompt: "hello".to_string(),
+			assistant: "world".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![],
+			parts: vec![],
+		};
+		let res = store.append_turn(&dummy_turn);
+		assert!(res.is_err(), "append_turn must fail on disabled/corrupted session");
+
+		let file_content_after = fs::read_to_string(&file).expect("read file after");
+		assert_eq!(file_content_after, initial_log, "file content must remain 100% intact with no loss or write");
+		let size_after = fs::metadata(&file).expect("metadata").len();
+		assert_eq!(size_before, size_after, "file size must remain unchanged");
+
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn direct_append_message_with_unknown_part_aborts_without_file_or_memory_mutation() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("preflight-test-session")));
+		assert!(store.enabled());
+
+		// Append a valid initial turn to establish baseline state
+		let initial_turn = TurnRecord {
+			prompt: "hello".to_string(),
+			assistant: "world".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![],
+			parts: vec![],
+		};
+		store.append_turn(&initial_turn).expect("append initial turn");
+		let file = store.file().expect("file").to_path_buf();
+
+		let file_content_before = fs::read_to_string(&file).expect("read file");
+		let file_size_before = fs::metadata(&file).expect("metadata").len();
+		let messages_len_before = store.messages.len();
+		let entries_len_before = store.entries.len();
+		let history_len_before = store.history().len();
+
+		// Construct direct MessageEntry with an unknown part kind
+		let bad_entry = MessageEntry::new(
+			"msg-bad".to_string(),
+			store.messages.last().map(|m| m.id.clone()),
+			output::iso8601(SystemTime::now()),
+			SessionMessage::user(
+				MessageContent::Parts(vec![ContentPart {
+					kind: "unknown_custom_extension".to_string(),
+					text: None,
+					data: None,
+					mime_type: None,
+					extra: serde_json::Map::new(),
+				}]),
+				12345,
+			),
+		);
+
+		let res = store.append_message(&bad_entry);
+		assert!(res.is_err(), "append_message must fail before mutation on unknown part");
+		let err = res.unwrap_err();
+		assert!(err.contains("unsupported content part kind in session log at index 0"), "got: {err}");
+
+		// Verify exact equality of file and in-memory state
+		let file_content_after = fs::read_to_string(&file).expect("read file after");
+		assert_eq!(file_content_before, file_content_after, "session file must remain 100% identical");
+		let file_size_after = fs::metadata(&file).expect("metadata after").len();
+		assert_eq!(file_size_before, file_size_after, "session file size must not change");
+		assert_eq!(store.messages.len(), messages_len_before, "messages must not mutate");
+		assert_eq!(store.entries.len(), entries_len_before, "entries must not mutate");
+		assert_eq!(store.history().len(), history_len_before, "history must not mutate");
+
 		fs::remove_dir_all(dir).ok();
 	}
 }

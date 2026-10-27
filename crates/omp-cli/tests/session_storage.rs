@@ -125,6 +125,7 @@ fn v1_legacy_log_is_read_only_and_never_overwritten() {
 		assistant: "done".to_string(),
 		stop_reason: "end_turn".to_string(),
 		tool_calls: Vec::new(),
+		parts: Vec::new(),
 	};
 	let append_result = store.append_turn(&dummy_turn);
 	assert!(
@@ -217,6 +218,7 @@ fn malformed_header_fails_without_append() {
 		assistant: "hello".into(),
 		stop_reason: "end_turn".into(),
 		tool_calls: vec![],
+		parts: vec![],
 	};
 	let _ = store.append_turn(&turn);
 	assert_eq!(
@@ -259,6 +261,7 @@ fn malformed_entry_disables_persistence_and_refuses_append() {
 		assistant: "hello".into(),
 		stop_reason: "end_turn".into(),
 		tool_calls: vec![],
+		parts: vec![],
 	};
 	let _ = store.append_turn(&turn);
 	assert_eq!(
@@ -478,6 +481,7 @@ fn append_turn_titles_and_appends_entries_and_reopens_cleanly() {
 			assistant: "initial reply".to_string(),
 			stop_reason: "end_turn".to_string(),
 			tool_calls: Vec::new(),
+			parts: Vec::new(),
 		})
 		.expect("initial append succeeds");
 
@@ -594,6 +598,7 @@ fn unsupported_session_version_rejected_without_append() {
 		assistant: "hello".into(),
 		stop_reason: "stop".into(),
 		tool_calls: vec![],
+		parts: vec![],
 	};
 	let _ = store.append_turn(&turn);
 	assert_eq!(
@@ -641,6 +646,7 @@ fn missing_session_version_rejected_without_append() {
 		assistant: "hello".into(),
 		stop_reason: "stop".into(),
 		tool_calls: vec![],
+		parts: vec![],
 	};
 	let _ = store.append_turn(&turn);
 	assert_eq!(
@@ -674,6 +680,7 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 			assistant: "first reply".to_string(),
 			stop_reason: "end_turn".to_string(),
 			tool_calls: Vec::new(),
+			parts: Vec::new(),
 		})
 		.expect("append turn 1");
 
@@ -690,6 +697,7 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 				result: "contents".to_string(),
 				is_error: false,
 			}],
+			parts: Vec::new(),
 		})
 		.expect("append turn 2");
 

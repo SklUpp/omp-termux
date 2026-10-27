@@ -11,12 +11,13 @@ pub use compaction::Compactor;
 pub use loop_module::{AgentError, AgentEvent, AgentLoop, SteeringEvent, INTERRUPTED_TOOL_RESULT};
 pub use tokio_util::sync::CancellationToken;
 pub use provider::{
-	ChunkStream, ModelProvider, OpenAiCompatibleProvider, ProviderError, StreamAssembler,
+	ChunkStream, ModelProvider, OpenAiChatRequest, OpenAiCompatibleProvider, OpenAiContent,
+	OpenAiContentPart, OpenAiImageUrl, OpenAiMessage, ProviderError, StreamAssembler,
 	StreamChunk, ToolCallDelta, parse_sse_line, sse_stream, to_openai_messages,
 };
 pub use state::{
-	AgentConfig, AgentContext, AgentState, Message, Role, ToolApprover, ToolCall, ToolResult,
-	TurnResult, TurnStatus,
+	AgentConfig, AgentContext, AgentState, ContentPart, ImagePart, Message, Role, ToolApprover,
+	ToolCall, ToolResult, TurnResult, TurnStatus,
 };
 pub use tokenizer::Tokenizer;
 pub use tools::{
