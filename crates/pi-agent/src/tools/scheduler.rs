@@ -1,19 +1,28 @@
+use std::sync::Arc;
+
 use futures::future::join_all;
 
 use super::{ToolError, registry::ToolRegistry};
-use crate::state::{AgentContext, ToolCall, ToolResult};
-
+use crate::state::{AgentContext, ToolApprover, ToolCall, ToolResult};
 /// Scheduler partitions a tool batch into concurrent non-exclusive runs and
 /// sequential exclusive ones, preserving call order in the results.
 pub struct ToolScheduler {
 	registry: ToolRegistry,
+	approver: Option<Arc<dyn ToolApprover>>,
 }
 
 impl ToolScheduler {
 	pub fn new(registry: ToolRegistry) -> Self {
-		Self { registry }
+		Self { registry, approver: None }
 	}
 
+	pub fn with_approver(registry: ToolRegistry, approver: Arc<dyn ToolApprover>) -> Self {
+		Self { registry, approver: Some(approver) }
+	}
+
+	pub fn approver(&self) -> Option<&Arc<dyn ToolApprover>> {
+		self.approver.as_ref()
+	}
 	/// Execute a batch of tool calls:
 	/// - Non-exclusive tools (read, grep, glob) run concurrently.
 	/// - Exclusive tools (bash, write, todo) run one at a time.
@@ -53,6 +62,17 @@ impl ToolScheduler {
 				is_error: true,
 			};
 		};
+
+		let approver = self.approver.as_ref().or(ctx.approver.as_ref());
+		if let Some(approver) = approver {
+			if let Err(denial) = approver.approve(&call.name, &call.arguments).await {
+				return ToolResult {
+					tool_call_id: call.id.clone(),
+					content: format!("Tool execution denied: {denial}"),
+					is_error: true,
+				};
+			}
+		}
 
 		let result = match tool.execute(&call.arguments, ctx).await {
 			Ok(result) => result,

@@ -709,6 +709,7 @@ pub struct SessionStore {
 	warnings: Vec<String>,
 	is_v1: bool,
 	title_slot: Option<TitleSlot>,
+	corrupt_reason: Option<String>,
 	/// Route stamp from [`SessionOptions`] — real configured values only.
 	model: Option<String>,
 	provider: Option<String>,
@@ -783,7 +784,10 @@ impl SessionStore {
 			let content = match fs::read_to_string(file) {
 				Ok(c) => c,
 				Err(err) => {
-					store.warn(format!("cannot read session log {}: {err}; session persistence disabled", file.display()));
+					let reason = format!("cannot read session log {}: {err}", file.display());
+					store.file = Some(file.clone());
+					store.corrupt_reason = Some(reason.clone());
+					store.warn(format!("{reason}; session persistence disabled"));
 					return store;
 				},
 			};
@@ -802,6 +806,8 @@ impl SessionStore {
 					return store;
 				},
 				Err(err) => {
+					store.file = Some(file.clone());
+					store.corrupt_reason = Some(err.clone());
 					store.warn(format!("{err}; session persistence disabled"));
 					return store;
 				},
@@ -918,10 +924,18 @@ impl SessionStore {
 		self.messages.iter().any(|entry| entry.message.content.has_image())
 	}
 
+	#[must_use]
+	pub fn corrupt_reason(&self) -> Option<&str> {
+		self.corrupt_reason.as_deref()
+	}
+
 	/// Append one raw/custom entry (`custom`, `title_change`, ...) with
 	/// rollback: a failed write truncates back to the original size and the
 	/// in-memory state is untouched.
 	pub fn append_entry(&mut self, entry: SessionEntry) -> Result<(), String> {
+		if let Some(reason) = &self.corrupt_reason {
+			return Err(format!("cannot append to corrupted session log: {reason}"));
+		}
 		if !self.enabled {
 			return Ok(());
 		}
@@ -965,6 +979,9 @@ impl SessionStore {
 		entries: &[MessageEntry],
 		strict: bool,
 	) -> Result<(), String> {
+		if let Some(reason) = &self.corrupt_reason {
+			return Err(format!("cannot append to corrupted session log: {reason}"));
+		}
 		if !self.enabled {
 			return Ok(());
 		}
@@ -1099,6 +1116,9 @@ impl SessionStore {
 	/// and tool-call arguments/results are the recorded real data. Use
 	/// [`append_message`](Self::append_message) when full metadata is available.
 	pub fn append_turn(&mut self, turn: &TurnRecord) -> Result<(), String> {
+		if let Some(reason) = &self.corrupt_reason {
+			return Err(format!("cannot append to corrupted session log: {reason}"));
+		}
 		if !self.enabled {
 			return Ok(());
 		}

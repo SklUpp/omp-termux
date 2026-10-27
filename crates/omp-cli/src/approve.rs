@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 
+use async_trait::async_trait;
 use clap::ValueEnum;
 
 use crate::{Error, Result};
@@ -17,7 +18,10 @@ pub enum ApprovalMode {
 	#[default]
 	#[value(name = "always-ask")]
 	AlwaysAsk,
-	/// Auto-approve read-only tools, ask for writes.
+	/// Auto-approve read-only tools, ask for writes/execs.
+	/// Note: In TS `approval.ts`, `write` mode approves up to `write` tier.
+	/// The Android headless parity plan explicitly defines `write` mode as
+	/// read-only auto-permitted, requiring explicit approval for writes and execs.
 	Write,
 	/// Auto-approve everything.
 	Yolo,
@@ -52,6 +56,90 @@ pub enum Decision {
 	Ask,
 }
 
+/// Capability tier of a tool invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ToolTier {
+	Read,
+	Write,
+	Exec,
+}
+
+/// Check if arguments target an ssh:// URI.
+pub fn has_ssh_target(args: &serde_json::Value) -> bool {
+	let is_ssh = |s: &str| s.starts_with("ssh://");
+	if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+		if is_ssh(p) {
+			return true;
+		}
+	}
+	if let Some(paths) = args.get("paths") {
+		if let Some(s) = paths.as_str() {
+			if is_ssh(s) {
+				return true;
+			}
+		} else if let Some(arr) = paths.as_array() {
+			for item in arr {
+				if let Some(s) = item.as_str() {
+					if is_ssh(s) {
+						return true;
+					}
+				}
+			}
+		}
+	}
+	false
+}
+
+/// Classify tool invocation into a capability tier.
+pub fn classify_tool(name: &str, args: &serde_json::Value) -> ToolTier {
+	match name {
+		"todo" | "glob" => ToolTier::Read,
+		"read" => {
+			if has_ssh_target(args) {
+				ToolTier::Exec
+			} else {
+				ToolTier::Read
+			}
+		},
+		"grep" => {
+			if has_ssh_target(args) {
+				ToolTier::Exec
+			} else {
+				ToolTier::Read
+			}
+		},
+		"write" | "edit" => {
+			if has_ssh_target(args) {
+				ToolTier::Exec
+			} else {
+				ToolTier::Write
+			}
+		},
+		"bash" => ToolTier::Exec,
+		// MCP tools and unknown tools default to conservative Exec
+		_ => ToolTier::Exec,
+	}
+}
+
+/// Extract detail description for approval prompts.
+pub fn extract_tool_detail(name: &str, args: &serde_json::Value) -> Option<String> {
+	match name {
+		"bash" => args.get("command").and_then(|v| v.as_str()).map(|cmd| {
+			let trimmed = cmd.trim();
+			if trimmed.chars().count() > 60 {
+				let prefix: String = trimmed.chars().take(57).collect();
+				format!("{prefix}...")
+			} else {
+				trimmed.to_string()
+			}
+		}),
+		"write" | "edit" | "read" => {
+			args.get("path").and_then(|v| v.as_str()).map(|p| p.trim().to_string())
+		},
+		_ => None,
+	}
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Approvals {
 	pub mode: ApprovalMode,
@@ -64,16 +152,23 @@ impl Approvals {
 		Self { mode, allow: allow.into_iter().collect() }
 	}
 
-	/// Pure matrix: explicit allow, then `yolo`, then read-only under `write`.
+	/// Resolve approval decision given explicit tool tier.
 	#[must_use]
-	pub fn decide(&self, tool: &str, read_only: bool) -> Decision {
+	pub fn decide_tier(&self, tool: &str, tier: ToolTier) -> Decision {
 		if self.allow.contains(tool) || self.mode == ApprovalMode::Yolo {
 			return Decision::Auto;
 		}
-		if read_only && self.mode == ApprovalMode::Write {
+		if tier == ToolTier::Read && self.mode == ApprovalMode::Write {
 			return Decision::Auto;
 		}
 		Decision::Ask
+	}
+
+	/// Pure matrix: explicit allow, then `yolo`, then read-only under `write`.
+	#[must_use]
+	pub fn decide(&self, tool: &str, read_only: bool) -> Decision {
+		let tier = if read_only { ToolTier::Read } else { ToolTier::Write };
+		self.decide_tier(tool, tier)
 	}
 
 	/// Decide, prompting on `input`/`prompt` when the matrix says ask.
@@ -102,6 +197,35 @@ impl Approvals {
 	}
 }
 
+#[async_trait]
+impl pi_agent::ToolApprover for Approvals {
+	async fn approve(&self, name: &str, args: &serde_json::Value) -> std::result::Result<(), String> {
+		let tier = classify_tool(name, args);
+		let decision = self.decide_tier(name, tier);
+		match decision {
+			Decision::Auto => Ok(()),
+			Decision::Ask => {
+				use std::io::IsTerminal;
+				// In non-interactive environments (pipes, /dev/null, daemons, background),
+				// closed stdin cannot prompt the operator; deny immediately before side effects.
+				// MCP tool discovery already registered schemas via read-only tools/list;
+				// this gate intercepts the execution before any side-effecting tools/call occurs.
+				if !std::io::stdin().is_terminal() {
+					return Err("approval required but stdin closed".to_string());
+				}
+				let detail = extract_tool_detail(name, args);
+				let mut stdin = std::io::stdin().lock();
+				let mut stderr = std::io::stderr().lock();
+				let read_only = tier == ToolTier::Read;
+				match self.confirm(name, read_only, detail.as_deref(), &mut stdin, &mut stderr) {
+					Ok(true) => Ok(()),
+					Ok(false) => Err(format!("approval denied for {name}")),
+					Err(err) => Err(err.to_string()),
+				}
+			},
+		}
+	}
+}
 #[cfg(test)]
 mod tests {
 	use std::io::Cursor;
@@ -165,5 +289,47 @@ mod tests {
 				.confirm("read", true, None, &mut input, &mut prompt)
 				.expect("confirm")
 		);
+	}
+
+	#[test]
+	fn arg_sensitive_classification_and_decide_tier() {
+		use serde_json::json;
+
+		// Local vs SSH paths
+		assert_eq!(classify_tool("todo", &json!({})), ToolTier::Read);
+		assert_eq!(classify_tool("glob", &json!({})), ToolTier::Read);
+		assert_eq!(
+			classify_tool("read", &json!({"path": "/local/file.txt"})),
+			ToolTier::Read
+		);
+		assert_eq!(
+			classify_tool("read", &json!({"path": "ssh://host/file.txt"})),
+			ToolTier::Exec
+		);
+		assert_eq!(
+			classify_tool("grep", &json!({"paths": ["local", "ssh://remote"]})),
+			ToolTier::Exec
+		);
+		assert_eq!(
+			classify_tool("write", &json!({"path": "file.txt"})),
+			ToolTier::Write
+		);
+		assert_eq!(
+			classify_tool("write", &json!({"path": "ssh://box/f.txt"})),
+			ToolTier::Exec
+		);
+		assert_eq!(classify_tool("bash", &json!({"command": "ls"})), ToolTier::Exec);
+		assert_eq!(classify_tool("mcp__server_tool", &json!({})), ToolTier::Exec);
+
+		// Tier decisions
+		let write_mode = approvals(ApprovalMode::Write, &[]);
+		assert_eq!(write_mode.decide_tier("read", ToolTier::Read), Decision::Auto);
+		assert_eq!(write_mode.decide_tier("write", ToolTier::Write), Decision::Ask);
+		assert_eq!(write_mode.decide_tier("bash", ToolTier::Exec), Decision::Ask);
+		assert_eq!(write_mode.decide_tier("read", ToolTier::Exec), Decision::Ask);
+
+		let allow_bash = approvals(ApprovalMode::AlwaysAsk, &["bash"]);
+		assert_eq!(allow_bash.decide_tier("bash", ToolTier::Exec), Decision::Auto);
+		assert_eq!(allow_bash.decide_tier("write", ToolTier::Write), Decision::Ask);
 	}
 }

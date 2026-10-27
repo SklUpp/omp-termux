@@ -130,7 +130,7 @@ fn malformed_tail_refuses_append() {
 	let temp = temp_dir("bad-tail");
 	let test_file = temp.join("bad_tail.jsonl");
 	fs::copy(&fixture_path, &test_file).expect("copy fixture");
-	let original = fs::read_to_string(&test_file).expect("read original");
+	let original_bytes = fs::read(&test_file).expect("read original");
 
 	let mut store = SessionStore::open(&SessionOptions {
 		enabled: true,
@@ -155,12 +155,69 @@ fn malformed_tail_refuses_append() {
 		stop_reason: "end_turn".into(),
 		tool_calls: vec![],
 	};
-	let _ = store.append_turn(&turn);
+	let result = store.append_turn(&turn);
+	assert!(result.is_err(), "append_turn on malformed tail session must return Err");
+	let err = result.unwrap_err();
+	assert!(
+		err.contains("incomplete/unclosed tail record"),
+		"append error must state exact cause: {err}"
+	);
 
 	assert_eq!(
-		fs::read_to_string(&test_file).expect("read after append attempt"),
-		original,
-		"corrupted file must never be appended to"
+		fs::read(&test_file).expect("read after append attempt"),
+		original_bytes,
+		"corrupted file must remain byte-exact unchanged"
+	);
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn malformed_entry_refuses_append() {
+	let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+		.join("tests/fixtures/malformed_entry.jsonl");
+	assert!(fixture_path.is_file(), "fixture must exist");
+
+	let temp = temp_dir("bad-entry");
+	let test_file = temp.join("bad_entry.jsonl");
+	fs::copy(&fixture_path, &test_file).expect("copy fixture");
+	let original_bytes = fs::read(&test_file).expect("read original");
+
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work/test"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("bad_entry".to_string()),
+		continue_latest: false,
+	});
+
+	assert!(!store.enabled(), "store must disable persistence on malformed entry");
+	let warnings = store.take_warnings();
+	assert!(
+		warnings.iter().any(|w| w.contains("malformed") || w.contains("corrupt")),
+		"must report warning about malformed entry: {warnings:?}"
+	);
+
+	let turn = TurnRecord {
+		prompt: "hi".into(),
+		assistant: "hello".into(),
+		stop_reason: "end_turn".into(),
+		tool_calls: vec![],
+	};
+	let result = store.append_turn(&turn);
+	assert!(result.is_err(), "append_turn on malformed entry session must return Err");
+	let err = result.unwrap_err();
+	assert!(
+		err.contains("malformed record"),
+		"append error must state exact cause: {err}"
+	);
+
+	assert_eq!(
+		fs::read(&test_file).expect("read after append attempt"),
+		original_bytes,
+		"corrupted file must remain byte-exact unchanged"
 	);
 
 	fs::remove_dir_all(temp).ok();

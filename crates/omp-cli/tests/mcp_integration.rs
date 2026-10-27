@@ -1,22 +1,24 @@
 //! Behavioral tests for MCP discovery priority, schema validation,
 //! collision warnings, disabled servers/tools, and tool execution.
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+	fs,
+	path::{Path, PathBuf},
+	sync::Arc,
+	time::{SystemTime, UNIX_EPOCH},
+};
 
-use omp_cli::approve::{ApprovalMode, Approvals};
-use omp_cli::config::{
-	Config, discover_mcp_servers_with_paths, expand_env_vars, is_valid_mcp_server_name,
-	parse_and_validate_mcp_server, parse_enabled_value,
+use omp_cli::{
+	approve::{ApprovalMode, Approvals},
+	config::{
+		Config, discover_mcp_servers_with_paths, expand_env_vars, is_valid_mcp_server_name,
+		parse_and_validate_mcp_server, parse_enabled_value,
+	},
+	runtime::{McpTool, deduplicate_mcp_tools_with_warnings, load_and_filter_mcp_tools_with_paths},
 };
-use omp_cli::runtime::{
-	McpTool, deduplicate_mcp_tools_with_warnings, load_and_filter_mcp_tools_with_paths,
-};
-use pi_agent::Tool;
-use pi_agent::mcp::{
-	MCPServerConfig, MCPStdioServerConfig, McpToolOriginSource, connect_to_server,
+use pi_agent::{
+	Tool,
+	mcp::{MCPServerConfig, MCPStdioServerConfig, McpToolOriginSource, connect_to_server},
 };
 use serde_json::json;
 
@@ -196,7 +198,8 @@ fn test_discovery_priority_and_shadowing() {
 	)
 	.expect("write .omp/.mcp.json");
 
-	// 3. agent_dir/mcp.json has s2 (echo-agent), shared (shared-agent), and agent_vs_root
+	// 3. agent_dir/mcp.json has s2 (echo-agent), shared (shared-agent), and
+	//    agent_vs_root
 	fs::write(
 		agent_dir.join("mcp.json"),
 		json!({
@@ -357,11 +360,13 @@ fn test_disabled_servers_shadowing_and_denylist() {
 	let report = discover_mcp_servers_with_paths(&cwd, &agent_dir);
 	let names: Vec<&str> = report.servers.iter().map(|s| s.name.as_str()).collect();
 
-	// shadow_disabled was shadowed by .omp's disabled entry -> must NOT be in active servers
+	// shadow_disabled was shadowed by .omp's disabled entry -> must NOT be in
+	// active servers
 	assert!(!names.contains(&"shadow_disabled"));
 	// active was denylisted by disabledServers -> must NOT be in active servers
 	assert!(!names.contains(&"active"));
-	// user_disabled cannot be forced on by project enabledServers -> must NOT be in active servers
+	// user_disabled cannot be forced on by project enabledServers -> must NOT be in
+	// active servers
 	assert!(!names.contains(&"user_disabled"));
 }
 
@@ -571,11 +576,11 @@ for line in sys.stdin:
 	.expect("write mock script");
 
 	MCPServerConfig::Stdio(MCPStdioServerConfig {
-		command: "python3".to_string(),
-		args: vec![script_path.to_str().unwrap().to_string()],
-		env: std::collections::HashMap::new(),
-		cwd: None,
-		timeout: Some(5000),
+		command:           "python3".to_string(),
+		args:              vec![script_path.to_str().unwrap().to_string()],
+		env:               std::collections::HashMap::new(),
+		cwd:               None,
+		timeout:           Some(5000),
 		request_id_format: None,
 	})
 }
@@ -604,7 +609,8 @@ fn test_tool_collision_warning_and_stable_winner() {
 	assert_eq!(tool1.name(), tool2.name());
 	assert_ne!(tool1.origin_key(), tool2.origin_key());
 
-	// Tool 2 origin key < tool 1 origin key in ASCII, so tool 2 must win regardless of order!
+	// Tool 2 origin key < tool 1 origin key in ASCII, so tool 2 must win regardless
+	// of order!
 	let (dedup1, warnings1) =
 		deduplicate_mcp_tools_with_warnings(vec![tool1.clone(), tool2.clone()]);
 	assert_eq!(dedup1.len(), 1);
@@ -636,8 +642,8 @@ fn test_approval_and_tools_filtering_and_effective_cwd() {
 
 	let _cfg = spawn_mock_stdio_server(&project_dir);
 
-	// Write .omp/mcp.json pointing to "mock_mcp.py" as relative command argument without cwd
-	// Spawn succeeds only if effective cwd is defaulted to project_dir
+	// Write .omp/mcp.json pointing to "mock_mcp.py" as relative command argument
+	// without cwd Spawn succeeds only if effective cwd is defaulted to project_dir
 	fs::write(
 		omp_dir.join("mcp.json"),
 		json!({
@@ -749,7 +755,8 @@ fn test_mcp_tool_execution_preserves_content_and_cancellation() {
 	assert!(res_err.content.contains("tool failed badly"));
 	assert!(res_err.is_error);
 
-	// 4. In-flight cancellation interrupts hang_tool (which sleeps 10s) via tokio::select!
+	// 4. In-flight cancellation interrupts hang_tool (which sleeps 10s) via
+	//    tokio::select!
 	let cancel_token = pi_agent::CancellationToken::new();
 	let ctx_cancel = pi_agent::AgentContext::with_cancellation(
 		temp_dir.path().to_path_buf(),

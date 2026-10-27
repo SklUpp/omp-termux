@@ -15,8 +15,8 @@ pub use provider::{
 	StreamChunk, ToolCallDelta, parse_sse_line, sse_stream, to_openai_messages,
 };
 pub use state::{
-	AgentConfig, AgentContext, AgentState, Message, Role, ToolCall, ToolResult, TurnResult,
-	TurnStatus,
+	AgentConfig, AgentContext, AgentState, Message, Role, ToolApprover, ToolCall, ToolResult,
+	TurnResult, TurnStatus,
 };
 pub use tokenizer::Tokenizer;
 pub use tools::{

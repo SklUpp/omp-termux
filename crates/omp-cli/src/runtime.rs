@@ -4,24 +4,29 @@
 //! [`RunRequest`]; this module maps it onto `pi-agent`'s `AgentConfig` and
 //! converts the loop's turn results back into the CLI [`Event`] stream.
 
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+	path::Path,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+};
 
 use async_trait::async_trait;
-use pi_agent::mcp::{
-	connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key,
-	MCPContent, McpConnection, MCPServerConfig, McpToolOriginSource,
-};
 use pi_agent::{
 	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, BashTool, EditTool, GlobTool,
 	GrepTool, ModelProvider, OpenAiCompatibleProvider, ReadTool, SteeringEvent, TodoTool, Tool,
 	ToolRegistry, WriteTool,
+	mcp::{
+		MCPContent, MCPServerConfig, McpConnection, McpToolOriginSource, connect_to_server,
+		create_mcp_tool_name, get_mcp_tool_origin_key,
+	},
 };
 
-use crate::agent::{AgentRunner, Event, EventStream, RunRequest};
-use crate::approve::Decision;
-use crate::{Error, Result};
+use crate::{
+	Error, Result,
+	agent::{AgentRunner, Event, EventStream, RunRequest},
+};
 
 /// Assistant-turn budget the CLI hands to the agent loop.
 pub const DEFAULT_MAX_TURNS: usize = 32;
@@ -45,7 +50,7 @@ const BUILTIN_TOOLS: [(&str, bool); 7] = [
 
 /// Synchronous `AgentRunner` that drives `pi-agent` on its own tokio runtime.
 pub struct PiAgentRunner {
-	runtime: tokio::runtime::Runtime,
+	runtime:    tokio::runtime::Runtime,
 	dispatcher: Arc<SignalDispatcher>,
 }
 
@@ -62,7 +67,7 @@ impl PiAgentRunner {
 
 struct SignalDispatcher {
 	active_turn: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SteeringEvent>>>>,
-	_handle: tokio::task::JoinHandle<()>,
+	_handle:     tokio::task::JoinHandle<()>,
 }
 
 struct TurnSignalRegistration {
@@ -178,7 +183,12 @@ impl AgentRunner for PiAgentRunner {
 			cwd,
 		};
 		let provider: Arc<dyn ModelProvider> = Arc::new(provider);
-		let agent = AgentLoop::new(config, provider, registry);
+		let agent = AgentLoop::with_approver(
+			config,
+			provider,
+			registry,
+			Arc::new(request.approvals.clone()),
+		);
 		let mut state = AgentState { messages, total_turns: 0 };
 
 		let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<Event>>(64);
@@ -376,9 +386,9 @@ impl AgentRunner for PiAgentRunner {
 					let _ = event_tx_clone
 						.send(Ok(Event::AgentEnd {
 							messages: new_messages,
-							api: Some(plan_api),
+							api:      Some(plan_api),
 							provider: Some(plan_provider),
-							model: Some(plan_model),
+							model:    Some(plan_model),
 						}))
 						.await;
 					completed_clone.store(true, Ordering::SeqCst);
@@ -424,12 +434,12 @@ impl AgentRunner for PiAgentRunner {
 
 struct StreamHandles {
 	cancellation_token: pi_agent::CancellationToken,
-	steering_tx: tokio::sync::mpsc::Sender<SteeringEvent>,
-	cancel_watcher: tokio::task::JoinHandle<()>,
-	dialog_abort: tokio::task::AbortHandle,
-	timer_handle: Option<tokio::task::JoinHandle<()>>,
-	_signal_reg: TurnSignalRegistration,
-	runtime_handle: tokio::runtime::Handle,
+	steering_tx:        tokio::sync::mpsc::Sender<SteeringEvent>,
+	cancel_watcher:     tokio::task::JoinHandle<()>,
+	dialog_abort:       tokio::task::AbortHandle,
+	timer_handle:       Option<tokio::task::JoinHandle<()>>,
+	_signal_reg:        TurnSignalRegistration,
+	runtime_handle:     tokio::runtime::Handle,
 }
 
 impl Drop for StreamHandles {
@@ -449,10 +459,10 @@ impl Drop for StreamHandles {
 }
 
 struct BoundedEventStream {
-	rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<Event>>>>,
-	completed: Arc<AtomicBool>,
+	rx:                    Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<Result<Event>>>>,
+	completed:             Arc<AtomicBool>,
 	yielded_closure_error: bool,
-	_handles: Arc<StreamHandles>,
+	_handles:              Arc<StreamHandles>,
 }
 
 impl Iterator for BoundedEventStream {
@@ -490,20 +500,20 @@ impl Iterator for BoundedEventStream {
 
 /// Provider/model/budget resolution from a [`RunRequest`].
 struct RunPlan {
-	base_url: String,
-	api_key: String,
-	api: String,
-	provider: String,
-	model: String,
-	effort: Option<String>,
-	max_turns: usize,
+	base_url:      String,
+	api_key:       String,
+	api:           String,
+	provider:      String,
+	model:         String,
+	effort:        Option<String>,
+	max_turns:     usize,
 	context_limit: usize,
 	system_prompt: Option<String>,
-	tools: Vec<&'static str>,
+	tools:         Vec<&'static str>,
 }
 
 impl RunPlan {
-	#[allow(dead_code)]
+	#[allow(dead_code, reason = "backwards-compatible resolve helper for tests")]
 	pub fn resolve(request: &RunRequest) -> Result<Self> {
 		Self::resolve_with_mcp(request, false)
 	}
@@ -595,7 +605,8 @@ impl RunPlan {
 	}
 }
 
-/// Trailing `:effort` selector (`:high`, `:xhi`, …) is not part of the model id.
+/// Trailing `:effort` selector (`:high`, `:xhi`, …) is not part of the model
+/// id.
 const EFFORT_SELECTORS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 fn split_effort(model: &str) -> (&str, Option<&str>) {
@@ -618,24 +629,17 @@ fn split_effort(model: &str) -> (&str, Option<&str>) {
 	(id, Some(selector))
 }
 
-/// Tools the model may call, derived from the approval matrix.
-fn allowed_tools(request: &RunRequest, has_mcp_tools: bool) -> Result<Vec<&'static str>> {
+/// Tools the model may call, preserving explicit configuration restrictions.
+fn allowed_tools(request: &RunRequest, _has_mcp_tools: bool) -> Result<Vec<&'static str>> {
 	if !request.tools_enabled {
 		return Ok(Vec::new());
 	}
 	let mut tools: Vec<&'static str> = BUILTIN_TOOLS
 		.iter()
-		.filter(|(name, read_only)| request.approvals.decide(name, *read_only) == Decision::Auto)
 		.map(|(name, _)| *name)
 		.collect();
 	if let Some(allowed) = &request.config.tools {
 		tools.retain(|name| allowed.iter().any(|a| a == *name));
-	}
-	if tools.is_empty() && !has_mcp_tools {
-		return Err(Error::new(
-			"approval gating requires --yolo in this build: pi-agent has no approval hook, so \
-			 --approval-mode always-ask needs --allow <tool> to offer any tool",
-		));
 	}
 	tools.sort_unstable();
 	Ok(tools)
@@ -676,12 +680,12 @@ pub fn build_registry_with_mcp(
 /// Dynamic MCP tool implementing pi-agent's `Tool` trait.
 #[derive(Clone)]
 pub struct McpTool {
-	name: String,
+	name:        String,
 	description: String,
 	server_name: String,
-	tool_name: String,
-	schema: serde_json::Value,
-	connection: Arc<McpConnection>,
+	tool_name:   String,
+	schema:      serde_json::Value,
+	connection:  Arc<McpConnection>,
 }
 
 impl std::fmt::Debug for McpTool {
@@ -759,8 +763,8 @@ impl Tool for McpTool {
 		if ctx.cancellation_token.is_cancelled() {
 			return Ok(pi_agent::ToolResult {
 				tool_call_id: String::new(),
-				content: format!("MCP tool {} cancelled", self.name),
-				is_error: true,
+				content:      format!("MCP tool {} cancelled", self.name),
+				is_error:     true,
 			});
 		}
 
@@ -845,7 +849,8 @@ pub fn deduplicate_mcp_tools_with_warnings(tools: Vec<McpTool>) -> (Vec<McpTool>
 			};
 
 			let msg = format!(
-				"MCP tool name collision; keeping stable winner: name=\"{}\", kept=\"{}/{}\", ignored=\"{}/{}\"",
+				"MCP tool name collision; keeping stable winner: name=\"{}\", kept=\"{}/{}\", \
+				 ignored=\"{}/{}\"",
 				tool.name(),
 				winner.server_name(),
 				winner.tool_name(),
@@ -922,13 +927,8 @@ pub async fn filter_and_spawn_mcp_servers(
 
 		for def in tool_defs {
 			let desc = def.description.as_deref().unwrap_or("");
-			let mcp_tool = McpTool::new(
-				&server.name,
-				&def.name,
-				desc,
-				def.input_schema,
-				Arc::clone(&conn),
-			);
+			let mcp_tool =
+				McpTool::new(&server.name, &def.name, desc, def.input_schema, Arc::clone(&conn));
 			all_tools.push(mcp_tool);
 		}
 	}
@@ -936,8 +936,7 @@ pub async fn filter_and_spawn_mcp_servers(
 	let mut unique_tools = deduplicate_mcp_tools_with_warning(all_tools);
 
 	if let Some(requested_tools) = &config.tools {
-		let mut known_tools: Vec<String> =
-			BUILTIN_TOOLS.iter().map(|(n, _)| n.to_string()).collect();
+		let mut known_tools: Vec<String> = BUILTIN_TOOLS.iter().map(|(n, _)| n.to_string()).collect();
 		for tool in &unique_tools {
 			known_tools.push(tool.name().to_string());
 		}
@@ -958,9 +957,7 @@ pub async fn filter_and_spawn_mcp_servers(
 
 		unique_tools.retain(|tool| requested_tools.iter().any(|allowed| allowed == tool.name()));
 	}
-
-	unique_tools.retain(|tool| approvals.decide(tool.name(), false) == Decision::Auto);
-
+	let _ = approvals;
 	Ok(unique_tools)
 }
 
@@ -1026,8 +1023,8 @@ fn history_messages(history: &[crate::session::TurnRecord]) -> Vec<pi_agent::Mes
 					.tool_calls
 					.iter()
 					.map(|call| pi_agent::ToolCall {
-						id: call.id.clone(),
-						name: call.name.clone(),
+						id:        call.id.clone(),
+						name:      call.name.clone(),
 						arguments: call.arguments.clone(),
 					})
 					.collect();
@@ -1058,8 +1055,8 @@ fn history_messages(history: &[crate::session::TurnRecord]) -> Vec<pi_agent::Mes
 			.tool_calls
 			.iter()
 			.map(|call| pi_agent::ToolCall {
-				id: call.id.clone(),
-				name: call.name.clone(),
+				id:        call.id.clone(),
+				name:      call.name.clone(),
 				arguments: call.arguments.clone(),
 			})
 			.collect();
@@ -1083,51 +1080,50 @@ fn history_messages(history: &[crate::session::TurnRecord]) -> Vec<pi_agent::Mes
 
 #[cfg(test)]
 mod tests {
-	use std::collections::BTreeMap;
-	use std::path::PathBuf;
+	use std::{collections::BTreeMap, path::PathBuf};
 
 	use super::*;
-	use crate::approve::{ApprovalMode, Approvals};
-	use crate::catalog::{Catalog, ModelInfo};
-	use crate::config::{Config, ProviderConfig};
-	use crate::output::OutputMode;
-	use crate::prompts::ContextFile;
-	use crate::skills::Skill;
+	use crate::{
+		approve::{ApprovalMode, Approvals},
+		catalog::{Catalog, ModelInfo},
+		config::{Config, ProviderConfig},
+		output::OutputMode,
+		prompts::ContextFile,
+		skills::Skill,
+	};
 
 	fn catalog() -> Catalog {
 		let mut providers = BTreeMap::new();
 		let mut models = BTreeMap::new();
-		models.insert(
-			"llama3".to_string(),
-			ModelInfo { provider: "local".to_string(), context_window: Some(8_192) },
-		);
+		models.insert("llama3".to_string(), ModelInfo {
+			provider:       "local".to_string(),
+			context_window: Some(8_192),
+		});
 		providers.insert("local".to_string(), models);
 		Catalog { providers, connections: BTreeMap::new(), source: PathBuf::from("test-models.json") }
 	}
 
 	fn catalog_with_connection(provider: &str, base_url: &str, api_key: Option<&str>) -> Catalog {
 		let mut catalog = catalog();
-		catalog.connections.insert(
-			provider.to_string(),
-			ProviderConfig {
+		catalog
+			.connections
+			.insert(provider.to_string(), ProviderConfig {
 				base_url: Some(base_url.to_string()),
 				api_key: api_key.map(str::to_string),
 				..ProviderConfig::default()
-			},
-		);
+			});
 		catalog
 	}
 
 	fn request(approvals: Approvals) -> RunRequest {
 		let mut config = Config::default();
-		config.providers.insert(
-			"local".to_string(),
-			ProviderConfig {
+		config
+			.providers
+			.insert("local".to_string(), ProviderConfig {
 				base_url: Some("http://127.0.0.1:8080/v1".to_string()),
 				api_key: Some("sk-test".to_string()),
 				..ProviderConfig::default()
-			},
-		);
+			});
 		RunRequest {
 			prompt: "fix the build".to_string(),
 			cwd: PathBuf::from("/work"),
@@ -1138,14 +1134,14 @@ mod tests {
 			system_prompt: Some("base prompt".to_string()),
 			append_system_prompt: Some("appended".to_string()),
 			context_files: vec![ContextFile {
-				path: PathBuf::from("/work/.omp/AGENTS.md"),
+				path:    PathBuf::from("/work/.omp/AGENTS.md"),
 				content: "repo rules".to_string(),
 			}],
 			skills: vec![Skill {
-				name: "review".to_string(),
+				name:        "review".to_string(),
 				description: "review code".to_string(),
-				path: PathBuf::from("/work/.omp/skills/review/SKILL.md"),
-				body: "skill body".to_string(),
+				path:        PathBuf::from("/work/.omp/skills/review/SKILL.md"),
+				body:        "skill body".to_string(),
 			}],
 			config,
 			catalog: Arc::new(catalog()),
@@ -1287,21 +1283,21 @@ mod tests {
 	}
 
 	#[test]
-	fn write_mode_offers_read_only_tools_only() {
+	fn write_mode_offers_all_tools() {
 		let plan =
 			RunPlan::resolve(&request(Approvals::new(ApprovalMode::Write, Vec::new()))).expect("plan");
-		assert_eq!(plan.tools, ["glob", "grep", "read"]);
+		assert_eq!(plan.tools, ["bash", "edit", "glob", "grep", "read", "todo", "write"]);
 	}
 
 	#[test]
-	fn always_ask_needs_an_explicit_allow() {
-		let err = RunPlan::resolve(&request(Approvals::new(ApprovalMode::AlwaysAsk, Vec::new())))
-			.err()
-			.expect("gating impossible");
-		assert!(err.to_string().contains("approval gating requires --yolo"));
+	fn always_ask_offers_all_tools() {
+		let plan = RunPlan::resolve(&request(Approvals::new(ApprovalMode::AlwaysAsk, Vec::new())))
+			.expect("plan");
+		assert_eq!(plan.tools, ["bash", "edit", "glob", "grep", "read", "todo", "write"]);
 
-		let allowed = Approvals::new(ApprovalMode::AlwaysAsk, ["bash".to_string()]);
-		let plan = RunPlan::resolve(&request(allowed)).expect("plan");
+		let mut req = request(Approvals::new(ApprovalMode::AlwaysAsk, Vec::new()));
+		req.config.tools = Some(vec!["bash".to_string()]);
+		let plan = RunPlan::resolve(&req).expect("plan");
 		assert_eq!(plan.tools, ["bash"]);
 	}
 
@@ -1316,15 +1312,15 @@ mod tests {
 	#[test]
 	fn history_turns_become_pi_agent_messages() {
 		let history = vec![crate::session::TurnRecord {
-			prompt: "fix".to_string(),
-			assistant: "done".to_string(),
+			prompt:      "fix".to_string(),
+			assistant:   "done".to_string(),
 			stop_reason: "end_turn".to_string(),
-			tool_calls: vec![crate::session::ToolCallRecord {
-				id: "call-1".to_string(),
-				name: "read".to_string(),
+			tool_calls:  vec![crate::session::ToolCallRecord {
+				id:        "call-1".to_string(),
+				name:      "read".to_string(),
 				arguments: serde_json::json!({"path": "a.txt"}),
-				result: "contents".to_string(),
-				is_error: false,
+				result:    "contents".to_string(),
+				is_error:  false,
 			}],
 		}];
 		let messages = history_messages(&history);
@@ -1342,10 +1338,10 @@ mod tests {
 	#[test]
 	fn history_messages_excludes_aborted_assistant_without_tools() {
 		let history = vec![crate::session::TurnRecord {
-			prompt: "fix".to_string(),
-			assistant: "partial output".to_string(),
+			prompt:      "fix".to_string(),
+			assistant:   "partial output".to_string(),
 			stop_reason: "aborted".to_string(),
-			tool_calls: vec![],
+			tool_calls:  vec![],
 		}];
 		let messages = history_messages(&history);
 		assert_eq!(messages.len(), 1);
@@ -1356,15 +1352,15 @@ mod tests {
 	#[test]
 	fn history_messages_keeps_aborted_assistant_with_tool_batch_results() {
 		let history = vec![crate::session::TurnRecord {
-			prompt: "fix".to_string(),
-			assistant: "partial answer that should be excluded".to_string(),
+			prompt:      "fix".to_string(),
+			assistant:   "partial answer that should be excluded".to_string(),
 			stop_reason: "aborted".to_string(),
-			tool_calls: vec![crate::session::ToolCallRecord {
-				id: "call-1".to_string(),
-				name: "read".to_string(),
+			tool_calls:  vec![crate::session::ToolCallRecord {
+				id:        "call-1".to_string(),
+				name:      "read".to_string(),
 				arguments: serde_json::json!({"path": "a.txt"}),
-				result: "[Tool execution interrupted by user]".to_string(),
-				is_error: true,
+				result:    "[Tool execution interrupted by user]".to_string(),
+				is_error:  true,
 			}],
 		}];
 		let messages = history_messages(&history);
@@ -1380,15 +1376,15 @@ mod tests {
 	#[test]
 	fn history_messages_preserves_failed_tool_status_and_name() {
 		let history = vec![crate::session::TurnRecord {
-			prompt: "run command".to_string(),
-			assistant: "running".to_string(),
+			prompt:      "run command".to_string(),
+			assistant:   "running".to_string(),
 			stop_reason: "stop".to_string(),
-			tool_calls: vec![crate::session::ToolCallRecord {
-				id: "call-err-1".to_string(),
-				name: "bash".to_string(),
+			tool_calls:  vec![crate::session::ToolCallRecord {
+				id:        "call-err-1".to_string(),
+				name:      "bash".to_string(),
 				arguments: serde_json::json!({"command": "false"}),
-				result: "exit code 1".to_string(),
-				is_error: true,
+				result:    "exit code 1".to_string(),
+				is_error:  true,
 			}],
 		}];
 		let messages = history_messages(&history);
@@ -1403,15 +1399,15 @@ mod tests {
 	#[test]
 	fn history_messages_preserves_aborted_failed_tool_status_and_name() {
 		let history = vec![crate::session::TurnRecord {
-			prompt: "run command".to_string(),
-			assistant: "running".to_string(),
+			prompt:      "run command".to_string(),
+			assistant:   "running".to_string(),
 			stop_reason: "aborted".to_string(),
-			tool_calls: vec![crate::session::ToolCallRecord {
-				id: "call-err-2".to_string(),
-				name: "fetch".to_string(),
+			tool_calls:  vec![crate::session::ToolCallRecord {
+				id:        "call-err-2".to_string(),
+				name:      "fetch".to_string(),
 				arguments: serde_json::json!({"url": "http://invalid"}),
-				result: "[Tool execution interrupted by user]".to_string(),
-				is_error: true,
+				result:    "[Tool execution interrupted by user]".to_string(),
+				is_error:  true,
 			}],
 		}];
 		let messages = history_messages(&history);
@@ -1456,14 +1452,13 @@ mod tests {
 		let addr = addr_rx.recv().unwrap();
 		let mut req = request(yolo());
 		req.cwd = std::env::temp_dir();
-		req.config.providers.insert(
-			"local".to_string(),
-			ProviderConfig {
+		req.config
+			.providers
+			.insert("local".to_string(), ProviderConfig {
 				base_url: Some(format!("http://{addr}/v1")),
 				api_key: Some("sk-test".to_string()),
 				..ProviderConfig::default()
-			},
-		);
+			});
 		req.max_time = Some(std::time::Duration::from_millis(150));
 
 		let runner = PiAgentRunner::new().expect("runner");
@@ -1509,14 +1504,13 @@ mod tests {
 
 		let addr = addr_rx.recv().unwrap();
 		let mut req = request(yolo());
-		req.config.providers.insert(
-			"local".to_string(),
-			ProviderConfig {
+		req.config
+			.providers
+			.insert("local".to_string(), ProviderConfig {
 				base_url: Some(format!("http://{addr}/v1")),
 				api_key: Some("sk-test".to_string()),
 				..ProviderConfig::default()
-			},
-		);
+			});
 
 		let runner = PiAgentRunner::new().expect("runner");
 		let mut stream = runner.run(&req).expect("stream");
@@ -1569,14 +1563,13 @@ mod tests {
 
 		let addr = addr_rx.recv().unwrap();
 		let mut req = request(yolo());
-		req.config.providers.insert(
-			"local".to_string(),
-			ProviderConfig {
+		req.config
+			.providers
+			.insert("local".to_string(), ProviderConfig {
 				base_url: Some(format!("http://{addr}/v1")),
 				api_key: Some("sk-test".to_string()),
 				..ProviderConfig::default()
-			},
-		);
+			});
 		req.max_time = Some(std::time::Duration::from_millis(150));
 
 		let runner = PiAgentRunner::new().expect("runner");
@@ -1620,14 +1613,13 @@ mod tests {
 
 		let addr = addr_rx.recv().unwrap();
 		let mut req = request(yolo());
-		req.config.providers.insert(
-			"local".to_string(),
-			ProviderConfig {
+		req.config
+			.providers
+			.insert("local".to_string(), ProviderConfig {
 				base_url: Some(format!("http://{addr}/v1")),
 				api_key: Some("sk-test".to_string()),
 				..ProviderConfig::default()
-			},
-		);
+			});
 
 		let runner = PiAgentRunner::new().expect("runner");
 		let mut stream = runner.run(&req).expect("stream");
@@ -1664,14 +1656,13 @@ mod tests {
 
 		let addr = addr_rx.recv().unwrap();
 		let mut req = request(yolo());
-		req.config.providers.insert(
-			"local".to_string(),
-			ProviderConfig {
+		req.config
+			.providers
+			.insert("local".to_string(), ProviderConfig {
 				base_url: Some(format!("http://{addr}/v1")),
 				api_key: Some("sk-test".to_string()),
 				..ProviderConfig::default()
-			},
-		);
+			});
 		let cancel_token = pi_agent::CancellationToken::new();
 		req.cancellation_token = Some(cancel_token.clone());
 

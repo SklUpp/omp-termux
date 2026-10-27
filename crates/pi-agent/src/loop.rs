@@ -8,8 +8,8 @@ use crate::{
 	compaction::Compactor,
 	provider::{ModelProvider, ProviderError, StreamAssembler},
 	state::{
-		AgentConfig, AgentContext, AgentState, Message, Role, ToolCall, ToolResult, TurnResult,
-		TurnStatus,
+		AgentConfig, AgentContext, AgentState, Message, Role, ToolApprover, ToolCall, ToolResult,
+		TurnResult, TurnStatus,
 	},
 	tools::{registry::ToolRegistry, scheduler::ToolScheduler},
 };
@@ -109,6 +109,15 @@ impl AgentLoop {
 		Self { config, provider, scheduler, registry }
 	}
 
+	pub fn with_approver(
+		config: AgentConfig,
+		provider: Arc<dyn ModelProvider>,
+		registry: ToolRegistry,
+		approver: Arc<dyn ToolApprover>,
+	) -> Self {
+		let scheduler = ToolScheduler::with_approver(registry.clone(), approver);
+		Self { config, provider, scheduler, registry }
+	}
 	/// Run turns without emitting live events.
 	pub async fn run_dialog(
 		&self,
@@ -155,8 +164,11 @@ impl AgentLoop {
 		state.messages.push(Message::user(user_input));
 
 		let cancellation_token = CancellationToken::new();
-		let ctx =
-			AgentContext::with_cancellation(self.config.cwd.clone(), cancellation_token.clone());
+		let ctx = AgentContext::with_approver(
+			self.config.cwd.clone(),
+			cancellation_token.clone(),
+			self.scheduler.approver().cloned(),
+		);
 		let mut turn_results = Vec::new();
 
 		while state.total_turns < self.config.max_turns {

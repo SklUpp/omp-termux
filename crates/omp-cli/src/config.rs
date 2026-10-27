@@ -3,10 +3,11 @@
 //! Only the runtime subset the headless binary consumes is modelled; unknown
 //! root keys are ignored because the file is shared with the full TS app.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+	collections::{BTreeMap, HashMap, HashSet},
+	env, fs,
+	path::{Path, PathBuf},
+};
 
 use pi_agent::mcp::{
 	MCPHttpServerConfig, MCPServerConfig, MCPSseServerConfig, MCPStdioServerConfig, RequestIdFormat,
@@ -28,10 +29,10 @@ pub struct ProviderConfig {
 	pub base_url: Option<String>,
 	/// Env var name when it names one, otherwise a literal key. Resolution
 	/// happens in [`Config::resolve_api_key`].
-	pub api_key: Option<String>,
-	pub api: Option<String>,
-	pub auth: Option<String>,
-	pub headers: BTreeMap<String, String>,
+	pub api_key:  Option<String>,
+	pub api:      Option<String>,
+	pub auth:     Option<String>,
+	pub headers:  BTreeMap<String, String>,
 }
 
 impl ProviderConfig {
@@ -62,16 +63,16 @@ impl ProviderConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
-	pub default_model: Option<String>,
-	pub providers: BTreeMap<String, ProviderConfig>,
-	pub system_prompt: Option<String>,
+	pub default_model:        Option<String>,
+	pub providers:            BTreeMap<String, ProviderConfig>,
+	pub system_prompt:        Option<String>,
 	pub append_system_prompt: Option<String>,
-	pub approval_mode: Option<ApprovalMode>,
-	pub allow: Vec<String>,
-	pub cwd: Option<PathBuf>,
-	pub tools: Option<Vec<String>>,
+	pub approval_mode:        Option<ApprovalMode>,
+	pub allow:                Vec<String>,
+	pub cwd:                  Option<PathBuf>,
+	pub tools:                Option<Vec<String>>,
 	/// Paths that contributed, base first.
-	pub sources: Vec<PathBuf>,
+	pub sources:              Vec<PathBuf>,
 }
 
 impl Config {
@@ -173,7 +174,8 @@ impl Config {
 	}
 }
 
-/// `~/.omp/agent/config.yml`, falling back to `.yaml`; `None` when neither exists.
+/// `~/.omp/agent/config.yml`, falling back to `.yaml`; `None` when neither
+/// exists.
 #[must_use]
 pub fn base_path() -> Option<PathBuf> {
 	let dir = dirs::agent_dir();
@@ -284,19 +286,19 @@ fn invalid(path: &Path, key: &str, expected: &str) -> Error {
 /// Discovered MCP server configuration with its declaration source.
 #[derive(Debug, Clone)]
 pub struct DiscoveredMcpServer {
-	pub name: String,
-	pub config: MCPServerConfig,
+	pub name:        String,
+	pub config:      MCPServerConfig,
 	pub source_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct McpDiscoveryReport {
-	pub servers: Vec<DiscoveredMcpServer>,
+	pub servers:  Vec<DiscoveredMcpServer>,
 	pub warnings: Vec<String>,
 }
 
-/// Validate server name against packages/coding-agent/src/config/mcp-schema.json:
-/// ^[a-zA-Z0-9_.-]{1,100}$
+/// Validate server name against
+/// packages/coding-agent/src/config/mcp-schema.json: ^[a-zA-Z0-9_.-]{1,100}$
 #[must_use]
 pub fn is_valid_mcp_server_name(name: &str) -> bool {
 	if name.is_empty() || name.len() > 100 {
@@ -370,8 +372,9 @@ pub fn expand_env_vars_deep(val: &serde_json::Value) -> serde_json::Value {
 	}
 }
 
-/// Validate enabled value: coerce boolean, coerce string "true"/"false"/"1"/"0", warn on other types.
-/// Returns (normalized_enabled, optional_warning).
+/// Validate enabled value: coerce boolean, coerce string
+/// "true"/"false"/"1"/"0", warn on other types. Returns (normalized_enabled,
+/// optional_warning).
 pub fn parse_enabled_value(val: Option<&serde_json::Value>) -> (Option<bool>, Option<String>) {
 	match val {
 		None | Some(serde_json::Value::Null) => (None, None),
@@ -390,7 +393,8 @@ pub fn parse_enabled_value(val: Option<&serde_json::Value>) -> (Option<bool>, Op
 	}
 }
 
-/// Validate raw JSON value against MCP server schema and construct `MCPServerConfig`.
+/// Validate raw JSON value against MCP server schema and construct
+/// `MCPServerConfig`.
 pub fn parse_and_validate_mcp_server(
 	name: &str,
 	val: &serde_json::Value,
@@ -620,7 +624,8 @@ pub fn discover_mcp_servers_with_paths(cwd: &Path, agent_dir: &Path) -> McpDisco
 	let mut report = McpDiscoveryReport::default();
 	let mut seen_paths = HashSet::new();
 
-	// Step 1: Collect user-level disabledServers and enabledServers ONLY from agent_dir configs
+	// Step 1: Collect user-level disabledServers and enabledServers ONLY from
+	// agent_dir configs
 	let mut disabled_servers = HashSet::new();
 	let mut forced_enabled_servers = HashSet::new();
 	let user_candidate_paths = [agent_dir.join("mcp.json"), agent_dir.join(".mcp.json")];
@@ -756,11 +761,13 @@ mod tests {
 	#[test]
 	fn later_overlay_wins_per_scalar_and_per_provider_field() {
 		let mut base = parse_config(
-			"defaultModel: a\nproviders:\n  openai:\n    baseUrl: https://one\n    apiKey: ONE_KEY\nallow: [read]\n",
+			"defaultModel: a\nproviders:\n  openai:\n    baseUrl: https://one\n    apiKey: \
+			 ONE_KEY\nallow: [read]\n",
 		)
 		.expect("base");
 		let overlay = parse_config(
-			"defaultModel: b\nproviders:\n  openai:\n    baseUrl: https://two\n    headers:\n      X-Test: '1'\nallow: [bash, edit]\n",
+			"defaultModel: b\nproviders:\n  openai:\n    baseUrl: https://two\n    headers:\n      \
+			 X-Test: '1'\nallow: [bash, edit]\n",
 		)
 		.expect("overlay");
 		base.merge(overlay);

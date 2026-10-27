@@ -1,8 +1,8 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
-
 /// Role of a message in context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -144,20 +144,62 @@ pub struct AgentConfig {
 }
 
 /// Shared context accessible to tools and execution loop.
-#[derive(Debug, Clone)]
+/// Tool approval gate checked prior to executing side-effecting operations.
+#[async_trait]
+pub trait ToolApprover: Send + Sync {
+	async fn approve(&self, name: &str, args: &serde_json::Value) -> Result<(), String>;
+}
+
+/// Shared context accessible to tools and execution loop.
+#[derive(Clone)]
 pub struct AgentContext {
 	pub cwd: PathBuf,
 	pub env: HashMap<String, String>,
 	pub cancellation_token: CancellationToken,
+	pub approver: Option<Arc<dyn ToolApprover>>,
+}
+
+impl std::fmt::Debug for AgentContext {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("AgentContext")
+			.field("cwd", &self.cwd)
+			.field("env", &self.env)
+			.field("cancellation_token", &self.cancellation_token)
+			.field("has_approver", &self.approver.is_some())
+			.finish()
+	}
 }
 
 impl AgentContext {
 	pub fn new(cwd: PathBuf) -> Self {
-		Self { cwd, env: std::env::vars().collect(), cancellation_token: CancellationToken::new() }
+		Self {
+			cwd,
+			env: std::env::vars().collect(),
+			cancellation_token: CancellationToken::new(),
+			approver: None,
+		}
 	}
 
 	pub fn with_cancellation(cwd: PathBuf, cancellation_token: CancellationToken) -> Self {
-		Self { cwd, env: std::env::vars().collect(), cancellation_token }
+		Self {
+			cwd,
+			env: std::env::vars().collect(),
+			cancellation_token,
+			approver: None,
+		}
+	}
+
+	pub fn with_approver(
+		cwd: PathBuf,
+		cancellation_token: CancellationToken,
+		approver: Option<Arc<dyn ToolApprover>>,
+	) -> Self {
+		Self {
+			cwd,
+			env: std::env::vars().collect(),
+			cancellation_token,
+			approver,
+		}
 	}
 }
 
