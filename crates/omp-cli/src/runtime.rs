@@ -1542,7 +1542,7 @@ pub fn history_messages(history: &[crate::session::TurnRecord]) -> Result<Vec<pi
 			));
 		}
 	}
-	messages
+	Ok(messages)
 }
 
 #[cfg(test)]

@@ -1844,7 +1844,10 @@ async fn unsupported_image_provider_rejects_clearly() {
 		err
 	);
 
-	let stream_err = provider.stream(&[msg.clone()], &[]).await.unwrap_err();
+	let stream_err = match provider.stream(&[msg.clone()], &[]).await {
+		Err(err) => err,
+		Ok(_) => panic!("expected UnsupportedImage error on stream"),
+	};
 	assert!(
 		matches!(stream_err, ProviderError::UnsupportedImage(_)),
 		"expected UnsupportedImage error on stream, got: {:?}",
