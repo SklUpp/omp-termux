@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::approve::ApprovalMode;
 use crate::output::OutputMode;
@@ -22,74 +22,78 @@ const DURATION_UNITS: [(char, f64); 3] = [('s', 1.0), ('m', 60.0), ('h', 3_600.0
 	long_about = None,
 	disable_help_subcommand = true
 )]
-pub struct Cli {
+struct RawCli {
 	/// Prompt text; repeated positionals run as sequential turns.
 	#[arg(value_name = "PROMPT")]
-	pub prompt: Vec<String>,
+	prompt: Vec<String>,
+
+	/// Operands given after the `--` end-of-options marker.
+	#[arg(last = true, allow_hyphen_values = true, hide = true)]
+	trailing: Vec<String>,
 
 	/// Non-interactive single-shot output (the default when a prompt is given).
 	#[arg(short = 'p', long)]
-	pub print: bool,
+	print: bool,
 
 	/// Output format.
 	#[arg(long, value_enum, default_value = "text")]
-	pub mode: OutputMode,
+	mode: OutputMode,
 
 	/// Working directory for the session.
 	#[arg(long, value_name = "DIR")]
-	pub cwd: Option<PathBuf>,
+	cwd: Option<PathBuf>,
 
 	/// Model id (`provider/model` or bare id).
 	#[arg(long)]
-	pub model: Option<String>,
+	model: Option<String>,
 
 	/// Provider id.
 	#[arg(long)]
-	pub provider: Option<String>,
+	provider: Option<String>,
 
 	/// Provider API key (literal, not an env var name).
 	#[arg(long = "api-key", value_name = "KEY")]
-	pub api_key: Option<String>,
+	api_key: Option<String>,
 
 	/// System prompt text, or a path to a file.
 	#[arg(long = "system-prompt", value_name = "TEXT|FILE")]
-	pub system_prompt: Option<String>,
+	system_prompt: Option<String>,
 
 	/// Text or file appended to the system prompt.
 	#[arg(long = "append-system-prompt", value_name = "TEXT|FILE")]
-	pub append_system_prompt: Option<String>,
+	append_system_prompt: Option<String>,
 
 	/// Turn deadline: seconds or a duration such as `5s`, `10m`, `1h`.
 	#[arg(long = "max-time", value_name = "DURATION", value_parser = parse_max_time)]
-	pub max_time: Option<Duration>,
+	max_time: Option<Duration>,
 
 	/// Disable every tool.
 	#[arg(long = "no-tools")]
-	pub no_tools: bool,
+	no_tools: bool,
 
 	/// Only enable these tools (comma-separated or repeatable).
 	#[arg(long, value_delimiter = ',', value_name = "TOOLS")]
-	pub tools: Option<Vec<String>>,
+	tools: Option<Vec<String>>,
 
 	/// When to ask before running a tool.
 	#[arg(long = "approval-mode", value_enum, value_name = "MODE")]
-	pub approval_mode: Option<ApprovalMode>,
+	approval_mode: Option<ApprovalMode>,
 
 	/// Auto-approve every tool (same as `--approval-mode yolo`).
 	#[arg(long = "yolo", alias = "auto-approve", conflicts_with = "approval_mode")]
-	pub yolo: bool,
+	yolo: bool,
 
 	/// Auto-approve a tool by name (repeatable).
 	#[arg(long = "allow", value_name = "TOOL")]
-	pub allow: Vec<String>,
+	allow: Vec<String>,
 
 	/// Additional config overlay (repeatable, later files win).
 	#[arg(long, value_name = "PATH")]
-	pub config: Vec<PathBuf>,
+	config: Vec<PathBuf>,
 
 	/// Resume the newest session in the session directory.
 	#[arg(short = 'c', long = "continue")]
-	pub continue_session: bool,
+	continue_session: bool,
 
 	/// Resume a session (by ID prefix, path, or interactive picker if omitted).
 	#[arg(
@@ -100,61 +104,264 @@ pub struct Cli {
 		default_missing_value = "",
 		value_name = "SELECTOR"
 	)]
-	pub resume: Option<String>,
+	resume: Option<String>,
 
 	/// Fork an existing session into a new session log.
 	#[arg(long = "fork", value_name = "SELECTOR")]
-	pub fork: Option<String>,
+	fork: Option<String>,
 
 	/// Import a Claude Code session into OMP.
 	#[arg(long = "from-claude")]
-	pub from_claude: bool,
+	from_claude: bool,
 
 	/// Import an OpenAI Codex session into OMP.
 	#[arg(long = "from-codex")]
-	pub from_codex: bool,
+	from_codex: bool,
 
 	/// Provider-specific session ID.
 	#[arg(long = "provider-session-id", value_name = "ID")]
-	pub provider_session_id: Option<String>,
+	provider_session_id: Option<String>,
 
 	/// Provider prompt cache key.
 	#[arg(long = "prompt-cache-key", value_name = "KEY")]
-	pub prompt_cache_key: Option<String>,
+	prompt_cache_key: Option<String>,
 
 	/// Disable session title generation.
 	#[arg(long = "no-title")]
-	pub no_title: bool,
+	no_title: bool,
 
 	/// Directory holding session logs (default: ~/.omp/agent/sessions/omp-cli).
 	#[arg(long = "session-dir", value_name = "DIR")]
-	pub session_dir: Option<PathBuf>,
+	session_dir: Option<PathBuf>,
 
 	/// Session id to create or resume.
 	#[arg(long = "session-id", value_name = "ID")]
-	pub session_id: Option<String>,
+	session_id: Option<String>,
 
 	/// Do not read or write session logs.
 	#[arg(long = "no-session")]
-	pub no_session: bool,
+	no_session: bool,
 
 	/// Discover no skills.
 	#[arg(long = "no-skills")]
-	pub no_skills: bool,
+	no_skills: bool,
 
 	/// Only load skills matching this glob (comma-separated or repeatable).
 	#[arg(long, value_delimiter = ',', value_name = "GLOB")]
-	pub skills: Vec<String>,
+	skills: Vec<String>,
 
 	#[command(subcommand)]
+	command: Option<Command>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cli {
+	/// Prompt text; repeated positionals run as sequential turns.
+	pub prompt: Vec<String>,
+
+	/// Attached file arguments (`@file`).
+	pub file_args: Vec<String>,
+
+	/// Non-interactive single-shot output (the default when a prompt is given).
+	pub print: bool,
+
+	/// Output format.
+	pub mode: OutputMode,
+
+	/// Working directory for the session.
+	pub cwd: Option<PathBuf>,
+
+	/// Model id (`provider/model` or bare id).
+	pub model: Option<String>,
+
+	/// Provider id.
+	pub provider: Option<String>,
+
+	/// Provider API key (literal, not an env var name).
+	pub api_key: Option<String>,
+
+	/// System prompt text, or a path to a file.
+	pub system_prompt: Option<String>,
+
+	/// Text or file appended to the system prompt.
+	pub append_system_prompt: Option<String>,
+
+	/// Turn deadline: seconds or a duration such as `5s`, `10m`, `1h`.
+	pub max_time: Option<Duration>,
+
+	/// Disable every tool.
+	pub no_tools: bool,
+
+	/// Only enable these tools (comma-separated or repeatable).
+	pub tools: Option<Vec<String>>,
+
+	/// When to ask before running a tool.
+	pub approval_mode: Option<ApprovalMode>,
+
+	/// Auto-approve every tool (same as `--approval-mode yolo`).
+	pub yolo: bool,
+
+	/// Auto-approve a tool by name (repeatable).
+	pub allow: Vec<String>,
+
+	/// Additional config overlay (repeatable, later files win).
+	pub config: Vec<PathBuf>,
+
+	/// Resume the newest session in the session directory.
+	pub continue_session: bool,
+
+	/// Resume a session (by ID prefix, path, or interactive picker if omitted).
+	pub resume: Option<String>,
+
+	/// Fork an existing session into a new session log.
+	pub fork: Option<String>,
+
+	/// Import a Claude Code session into OMP.
+	pub from_claude: bool,
+
+	/// Import an OpenAI Codex session into OMP.
+	pub from_codex: bool,
+
+	/// Provider-specific session ID.
+	pub provider_session_id: Option<String>,
+
+	/// Provider prompt cache key.
+	pub prompt_cache_key: Option<String>,
+
+	/// Disable session title generation.
+	pub no_title: bool,
+
+	/// Directory holding session logs (default: ~/.omp/agent/sessions/omp-cli).
+	pub session_dir: Option<PathBuf>,
+
+	/// Session id to create or resume.
+	pub session_id: Option<String>,
+
+	/// Do not read or write session logs.
+	pub no_session: bool,
+
+	/// Discover no skills.
+	pub no_skills: bool,
+
+	/// Only load skills matching this glob (comma-separated or repeatable).
+	pub skills: Vec<String>,
+
 	pub command: Option<Command>,
 }
 
-#[derive(Debug, Subcommand)]
+/// Parse an `@file` positional token into a file path according to TS CLI parity.
+///
+/// Strips leading `@` and, if enclosed in matching quotes (`"` or `'`), strips outer quotes.
+#[must_use]
+pub fn parse_file_arg(token: &str) -> String {
+	let raw_path = token.strip_prefix('@').unwrap_or(token);
+	if raw_path.len() > 1 && raw_path.starts_with('"') && raw_path.ends_with('"') {
+		raw_path[1..raw_path.len() - 1].to_string()
+	} else if raw_path.len() > 1 && raw_path.starts_with('\'') && raw_path.ends_with('\'') {
+		raw_path[1..raw_path.len() - 1].to_string()
+	} else {
+		raw_path.to_string()
+	}
+}
+
+impl Cli {
+	fn from_raw(raw: RawCli) -> Self {
+		let mut prompt = Vec::new();
+		let mut file_args = Vec::new();
+
+		for token in raw.prompt {
+			if token.starts_with('@') {
+				file_args.push(parse_file_arg(&token));
+			} else {
+				prompt.push(token);
+			}
+		}
+
+		// Arguments after `--` are literal positional text (POSIX end-of-options).
+		// Everything after `--` remains a prompt message, even if starting with `@`.
+		prompt.extend(raw.trailing);
+
+		Self {
+			prompt,
+			file_args,
+			print: raw.print,
+			mode: raw.mode,
+			cwd: raw.cwd,
+			model: raw.model,
+			provider: raw.provider,
+			api_key: raw.api_key,
+			system_prompt: raw.system_prompt,
+			append_system_prompt: raw.append_system_prompt,
+			max_time: raw.max_time,
+			no_tools: raw.no_tools,
+			tools: raw.tools,
+			approval_mode: raw.approval_mode,
+			yolo: raw.yolo,
+			allow: raw.allow,
+			config: raw.config,
+			continue_session: raw.continue_session,
+			resume: raw.resume,
+			fork: raw.fork,
+			from_claude: raw.from_claude,
+			from_codex: raw.from_codex,
+			provider_session_id: raw.provider_session_id,
+			prompt_cache_key: raw.prompt_cache_key,
+			no_title: raw.no_title,
+			session_dir: raw.session_dir,
+			session_id: raw.session_id,
+			no_session: raw.no_session,
+			no_skills: raw.no_skills,
+			skills: raw.skills,
+			command: raw.command,
+		}
+	}
+}
+
+impl CommandFactory for Cli {
+	fn command() -> clap::Command {
+		RawCli::command()
+	}
+
+	fn command_for_update() -> clap::Command {
+		RawCli::command_for_update()
+	}
+}
+
+impl FromArgMatches for Cli {
+	fn from_arg_matches(matches: &clap::ArgMatches) -> std::result::Result<Self, clap::Error> {
+		let raw = RawCli::from_arg_matches(matches)?;
+		Ok(Self::from_raw(raw))
+	}
+
+	fn from_arg_matches_mut(matches: &mut clap::ArgMatches) -> std::result::Result<Self, clap::Error> {
+		let raw = RawCli::from_arg_matches_mut(matches)?;
+		Ok(Self::from_raw(raw))
+	}
+
+	fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> std::result::Result<(), clap::Error> {
+		let new = Self::from_arg_matches(matches)?;
+		*self = new;
+		Ok(())
+	}
+
+	fn update_from_arg_matches_mut(
+		&mut self,
+		matches: &mut clap::ArgMatches,
+	) -> std::result::Result<(), clap::Error> {
+		let new = Self::from_arg_matches_mut(matches)?;
+		*self = new;
+		Ok(())
+	}
+}
+
+impl Parser for Cli {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
 	/// Read prompts from stdin until `/exit`.
 	Repl,
 }
+
 
 /// Parse `--max-time`: positive seconds or `<number>{s,m,h}`.
 pub fn parse_max_time(raw: &str) -> std::result::Result<Duration, String> {
@@ -202,6 +409,96 @@ mod tests {
 		assert_eq!(cli.mode, OutputMode::Text);
 		assert_eq!(cli.approval_mode, None);
 		assert!(cli.command.is_none());
+	}
+
+	#[test]
+	fn positional_file_args_separated_from_prompt() {
+		let cli = parse(&["omp", "@first.rs", "explain this", "@second.rs", "and that"]);
+		assert_eq!(cli.file_args, ["first.rs", "second.rs"]);
+		assert_eq!(cli.prompt, ["explain this", "and that"]);
+	}
+
+	#[test]
+	fn positional_file_args_strip_outer_quotes_according_to_ts() {
+		let cli = parse(&[
+			"omp",
+			r#"@"path with spaces/file.txt""#,
+			r#"@'another space/path.txt'"#,
+			r#"@"quotes'inside.rs""#,
+			r#"@'double"inside.rs'"#,
+			r#"@"unclosed.rs"#,
+			r#"@unclosed""#,
+			"@",
+			r#"@"""#,
+			r#"@''"#,
+			r#"@"a""#,
+			r#"@""#,
+			r#"@'"#,
+			"@@double.rs",
+		]);
+		assert_eq!(
+			cli.file_args,
+			[
+				"path with spaces/file.txt",
+				"another space/path.txt",
+				"quotes'inside.rs",
+				r#"double"inside.rs"#,
+				r#""unclosed.rs"#,
+				r#"unclosed""#,
+				"",
+				"",
+				"",
+				"a",
+				r#"""#,
+				"'",
+				"@double.rs",
+			]
+		);
+		assert!(cli.prompt.is_empty());
+	}
+
+	#[test]
+	fn posix_separator_keeps_at_prefixed_tokens_as_prompts() {
+		let cli = parse(&["omp", "@before.rs", "first", "--", "@after.rs", "second", "--model", "opus"]);
+		assert_eq!(cli.file_args, ["before.rs"]);
+		assert_eq!(cli.prompt, ["first", "@after.rs", "second", "--model", "opus"]);
+		assert!(cli.model.is_none());
+
+		let bare_separator = parse(&["omp", "--", "hello"]);
+		assert_eq!(bare_separator.prompt, ["hello"]);
+		assert!(bare_separator.file_args.is_empty());
+	}
+
+	#[test]
+	fn option_values_starting_with_at_are_not_intercepted_as_file_args() {
+		let cli = parse(&[
+			"omp",
+			"--model",
+			"@custom-model",
+			"--append-system-prompt",
+			"@system.md",
+			"--allow",
+			"@bash",
+			"--allow",
+			"@read",
+			"--resume",
+			"@session-id",
+			"@actual_file.rs",
+			"prompt text",
+		]);
+		assert_eq!(cli.model.as_deref(), Some("@custom-model"));
+		assert_eq!(cli.append_system_prompt.as_deref(), Some("@system.md"));
+		assert_eq!(cli.allow, ["@bash", "@read"]);
+		assert_eq!(cli.resume.as_deref(), Some("@session-id"));
+		assert_eq!(cli.file_args, ["actual_file.rs"]);
+		assert_eq!(cli.prompt, ["prompt text"]);
+	}
+
+	#[test]
+	fn lone_hyphen_remains_prompt_message() {
+		let cli = parse(&["omp", "@file.rs", "-"]);
+		assert_eq!(cli.file_args, ["file.rs"]);
+		assert_eq!(cli.prompt, ["-"]);
 	}
 
 	#[test]
