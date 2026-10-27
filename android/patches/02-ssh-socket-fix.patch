@@ -1,0 +1,188 @@
+diff --git a/packages/coding-agent/src/ssh/connection-manager.ts b/packages/coding-agent/src/ssh/connection-manager.ts
+index fc54f4c..17b068f 100644
+--- a/packages/coding-agent/src/ssh/connection-manager.ts
++++ b/packages/coding-agent/src/ssh/connection-manager.ts
+@@ -110,6 +110,35 @@ export function resolveSshControlDir(opts: {
+ 	return { dir: sshControlFallbackDir(canonicalDir, uid, tmpBase), shared: true };
+ }
+ 
++export function isFallbackRootAvailable(tmpBase = "/tmp"): boolean {
++	try {
++		const st = fs.statSync(tmpBase);
++		if (!st.isDirectory()) return false;
++		fs.accessSync(tmpBase, fs.constants.W_OK);
++		return true;
++	} catch {
++		try {
++			const parent = path.dirname(tmpBase);
++			const st = fs.statSync(parent);
++			if (!st.isDirectory()) return false;
++			fs.accessSync(parent, fs.constants.W_OK);
++			return true;
++		} catch {
++			return false;
++		}
++	}
++}
++
++export function shouldUseSshControlMaster(
++	platform: SshPlatform = process.platform,
++	needsFallback = CONTROL_DIR_SHARED,
++	fallbackAvailable = isFallbackRootAvailable(),
++): boolean {
++	if (!supportsSshControlMaster(platform)) return false;
++	if (needsFallback && !fallbackAvailable) return false;
++	return true;
++}
++
+ const { dir: CONTROL_DIR, shared: CONTROL_DIR_SHARED } = resolveSshControlDir({
+ 	canonicalDir: getSshControlDir(),
+ 	platform: process.platform,
+@@ -137,6 +166,7 @@ interface SSHArgsOptions {
+  * mode checks.
+  */
+ export function ensureSshControlDir(): void {
++	if (!shouldUseSshControlMaster()) return;
+ 	fs.mkdirSync(CONTROL_DIR, { recursive: true, mode: 0o700 });
+ 	if (CONTROL_DIR_SHARED) {
+ 		assertOwnerPrivateDir(CONTROL_DIR, "SSH control directory");
+@@ -193,10 +223,12 @@ type ControlPathOwner = "omp" | "config";
+ function buildCommonArgs(host: SSHConnectionTarget, owner: ControlPathOwner, options?: SSHArgsOptions): string[] {
+ 	const args = options?.allowStdin ? [] : ["-n"];
+ 
+-	if (supportsSshControlMaster(options?.platform)) {
++	if (shouldUseSshControlMaster(options?.platform)) {
+ 		args.push("-o", "ControlMaster=auto");
+ 		// A config-owned socket keeps the user's ControlPath and ControlPersist.
+ 		if (owner === "omp") args.push("-o", `ControlPath=${CONTROL_PATH}`, "-o", "ControlPersist=3600");
++	} else {
++		args.push("-o", "ControlMaster=no");
+ 	}
+ 
+ 	args.push("-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new");
+@@ -757,7 +789,7 @@ export async function ensureConnection(host: SSHConnectionTarget): Promise<void>
+ 		}
+ 
+ 		const target = buildSshTarget(host.username, host.host);
+-		if (!supportsSshControlMaster()) {
++		if (!shouldUseSshControlMaster()) {
+ 			activeHosts.set(key, host);
+ 			if (!hostInfoCache.has(key) && !(await loadHostInfoFromDisk(host))) {
+ 				await probeHostInfo(host);
+@@ -818,7 +850,7 @@ export async function invalidateHostMetadata(hostNames: Iterable<string>): Promi
+ }
+ 
+ async function closeConnectionInternal(host: SSHConnectionTarget): Promise<void> {
+-	if (!supportsSshControlMaster()) return;
++	if (!shouldUseSshControlMaster()) return;
+ 	const target = buildSshTarget(host.username, host.host);
+ 	const owner = await resolveControlPathOwner(host);
+ 	// Configured sockets may have been replaced by a user's master since the
+diff --git a/packages/coding-agent/src/ssh/sshfs-mount.ts b/packages/coding-agent/src/ssh/sshfs-mount.ts
+index f6cd2cb..09a3c97 100644
+--- a/packages/coding-agent/src/ssh/sshfs-mount.ts
++++ b/packages/coding-agent/src/ssh/sshfs-mount.ts
+@@ -5,8 +5,8 @@ import { $ } from "bun";
+ import {
+ 	ensureSshControlDir,
+ 	getControlPathTemplate,
++	shouldUseSshControlMaster,
+ 	type SSHConnectionTarget,
+-	supportsSshControlMaster,
+ } from "./connection-manager";
+ import { buildSshTarget, sanitizeHostName } from "./utils";
+ 
+@@ -42,7 +42,7 @@ function getMountPath(host: SSHConnectionTarget): string {
+ 	return path.join(REMOTE_DIR, getMountName(host));
+ }
+ 
+-function buildSshfsArgs(host: SSHConnectionTarget): string[] {
++export function buildSshfsArgs(host: SSHConnectionTarget, useMaster = shouldUseSshControlMaster()): string[] {
+ 	const args = [
+ 		"-o",
+ 		"reconnect",
+@@ -56,8 +56,10 @@ function buildSshfsArgs(host: SSHConnectionTarget): string[] {
+ 		"StrictHostKeyChecking=accept-new",
+ 	];
+ 
+-	if (supportsSshControlMaster()) {
++	if (useMaster) {
+ 		args.push("-o", "ControlMaster=auto", "-o", `ControlPath=${CONTROL_PATH}`, "-o", "ControlPersist=3600");
++	} else {
++		args.push("-o", "ControlMaster=no");
+ 	}
+ 
+ 	if (host.port) {
+diff --git a/packages/coding-agent/test/ssh-control-path.test.ts b/packages/coding-agent/test/ssh-control-path.test.ts
+index bd05e3f..82f4415 100644
+--- a/packages/coding-agent/test/ssh-control-path.test.ts
++++ b/packages/coding-agent/test/ssh-control-path.test.ts
+@@ -2,7 +2,13 @@ import { afterEach, describe, expect, it } from "bun:test";
+ import * as fs from "node:fs";
+ import * as os from "node:os";
+ import * as path from "node:path";
+-import { controlPathFitsBudget, resolveSshControlDir, sshControlFallbackDir } from "../src/ssh/connection-manager";
++import {
++	buildRemoteCommand,
++	controlPathFitsBudget,
++	resolveSshControlDir,
++	shouldUseSshControlMaster,
++	sshControlFallbackDir,
++} from "../src/ssh/connection-manager";
+ import { assertOwnerPrivateDir, ownerPrivateDirError } from "../src/utils/owner-private-dir";
+ 
+ // Regression coverage for #9070: named-profile roots pushed the SSH ControlPath
+@@ -149,3 +155,19 @@ describe("assertOwnerPrivateDir", () => {
+ 		expect(() => assertOwnerPrivateDir(file, "SSH control directory")).toThrow("is not a directory");
+ 	});
+ });
++
++describe("SSH master availability", () => {
++	it("uses direct SSH when the bounded fallback root is unavailable", () => {
++		expect(shouldUseSshControlMaster("linux", true, false)).toBe(false);
++		expect(shouldUseSshControlMaster("linux", true, true)).toBe(true);
++		expect(shouldUseSshControlMaster("linux", false, false)).toBe(true);
++		expect(shouldUseSshControlMaster("win32", false, false)).toBe(false);
++		expect(shouldUseSshControlMaster("win32", true, true)).toBe(false);
++	});
++
++	it("explicitly disables ControlMaster when master is unavailable", async () => {
++		const args = await buildRemoteCommand({ name: "srv", host: "10.0.0.1" }, "uptime", { platform: "win32" });
++		expect(args).toContain("ControlMaster=no");
++		expect(args).not.toContain("ControlMaster=auto");
++	});
++});
+diff --git a/packages/coding-agent/test/ssh/sshfs-mount.test.ts b/packages/coding-agent/test/ssh/sshfs-mount.test.ts
+index 097aec7..e9d147c 100644
+--- a/packages/coding-agent/test/ssh/sshfs-mount.test.ts
++++ b/packages/coding-agent/test/ssh/sshfs-mount.test.ts
+@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
+ import * as path from "node:path";
+ import * as piUtils from "@oh-my-pi/pi-utils";
+ import * as connectionManager from "../../src/ssh/connection-manager";
+-import { isMounted, mountRemote } from "../../src/ssh/sshfs-mount";
++import { buildSshfsArgs, isMounted, mountRemote } from "../../src/ssh/sshfs-mount";
+ 
+ afterEach(() => {
+ 	vi.restoreAllMocks();
+@@ -19,6 +19,20 @@ describe("mountRemote", () => {
+ 	});
+ });
+ 
++describe("buildSshfsArgs fallback", () => {
++	it("keeps ControlPath when master is enabled", () => {
++		const args = buildSshfsArgs({ name: "nixbox", host: "nixbox" }, true);
++		expect(args).toContain("ControlMaster=auto");
++		expect(args.some(arg => arg.startsWith("ControlPath="))).toBe(true);
++	});
++
++	it("forces direct sshfs when the shared fallback root is unavailable", () => {
++		const args = buildSshfsArgs({ name: "nixbox", host: "nixbox" }, false);
++		expect(args).toContain("ControlMaster=no");
++		expect(args.some(arg => arg.startsWith("ControlPath="))).toBe(false);
++	});
++});
++
+ describe("isMounted", () => {
+ 	it("detects a macOS mount point when mountpoint is unavailable", async () => {
+ 		const parentPath = import.meta.dir;

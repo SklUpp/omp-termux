@@ -1,3 +1,4 @@
-# Active patch order: clean upstream -> 01-termux
+# Active patch order: clean upstream -> 01-termux -> 02-ssh-socket-fix
 # This manifest is validated by android/scripts/apply-patches.sh
 01-termux.patch
+02-ssh-socket-fix.patch
