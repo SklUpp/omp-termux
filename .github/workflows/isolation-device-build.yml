@@ -116,8 +116,8 @@ jobs:
       - name: Install JS dependencies
         run: bun install --minimum-release-age 0
 
-      - name: Verify isolated task repoRoot schema
-        run: bun test packages/coding-agent/test/repo-root-isolation.test.ts
+      - name: Verify isolated task schema and merge
+        run: bun test packages/coding-agent/test/repo-root-isolation.test.ts packages/coding-agent/test/isolation-merge-three-way.test.ts
 
       - name: Cross-compile native addon
         env:
