@@ -50,6 +50,12 @@ The queue is regenerated from clean upstream-derived source when upstream change
 The sync workflow applies it in CI; release workflows apply it idempotently after
 checking out immutable release tag.
 
+## Subagent isolation repository selection
+
+`task(isolated: true, repoRoot: "/path/to/repo")` supports a session cwd outside Git. The active `01-termux.patch` passes explicit `repoRoot` to the existing isolation backend. Static task schemas retained it, but dynamic schemas (used with effort, seance, and other options) deleted it before spawn. All four dynamic single/batch, isolation-on/off schemas now retain `repoRoot`; only `isolated: true` requests isolation. No `task.isolation.repoRoot` setting or alternate backend is added.
+
+Regression: `packages/coding-agent/test/repo-root-isolation.test.ts` parses real dynamic schemas for flat and batch requests and checks that non-isolated requests do not gain `isolated`. It runs schema imports in a child process so test-only module mocks cannot affect other suites. On a clean pinned upstream checkout, apply the active queue, run that test, then exercise an isolated worker from outside the Git fixture before calling the Android path verified; parser coverage alone does not prove native worker creation or cleanup.
+
 ## Transformation catalog (current)
 
 The eight overlay transforms, one concern each:
