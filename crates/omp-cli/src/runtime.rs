@@ -189,7 +189,7 @@ impl AgentRunner for PiAgentRunner {
 		let registry = build_registry_with_mcp(&plan.tools, mcp_tools)?;
 		let cwd = request.cwd.clone();
 		let prompt = request.prompt.clone();
-		let mut messages = history_messages(&request.history);
+		let mut messages = history_messages(&request.history)?;
 		if let Some(system) = plan.system_prompt {
 			messages.insert(0, pi_agent::Message::system(system));
 		}
@@ -198,7 +198,8 @@ impl AgentRunner for PiAgentRunner {
 		let plan_model = plan.model.clone();
 		let provider = OpenAiCompatibleProvider::new(plan.base_url, plan.api_key, plan.model)
 			.map_err(|err| Error::with_source("pi-agent provider setup failed", err))?
-			.with_effort(plan.effort);
+			.with_effort(plan.effort)
+			.with_images(plan.supports_images);
 		let config = AgentConfig {
 			max_turns: plan.max_turns,
 			context_limit: plan.context_limit,
@@ -533,6 +534,7 @@ struct RunPlan {
 	context_limit: usize,
 	system_prompt: Option<String>,
 	tools:         Vec<&'static str>,
+	supports_images: bool,
 }
 
 impl RunPlan {
@@ -613,6 +615,19 @@ impl RunPlan {
 			.as_ref()
 			.and_then(|c| c.api.clone())
 			.unwrap_or_else(|| "openai-completions".to_string());
+		// Model image capabilities resolution:
+		// - If catalog explicitly declares inputs without "image" -> fail closed (`supports_images = false`).
+		// - If catalog explicitly declares "image" -> `supports_images = true`.
+		// - If capabilities unknown (unlisted model / missing `input` in catalog) -> documented unknown,
+		//   default to permissive (`supports_images = true`) so custom endpoints and unlisted models work.
+		let supports_images = match request.catalog.supports_images(&provider, &model) {
+			Some(supported) => supported,
+			None => {
+				// Unknown model capabilities: catalog does not declare input modalities for
+				// `{provider}/{model}`. Defaulting to true for permissive unlisted gateway compatibility.
+				true
+			},
+		};
 		Ok(Self {
 			base_url,
 			api_key,
@@ -624,10 +639,10 @@ impl RunPlan {
 			context_limit,
 			system_prompt: compose_system_prompt(request),
 			tools: allowed_tools(request, has_mcp_tools)?,
+			supports_images,
 		})
 	}
 }
-
 /// Trailing `:effort` selector (`:high`, `:xhi`, …) is not part of the model
 /// id.
 const EFFORT_SELECTORS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -1382,10 +1397,46 @@ fn compose_system_prompt(request: &RunRequest) -> Option<String> {
 }
 
 /// Previous session turns as `pi-agent` history messages.
-fn history_messages(history: &[crate::session::TurnRecord]) -> Vec<pi_agent::Message> {
+pub fn history_messages(history: &[crate::session::TurnRecord]) -> Result<Vec<pi_agent::Message>, Error> {
 	let mut messages = Vec::new();
 	for turn in history {
-		messages.push(pi_agent::Message::user(turn.prompt.clone()));
+		if !turn.parts.is_empty() {
+			let mut pi_parts = Vec::new();
+			for (index, p) in turn.parts.iter().enumerate() {
+				if p.is_image() {
+					let Some(data) = p.data.as_deref() else {
+						return Err(Error::new(format!(
+							"session history contains image part missing data at index {index}"
+						)));
+					};
+					let Some(mime) = p.mime_type.as_deref() else {
+						return Err(Error::new(format!(
+							"session history contains image part missing mimeType at index {index}"
+						)));
+					};
+					let (clean_b64, norm_mime) = pi_agent::state::normalize_image_payload(data, mime)
+						.map_err(|err| Error::new(format!("session history contains invalid image part at index {index}: {err}")))?;
+					pi_parts.push(pi_agent::ContentPart::Image {
+						data: clean_b64,
+						mime_type: norm_mime,
+					});
+				} else if p.kind == "text" {
+					let Some(text) = p.text.clone() else {
+						return Err(Error::new(format!(
+							"session history contains malformed text part missing text at index {index}"
+						)));
+					};
+					pi_parts.push(pi_agent::ContentPart::Text { text });
+				} else {
+					return Err(Error::new(format!(
+						"session history contains unsupported content part kind at index {index}"
+					)));
+				}
+			}
+			messages.push(pi_agent::Message::user_with_parts(pi_parts));
+		} else {
+			messages.push(pi_agent::Message::user(turn.prompt.clone()));
+		}
 		let stop_reason = crate::session::canonical_stop_reason(&turn.stop_reason);
 		if stop_reason == "aborted" {
 			if !turn.tool_calls.is_empty() {
@@ -1468,6 +1519,7 @@ mod tests {
 		models.insert("llama3".to_string(), ModelInfo {
 			provider:       "local".to_string(),
 			context_window: Some(8_192),
+			input:          None,
 		});
 		providers.insert("local".to_string(), models);
 		Catalog { providers, connections: BTreeMap::new(), source: PathBuf::from("test-models.json") }
@@ -1692,8 +1744,9 @@ mod tests {
 				result:    "contents".to_string(),
 				is_error:  false,
 			}],
+			parts:       vec![],
 		}];
-		let messages = history_messages(&history);
+		let messages = history_messages(&history).expect("history messages");
 		assert_eq!(messages.len(), 3);
 		assert_eq!(messages[0].role, pi_agent::Role::User);
 		assert_eq!(messages[0].content, "fix");
@@ -1712,8 +1765,9 @@ mod tests {
 			assistant:   "partial output".to_string(),
 			stop_reason: "aborted".to_string(),
 			tool_calls:  vec![],
+			parts:       vec![],
 		}];
-		let messages = history_messages(&history);
+		let messages = history_messages(&history).expect("history messages");
 		assert_eq!(messages.len(), 1);
 		assert_eq!(messages[0].role, pi_agent::Role::User);
 		assert_eq!(messages[0].content, "fix");
@@ -1732,8 +1786,9 @@ mod tests {
 				result:    "[Tool execution interrupted by user]".to_string(),
 				is_error:  true,
 			}],
+			parts:       vec![],
 		}];
-		let messages = history_messages(&history);
+		let messages = history_messages(&history).expect("history messages");
 		assert_eq!(messages.len(), 3);
 		assert_eq!(messages[0].role, pi_agent::Role::User);
 		assert_eq!(messages[1].role, pi_agent::Role::Assistant);
@@ -1756,8 +1811,9 @@ mod tests {
 				result:    "exit code 1".to_string(),
 				is_error:  true,
 			}],
+			parts:       vec![],
 		}];
-		let messages = history_messages(&history);
+		let messages = history_messages(&history).expect("history messages");
 		assert_eq!(messages.len(), 3);
 		assert_eq!(messages[2].role, pi_agent::Role::Tool);
 		assert_eq!(messages[2].tool_call_id.as_deref(), Some("call-err-1"));
@@ -1779,8 +1835,9 @@ mod tests {
 				result:    "[Tool execution interrupted by user]".to_string(),
 				is_error:  true,
 			}],
+			parts:       vec![],
 		}];
-		let messages = history_messages(&history);
+		let messages = history_messages(&history).expect("history messages");
 		assert_eq!(messages.len(), 3);
 		assert_eq!(messages[2].role, pi_agent::Role::Tool);
 		assert_eq!(messages[2].tool_call_id.as_deref(), Some("call-err-2"));
@@ -1792,6 +1849,95 @@ mod tests {
 		assert_eq!(messages[2].content, "[Tool execution interrupted by user]");
 	}
 
+	#[test]
+	fn history_messages_preserves_user_image_parts() {
+		let history = vec![crate::session::TurnRecord {
+			prompt:      "inspect diagram".to_string(),
+			assistant:   "looks correct".to_string(),
+			stop_reason: "end_turn".to_string(),
+			tool_calls:  vec![],
+			parts:       vec![
+				crate::session::ContentPart::text("inspect diagram"),
+				crate::session::ContentPart::image("aGVsbG8=", "image/png"),
+			],
+		}];
+		let messages = history_messages(&history).expect("history messages");
+		assert_eq!(messages.len(), 2);
+		assert_eq!(messages[0].role, pi_agent::Role::User);
+		assert_eq!(messages[0].content, "inspect diagram");
+		assert!(messages[0].has_image());
+		assert_eq!(messages[0].image_parts().len(), 1);
+		assert_eq!(messages[0].image_parts()[0].mime_type, "image/png");
+		assert_eq!(messages[0].image_parts()[0].data_base64, "aGVsbG8=");
+	}
+
+	#[test]
+	fn history_messages_rejects_unsupported_part_kind() {
+		let history = vec![crate::session::TurnRecord {
+			prompt: "look".to_string(),
+			assistant: "ok".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![],
+			parts: vec![crate::session::ContentPart {
+				kind: "video".to_string(),
+				text: None,
+				data: Some("video-stream".to_string()),
+				mime_type: Some("video/mp4".to_string()),
+				extra: serde_json::Map::new(),
+			}],
+		}];
+		let err = history_messages(&history).unwrap_err();
+		assert!(
+			err.to_string().contains("unsupported content part kind at index 0"),
+			"must reject unknown part kind safely, got: {err}"
+		);
+	}
+
+	#[test]
+	fn history_messages_rejects_malformed_image_part() {
+		let history = vec![crate::session::TurnRecord {
+			prompt: "look".to_string(),
+			assistant: "ok".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![],
+			parts: vec![crate::session::ContentPart {
+				kind: "image".to_string(),
+				text: None,
+				data: Some("http://evil.com/pic.png".to_string()),
+				mime_type: Some("image/png".to_string()),
+				extra: serde_json::Map::new(),
+			}],
+		}];
+		let err = history_messages(&history).unwrap_err();
+		assert!(
+			err.to_string().contains("external URLs are not permitted"),
+			"must reject external URL in history, got: {err}"
+		);
+	}
+
+	#[test]
+	fn resumed_text_only_session_preserves_unaltered_string_wire_format() {
+		let history = vec![crate::session::TurnRecord {
+			prompt: "hello purely textual".to_string(),
+			assistant: "hello human".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![],
+			parts: vec![],
+		}];
+		let messages = history_messages(&history).expect("history messages");
+		assert_eq!(messages.len(), 2);
+		assert_eq!(messages[0].content, "hello purely textual");
+		assert!(messages[0].parts.is_empty(), "text-only turn must have empty parts");
+		assert!(!messages[0].has_image());
+
+		let wire = pi_agent::to_openai_messages(&messages).expect("wire messages");
+		let wire_val = serde_json::to_value(&wire[0]).expect("serialize");
+		assert_eq!(
+			wire_val["content"],
+			"hello purely textual",
+			"resumed text-only message must serialize as plain string on OpenAI wire, not array"
+		);
+	}
 	#[test]
 	fn interrupted_tool_batch_emits_turn_end_exactly_once() {
 		use std::io::{Read, Write};
@@ -2090,5 +2236,80 @@ mod tests {
 
 		std::thread::sleep(std::time::Duration::from_millis(100));
 		assert!(!cancel_token.is_cancelled(), "orphaned timer must not cancel caller token");
+	}
+
+	#[tokio::test]
+	async fn run_plan_fails_closed_for_explicit_text_only_catalog_model() {
+		let mut cat = catalog_with_connection("local", "http://127.0.0.1:8080/v1", Some("sk-test"));
+		let mut models = BTreeMap::new();
+		models.insert("text-only".to_string(), ModelInfo {
+			provider:       "local".to_string(),
+			context_window: Some(4096),
+			input:          Some(vec!["text".to_string()]),
+		});
+		cat.providers.insert("local".to_string(), models);
+
+		let mut req = request(Approvals::default());
+		req.catalog = Arc::new(cat);
+		req.model = Some("local/text-only".to_string());
+
+		let plan = RunPlan::resolve(&req).expect("resolve plan");
+		assert!(!plan.supports_images, "explicit text-only model must fail closed (supports_images: false)");
+
+		let provider = OpenAiCompatibleProvider::new(plan.base_url, plan.api_key, plan.model)
+			.expect("provider build")
+			.with_images(plan.supports_images);
+
+		let msg = pi_agent::Message::user_with_images(
+			"look at this",
+			vec![pi_agent::ImagePart::new("image/png", "aGVsbG8=")],
+		);
+		let err = provider.complete(&[msg], &[]).await.unwrap_err();
+		assert!(
+			matches!(err, pi_agent::ProviderError::UnsupportedImage(_)),
+			"provider must reject image message when model is text-only, got: {:?}",
+			err
+		);
+	}
+
+	#[test]
+	fn run_plan_enables_images_for_multimodal_catalog_model() {
+		let mut cat = catalog_with_connection("local", "http://127.0.0.1:8080/v1", Some("sk-test"));
+		let mut models = BTreeMap::new();
+		models.insert("vision-model".to_string(), ModelInfo {
+			provider:       "local".to_string(),
+			context_window: Some(4096),
+			input:          Some(vec!["text".to_string(), "image".to_string()]),
+		});
+		cat.providers.insert("local".to_string(), models);
+
+		let mut req = request(Approvals::default());
+		req.catalog = Arc::new(cat);
+		req.model = Some("local/vision-model".to_string());
+
+		let plan = RunPlan::resolve(&req).expect("resolve plan");
+		assert!(plan.supports_images, "multimodal model declaring 'image' must have supports_images: true");
+	}
+
+	#[test]
+	fn run_plan_permits_images_for_unknown_catalog_model_capabilities() {
+		let mut cat = catalog_with_connection("local", "http://127.0.0.1:8080/v1", Some("sk-test"));
+		let mut models = BTreeMap::new();
+		models.insert("unspecified".to_string(), ModelInfo {
+			provider:       "local".to_string(),
+			context_window: Some(4096),
+			input:          None,
+		});
+		cat.providers.insert("local".to_string(), models);
+
+		let mut req = request(Approvals::default());
+		req.catalog = Arc::new(cat);
+		req.model = Some("local/unspecified".to_string());
+
+		let plan = RunPlan::resolve(&req).expect("resolve plan");
+		assert!(
+			plan.supports_images,
+			"unspecified model input capabilities default to permissive true for gateway compatibility"
+		);
 	}
 }

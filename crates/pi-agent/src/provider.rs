@@ -32,6 +32,8 @@ pub enum ProviderError {
 	Protocol(String),
 	#[error("Invalid base URL: {0}")]
 	InvalidBaseUrl(String),
+	#[error("Unsupported image: {0}")]
+	UnsupportedImage(String),
 }
 
 /// Delta chunk emitted by streaming completions.
@@ -79,6 +81,30 @@ pub trait ModelProvider: Send + Sync {
 		messages: &[Message],
 		tools: &[serde_json::Value],
 	) -> Result<ChunkStream, ProviderError>;
+
+	/// Whether this provider supports multimodal image inputs.
+	fn supports_images(&self) -> bool {
+		false
+	}
+
+	/// Validate that message contents are supported by this provider.
+	fn check_support(&self, messages: &[Message]) -> Result<(), ProviderError> {
+		if !self.supports_images() && messages.iter().any(Message::has_image) {
+			return Err(ProviderError::UnsupportedImage(
+				"provider does not support image content".to_string(),
+			));
+		}
+		for m in messages {
+			for img in m.image_parts() {
+				if let Err(err) = img.validate() {
+					return Err(ProviderError::UnsupportedImage(format!(
+						"invalid image payload: {err}"
+					)));
+				}
+			}
+		}
+		Ok(())
+	}
 }
 
 /// Chat-completions provider for any OpenAI-compatible HTTP endpoint.
@@ -91,6 +117,7 @@ pub struct OpenAiCompatibleProvider {
 	api_key: String,
 	model: String,
 	effort: Option<String>,
+	supports_images: bool,
 }
 
 impl OpenAiCompatibleProvider {
@@ -129,7 +156,19 @@ impl OpenAiCompatibleProvider {
 			api_key: api_key.into(),
 			model: model.into(),
 			effort: None,
+			supports_images: true,
 		}
+	}
+
+	/// Enable or disable multimodal image support.
+	pub fn with_images(mut self, enabled: bool) -> Self {
+		self.supports_images = enabled;
+		self
+	}
+
+	/// Whether multimodal image inputs are accepted.
+	pub fn supports_images(&self) -> bool {
+		self.supports_images
 	}
 
 	/// Set the reasoning effort sent as `reasoning_effort`.
@@ -156,25 +195,30 @@ impl OpenAiCompatibleProvider {
 		messages: &[Message],
 		tools: &[serde_json::Value],
 		stream: bool,
-	) -> OpenAiChatRequest {
-		OpenAiChatRequest {
+	) -> Result<OpenAiChatRequest, ProviderError> {
+		Ok(OpenAiChatRequest {
 			model: self.model.clone(),
-			messages: to_openai_messages(messages),
+			messages: to_openai_messages(messages)?,
 			tools: tools.to_vec(),
 			stream,
 			reasoning_effort: self.effort.clone(),
-		}
+		})
 	}
 }
 
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleProvider {
+	fn supports_images(&self) -> bool {
+		self.supports_images
+	}
+
 	async fn complete(
 		&self,
 		messages: &[Message],
 		tools: &[serde_json::Value],
 	) -> Result<Message, ProviderError> {
-		let body = self.request(messages, tools, false);
+		self.check_support(messages)?;
+		let body = self.request(messages, tools, false)?;
 		let response = self
 			.http
 			.post(self.endpoint())
@@ -207,7 +251,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
 		messages: &[Message],
 		tools: &[serde_json::Value],
 	) -> Result<ChunkStream, ProviderError> {
-		let body = self.request(messages, tools, true);
+		self.check_support(messages)?;
+		let body = self.request(messages, tools, true)?;
 		let response = self
 			.http
 			.post(self.endpoint())
@@ -324,13 +369,34 @@ pub struct OpenAiChatRequest {
 	pub reasoning_effort: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiImageUrl {
+	pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum OpenAiContentPart {
+	#[serde(rename = "text")]
+	Text { text: String },
+	#[serde(rename = "image_url")]
+	ImageUrl { image_url: OpenAiImageUrl },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAiContent {
+	Text(String),
+	Parts(Vec<OpenAiContentPart>),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiMessage {
 	pub role: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub name: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub content: Option<String>,
+	pub content: Option<OpenAiContent>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub tool_calls: Option<Vec<OpenAiToolCall>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -409,7 +475,7 @@ pub struct OpenAiStreamFunctionCall {
 }
 
 /// Convert pi-agent domain messages into OpenAI API messages.
-pub fn to_openai_messages(messages: &[Message]) -> Vec<OpenAiMessage> {
+pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, ProviderError> {
 	messages
 		.iter()
 		.map(|m| {
@@ -438,17 +504,52 @@ pub fn to_openai_messages(messages: &[Message]) -> Vec<OpenAiMessage> {
 				)
 			};
 
-			OpenAiMessage {
+			let content = if m.has_image() || !m.parts.is_empty() {
+				let mut parts = Vec::new();
+				for part in &m.parts {
+					match part {
+						crate::state::ContentPart::Text { text } => {
+							if !text.is_empty() {
+								parts.push(OpenAiContentPart::Text {
+									text: text.clone(),
+								});
+							}
+						}
+						crate::state::ContentPart::Image { data, mime_type } => {
+							let (clean_b64, mime) = crate::state::normalize_image_payload(data, mime_type)
+								.map_err(|err| ProviderError::UnsupportedImage(format!("invalid image payload: {err}")))?;
+							parts.push(OpenAiContentPart::ImageUrl {
+								image_url: OpenAiImageUrl {
+									url: format!("data:{mime};base64,{clean_b64}"),
+								},
+							});
+						}
+					}
+				}
+				if !m.content.is_empty()
+					&& !parts.iter().any(|p| matches!(p, OpenAiContentPart::Text { .. }))
+				{
+					parts.insert(
+						0,
+						OpenAiContentPart::Text {
+							text: m.content.clone(),
+						},
+					);
+				}
+				Some(OpenAiContent::Parts(parts))
+			} else if m.content.is_empty() && tool_calls.is_some() {
+				None
+			} else {
+				Some(OpenAiContent::Text(m.content.clone()))
+			};
+
+			Ok(OpenAiMessage {
 				role: role.to_string(),
 				name: m.name.clone(),
-				content: if m.content.is_empty() && tool_calls.is_some() {
-					None
-				} else {
-					Some(m.content.clone())
-				},
+				content,
 				tool_calls,
 				tool_call_id: m.tool_call_id.clone(),
-			}
+			})
 		})
 		.collect()
 }

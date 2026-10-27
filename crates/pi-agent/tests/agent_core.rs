@@ -11,11 +11,12 @@ use futures::StreamExt;
 use pi_agent::provider::OpenAiChatRequest;
 use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
-	CancellationToken, ChunkStream, EditTool, Message, ModelProvider,
+	CancellationToken, ChunkStream, EditTool, ImagePart, Message, ModelProvider,
 	OpenAiCompatibleProvider, ProviderError, ReadTool, Role, SteeringEvent,
 	StreamAssembler, StreamChunk, Tool, ToolCall, ToolCallDelta, ToolRegistry, TurnStatus,
 	WriteTool, parse_sse_line, sse_stream,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde_json::json;
 
 /// Scripted transport: a queue of canned provider turns. This is a test double
@@ -41,6 +42,7 @@ impl ModelProvider for ScriptedProvider {
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
 	) -> Result<Message, ProviderError> {
+		self.check_support(_messages)?;
 		self
 			.script
 			.lock()
@@ -54,6 +56,7 @@ impl ModelProvider for ScriptedProvider {
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
 	) -> Result<ChunkStream, ProviderError> {
+		self.check_support(_messages)?;
 		Err(ProviderError::Protocol("scripted provider has no stream".to_string()))
 	}
 }
@@ -1215,7 +1218,7 @@ fn message_name_reaches_the_openai_payload() {
 	let mut message = Message::user("hello");
 	message.name = Some("alice".to_string());
 
-	let payload = pi_agent::to_openai_messages(std::slice::from_ref(&message));
+	let payload = pi_agent::to_openai_messages(std::slice::from_ref(&message)).expect("openai messages");
 	let json = serde_json::to_value(&payload[0]).expect("serialize");
 
 	assert_eq!(json["role"], json!("user"));
@@ -1703,4 +1706,426 @@ async fn batch_abort_paired_results_in_provider_context() {
 	assert_eq!(tool_msgs.len(), 2);
 	assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("c1"));
 	assert_eq!(tool_msgs[1].tool_call_id.as_deref(), Some("c2"));
+}
+
+async fn spawn_mock_openai_server() -> (String, tokio::sync::oneshot::Receiver<serde_json::Value>) {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+	let port = listener.local_addr().expect("local addr").port();
+	let url = format!("http://127.0.0.1:{port}");
+	let (tx, rx) = tokio::sync::oneshot::channel();
+
+	tokio::spawn(async move {
+		if let Ok((mut stream, _)) = listener.accept().await {
+			let mut buf = vec![0u8; 16384];
+			let mut read_bytes = 0;
+			while read_bytes < buf.len() {
+				let n = stream.read(&mut buf[read_bytes..]).await.unwrap_or(0);
+				if n == 0 {
+					break;
+				}
+				read_bytes += n;
+				if let Some(pos) = buf[..read_bytes].windows(4).position(|w| w == b"\r\n\r\n") {
+					let header_str = String::from_utf8_lossy(&buf[..pos]);
+					let content_length: usize = header_str
+						.lines()
+						.find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+						.and_then(|l| l.split(':').nth(1))
+						.and_then(|v| v.trim().parse().ok())
+						.unwrap_or(0);
+					if read_bytes >= pos + 4 + content_length {
+						let body_bytes = &buf[pos + 4..pos + 4 + content_length];
+						if let Ok(json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
+							let _ = tx.send(json_body);
+						}
+						break;
+					}
+				}
+			}
+			let resp_body = serde_json::json!({
+				"id": "chatcmpl-test",
+				"object": "chat.completion",
+				"created": 12345,
+				"model": "gpt-4o",
+				"choices": [{
+					"index": 0,
+					"message": {
+						"role": "assistant",
+						"content": "Saw the image clearly"
+					},
+					"finish_reason": "stop"
+				}]
+			});
+			let resp_str = resp_body.to_string();
+			let http_response = format!(
+				"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+				resp_str.len(),
+				resp_str
+			);
+			let _ = stream.write_all(http_response.as_bytes()).await;
+			let _ = stream.flush().await;
+		}
+	});
+
+	(url, rx)
+}
+
+#[tokio::test]
+async fn openai_request_with_image_serializes_multipart_data_uri() {
+	let (server_url, rx) = spawn_mock_openai_server().await;
+	let provider = OpenAiCompatibleProvider::new(server_url, "fake-key", "gpt-4o")
+		.expect("provider build");
+
+	let image_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+	let msg = Message::user_with_images(
+		"describe this image",
+		vec![ImagePart::new("image/png", image_b64)],
+	);
+
+	assert_eq!(msg.content, "describe this image");
+	assert!(msg.has_image());
+
+	let reply = provider.complete(&[msg], &[]).await.expect("complete ok");
+	assert_eq!(reply.content, "Saw the image clearly");
+
+	let wire = rx.await.expect("server received request payload");
+	let messages = wire["messages"].as_array().expect("messages array");
+	assert_eq!(messages.len(), 1);
+	assert_eq!(messages[0]["role"], "user");
+
+	let content = messages[0]["content"].as_array().expect("content array");
+	assert_eq!(content.len(), 2);
+	assert_eq!(content[0]["type"], "text");
+	assert_eq!(content[0]["text"], "describe this image");
+	assert_eq!(content[1]["type"], "image_url");
+	assert_eq!(
+		content[1]["image_url"]["url"],
+		format!("data:image/png;base64,{image_b64}")
+	);
+}
+
+#[tokio::test]
+async fn openai_request_with_existing_data_uri_preserves_url() {
+	let (server_url, rx) = spawn_mock_openai_server().await;
+	let provider = OpenAiCompatibleProvider::new(server_url, "fake-key", "gpt-4o")
+		.expect("provider build");
+
+	let data_uri = "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+	let msg = Message::user_with_images("", vec![ImagePart::new("image/jpeg", data_uri)]);
+
+	assert_eq!(msg.content, "");
+	assert!(msg.has_image());
+
+	let _ = provider.complete(&[msg], &[]).await.expect("complete ok");
+
+	let wire = rx.await.expect("server received request payload");
+	let messages = wire["messages"].as_array().expect("messages array");
+	let content = messages[0]["content"].as_array().expect("content array");
+	assert_eq!(content.len(), 1);
+	assert_eq!(content[0]["type"], "image_url");
+	assert_eq!(content[0]["image_url"]["url"], data_uri);
+}
+
+#[tokio::test]
+async fn unsupported_image_provider_rejects_clearly() {
+	let msg = Message::user_with_images(
+		"look",
+		vec![ImagePart::new("image/png", "abc")],
+	);
+
+	// 1. OpenAiCompatibleProvider with images disabled
+	let provider = OpenAiCompatibleProvider::new("http://127.0.0.1:9", "fake-key", "text-only")
+		.expect("provider build")
+		.with_images(false);
+
+	let err = provider.complete(&[msg.clone()], &[]).await.unwrap_err();
+	assert!(
+		matches!(err, ProviderError::UnsupportedImage(_)),
+		"expected UnsupportedImage error, got: {:?}",
+		err
+	);
+
+	let stream_err = provider.stream(&[msg.clone()], &[]).await.unwrap_err();
+	assert!(
+		matches!(stream_err, ProviderError::UnsupportedImage(_)),
+		"expected UnsupportedImage error on stream, got: {:?}",
+		stream_err
+	);
+
+	// 2. ScriptedProvider (mock double without multimodal support)
+	let scripted = ScriptedProvider::new(vec![Ok(Message::assistant("never called"))]);
+	let script_err = scripted.complete(&[msg], &[]).await.unwrap_err();
+	assert!(
+		matches!(script_err, ProviderError::UnsupportedImage(_)),
+		"unsupported provider must reject clearly, got: {:?}",
+		script_err
+	);
+}
+
+#[test]
+fn pure_text_user_message_wire_format_is_unaltered() {
+	let msg = Message::user("plain text prompt");
+	assert!(!msg.has_image());
+	assert_eq!(msg.content, "plain text prompt");
+
+	let wire_msgs = pi_agent::to_openai_messages(&[msg]).expect("openai messages");
+	let wire_val = serde_json::to_value(&wire_msgs[0]).expect("serialize");
+	assert_eq!(wire_val["role"], "user");
+	assert_eq!(wire_val["content"], "plain text prompt");
+}
+
+#[test]
+fn deserialized_message_with_content_and_image_only_parts_preserves_both() {
+	let json_str = r#"{
+		"role": "user",
+		"content": "look at this",
+		"parts": [
+			{"type": "image", "data": "aW1n", "mime_type": "image/png"}
+		]
+	}"#;
+	let msg: Message = serde_json::from_str(json_str).expect("deserialize");
+	assert_eq!(msg.content, "look at this");
+	assert!(msg.has_image());
+
+	let wire = pi_agent::to_openai_messages(&[msg]).expect("openai messages");
+	let val = serde_json::to_value(&wire[0]).expect("serialize");
+	let content = val["content"].as_array().expect("content array");
+	assert_eq!(content.len(), 2);
+	assert_eq!(content[0]["type"], "text");
+	assert_eq!(content[0]["text"], "look at this");
+	assert_eq!(content[1]["type"], "image_url");
+	assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,aW1n");
+}
+
+#[test]
+fn deserialized_message_with_legacy_images_alias_preserves_both() {
+	let json_str = r#"{
+		"role": "user",
+		"content": "legacy images field",
+		"images": [
+			{"data_base64": "aW1n", "mime_type": "image/png"}
+		]
+	}"#;
+	let msg: Message = serde_json::from_str(json_str).expect("deserialize");
+	assert_eq!(msg.content, "legacy images field");
+	assert!(msg.has_image());
+
+	let wire = pi_agent::to_openai_messages(&[msg]).expect("openai messages");
+	let val = serde_json::to_value(&wire[0]).expect("serialize");
+	let content = val["content"].as_array().expect("content array");
+	assert_eq!(content.len(), 2);
+	assert_eq!(content[0]["type"], "text");
+	assert_eq!(content[0]["text"], "legacy images field");
+	assert_eq!(content[1]["type"], "image_url");
+	assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,aW1n");
+}
+
+#[test]
+fn deserialized_message_with_legacy_image_parts_alias_preserves_both() {
+	let json_str = r#"{
+		"role": "user",
+		"content": "legacy image_parts field",
+		"image_parts": [
+			{"data_base64": "aW1n", "mime_type": "image/png"}
+		]
+	}"#;
+	let msg: Message = serde_json::from_str(json_str).expect("deserialize");
+	assert_eq!(msg.content, "legacy image_parts field");
+	assert!(msg.has_image());
+
+	let wire = pi_agent::to_openai_messages(&[msg]).expect("openai messages");
+	let val = serde_json::to_value(&wire[0]).expect("serialize");
+	let content = val["content"].as_array().expect("content array");
+	assert_eq!(content.len(), 2);
+	assert_eq!(content[0]["type"], "text");
+	assert_eq!(content[0]["text"], "legacy image_parts field");
+	assert_eq!(content[1]["type"], "image_url");
+	assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,aW1n");
+}
+
+#[test]
+fn already_ordered_parts_with_text_and_images_does_not_duplicate_text() {
+	let json_str = r#"{
+		"role": "user",
+		"content": "do not duplicate me",
+		"parts": [
+			{"type": "text", "text": "do not duplicate me"},
+			{"type": "image", "data": "aW1n", "mime_type": "image/png"}
+		]
+	}"#;
+	let msg: Message = serde_json::from_str(json_str).expect("deserialize");
+	assert_eq!(msg.content, "do not duplicate me");
+	assert_eq!(msg.parts.len(), 2, "parts must not duplicate text");
+
+	let wire = pi_agent::to_openai_messages(&[msg]).expect("openai messages");
+	let val = serde_json::to_value(&wire[0]).expect("serialize");
+	let content = val["content"].as_array().expect("content array");
+	assert_eq!(content.len(), 2);
+	assert_eq!(content[0]["type"], "text");
+	assert_eq!(content[0]["text"], "do not duplicate me");
+	assert_eq!(content[1]["type"], "image_url");
+}
+
+#[test]
+fn directly_constructed_message_with_content_and_image_part_preserves_both_on_wire() {
+	let msg = Message {
+		role: Role::User,
+		content: "manually constructed prompt".to_string(),
+		parts: vec![pi_agent::ContentPart::image("aW1n", "image/png").expect("img")],
+		name: None,
+		tool_calls: vec![],
+		tool_call_id: None,
+		is_error: false,
+	};
+	let wire = pi_agent::to_openai_messages(&[msg]).expect("openai messages");
+	let val = serde_json::to_value(&wire[0]).expect("serialize");
+	let content = val["content"].as_array().expect("content array");
+	assert_eq!(content.len(), 2);
+	assert_eq!(content[0]["type"], "text");
+	assert_eq!(content[0]["text"], "manually constructed prompt");
+	assert_eq!(content[1]["type"], "image_url");
+	assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,aW1n");
+}
+
+#[test]
+fn plain_text_user_message_omits_parts_in_json() {
+	let msg = Message::user("hello");
+	let val = serde_json::to_value(&msg).expect("serialize");
+	assert!(val.get("image_parts").is_none(), "plain text message must not serialize empty parts");
+	assert_eq!(val["content"], "hello");
+}
+
+#[test]
+fn image_part_rejects_external_http_urls_and_invalid_data() {
+	assert!(ImagePart::new("image/png", "http://example.com/pic.png").validate().is_err());
+	assert!(ImagePart::new("image/png", "https://example.com/pic.png").validate().is_err());
+	assert!(ImagePart::new("image/png", "//example.com/pic.png").validate().is_err());
+	assert!(ImagePart::new("image/png", "ftp://example.com/pic.png").validate().is_err());
+	assert!(ImagePart::new("text/plain", "aGVsbG8=").validate().is_err());
+	assert!(ImagePart::new("image/png", "not-base64-???").validate().is_err());
+	assert!(ImagePart::new("image/png", "data:text/plain;base64,aGVsbG8=").validate().is_err());
+	assert!(ImagePart::new("image/png", "data:image/png;notb64,aGVsbG8=").validate().is_err());
+
+	let valid_raw = ImagePart::new("image/png", "aGVsbG8=");
+	assert!(valid_raw.validate().is_ok());
+	assert_eq!(valid_raw.to_data_url().unwrap(), "data:image/png;base64,aGVsbG8=");
+
+	let valid_data = ImagePart::new("image/jpeg", "data:image/jpeg;base64,/9j/4AAQSkZJRg==");
+	assert!(valid_data.validate().is_ok());
+	assert_eq!(valid_data.to_data_url().unwrap(), "data:image/jpeg;base64,/9j/4AAQSkZJRg==");
+}
+
+#[tokio::test]
+async fn provider_rejects_external_image_url_payload() {
+	let provider = OpenAiCompatibleProvider::new("http://127.0.0.1:9", "fake-key", "gpt-4o")
+		.expect("provider build");
+	let msg = Message::user_with_images(
+		"steal data",
+		vec![ImagePart::new("image/png", "https://attacker.com/leak.png")],
+	);
+	let err = provider.complete(&[msg], &[]).await.unwrap_err();
+	assert!(
+		matches!(err, ProviderError::UnsupportedImage(_)),
+		"provider must reject external image URLs via UnsupportedImage, got: {:?}",
+		err
+	);
+}
+
+#[test]
+fn ordered_image_text_image_parts_preserve_sequence_on_openai_wire() {
+	let parts = vec![
+		pi_agent::ContentPart::image("aW1nMQ==", "image/png").expect("img1"),
+		pi_agent::ContentPart::text("middle description"),
+		pi_agent::ContentPart::image("aW1nMg==", "image/jpeg").expect("img2"),
+	];
+	let msg = Message::user_with_parts(parts);
+	assert!(msg.has_image());
+
+	let wire = pi_agent::to_openai_messages(&[msg]).expect("openai messages");
+	let val = serde_json::to_value(&wire[0]).expect("serialize");
+	let content = val["content"].as_array().expect("content array");
+	assert_eq!(content.len(), 3);
+	assert_eq!(content[0]["type"], "image_url");
+	assert_eq!(content[0]["image_url"]["url"], "data:image/png;base64,aW1nMQ==");
+	assert_eq!(content[1]["type"], "text");
+	assert_eq!(content[1]["text"], "middle description");
+	assert_eq!(content[2]["type"], "image_url");
+	assert_eq!(content[2]["image_url"]["url"], "data:image/jpeg;base64,aW1nMg==");
+}
+
+#[test]
+fn multiple_text_parts_preserve_sequence_on_openai_wire() {
+	let parts = vec![
+		pi_agent::ContentPart::text("first point"),
+		pi_agent::ContentPart::text("second point"),
+		pi_agent::ContentPart::text("third point"),
+	];
+	let msg = Message::user_with_parts(parts);
+	assert!(!msg.has_image());
+
+	let wire = pi_agent::to_openai_messages(&[msg]).expect("openai messages");
+	let val = serde_json::to_value(&wire[0]).expect("serialize");
+	let content = val["content"].as_array().expect("content array");
+	assert_eq!(content.len(), 3);
+	assert_eq!(content[0]["text"], "first point");
+	assert_eq!(content[1]["text"], "second point");
+	assert_eq!(content[2]["text"], "third point");
+}
+
+#[test]
+fn data_uri_mime_mismatch_is_rejected() {
+	let err = ImagePart::new("image/jpeg", "data:image/png;base64,aW1n").validate().unwrap_err();
+	assert!(err.contains("MIME type mismatch"), "expected mismatch error, got: {err}");
+}
+
+#[test]
+fn secret_in_mime_or_type_or_part_does_not_leak_in_errors() {
+	let secret_marker = "SUPER_SECRET_PI_AGENT_TOKEN_999";
+
+	// 1. Secret in declared MIME
+	let err = pi_agent::state::normalize_image_payload("aW1n", &format!("image/{secret_marker}")).unwrap_err();
+	assert!(!err.contains(secret_marker), "error must not leak secret declared MIME: {err}");
+
+	// 2. Secret in data URI MIME
+	let err = pi_agent::state::normalize_image_payload(&format!("data:image/{secret_marker};base64,aW1n"), "image/png").unwrap_err();
+	assert!(!err.contains(secret_marker), "error must not leak secret URI MIME: {err}");
+
+	// 3. Secret in data URI encoding
+	let err = pi_agent::state::normalize_image_payload(&format!("data:image/png;{secret_marker},aW1n"), "image/png").unwrap_err();
+	assert!(!err.contains(secret_marker), "error must not leak secret encoding: {err}");
+
+	// 4. Secret in unsupported Message content part
+	let raw_msg_json = format!(
+		"{{\"role\":\"user\",\"content\":\"hi\",\"parts\":[{{\"type\":\"{secret_marker}\"}}]}}"
+	);
+	let err = serde_json::from_str::<pi_agent::Message>(&raw_msg_json).unwrap_err().to_string();
+	assert!(!err.contains(secret_marker), "deserialization error must not leak secret part kind: {err}");
+	assert!(err.contains("at index 0"), "error must report index: {err}");
+}
+
+#[test]
+fn image_mime_and_base64_validation_strict_logic() {
+	use pi_agent::state::{is_valid_base64_payload, is_valid_image_mime};
+
+	assert!(is_valid_image_mime("image/png"));
+	assert!(is_valid_image_mime("image/jpeg"));
+	assert!(is_valid_image_mime("IMAGE/JPEG"));
+	assert!(is_valid_image_mime("image/webp"));
+	assert!(is_valid_image_mime("image/gif"));
+	assert!(!is_valid_image_mime("text/plain"));
+	assert!(!is_valid_image_mime("application/json"));
+	assert!(!is_valid_image_mime("image/"));
+	assert!(!is_valid_image_mime(""));
+
+	assert!(is_valid_base64_payload("aW1n"));
+	assert!(is_valid_base64_payload("aGVsbG8="));
+	assert!(is_valid_base64_payload("/9j/4AAQSkZJRg=="));
+	assert!(!is_valid_base64_payload(""));
+	assert!(!is_valid_base64_payload("=="));
+	assert!(!is_valid_base64_payload("="));
+	assert!(is_valid_base64_payload("abc="));
+	assert!(!is_valid_base64_payload("abd="));
+	assert!(!is_valid_base64_payload("AAh=="));
+	assert!(!is_valid_base64_payload("ab="));
+	assert!(!is_valid_base64_payload("a"));
+	assert!(!is_valid_base64_payload("not-b64-???"));
 }
