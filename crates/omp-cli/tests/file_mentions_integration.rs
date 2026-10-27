@@ -420,3 +420,71 @@ fn test_fifo_opened_non_blocking_rejected_integration() {
 	let _ = fs::remove_file(&fifo);
 	let _ = fs::remove_dir_all(&cwd);
 }
+
+#[test]
+fn test_process_prompt_mentions_extracts_images_and_formats_prompt_blocks() {
+	let cwd = temp_dir("prompt-img");
+	let png_path = cwd.join("pic.png");
+	let txt_path = cwd.join("notes.txt");
+
+	let png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4";
+	fs::write(&png_path, png_bytes).expect("write png");
+	fs::write(&txt_path, "important note").expect("write txt");
+
+	let prompt = "Look at @pic.png and @notes.txt";
+	let msg = process_prompt_mentions(prompt, &cwd).expect("process mentions");
+	assert_eq!(msg.files.len(), 2);
+
+	let img_file = msg.files.iter().find(|f| f.path == "pic.png").expect("pic.png");
+	let txt_file = msg.files.iter().find(|f| f.path == "notes.txt").expect("notes.txt");
+
+	assert!(img_file.image.is_some());
+	let img = img_file.image.as_ref().unwrap();
+	assert_eq!(img.mime_type, "image/png");
+	assert_eq!(img.data_base64, base64_encode(png_bytes));
+
+	assert!(txt_file.image.is_none());
+	assert!(txt_file.content.contains("important note"));
+
+	let text_block = msg.format_text_prompt_block();
+	assert!(text_block.contains("<file path=\"notes.txt\">"));
+	assert!(!text_block.contains("<file path=\"pic.png\">"));
+
+	let img_block = msg.format_image_prompt_block();
+	assert!(img_block.contains("<file path=\"pic.png\">"));
+	assert!(!img_block.contains("<file path=\"notes.txt\">"));
+
+	let _ = fs::remove_dir_all(&cwd);
+}
+
+#[test]
+fn test_process_prompt_mentions_enforces_image_size_bounds_and_binary() {
+	let cwd = temp_dir("bounds-img");
+	let big_path = cwd.join("huge.png");
+	let bin_path = cwd.join("corrupt.png");
+
+	// Fake huge file with PNG header that claims/exceeds 25 MiB
+	let mut f = File::create(&big_path).expect("create huge.png");
+	f.write_all(b"\x89PNG\r\n\x1a\n").expect("write png header");
+	f.set_len(MAX_AUTO_READ_IMAGE_BYTES + 1024).expect("set_len");
+	drop(f);
+
+	// Fake binary with invalid header (NUL bytes)
+	fs::write(&bin_path, b"not-image\x00\x01\x02").expect("write corrupt");
+
+	let prompt = "Inspect @huge.png and @corrupt.png";
+	let msg = process_prompt_mentions(prompt, &cwd).expect("process");
+	assert_eq!(msg.files.len(), 2);
+
+	let huge = msg.files.iter().find(|f| f.path == "huge.png").unwrap();
+	assert_eq!(huge.skipped_reason, Some(SkippedReason::TooLarge));
+	assert!(huge.image.is_none());
+	assert!(huge.content.contains("too large"));
+
+	let bin = msg.files.iter().find(|f| f.path == "corrupt.png").unwrap();
+	assert_eq!(bin.skipped_reason, Some(SkippedReason::Binary));
+	assert!(bin.image.is_none());
+	assert!(bin.content.contains("binary file"));
+
+	let _ = fs::remove_dir_all(&cwd);
+}

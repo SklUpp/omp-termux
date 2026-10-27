@@ -111,6 +111,7 @@ pub type EventStream = Box<dyn Iterator<Item = Result<Event>> + Send>;
 #[derive(Debug, Clone)]
 pub struct RunRequest {
 	pub prompt: String,
+	pub parts: Vec<crate::session::ContentPart>,
 	pub cwd: std::path::PathBuf,
 	pub output_mode: OutputMode,
 	pub model: Option<String>,
@@ -132,6 +133,13 @@ pub struct RunRequest {
 	pub tools_enabled: bool,
 	/// Optional cancellation trigger from the consumer.
 	pub cancellation_token: Option<pi_agent::CancellationToken>,
+}
+
+impl RunRequest {
+	#[must_use]
+	pub fn has_image(&self) -> bool {
+		self.parts.iter().any(crate::session::ContentPart::is_image)
+	}
 }
 
 pub trait AgentRunner: Send + Sync {
