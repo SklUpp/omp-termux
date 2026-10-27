@@ -15,6 +15,7 @@ use omp_cli::{
 	config::Config,
 	deadline::{self, Deadline},
 	dirs,
+	file_mentions,
 	foreign_session::{self, ForeignSessionSource, ForeignSessionStore},
 	output::{self, OutputMode, Reporter, session_id},
 	prompts::{self, Prompts},
@@ -97,6 +98,11 @@ fn run() -> std::result::Result<(), CliError> {
 		config.tools = Some(normalized);
 	}
 	let cwd = resolve_cwd(cli.cwd.clone(), config.cwd.clone())?;
+	let file_text = if !cli.file_args.is_empty() {
+		process_cli_file_args(&cli.file_args, &cwd)?
+	} else {
+		String::new()
+	};
 	if cli.resume.as_deref() == Some("")
 		&& (!io::stdin().is_terminal() || !io::stdout().is_terminal())
 	{
@@ -393,21 +399,48 @@ fn run() -> std::result::Result<(), CliError> {
 	let mut reporter = Reporter::new(mode, io::stdout(), io::stderr());
 	reporter.session_header(&reporter_id, &session.cwd)?;
 
-	let repl_mode = matches!(cli.command.as_ref(), Some(Command::Repl))
-		|| (cli.command.is_none() && cli.prompt.is_empty() && !cli.print);
+	if matches!(cli.command.as_ref(), Some(Command::Repl)) {
+		return run_repl(&mut session, mode, &mut reporter).map_err(CliError::from);
+	}
+
+	let piped_stdin = read_piped_stdin()?;
+
+	let repl_mode = cli.command.is_none()
+		&& cli.prompt.is_empty()
+		&& cli.file_args.is_empty()
+		&& piped_stdin.is_none()
+		&& !cli.print;
 	if repl_mode {
 		return run_repl(&mut session, mode, &mut reporter).map_err(CliError::from);
 	}
 
-	let mut prompts_to_run = cli.prompt.clone();
-	if prompts_to_run.is_empty() {
-		let mut text = String::new();
-		io::stdin().read_to_string(&mut text)?;
-		if text.trim().is_empty() {
-			// TS print mode with zero messages writes nothing and exits 0.
-			return reporter.finish().map_err(CliError::from);
+	let mut remaining_prompts = cli.prompt.clone();
+	let mut body = String::new();
+	if !file_text.is_empty() {
+		body.push_str(&file_text);
+	}
+	if !remaining_prompts.is_empty() {
+		body.push_str(&remaining_prompts.remove(0));
+	}
+
+	let initial_message = match (piped_stdin, !body.is_empty()) {
+		(Some(stdin), true) => Some(format!("{stdin}\n{body}")),
+		(Some(stdin), false) => Some(stdin),
+		(None, true) => Some(body),
+		(None, false) => None,
+	};
+
+	let mut prompts_to_run = Vec::new();
+	if let Some(initial) = initial_message {
+		if !initial.trim().is_empty() {
+			prompts_to_run.push(initial);
 		}
-		prompts_to_run.push(text);
+	}
+	prompts_to_run.extend(remaining_prompts);
+
+	if prompts_to_run.is_empty() {
+		// TS print mode with zero messages writes nothing and exits 0.
+		return reporter.finish().map_err(CliError::from);
 	}
 	for prompt in prompts_to_run {
 		if let Err(error) = session.turn(prompt, mode, &mut reporter) {
@@ -822,4 +855,162 @@ fn resolve_cwd(cli_cwd: Option<PathBuf>, config_cwd: Option<PathBuf>) -> Result<
 	let path = dirs::absolute(&base, &path);
 	std::fs::canonicalize(&path)
 		.map_err(|err| Error::with_source(format!("cwd {} is not accessible", path.display()), err))
+}
+
+
+#[cfg(unix)]
+fn open_file_safe(path: &Path) -> std::io::Result<std::fs::File> {
+	use std::os::unix::fs::OpenOptionsExt;
+	#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))))]
+	const O_NONBLOCK: i32 = 0o4000;
+	#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))]
+	const O_NONBLOCK: i32 = 0x0004;
+
+	let mut options = std::fs::OpenOptions::new();
+	options.read(true);
+	options.custom_flags(O_NONBLOCK);
+	options.open(path)
+}
+
+#[cfg(not(unix))]
+fn open_file_safe(path: &Path) -> std::io::Result<std::fs::File> {
+	std::fs::File::open(path)
+}
+
+fn read_piped_stdin() -> std::io::Result<Option<String>> {
+	if io::stdin().is_terminal() {
+		return Ok(None);
+	}
+	let mut text = String::new();
+	io::stdin().read_to_string(&mut text)?;
+	if text.trim().is_empty() {
+		Ok(None)
+	} else {
+		Ok(Some(text))
+	}
+}
+
+fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Result<String, CliError> {
+	let mut text = String::new();
+	for file_arg in file_args {
+		let resolved = file_mentions::resolve_path(file_arg, cwd);
+		let abs_path = dirs::absolute(cwd, &resolved);
+
+		if abs_path.is_dir() {
+			let listing = file_mentions::build_directory_listing(&abs_path).map_err(|err| {
+				CliError::fail(format!(
+					"Error: Could not read directory {}: {err}",
+					abs_path.display()
+				))
+			})?;
+			text.push_str(&format!(
+				"<file name=\"{}\">\n{}\n</file>\n",
+				abs_path.display(),
+				listing.output
+			));
+			continue;
+		}
+
+		let mut file = match open_file_safe(&abs_path) {
+			Ok(f) => f,
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+				return Err(CliError::fail(format!(
+					"Error: File not found: {}",
+					abs_path.display()
+				)));
+			},
+			Err(err) => {
+				return Err(CliError::fail(format!(
+					"Error: Could not read file {}: {err}",
+					abs_path.display()
+				)));
+			},
+		};
+
+		let opened_meta = match file.metadata() {
+			Ok(m) => m,
+			Err(err) => {
+				return Err(CliError::fail(format!(
+					"Error: Could not read file {}: {err}",
+					abs_path.display()
+				)));
+			},
+		};
+
+		if !opened_meta.is_file() {
+			return Err(CliError::fail(format!(
+				"Error: Could not read file {}: not a regular file",
+				abs_path.display()
+			)));
+		}
+
+		if opened_meta.len() == 0 {
+			continue;
+		}
+
+		let mut header = [0u8; 512];
+		let mut n = 0;
+		while n < header.len() {
+			match file.read(&mut header[n..]) {
+				Ok(0) => break,
+				Ok(bytes_read) => n += bytes_read,
+				Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+				Err(err) => {
+					return Err(CliError::fail(format!(
+						"Error: Could not read file {}: {err}",
+						abs_path.display()
+					)));
+				},
+			}
+		}
+
+		if file_mentions::detect_image_mime(&header[..n]).is_some() {
+			return Err(CliError::fail(format!(
+				"image attachments are not supported yet: {}",
+				abs_path.display()
+			)));
+		}
+
+		let initial_buf = header[..n].to_vec();
+		let bytes = match file_mentions::read_bounded(
+			&mut file,
+			initial_buf,
+			file_mentions::MAX_AUTO_READ_TEXT_BYTES,
+		) {
+			Ok(b) => b,
+			Err(file_mentions::BoundedReadError::TooLarge { actual_read }) => {
+				let disk_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+				let reported_size = if disk_size > file_mentions::MAX_AUTO_READ_TEXT_BYTES {
+					disk_size
+				} else {
+					actual_read
+				};
+				eprintln!(
+					"Warning: Skipping file contents (too large: {}): {}",
+					file_mentions::format_bytes(reported_size),
+					abs_path.display()
+				);
+				text.push_str(&format!(
+					"<file name=\"{}\">(skipped: too large, {})</file>\n",
+					abs_path.display(),
+					file_mentions::format_bytes(reported_size)
+				));
+				continue;
+			},
+			Err(file_mentions::BoundedReadError::Io(err)) => {
+				return Err(CliError::fail(format!(
+					"Error: Could not read file {}: {err:?}",
+					abs_path.display()
+				)));
+			},
+		};
+
+		let content = String::from_utf8_lossy(&bytes);
+		text.push_str(&format!(
+			"<file name=\"{}\">\n{content}\n</file>\n",
+			abs_path.display()
+		));
+	}
+	Ok(text)
 }

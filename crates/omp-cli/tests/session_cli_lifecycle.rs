@@ -31,7 +31,9 @@ fn temp_dir(prefix: &str) -> PathBuf {
 }
 
 fn omp() -> ProcCommand {
-	ProcCommand::new(env!("CARGO_BIN_EXE_omp"))
+	let mut cmd = ProcCommand::new(env!("CARGO_BIN_EXE_omp"));
+	cmd.stdin(Stdio::null());
+	cmd
 }
 
 struct MockSseServer {
@@ -384,4 +386,737 @@ fn test_nontty_bare_resume_error() {
 			|| stderr.contains("requires a TTY"),
 		"stderr must explain non-interactive error, got: {stderr}"
 	);
+}
+
+#[test]
+fn test_cli_file_arg_does_not_enter_repl_and_runs_turn() {
+	let server = MockSseServer::start();
+	let temp = temp_dir("file-arg-repl");
+	let agent_dir = temp.join("agent");
+	let sessions_dir = temp.join("sessions");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, server.port);
+
+	let file_path = work_dir.join("sample.txt");
+	fs::write(&file_path, "sample text content").expect("write sample file");
+
+	let output = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--session-dir",
+			sessions_dir.to_str().unwrap(),
+			"--session-id",
+			"file-arg-session",
+			"--no-tools",
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"@sample.txt",
+		])
+		.output()
+		.expect("run omp @sample.txt");
+
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert_eq!(
+		output.status.code(),
+		Some(0),
+		"omp @sample.txt must not enter REPL or fail; exit 0 expected: {stderr}"
+	);
+
+	let files = fs::read_dir(&sessions_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+		.collect::<Vec<_>>();
+	assert!(!files.is_empty(), "must write session log");
+
+	let content = fs::read_to_string(&files[0]).expect("read session file");
+	let lines: Vec<&str> = content.lines().collect();
+	assert!(lines.len() >= 4, "must have recorded turn: found {}", lines.len());
+
+	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
+	assert_eq!(user_entry["type"], "message");
+	assert_eq!(user_entry["message"]["role"], "user");
+	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	assert!(
+		user_text.contains("<file name=\"") && user_text.contains("sample.txt\">"),
+		"user prompt must format <file name=...>: got {user_text}"
+	);
+	assert!(
+		user_text.contains("sample text content"),
+		"user prompt must contain file content: got {user_text}"
+	);
+
+	let _ = fs::remove_dir_all(temp);
+}
+
+// File-only invocation (`omp -p @file`) with empty/closed stdin executes the prompt directly
+// without blocking for input.
+#[test]
+fn test_cli_file_arg_print_mode_does_not_block_on_empty_stdin() {
+	let server = MockSseServer::start();
+	let temp = temp_dir("file-arg-print");
+	let agent_dir = temp.join("agent");
+	let sessions_dir = temp.join("sessions");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, server.port);
+
+	let file_path = work_dir.join("code.rs");
+	fs::write(&file_path, "fn hello() {}").expect("write code file");
+
+	let output = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--session-dir",
+			sessions_dir.to_str().unwrap(),
+			"--session-id",
+			"file-arg-print-session",
+			"--no-tools",
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"-p",
+			"@code.rs",
+		])
+		.output()
+		.expect("run omp -p @code.rs");
+
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert_eq!(
+		output.status.code(),
+		Some(0),
+		"omp -p @code.rs must succeed exit 0: {stderr}"
+	);
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	assert!(
+		stdout.contains("mock answer"),
+		"print output must contain mock answer, got: {stdout}"
+	);
+
+	let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn test_cli_file_arg_combined_with_prompt_message() {
+	let server = MockSseServer::start();
+	let temp = temp_dir("file-arg-combined");
+	let agent_dir = temp.join("agent");
+	let sessions_dir = temp.join("sessions");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, server.port);
+
+	let file_path = work_dir.join("data.txt");
+	fs::write(&file_path, "first file payload").expect("write data file");
+
+	let output = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--session-dir",
+			sessions_dir.to_str().unwrap(),
+			"--session-id",
+			"file-arg-combined-session",
+			"--no-tools",
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"@data.txt",
+			"explain this payload",
+		])
+		.output()
+		.expect("run omp @data.txt prompt");
+
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert_eq!(output.status.code(), Some(0), "exit 0: {stderr}");
+
+	let files = fs::read_dir(&sessions_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+		.collect::<Vec<_>>();
+	assert!(!files.is_empty(), "must write session log");
+
+	let content = fs::read_to_string(&files[0]).expect("read session file");
+	let lines: Vec<&str> = content.lines().collect();
+	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
+	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	assert!(
+		user_text.contains("<file name=\"") && user_text.contains("first file payload"),
+		"must contain file payload block"
+	);
+	assert!(
+		user_text.contains("explain this payload"),
+		"must contain prompt message"
+	);
+
+	let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn test_cli_file_arg_missing_file_fails_honestly() {
+	let temp = temp_dir("missing-file");
+	let agent_dir = temp.join("agent");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, 9999);
+
+	let output = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"@does_not_exist_12345.txt",
+		])
+		.output()
+		.expect("run omp with missing file");
+
+	assert_eq!(
+		output.status.code(),
+		Some(1),
+		"missing file arg must exit 1 (EXIT_FAILURE)"
+	);
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert!(
+		stderr.contains("Error: File not found:") && stderr.contains("does_not_exist_12345.txt"),
+		"stderr must report File not found error, got: {stderr}"
+	);
+
+	let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn test_cli_file_arg_image_fails_with_explicit_error() {
+	let temp = temp_dir("image-file");
+	let agent_dir = temp.join("agent");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, 9999);
+
+	let png_path = work_dir.join("photo.png");
+	let png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4";
+	fs::write(&png_path, png_bytes).expect("write png");
+
+	let output = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"@photo.png",
+		])
+		.output()
+		.expect("run omp with image file");
+
+	assert_eq!(
+		output.status.code(),
+		Some(1),
+		"image file arg must exit 1 when image wire unavailable"
+	);
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert!(
+		stderr.contains("image attachments are not supported yet:"),
+		"stderr must explicitly report unsupported image wire, got: {stderr}"
+	);
+	assert!(
+		stderr.contains("photo.png"),
+		"stderr must include image path, got: {stderr}"
+	);
+
+	let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn test_cli_file_arg_svg_treated_as_text_matching_ts() {
+	let server = MockSseServer::start();
+	let temp = temp_dir("svg-file");
+	let agent_dir = temp.join("agent");
+	let sessions_dir = temp.join("sessions");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, server.port);
+
+	let svg_path = work_dir.join("logo.svg");
+	let svg_content = "<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"5\"/></svg>";
+	fs::write(&svg_path, svg_content).expect("write svg");
+
+	let output = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--session-dir",
+			sessions_dir.to_str().unwrap(),
+			"--session-id",
+			"svg-turn-session",
+			"--no-tools",
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"@logo.svg",
+		])
+		.output()
+		.expect("run omp with svg file");
+
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert_eq!(
+		output.status.code(),
+		Some(0),
+		"svg file arg must be processed as text, exit 0: {stderr}"
+	);
+
+	let files = fs::read_dir(&sessions_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+		.collect::<Vec<_>>();
+	assert!(!files.is_empty(), "must write session log");
+
+	let content = fs::read_to_string(&files[0]).expect("read session file");
+	let lines: Vec<&str> = content.lines().collect();
+	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
+	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	assert!(
+		user_text.contains("<file name=\"") && user_text.contains("logo.svg\">"),
+		"user prompt must format <file name=...>: got {user_text}"
+	);
+	assert!(
+		user_text.contains(svg_content),
+		"user prompt must contain raw svg xml: got {user_text}"
+	);
+
+	let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn test_cli_delayed_piped_stdin_producer_with_file_and_prompt_order() {
+	let server = MockSseServer::start();
+	let temp = temp_dir("delayed-stdin");
+	let agent_dir = temp.join("agent");
+	let sessions_dir = temp.join("sessions");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, server.port);
+
+	let file1 = work_dir.join("f1.txt");
+	fs::write(&file1, "content1").expect("write f1");
+	let file2 = work_dir.join("f2.txt");
+	fs::write(&file2, "content2").expect("write f2");
+
+	let mut child = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--session-dir",
+			sessions_dir.to_str().unwrap(),
+			"--session-id",
+			"delayed-session",
+			"--no-tools",
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"-p",
+			"@f1.txt",
+			"@f2.txt",
+			"prompt_tail",
+		])
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.expect("spawn omp with piped stdin");
+
+	let mut stdin = child.stdin.take().expect("child stdin pipe");
+	let producer = thread::spawn(move || {
+		// Delayed producer: simulate slow pipe writer producing data after delay.
+		thread::sleep(Duration::from_millis(50));
+		stdin.write_all(b"delayed_stdin_header\n").expect("write delayed stdin");
+		// Explicit close (EOF) according to Unix pipe semantics and TS contract (main.ts:199-221).
+		drop(stdin);
+	});
+
+	let output = child.wait_with_output().expect("wait with output");
+	producer.join().expect("join producer thread");
+
+	assert_eq!(output.status.code(), Some(0));
+
+	let files = fs::read_dir(&sessions_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+		.collect::<Vec<_>>();
+	assert!(!files.is_empty(), "must write session log");
+
+	let content = fs::read_to_string(&files[0]).expect("read session file");
+	let lines: Vec<&str> = content.lines().collect();
+	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
+	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+
+	let pos_stdin = user_text.find("delayed_stdin_header").expect("stdin pos");
+	let pos_f1 = user_text.find("f1.txt").expect("f1 pos");
+	let pos_f2 = user_text.find("f2.txt").expect("f2 pos");
+	let pos_prompt = user_text.find("prompt_tail").expect("prompt pos");
+
+	assert!(
+		pos_stdin < pos_f1 && pos_f1 < pos_f2 && pos_f2 < pos_prompt,
+		"order must be delayed_stdin < f1 < f2 < prompt: got {user_text}"
+	);
+
+	let _ = fs::remove_dir_all(temp);
+}
+#[test]
+fn test_cli_bare_piped_stdin_without_flags_runs_autoprint_turn() {
+	let server = MockSseServer::start();
+	let temp = temp_dir("bare-piped-stdin");
+	let agent_dir = temp.join("agent");
+	let sessions_dir = temp.join("sessions");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, server.port);
+
+	let mut child = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--session-dir",
+			sessions_dir.to_str().unwrap(),
+			"--session-id",
+			"bare-piped-session",
+			"--no-tools",
+			"--cwd",
+			work_dir.to_str().unwrap(),
+		])
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.expect("spawn omp with bare piped stdin");
+
+	if let Some(mut stdin) = child.stdin.take() {
+		stdin.write_all(b"bare piped prompt question\n").expect("write piped stdin");
+		drop(stdin);
+	}
+
+	let output = child.wait_with_output().expect("wait with output");
+	assert_eq!(output.status.code(), Some(0));
+
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	assert!(stdout.contains("mock answer"), "must print mock answer in print mode: {stdout}");
+
+	let files = fs::read_dir(&sessions_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+		.collect::<Vec<_>>();
+	assert!(!files.is_empty(), "must write session log");
+
+	let content = fs::read_to_string(&files[0]).expect("read session file");
+	let lines: Vec<&str> = content.lines().collect();
+	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
+	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	assert!(user_text.contains("bare piped prompt question"), "log must contain piped prompt: {user_text}");
+
+	let _ = fs::remove_dir_all(temp);
+}
+#[test]
+fn test_cli_piped_stdin_to_explicit_repl_subcommand() {
+	let server = MockSseServer::start();
+	let temp = temp_dir("piped-repl");
+	let agent_dir = temp.join("agent");
+	let sessions_dir = temp.join("sessions");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, server.port);
+
+	let mut child = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--session-dir",
+			sessions_dir.to_str().unwrap(),
+			"--session-id",
+			"piped-repl-session",
+			"--no-tools",
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"repl",
+		])
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.expect("spawn omp repl with piped stdin");
+
+	if let Some(mut stdin) = child.stdin.take() {
+		stdin.write_all(b"repl piped question\n/exit\n").expect("write repl pipe");
+		drop(stdin);
+	}
+
+	let output = child.wait_with_output().expect("wait with output");
+	assert_eq!(output.status.code(), Some(0));
+
+	let files = fs::read_dir(&sessions_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+		.collect::<Vec<_>>();
+	assert!(!files.is_empty(), "must write session log");
+
+	let content = fs::read_to_string(&files[0]).expect("read session file");
+	let lines: Vec<&str> = content.lines().collect();
+	assert!(lines.len() >= 4, "must record turn in repl: found {}", lines.len());
+
+	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
+	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	assert!(
+		user_text.contains("repl piped question"),
+		"repl must process prompt from stdin: {user_text}"
+	);
+
+	let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn test_cli_message_order_stdin_files_prompts() {
+	let server = MockSseServer::start();
+	let temp = temp_dir("order-test");
+	let agent_dir = temp.join("agent");
+	let sessions_dir = temp.join("sessions");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, server.port);
+
+	let file1 = work_dir.join("f1.txt");
+	fs::write(&file1, "content1").expect("write f1");
+	let file2 = work_dir.join("f2.txt");
+	fs::write(&file2, "content2").expect("write f2");
+
+	let stdin_path = work_dir.join("stdin.txt");
+	fs::write(&stdin_path, "stdin_header\n").expect("write stdin file");
+
+	let output = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--session-dir",
+			sessions_dir.to_str().unwrap(),
+			"--session-id",
+			"order-session",
+			"--no-tools",
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"-p",
+			"@f1.txt",
+			"@f2.txt",
+			"prompt_tail",
+		])
+		.stdin(Stdio::from(fs::File::open(&stdin_path).expect("open stdin file")))
+		.output()
+		.expect("run omp with redirected stdin");
+	assert_eq!(output.status.code(), Some(0));
+
+	let files = fs::read_dir(&sessions_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+		.collect::<Vec<_>>();
+	assert!(!files.is_empty(), "must write session log");
+
+	let content = fs::read_to_string(&files[0]).expect("read session file");
+	let lines: Vec<&str> = content.lines().collect();
+	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
+	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+
+	let pos_stdin = user_text.find("stdin_header").expect("stdin pos");
+	let pos_f1 = user_text.find("f1.txt").expect("f1 pos");
+	let pos_f2 = user_text.find("f2.txt").expect("f2 pos");
+	let pos_prompt = user_text.find("prompt_tail").expect("prompt pos");
+
+	assert!(
+		pos_stdin < pos_f1 && pos_f1 < pos_f2 && pos_f2 < pos_prompt,
+		"order must be stdin < f1 < f2 < prompt: got {user_text}"
+	);
+
+	let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn test_cli_file_arg_oversize_skips_content() {
+	let server = MockSseServer::start();
+	let temp = temp_dir("oversize-file");
+	let agent_dir = temp.join("agent");
+	let sessions_dir = temp.join("sessions");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, server.port);
+
+	let oversize_path = work_dir.join("big.txt");
+	let chunk = vec![b'A'; 1024 * 1024];
+	{
+		let mut f = fs::File::create(&oversize_path).expect("create big file");
+		for _ in 0..5 {
+			f.write_all(&chunk).expect("write chunk");
+		}
+		f.write_all(&vec![b'A'; 512 * 1024]).expect("write last half mb");
+	}
+
+	let output = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--session-dir",
+			sessions_dir.to_str().unwrap(),
+			"--session-id",
+			"oversize-session",
+			"--no-tools",
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"@big.txt",
+		])
+		.output()
+		.expect("run omp with oversize file");
+
+	assert_eq!(output.status.code(), Some(0));
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert!(
+		stderr.contains("Warning: Skipping file contents (too large:"),
+		"stderr must contain skipping warning: {stderr}"
+	);
+
+	let files = fs::read_dir(&sessions_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+		.collect::<Vec<_>>();
+	assert!(!files.is_empty(), "must write session log");
+
+	let content = fs::read_to_string(&files[0]).expect("read session file");
+	let lines: Vec<&str> = content.lines().collect();
+	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
+	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	assert!(
+		user_text.contains("<file name=\"") && user_text.contains("(skipped: too large,"),
+		"must contain skipped block: {user_text}"
+	);
+
+	let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn test_cli_file_arg_fifo_rejected_nonblocking() {
+	let temp = temp_dir("fifo-file");
+	let agent_dir = temp.join("agent");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, 9999);
+
+	let fifo_path = work_dir.join("test.fifo");
+	let mkfifo_status = ProcCommand::new("mkfifo")
+		.arg(&fifo_path)
+		.status();
+	if mkfifo_status.is_err() || !mkfifo_status.unwrap().success() {
+		use std::ffi::CString;
+		unsafe extern "C" {
+			fn mkfifo(path: *const std::os::raw::c_char, mode: std::os::raw::c_uint) -> std::os::raw::c_int;
+		}
+		let c_path = CString::new(fifo_path.to_str().unwrap()).unwrap();
+		let ret = unsafe { mkfifo(c_path.as_ptr(), 0o600) };
+		if ret != 0 {
+			let _ = fs::remove_dir_all(temp);
+			return;
+		}
+	}
+
+	let output = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"@test.fifo",
+		])
+		.output()
+		.expect("run omp with fifo");
+
+	assert_eq!(
+		output.status.code(),
+		Some(1),
+		"fifo must exit 1"
+	);
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert!(
+		stderr.contains("not a regular file"),
+		"stderr must report not a regular file, got: {stderr}"
+	);
+
+	let _ = fs::remove_file(&fifo_path);
+	let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn test_cli_file_arg_invalid_utf8_lossy_decoded() {
+	let server = MockSseServer::start();
+	let temp = temp_dir("invalid-utf8");
+	let agent_dir = temp.join("agent");
+	let sessions_dir = temp.join("sessions");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, server.port);
+
+	let invalid_path = work_dir.join("corrupt.txt");
+	fs::write(&invalid_path, b"hello \xff\xfe world").expect("write invalid utf8 file");
+
+	let output = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--session-dir",
+			sessions_dir.to_str().unwrap(),
+			"--session-id",
+			"invalid-utf8-session",
+			"--no-tools",
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"@corrupt.txt",
+		])
+		.output()
+		.expect("run omp with invalid utf8 file");
+
+	assert_eq!(output.status.code(), Some(0));
+
+	let files = fs::read_dir(&sessions_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+		.collect::<Vec<_>>();
+	assert!(!files.is_empty(), "must write session log");
+
+	let content = fs::read_to_string(&files[0]).expect("read session file");
+	let lines: Vec<&str> = content.lines().collect();
+	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
+	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	assert!(
+		user_text.contains("hello \u{fffd}\u{fffd} world"),
+		"must contain lossy decoded string with replacement characters: {user_text}"
+	);
+
+	let _ = fs::remove_dir_all(temp);
 }
