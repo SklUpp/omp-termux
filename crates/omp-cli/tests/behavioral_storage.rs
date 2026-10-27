@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
 
-use omp_cli::session::{SessionOptions, SessionStore, TurnRecord, import_legacy_v1};
+use omp_cli::session::{
+	SessionOptions, SessionStore, TurnRecord, create_session_log_exclusive, import_legacy_v1,
+	sanitize_terminal_id,
+};
 
 static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -250,6 +253,324 @@ fn import_legacy_v1_refuses_overwrite() {
 	assert!(
 		second_result.unwrap_err().contains("refusing to overwrite"),
 		"error message must state refusing to overwrite"
+	);
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn session_create_new_collision_refuses_overwrite_and_leaves_victim_intact() {
+	let temp = temp_dir("collision-victim");
+	let victim_content = b"CRITICAL VICTIM DATA MUST REMAIN UNTOUCHED";
+
+	// Direct exclusive-create unit test (exercises O_EXCL immutability without id-stem scan)
+	let direct_victim = temp.join("direct_victim.jsonl");
+	fs::write(&direct_victim, victim_content).expect("write direct victim");
+	let direct_err = create_session_log_exclusive(&direct_victim, b"OVERWRITE ATTEMPT")
+		.expect_err("create_session_log_exclusive must fail on existing file");
+	assert_eq!(direct_err.kind(), std::io::ErrorKind::AlreadyExists);
+	assert_eq!(
+		fs::read(&direct_victim).expect("read direct victim"),
+		victim_content,
+		"direct victim file must be byte-exact unmodified"
+	);
+
+	#[cfg(unix)]
+	{
+		let direct_sym_victim = temp.join("direct_sym_victim.txt");
+		fs::write(&direct_sym_victim, victim_content).expect("write sym victim");
+		let direct_symlink = temp.join("direct_symlink.jsonl");
+		std::os::unix::fs::symlink(&direct_sym_victim, &direct_symlink).expect("create symlink");
+
+		let sym_err = create_session_log_exclusive(&direct_symlink, b"OVERWRITE ATTEMPT")
+			.expect_err("create_session_log_exclusive must fail on existing symlink");
+		assert_eq!(sym_err.kind(), std::io::ErrorKind::AlreadyExists);
+		assert_eq!(
+			fs::read(&direct_sym_victim).expect("read direct sym victim"),
+			victim_content,
+			"symlink target file must be byte-exact unmodified"
+		);
+	}
+
+	// 1. Existing regular file collision
+	let now_iso = omp_cli::output::iso8601(std::time::SystemTime::now());
+	let ts = omp_cli::session::file_safe_timestamp(&now_iso);
+	let target_filename = format!("{ts}_collision_target.jsonl");
+	let victim_file = temp.join(&target_filename);
+	fs::write(&victim_file, victim_content).expect("write regular victim");
+
+	let store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("collision_target".to_string()),
+		continue_latest: false,
+	});
+
+	assert!(!store.enabled(), "store must be disabled on collision");
+	assert_eq!(
+		fs::read(&victim_file).expect("read victim file"),
+		victim_content,
+		"victim file must never be overwritten or truncated on collision"
+	);
+
+	// 2. Symlink collision
+	#[cfg(unix)]
+	{
+		let symlink_victim = temp.join("symlink_victim_file.txt");
+		let symlink_target_bytes = b"SENSITIVE SYMLINK TARGET NEVER TRUNCATE";
+		fs::write(&symlink_victim, symlink_target_bytes).expect("write symlink victim");
+
+		let symlink_path = temp.join(format!("{ts}_symlink_target.jsonl"));
+		std::os::unix::fs::symlink(&symlink_victim, &symlink_path).expect("create symlink");
+
+		let symlink_store = SessionStore::open(&SessionOptions {
+			enabled: true,
+			cwd: PathBuf::from("/work"),
+			model: None,
+			provider: None,
+			dir: Some(temp.clone()),
+			id: Some("symlink_target".to_string()),
+			continue_latest: false,
+		});
+
+		assert!(!symlink_store.enabled(), "store must be disabled on symlink collision");
+		assert_eq!(
+			fs::read(&symlink_victim).expect("read symlink target"),
+			symlink_target_bytes,
+			"symlink victim must remain untouched"
+		);
+	}
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn terminal_id_env_traversal_is_rejected_or_sanitized() {
+	// Traversal sequences must be rejected
+	assert!(sanitize_terminal_id("../../../etc/passwd").is_none());
+	assert!(sanitize_terminal_id("..").is_none());
+	assert!(sanitize_terminal_id(".").is_none());
+	assert!(sanitize_terminal_id("").is_none());
+	assert!(sanitize_terminal_id("   ").is_none());
+	assert!(sanitize_terminal_id("foo/../bar").is_none());
+	assert!(sanitize_terminal_id("foo\\..\\bar").is_none());
+	assert!(sanitize_terminal_id("pane/\0/bad").is_none());
+
+	// Safe single-component names must be accepted
+	assert_eq!(sanitize_terminal_id("tmux-%0").as_deref(), Some("tmux-%0"));
+	assert_eq!(sanitize_terminal_id("zellij-sess-1").as_deref(), Some("zellij-sess-1"));
+	assert_eq!(sanitize_terminal_id("kitty-123").as_deref(), Some("kitty-123"));
+
+	// Slashes without traversal are sanitized to a single component
+	assert_eq!(sanitize_terminal_id("session/1").as_deref(), Some("session-1"));
+	assert_eq!(sanitize_terminal_id("session\\2").as_deref(), Some("session-2"));
+}
+
+#[test]
+fn parse_error_does_not_leak_raw_line_secrets() {
+	let temp = temp_dir("secret-leak-syntax");
+	let bad_file = temp.join("s-secret-1.jsonl");
+	let secret_marker = "SUPER_SECRET_TOKEN_DO_NOT_LEAK_IN_DIAGNOSTICS_999";
+	// Truly invalid JSON syntax with secret
+	let content = format!(
+		"{{\"type\":\"session\",\"version\":3,\"id\":\"s-secret-1\",\"timestamp\":\"2026-10-26T10:00:00.000Z\",\"cwd\":\"/work\"}}\n\
+		 {{NOT_VALID_JSON_SYNTAX_WITH_SECRET: \"{secret_marker}\"}}\n"
+	);
+	fs::write(&bad_file, &content).expect("write bad file");
+
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("s-secret-1".to_string()),
+		continue_latest: false,
+	});
+
+	assert!(!store.enabled());
+	let warnings = store.take_warnings();
+	assert!(!warnings.is_empty(), "must have warnings on malformed log");
+	for warning in &warnings {
+		assert!(
+			!warning.contains(secret_marker),
+			"warning message must never leak raw secret content: {warning}"
+		);
+	}
+
+	let turn = TurnRecord {
+		prompt: "hi".into(),
+		assistant: "hello".into(),
+		stop_reason: "end_turn".into(),
+		tool_calls: vec![],
+	};
+	let append_res = store.append_turn(&turn);
+	assert!(append_res.is_err());
+	let err = append_res.unwrap_err();
+	assert!(
+		!err.contains(secret_marker),
+		"append error must never leak raw secret content: {err}"
+	);
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn parse_error_field_type_mismatch_does_not_leak_field_value_secret() {
+	let temp = temp_dir("secret-leak-type-mismatch");
+	let bad_file = temp.join("s-secret-2.jsonl");
+	let secret_field_val = "SUPER_SECRET_FIELD_VALUE_NEVER_LEAK_12345";
+	// Valid JSON, but message timestamp is string instead of numeric ms
+	let content = format!(
+		"{{\"type\":\"session\",\"version\":3,\"id\":\"s-secret-2\",\"timestamp\":\"2026-10-26T10:00:00.000Z\",\"cwd\":\"/work\"}}\n\
+		 {{\"type\":\"message\",\"id\":\"msg-1\",\"parentId\":null,\"timestamp\":\"2026-10-26T10:00:01.000Z\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"hi\"}}],\"timestamp\":\"{secret_field_val}\"}}}}\n"
+	);
+	fs::write(&bad_file, &content).expect("write bad file");
+
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("s-secret-2".to_string()),
+		continue_latest: false,
+	});
+
+	assert!(!store.enabled(), "store must disable persistence on schema error");
+	let warnings = store.take_warnings();
+	assert!(!warnings.is_empty(), "must have warnings on malformed entry");
+	for warning in &warnings {
+		assert!(
+			!warning.contains(secret_field_val),
+			"warning message must never leak field value secret: {warning}"
+		);
+	}
+
+	let turn = TurnRecord {
+		prompt: "hi".into(),
+		assistant: "hello".into(),
+		stop_reason: "end_turn".into(),
+		tool_calls: vec![],
+	};
+	let append_res = store.append_turn(&turn);
+	assert!(append_res.is_err());
+	let err = append_res.unwrap_err();
+	assert!(
+		!err.contains(secret_field_val),
+		"append error must never leak field value secret: {err}"
+	);
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn parse_error_untyped_record_is_rejected_without_secret_leak() {
+	let temp = temp_dir("secret-leak-untyped");
+	let bad_file = temp.join("s-secret-3.jsonl");
+	let secret_marker = "SUPER_SECRET_IN_UNTYPED_RECORD_777";
+	// Valid JSON, but missing record type discriminator
+	let content = format!(
+		"{{\"type\":\"session\",\"version\":3,\"id\":\"s-secret-3\",\"timestamp\":\"2026-10-26T10:00:00.000Z\",\"cwd\":\"/work\"}}\n\
+		 {{\"untyped_data\": true, \"secret\": \"{secret_marker}\"}}\n"
+	);
+	fs::write(&bad_file, &content).expect("write bad file");
+
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("s-secret-3".to_string()),
+		continue_latest: false,
+	});
+
+	assert!(!store.enabled(), "store must disable persistence on untyped record");
+	let warnings = store.take_warnings();
+	assert!(!warnings.is_empty(), "must have warnings on untyped record");
+	for warning in &warnings {
+		assert!(
+			!warning.contains(secret_marker),
+			"warning message must never leak secret: {warning}"
+		);
+	}
+
+	let turn = TurnRecord {
+		prompt: "hi".into(),
+		assistant: "hello".into(),
+		stop_reason: "end_turn".into(),
+		tool_calls: vec![],
+	};
+	let append_res = store.append_turn(&turn);
+	assert!(append_res.is_err());
+	let err = append_res.unwrap_err();
+	assert!(
+		!err.contains(secret_marker),
+		"append error must never leak secret: {err}"
+	);
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn parse_v1_log_field_type_mismatch_does_not_leak_field_value_secret() {
+	let temp = temp_dir("secret-leak-v1");
+	let bad_file = temp.join("s-secret-v1.jsonl");
+	let secret_marker = "SUPER_SECRET_V1_PAYLOAD_DO_NOT_LEAK";
+	// V1 format session with a turn record whose tool_calls is an invalid string type containing secret
+	let content = format!(
+		"{{\"type\":\"header\",\"version\":1,\"id\":\"s-secret-v1\",\"timestamp\":\"2026-10-26T10:00:00.000Z\",\"cwd\":\"/work\"}}\n\
+		 {{\"type\":\"turn\",\"prompt\":\"hi\",\"assistant\":\"there\",\"stop_reason\":\"end_turn\",\"tool_calls\":\"{secret_marker}\"}}\n"
+	);
+	fs::write(&bad_file, &content).expect("write bad v1 file");
+
+	// 1. SessionStore::open on malformed v1
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("s-secret-v1".to_string()),
+		continue_latest: false,
+	});
+
+	assert!(!store.enabled(), "store must disable persistence on malformed v1 log");
+	let warnings = store.take_warnings();
+	assert!(!warnings.is_empty(), "must have warnings on malformed v1 log");
+	for warning in &warnings {
+		assert!(
+			!warning.contains(secret_marker),
+			"warning message must never leak v1 secret: {warning}"
+		);
+	}
+
+	let turn = TurnRecord {
+		prompt: "hi".into(),
+		assistant: "hello".into(),
+		stop_reason: "end_turn".into(),
+		tool_calls: vec![],
+	};
+	let append_res = store.append_turn(&turn);
+	assert!(append_res.is_err());
+	let err = append_res.unwrap_err();
+	assert!(
+		!err.contains(secret_marker),
+		"append error must never leak v1 secret: {err}"
+	);
+
+	// 2. import_legacy_v1 on malformed v1
+	let import_dest = temp.join("imported_target");
+	let import_res = import_legacy_v1(&bad_file, &import_dest, None);
+	assert!(import_res.is_err(), "import_legacy_v1 must fail on malformed v1 log");
+	let import_err = import_res.unwrap_err();
+	assert!(
+		!import_err.contains(secret_marker),
+		"import error must never leak v1 secret: {import_err}"
 	);
 
 	fs::remove_dir_all(temp).ok();

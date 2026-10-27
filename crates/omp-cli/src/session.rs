@@ -857,8 +857,20 @@ impl SessionStore {
 		init_bytes.extend_from_slice(title_slot_str.as_bytes());
 		init_bytes.extend_from_slice(header_line.as_bytes());
 
-		if let Err(err) = fs::write(&file, init_bytes) {
-			store.warn(format!("cannot initialize session log {}: {err}; session persistence disabled", file.display()));
+		let create_res = create_session_log_exclusive(&file, &init_bytes);
+
+		if let Err(err) = create_res {
+			let reason = if err.kind() == std::io::ErrorKind::AlreadyExists {
+				format!(
+					"session log {} already exists; refusing to overwrite existing file or symlink target",
+					file.display()
+				)
+			} else {
+				format!("cannot initialize session log {}: {err}", file.display())
+			};
+			store.file = Some(file.clone());
+			store.corrupt_reason = Some(reason.clone());
+			store.warn(format!("{reason}; session persistence disabled"));
 			return store;
 		}
 
@@ -1685,6 +1697,54 @@ fn derive_turn_history(messages: &[MessageEntry]) -> Vec<TurnRecord> {
 	turns
 }
 
+fn format_safe_serde_error(err: &serde_json::Error) -> String {
+	let msg = err.to_string();
+	if let Some(rest) = msg.strip_prefix("missing field ") {
+		return format!("missing required field {rest}");
+	}
+	if let Some(rest) = msg.strip_prefix("duplicate field ") {
+		return format!("duplicate field {rest}");
+	}
+	let loc = if err.line() > 0 && err.column() > 0 {
+		format!(" at line {} column {}", err.line(), err.column())
+	} else {
+		String::new()
+	};
+	if msg.starts_with("invalid type:") {
+		return format!("invalid field type{loc}");
+	}
+	if msg.starts_with("invalid value:") {
+		return format!("invalid field value{loc}");
+	}
+	if msg.starts_with("unknown variant ") {
+		return format!("unknown variant{loc}");
+	}
+	match err.classify() {
+		serde_json::error::Category::Syntax => {
+			format!("syntax error{loc}")
+		},
+		serde_json::error::Category::Data => {
+			format!("data schema mismatch{loc}")
+		},
+		serde_json::error::Category::Eof => {
+			format!("unexpected end of input{loc}")
+		},
+		serde_json::error::Category::Io => "I/O error".to_string(),
+	}
+}
+
+/// Create a session log exclusively (O_EXCL). Fails if the file exists or is a symlink,
+/// leaving pre-existing files and symlink targets unmodified.
+pub fn create_session_log_exclusive(file: &Path, init_bytes: &[u8]) -> std::io::Result<()> {
+	let mut f = OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(file)?;
+	f.write_all(init_bytes)?;
+	f.flush()?;
+	Ok(())
+}
+
 fn parse_session_content(file: &Path, text: &str) -> Result<ParsedSession, String> {
 	if text.trim().is_empty() {
 		return Err(format!("session log {} is empty", file.display()));
@@ -1706,7 +1766,7 @@ fn parse_session_content(file: &Path, text: &str) -> Result<ParsedSession, Strin
 	};
 
 	let header_val: serde_json::Value = serde_json::from_str(header_line)
-		.map_err(|err| format!("invalid session header in {}: {err}", file.display()))?;
+		.map_err(|err| format!("invalid session header in {}: {}", file.display(), format_safe_serde_error(&err)))?;
 
 	let kind = header_val.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
 	let version = header_val.get("version").and_then(serde_json::Value::as_u64);
@@ -1738,7 +1798,7 @@ fn parse_session_content(file: &Path, text: &str) -> Result<ParsedSession, Strin
 	}
 
 	let mut header: SessionHeader = serde_json::from_value(header_val)
-		.map_err(|err| format!("cannot parse session header in {}: {err}", file.display()))?;
+		.map_err(|err| format!("cannot parse session header in {}: {}", file.display(), format_safe_serde_error(&err)))?;
 
 	if let Some(slot) = &title_slot {
 		if !slot.title.is_empty() {
@@ -1757,23 +1817,39 @@ fn parse_session_content(file: &Path, text: &str) -> Result<ParsedSession, Strin
 		lines
 	};
 
+	let mut line_number = if start_entries_at_second_line { 2 } else { 1 };
 	for line in remaining_lines {
+		line_number += 1;
 		if line.trim().is_empty() {
 			continue;
 		}
 		let val: serde_json::Value = match serde_json::from_str(line) {
 			Ok(v) => v,
 			Err(err) => {
-				return Err(format!("session log {} has malformed record `{line}`: {err}; appending disabled to prevent corrupting log", file.display()));
+				let safe_err = format_safe_serde_error(&err);
+				return Err(format!(
+					"session log {} has malformed record at line {line_number}: {safe_err}; appending disabled to prevent corrupting log",
+					file.display()
+				));
 			},
 		};
 
 		let entry_type = val.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
+		if entry_type.is_empty() {
+			return Err(format!(
+				"session log {} has malformed record at line {line_number}: missing record type discriminator; appending disabled to prevent corrupting log",
+				file.display()
+			));
+		}
 		if entry_type == "message" {
 			match serde_json::from_value::<MessageEntry>(val.clone()) {
 				Ok(entry) => messages.push(entry),
 				Err(err) => {
-					return Err(format!("session log {} has malformed message entry `{line}`: {err}; appending disabled to prevent corrupting log", file.display()));
+					let safe_err = format_safe_serde_error(&err);
+					return Err(format!(
+						"session log {} has malformed message entry at line {line_number}: {safe_err}; appending disabled to prevent corrupting log",
+						file.display()
+					));
 				},
 			}
 		}
@@ -1803,7 +1879,12 @@ fn parse_v1_log(file: &Path, text: &str) -> Result<(SessionHeader, Vec<TurnRecor
 			continue;
 		}
 		let value: serde_json::Value = serde_json::from_str(line).map_err(|err| {
-			format!("invalid session log {} line {}: {err}", file.display(), index + 1)
+			format!(
+				"invalid session log {} line {}: {}",
+				file.display(),
+				index + 1,
+				format_safe_serde_error(&err)
+			)
 		})?;
 		let kind = value
 			.get("type")
@@ -1813,13 +1894,23 @@ fn parse_v1_log(file: &Path, text: &str) -> Result<(SessionHeader, Vec<TurnRecor
 		match kind.as_str() {
 			"header" => {
 				let parsed: HeaderLine = serde_json::from_value(value).map_err(|err| {
-					format!("invalid session log {} line {}: {err}", file.display(), index + 1)
+					format!(
+						"invalid session log {} line {}: {}",
+						file.display(),
+						index + 1,
+						format_safe_serde_error(&err)
+					)
 				})?;
 				header = Some(parsed.header);
 			},
 			"turn" => {
 				let parsed: TurnLine = serde_json::from_value(value).map_err(|err| {
-					format!("invalid session log {} line {}: {err}", file.display(), index + 1)
+					format!(
+						"invalid session log {} line {}: {}",
+						file.display(),
+						index + 1,
+						format_safe_serde_error(&err)
+					)
 				})?;
 				turns.push(parsed.turn);
 			},
@@ -1882,7 +1973,42 @@ pub struct TerminalBreadcrumb {
 	pub fresh: bool,
 }
 
+/// Sanitize a terminal ID component from the environment into a safe, single
+/// file name without path traversal sequences.
+pub fn sanitize_terminal_id(id: &str) -> Option<String> {
+	let trimmed = id.trim();
+	if trimmed.is_empty() || trimmed.contains('\0') || trimmed.contains("..") {
+		return None;
+	}
+	let sanitized: String = trimmed
+		.chars()
+		.map(|c| if c == '/' || c == '\\' { '-' } else { c })
+		.collect();
+	let sanitized = sanitized.trim_matches(|c: char| c == '-' || c == '.');
+	if sanitized.is_empty() || sanitized.contains("..") {
+		return None;
+	}
+	let path = Path::new(&sanitized);
+	let mut components = path.components();
+	match (components.next(), components.next()) {
+		(Some(std::path::Component::Normal(comp)), None) => {
+			let s = comp.to_str()?;
+			if s.is_empty() || s == "." || s == ".." {
+				None
+			} else {
+				Some(s.to_string())
+			}
+		},
+		_ => None,
+	}
+}
+
 pub fn get_terminal_id() -> Option<String> {
+	let raw = get_raw_terminal_id()?;
+	sanitize_terminal_id(&raw)
+}
+
+fn get_raw_terminal_id() -> Option<String> {
 	if let Ok(pane) = std::env::var("ZELLIJ_PANE_ID") {
 		let session = std::env::var("ZELLIJ_SESSION_NAME").ok()
 			.map(|s| s.replace(['/', '\\'], "-"));
