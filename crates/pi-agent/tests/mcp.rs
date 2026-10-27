@@ -1601,55 +1601,88 @@ async fn test_utf8_multibyte_split_across_chunks() {
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
-                let n = socket.read(&mut buf).await.unwrap();
-                let req_str = String::from_utf8_lossy(&buf[..n]);
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let n = match socket.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
 
-                let body_start = req_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(n);
-                let body_str = &req_str[body_start..];
-                let json_body: Value = serde_json::from_str(body_str).unwrap_or(Value::Null);
-                let method = json_body.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                    let mut handled_any = false;
+                    while let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header_str = String::from_utf8_lossy(&buf[..header_end]);
+                        let content_len = header_str
+                            .lines()
+                            .find_map(|line| {
+                                let l = line.to_ascii_lowercase();
+                                if l.starts_with("content-length:") {
+                                    l.split(':').nth(1)?.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
 
-                if method == "initialize" {
-                    let resp = json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "result": {
-                            "protocolVersion": "2025-11-25",
-                            "capabilities": { "tools": {} },
-                            "serverInfo": { "name": "mock-utf8", "version": "1.0.0" }
+                        let body_start = header_end + 4;
+                        if buf.len() < body_start + content_len {
+                            break;
                         }
-                    });
-                    let resp_bytes = serde_json::to_vec(&resp).unwrap();
-                    let http_resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                        resp_bytes.len()
-                    );
-                    socket.write_all(http_resp.as_bytes()).await.unwrap();
-                    socket.write_all(&resp_bytes).await.unwrap();
-                } else if method == "notifications/initialized" {
-                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
-                } else if method == "tools/call" {
-                    // Stream response with UTF-8 string "café 🚀 тест"
-                    let http_resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
-                    socket.write_all(http_resp.as_bytes()).await.unwrap();
 
-                    let full_resp = json!({
-                        "jsonrpc": "2.0",
-                        "id": 2,
-                        "result": {
-                            "content": [{ "type": "text", "text": "café 🚀 тест" }],
-                            "isError": false
+                        let body_bytes = &buf[body_start..body_start + content_len];
+                        let json_body: Value = serde_json::from_slice(body_bytes).unwrap_or(Value::Null);
+                        let method = json_body.get("method").and_then(|v| v.as_str()).unwrap_or("");
+
+                        buf.drain(..body_start + content_len);
+                        handled_any = true;
+
+                        if method == "initialize" {
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {
+                                    "protocolVersion": "2025-11-25",
+                                    "capabilities": { "tools": {} },
+                                    "serverInfo": { "name": "mock-utf8", "version": "1.0.0" }
+                                }
+                            });
+                            let resp_bytes = serde_json::to_vec(&resp).unwrap();
+                            let http_resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                                 resp_bytes.len()
+                            );
+                            if socket.write_all(http_resp.as_bytes()).await.is_err() { return; }
+                            if socket.write_all(&resp_bytes).await.is_err() { return; }
+                        } else if method == "notifications/initialized" {
+                            if socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.is_err() { return; }
+                        } else if method == "tools/call" {
+                            let http_resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+                            if socket.write_all(http_resp.as_bytes()).await.is_err() { return; }
+
+                            let full_resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": 2,
+                                "result": {
+                                    "content": [{ "type": "text", "text": "café 🚀 тест" }],
+                                    "isError": false
+                                }
+                            });
+                            let sse_line = format!("data: {}\n\n", serde_json::to_string(&full_resp).unwrap());
+                            let bytes = sse_line.as_bytes();
+
+                            // Deliberately split chunk in the middle of multi-byte character 'é' (\xc3\xa9)
+                            let split_pos = sse_line.find("caf").unwrap() + 4; // 'f' + 1 byte of 'é' (\xc3)
+                            if socket.write_all(&bytes[..split_pos]).await.is_err() { return; }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            if socket.write_all(&bytes[split_pos..]).await.is_err() { return; }
+                            return;
                         }
-                    });
-                    let sse_line = format!("data: {}\n\n", serde_json::to_string(&full_resp).unwrap());
-                    let bytes = sse_line.as_bytes();
-
-                    // Deliberately split chunk in the middle of multi-byte character 'é' (\xc3\xa9)
-                    let split_pos = sse_line.find("caf").unwrap() + 4; // 'f' + 1 byte of 'é' (\xc3)
-                    socket.write_all(&bytes[..split_pos]).await.unwrap();
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    socket.write_all(&bytes[split_pos..]).await.unwrap();
+                    }
+                    if !handled_any && buf.len() > 65536 {
+                        break;
+                    }
                 }
             });
         }
