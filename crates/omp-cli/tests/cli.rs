@@ -219,6 +219,7 @@ impl AgentRunner for ScriptedRunner {
 fn fake_request(prompt: &str) -> RunRequest {
 	RunRequest {
 		prompt: prompt.to_string(),
+		parts: Vec::new(),
 		cwd: PathBuf::from("/work"),
 		output_mode: OutputMode::Text,
 		model: None,

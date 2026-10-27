@@ -98,10 +98,10 @@ fn run() -> std::result::Result<(), CliError> {
 		config.tools = Some(normalized);
 	}
 	let cwd = resolve_cwd(cli.cwd.clone(), config.cwd.clone())?;
-	let file_text = if !cli.file_args.is_empty() {
+	let processed_cli_files = if !cli.file_args.is_empty() {
 		process_cli_file_args(&cli.file_args, &cwd)?
 	} else {
-		String::new()
+		ProcessedCliFiles::default()
 	};
 	if cli.resume.as_deref() == Some("")
 		&& (!io::stdin().is_terminal() || !io::stdout().is_terminal())
@@ -415,40 +415,48 @@ fn run() -> std::result::Result<(), CliError> {
 	}
 
 	let mut remaining_prompts = cli.prompt.clone();
-	let mut body = String::new();
-	if !file_text.is_empty() {
-		body.push_str(&file_text);
-	}
-	if !remaining_prompts.is_empty() {
-		body.push_str(&remaining_prompts.remove(0));
-	}
-
-	let initial_message = match (piped_stdin, !body.is_empty()) {
-		(Some(stdin), true) => Some(format!("{stdin}\n{body}")),
-		(Some(stdin), false) => Some(stdin),
-		(None, true) => Some(body),
-		(None, false) => None,
+	let initial_prompt = if !remaining_prompts.is_empty() {
+		remaining_prompts.remove(0)
+	} else {
+		String::new()
 	};
 
-	let mut prompts_to_run = Vec::new();
-	if let Some(initial) = initial_message {
-		if !initial.trim().is_empty() {
-			prompts_to_run.push(initial);
-		}
+	let mut context_prefix = String::new();
+	if let Some(stdin) = piped_stdin {
+		context_prefix.push_str(&stdin);
+		context_prefix.push('\n');
 	}
-	prompts_to_run.extend(remaining_prompts);
+	if !processed_cli_files.text.is_empty() {
+		context_prefix.push_str(&processed_cli_files.text);
+	}
 
-	if prompts_to_run.is_empty() {
+	let has_initial_content = !context_prefix.is_empty()
+		|| !initial_prompt.trim().is_empty()
+		|| !processed_cli_files.images.is_empty();
+
+	if !has_initial_content && remaining_prompts.is_empty() {
 		// TS print mode with zero messages writes nothing and exits 0.
 		return reporter.finish().map_err(CliError::from);
 	}
-	for prompt in prompts_to_run {
-		if let Err(error) = session.turn(prompt, mode, &mut reporter) {
+
+	let mut prompts_to_run = Vec::new();
+	if has_initial_content {
+		prompts_to_run.push((
+			if context_prefix.is_empty() { None } else { Some(context_prefix) },
+			initial_prompt,
+			processed_cli_files.images,
+		));
+	}
+	for prompt in remaining_prompts {
+		prompts_to_run.push((None, prompt, Vec::new()));
+	}
+
+	for (ctx, prompt, parts) in prompts_to_run {
+		if let Err(error) = session.turn(ctx, prompt, parts, mode, &mut reporter) {
 			reporter.finish().ok();
 			return Err(CliError::from(error));
 		}
 	}
-	reporter.finish().map_err(CliError::from)
 }
 
 fn list_sessions_for_picker(dir: &Path) -> Vec<(PathBuf, Option<String>, String, String)> {
@@ -516,7 +524,7 @@ fn run_repl<W: Write, E: Write>(
 			},
 			repl::ReplCommand::Cwd(None) => eprintln!("cwd: {}", session.cwd.display()),
 			repl::ReplCommand::Prompt(text) => {
-				if let Err(error) = session.turn(text, mode, reporter) {
+				if let Err(error) = session.turn(None, text, Vec::new(), mode, reporter) {
 					reporter.finish().ok();
 					eprintln!("{error}");
 					continue;
@@ -575,9 +583,10 @@ impl Session<'_> {
 		Ok(())
 	}
 
-	fn request(&self, prompt: String, output_mode: OutputMode) -> RunRequest {
+	fn request(&self, prompt: String, parts: Vec<ContentPart>, output_mode: OutputMode) -> RunRequest {
 		RunRequest {
 			prompt,
+			parts,
 			cwd: self.cwd.clone(),
 			output_mode,
 			model: self.model.clone(),
@@ -600,7 +609,9 @@ impl Session<'_> {
 
 	fn turn<W: Write, E: Write>(
 		&mut self,
-		prompt: String,
+		context_prefix: Option<String>,
+		raw_prompt: String,
+		initial_parts: Vec<ContentPart>,
 		mode: OutputMode,
 		reporter: &mut Reporter<W, E>,
 	) -> Result<()> {
@@ -618,6 +629,85 @@ impl Session<'_> {
 			.unwrap_or_default()
 			.as_millis() as u64;
 
+		let mentions = file_mentions::extract_file_mentions(&raw_prompt);
+		let mention_msg = if !mentions.is_empty() {
+			file_mentions::process_file_mentions(&mentions, &self.cwd)
+		} else {
+			None
+		};
+
+		let mut full_prompt = String::new();
+		if let Some(ctx) = context_prefix {
+			full_prompt.push_str(&ctx);
+		}
+
+		let mut parts = initial_parts;
+
+		if let Some(msg) = &mention_msg {
+			let text_block = msg.format_text_prompt_block();
+			let image_block = msg.format_image_prompt_block();
+			if !text_block.is_empty() {
+				full_prompt.push_str(&text_block);
+				full_prompt.push('\n');
+			}
+			if !image_block.is_empty() {
+				full_prompt.push_str(&image_block);
+				full_prompt.push('\n');
+			}
+			for file in msg.image_files() {
+				if let Some(img) = &file.image {
+					parts.push(ContentPart::image(&img.data_base64, &img.mime_type));
+				}
+			}
+		}
+
+		if !raw_prompt.is_empty() {
+			full_prompt.push_str(&raw_prompt);
+		}
+
+		let has_images = parts.iter().any(ContentPart::is_image);
+		if has_images {
+			let bare_model = if let Some(p) = self.provider.as_deref() {
+				let prefix = format!("{p}/");
+				self.model
+					.as_deref()
+					.and_then(|m| m.strip_prefix(&prefix))
+					.or(self.model.as_deref())
+					.unwrap_or_default()
+			} else if let Some((_, bare)) = self.model.as_deref().and_then(|m| m.split_once('/')) {
+				bare
+			} else {
+				self.model.as_deref().unwrap_or_default()
+			};
+			let bare_id = bare_model.split(':').next().unwrap_or(bare_model);
+			let provider = self
+				.provider
+				.as_deref()
+				.or_else(|| self.model.as_deref().and_then(|m| m.split_once('/')).map(|(p, _)| p))
+				.unwrap_or_default();
+			let supports_images = self.catalog.supports_images(provider, bare_id).unwrap_or(true);
+			if !supports_images {
+				return Err(Error::new(format!(
+					"model '{provider}/{bare_id}' does not support image input"
+				)));
+			}
+		}
+
+		let (turn_parts, user_content) = if has_images {
+			let mut assembled = Vec::new();
+			if !full_prompt.is_empty() {
+				assembled.push(ContentPart::text(&full_prompt));
+			}
+			for p in parts {
+				if p.is_image() {
+					assembled.push(p);
+				}
+			}
+			(assembled.clone(), MessageContent::Parts(assembled))
+		} else {
+			(Vec::new(), MessageContent::Text(full_prompt.clone()))
+		};
+
 		let user_id = format!("msg-{}", output::session_id());
 		let parent_id = self
 			.store
@@ -630,7 +720,7 @@ impl Session<'_> {
 			user_id.clone(),
 			parent_id,
 			&now_iso,
-			SessionMessage::user(MessageContent::Text(prompt.clone()), now_ms),
+			SessionMessage::user(user_content, now_ms),
 		);
 		if self.store.enabled() {
 			if let Err(err) = user_entry.validate() {
@@ -645,10 +735,14 @@ impl Session<'_> {
 			std::collections::HashMap::new();
 
 		let cancel_token = pi_agent::CancellationToken::new();
-		let mut request = self.request(prompt.clone(), mode);
+		let mut request = self.request(full_prompt.clone(), turn_parts.clone(), mode);
 		request.cancellation_token = Some(cancel_token.clone());
 		let started = std::time::Instant::now();
-		let mut builder = TurnBuilder::new(prompt);
+		let mut builder = if !turn_parts.is_empty() {
+			TurnBuilder::new_with_parts(full_prompt, turn_parts)
+		} else {
+			TurnBuilder::new(full_prompt)
+		};
 		let mut stream = self.runner.run(&request)?;
 		let mut reporter_failed = false;
 
@@ -890,8 +984,15 @@ fn read_piped_stdin() -> std::io::Result<Option<String>> {
 	}
 }
 
-fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Result<String, CliError> {
+#[derive(Debug, Default, Clone)]
+struct ProcessedCliFiles {
+	text: String,
+	images: Vec<ContentPart>,
+}
+
+fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Result<ProcessedCliFiles, CliError> {
 	let mut text = String::new();
+	let mut images = Vec::new();
 	for file_arg in file_args {
 		let resolved = file_mentions::resolve_path(file_arg, cwd);
 		let abs_path = dirs::absolute(cwd, &resolved);
@@ -965,52 +1066,88 @@ fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Resul
 			}
 		}
 
-		if file_mentions::detect_image_mime(&header[..n]).is_some() {
-			return Err(CliError::fail(format!(
-				"image attachments are not supported yet: {}",
-				abs_path.display()
-			)));
-		}
-
+		let detected_image_mime = file_mentions::detect_image_mime(&header[..n]);
 		let initial_buf = header[..n].to_vec();
-		let bytes = match file_mentions::read_bounded(
-			&mut file,
-			initial_buf,
-			file_mentions::MAX_AUTO_READ_TEXT_BYTES,
-		) {
-			Ok(b) => b,
-			Err(file_mentions::BoundedReadError::TooLarge { actual_read }) => {
-				let disk_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-				let reported_size = if disk_size > file_mentions::MAX_AUTO_READ_TEXT_BYTES {
-					disk_size
-				} else {
-					actual_read
-				};
-				eprintln!(
-					"Warning: Skipping file contents (too large: {}): {}",
-					file_mentions::format_bytes(reported_size),
-					abs_path.display()
-				);
-				text.push_str(&format!(
-					"<file name=\"{}\">(skipped: too large, {})</file>\n",
-					abs_path.display(),
-					file_mentions::format_bytes(reported_size)
-				));
-				continue;
-			},
-			Err(file_mentions::BoundedReadError::Io(err)) => {
-				return Err(CliError::fail(format!(
-					"Error: Could not read file {}: {err:?}",
-					abs_path.display()
-				)));
-			},
-		};
 
-		let content = String::from_utf8_lossy(&bytes);
-		text.push_str(&format!(
-			"<file name=\"{}\">\n{content}\n</file>\n",
-			abs_path.display()
-		));
+		if let Some(mime) = detected_image_mime {
+			let max_bytes = file_mentions::MAX_AUTO_READ_IMAGE_BYTES;
+			let bytes = match file_mentions::read_bounded(
+				&mut file,
+				initial_buf,
+				max_bytes,
+			) {
+				Ok(b) => b,
+				Err(file_mentions::BoundedReadError::TooLarge { actual_read }) => {
+					let disk_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+					let reported_size = if disk_size > max_bytes {
+						disk_size
+					} else {
+						actual_read
+					};
+					eprintln!(
+						"Warning: Skipping file contents (too large: {}): {}",
+						file_mentions::format_bytes(reported_size),
+						abs_path.display()
+					);
+					text.push_str(&format!(
+						"<file name=\"{}\">(skipped: too large, {})</file>\n",
+						abs_path.display(),
+						file_mentions::format_bytes(reported_size)
+					));
+					continue;
+				},
+				Err(file_mentions::BoundedReadError::Io(err)) => {
+					return Err(CliError::fail(format!(
+						"Error: Could not read file {}: {err:?}",
+						abs_path.display()
+					)));
+				},
+			};
+
+			let b64 = file_mentions::base64_encode(&bytes);
+			text.push_str(&format!("<file name=\"{}\"></file>\n", abs_path.display()));
+			images.push(ContentPart::image(b64, mime));
+		} else {
+			let max_bytes = file_mentions::MAX_AUTO_READ_TEXT_BYTES;
+			let bytes = match file_mentions::read_bounded(
+				&mut file,
+				initial_buf,
+				max_bytes,
+			) {
+				Ok(b) => b,
+				Err(file_mentions::BoundedReadError::TooLarge { actual_read }) => {
+					let disk_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+					let reported_size = if disk_size > max_bytes {
+						disk_size
+					} else {
+						actual_read
+					};
+					eprintln!(
+						"Warning: Skipping file contents (too large: {}): {}",
+						file_mentions::format_bytes(reported_size),
+						abs_path.display()
+					);
+					text.push_str(&format!(
+						"<file name=\"{}\">(skipped: too large, {})</file>\n",
+						abs_path.display(),
+						file_mentions::format_bytes(reported_size)
+					));
+					continue;
+				},
+				Err(file_mentions::BoundedReadError::Io(err)) => {
+					return Err(CliError::fail(format!(
+						"Error: Could not read file {}: {err:?}",
+						abs_path.display()
+					)));
+				},
+			};
+
+			let content = String::from_utf8_lossy(&bytes);
+			text.push_str(&format!(
+				"<file name=\"{}\">\n{content}\n</file>\n",
+				abs_path.display()
+			));
+		}
 	}
-	Ok(text)
+	Ok(ProcessedCliFiles { text, images })
 }

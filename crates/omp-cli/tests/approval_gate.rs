@@ -98,6 +98,7 @@ fn make_run_request(
 
 	RunRequest {
 		prompt: "call tool".to_string(),
+		parts: Vec::new(),
 		cwd: work_dir.to_path_buf(),
 		output_mode: OutputMode::Json,
 		model: Some("local/mock-model".to_string()),

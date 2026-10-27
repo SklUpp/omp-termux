@@ -148,6 +148,17 @@ impl AgentLoop {
 		&self,
 		user_input: &str,
 		state: &mut AgentState,
+		steering_rx: Option<mpsc::Receiver<SteeringEvent>>,
+		events: Option<mpsc::Sender<AgentEvent>>,
+	) -> Result<Vec<TurnResult>, AgentError> {
+		self.run_dialog_message(Message::user(user_input), state, steering_rx, events).await
+	}
+
+	/// Run turns with a pre-constructed user message (supporting text and image parts).
+	pub async fn run_dialog_message(
+		&self,
+		user_message: Message,
+		state: &mut AgentState,
 		mut steering_rx: Option<mpsc::Receiver<SteeringEvent>>,
 		events: Option<mpsc::Sender<AgentEvent>>,
 	) -> Result<Vec<TurnResult>, AgentError> {
@@ -161,7 +172,7 @@ impl AgentLoop {
 		{
 			state.messages.insert(0, Message::system(system.clone()));
 		}
-		state.messages.push(Message::user(user_input));
+		state.messages.push(user_message);
 
 		let cancellation_token = CancellationToken::new();
 		let ctx = AgentContext::with_approver(

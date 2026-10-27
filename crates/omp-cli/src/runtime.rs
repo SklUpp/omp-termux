@@ -202,6 +202,53 @@ impl AgentRunner for PiAgentRunner {
 		if let Some(system) = plan.system_prompt {
 			messages.insert(0, pi_agent::Message::system(system));
 		}
+
+		let user_message = if !request.parts.is_empty() {
+			let mut pi_parts = Vec::with_capacity(request.parts.len());
+			for (index, p) in request.parts.iter().enumerate() {
+				if p.is_image() {
+					let Some(data) = p.data.as_deref() else {
+						return Err(Error::new(format!(
+							"request contains image part missing data at index {index}"
+						)));
+					};
+					let Some(mime) = p.mime_type.as_deref() else {
+						return Err(Error::new(format!(
+							"request contains image part missing mimeType at index {index}"
+						)));
+					};
+					let (clean_b64, norm_mime) = pi_agent::state::normalize_image_payload(data, mime)
+						.map_err(|err| Error::new(format!("request contains invalid image part at index {index}: {err}")))?;
+					pi_parts.push(pi_agent::ContentPart::Image {
+						data: clean_b64,
+						mime_type: norm_mime,
+					});
+				} else if p.kind == "text" {
+					let Some(text) = p.text.clone() else {
+						return Err(Error::new(format!(
+							"request contains malformed text part missing text at index {index}"
+						)));
+					};
+					pi_parts.push(pi_agent::ContentPart::Text { text });
+				} else {
+					return Err(Error::new(format!(
+						"request contains unsupported content part kind at index {index}"
+					)));
+				}
+			}
+			pi_agent::Message::user_with_parts(pi_parts)
+		} else {
+			pi_agent::Message::user(&prompt)
+		};
+
+		if !plan.supports_images
+			&& (user_message.has_image() || messages.iter().any(pi_agent::Message::has_image))
+		{
+			return Err(Error::new(format!(
+				"model '{}/{}' does not support image input",
+				plan.provider, plan.model
+			)));
+		}
 		let plan_api = plan.api.clone();
 		let plan_provider = plan.provider.clone();
 		let plan_model = plan.model.clone();
@@ -241,10 +288,11 @@ impl AgentRunner for PiAgentRunner {
 
 		let signal_reg = self.dispatcher.register(steering_tx.clone());
 
-		let dialog_prompt = prompt.clone();
+		let end_user_message = user_message.clone();
+		let dialog_message = user_message;
 		let dialog_handle = self.runtime.spawn(async move {
 			agent
-				.run_dialog_with(&dialog_prompt, &mut state, Some(steering_rx), Some(pi_events_tx))
+				.run_dialog_message(dialog_message, &mut state, Some(steering_rx), Some(pi_events_tx))
 				.await
 		});
 		let dialog_abort = dialog_handle.abort_handle();
@@ -394,7 +442,7 @@ impl AgentRunner for PiAgentRunner {
 
 			match dialog_result {
 				Ok(turns) => {
-					let mut new_messages = vec![pi_agent::Message::user(prompt.clone())];
+					let mut new_messages = vec![end_user_message];
 					for turn in turns {
 						let tool_names: std::collections::HashMap<String, String> = turn
 							.message
@@ -1594,6 +1642,7 @@ mod tests {
 			});
 		RunRequest {
 			prompt: "fix the build".to_string(),
+			parts: Vec::new(),
 			cwd: PathBuf::from("/work"),
 			output_mode: OutputMode::Text,
 			model: Some("local/llama3".to_string()),
@@ -2357,5 +2406,133 @@ mod tests {
 			plan.supports_images,
 			"unspecified model input capabilities default to permissive true for gateway compatibility"
 		);
+	}
+
+	#[test]
+	fn runner_rejects_image_request_on_text_only_model() {
+		let mut cat = catalog_with_connection("local", "http://127.0.0.1:8080/v1", Some("sk-test"));
+		let mut models = BTreeMap::new();
+		models.insert("text-only".to_string(), ModelInfo {
+			provider: "local".to_string(),
+			context_window: Some(4096),
+			input: Some(vec!["text".to_string()]),
+		});
+		cat.providers.insert("local".to_string(), models);
+
+		let mut req = request(Approvals::default());
+		req.catalog = Arc::new(cat);
+		req.model = Some("local/text-only".to_string());
+		req.parts = vec![
+			crate::session::ContentPart::text("describe"),
+			crate::session::ContentPart::image("aW1hZ2VkYXRh", "image/png"),
+		];
+
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.expect("runtime");
+		let runner = PiAgentRunner::new(Arc::new(rt));
+		let err = runner.run(&req).unwrap_err();
+		assert!(
+			err.to_string().contains("does not support image input"),
+			"must fail explicitly for text-only model with images: {err}"
+		);
+	}
+
+	#[test]
+	fn runner_transfers_ordered_image_and_text_to_wire() {
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.expect("runtime");
+		let rt_handle = Arc::new(rt);
+
+		let (url, rx) = rt_handle.block_on(async {
+			let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+			let port = listener.local_addr().expect("port").port();
+			let url = format!("http://127.0.0.1:{port}/v1");
+			let (tx, rx) = tokio::sync::oneshot::channel();
+
+			tokio::spawn(async move {
+				use tokio::io::{AsyncReadExt, AsyncWriteExt};
+				if let Ok((mut stream, _)) = listener.accept().await {
+					let mut buf = vec![0u8; 16384];
+					let mut n_read = 0;
+					while n_read < buf.len() {
+						let n = stream.read(&mut buf[n_read..]).await.unwrap_or(0);
+						if n == 0 {
+							break;
+						}
+						n_read += n;
+						if let Some(pos) = buf[..n_read].windows(4).position(|w| w == b"\r\n\r\n") {
+							let header = String::from_utf8_lossy(&buf[..pos]);
+							let content_len: usize = header
+								.lines()
+								.find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+								.and_then(|l| l.split(':').nth(1))
+								.and_then(|v| v.trim().parse().ok())
+								.unwrap_or(0);
+							if n_read >= pos + 4 + content_len {
+								let body = &buf[pos + 4..pos + 4 + content_len];
+								if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
+									let _ = tx.send(json);
+								}
+								break;
+							}
+						}
+					}
+					let resp = serde_json::json!({
+						"id": "cmpl-img",
+						"object": "chat.completion",
+						"created": 1,
+						"model": "vision-model",
+						"choices": [{
+							"index": 0,
+							"message": { "role": "assistant", "content": "I see the chart" },
+							"finish_reason": "stop"
+						}]
+					}).to_string();
+					let http_resp = format!(
+						"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+						resp.len(),
+						resp
+					);
+					let _ = stream.write_all(http_resp.as_bytes()).await;
+					let _ = stream.flush().await;
+				}
+			});
+			(url, rx)
+		});
+
+		let mut cat = catalog_with_connection("local", &url, Some("sk-test"));
+		let mut models = BTreeMap::new();
+		models.insert("vision-model".to_string(), ModelInfo {
+			provider: "local".to_string(),
+			context_window: Some(4096),
+			input: Some(vec!["text".to_string(), "image".to_string()]),
+		});
+		cat.providers.insert("local".to_string(), models);
+
+		let mut req = request(Approvals::default());
+		req.catalog = Arc::new(cat);
+		req.model = Some("local/vision-model".to_string());
+		req.parts = vec![
+			crate::session::ContentPart::text("describe this"),
+			crate::session::ContentPart::image("aW1hZ2VkYXRh", "image/png"),
+		];
+
+		let runner = PiAgentRunner::new(Arc::clone(&rt_handle));
+		let stream = runner.run(&req).expect("run runner");
+		let _events: Vec<_> = stream.collect();
+
+		let wire_json = rt_handle.block_on(rx).expect("received wire json");
+		let messages = wire_json["messages"].as_array().expect("messages");
+		assert_eq!(messages.len(), 1);
+		let content = messages[0]["content"].as_array().expect("content parts");
+		assert_eq!(content.len(), 2);
+		assert_eq!(content[0]["type"], "text");
+		assert_eq!(content[0]["text"], "describe this");
+		assert_eq!(content[1]["type"], "image_url");
+		assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,aW1hZ2VkYXRh");
 	}
 }
