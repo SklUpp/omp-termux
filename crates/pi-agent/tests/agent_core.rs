@@ -11,7 +11,7 @@ use futures::StreamExt;
 use pi_agent::provider::OpenAiChatRequest;
 use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
-	CancellationToken, ChunkStream, EditTool, ImagePart, Message, ModelProvider,
+	CancellationToken, ChunkStream, EditTool, GlobTool, ImagePart, Message, ModelProvider,
 	OpenAiCompatibleProvider, ProviderError, ReadTool, Role, SteeringEvent,
 	StreamAssembler, StreamChunk, Tool, ToolCall, ToolCallDelta, ToolRegistry, TurnStatus,
 	WriteTool, parse_sse_line, sse_stream,
@@ -877,6 +877,187 @@ async fn grep_uses_regex_and_skips_non_files() {
 		.await
 		.expect("grep");
 	assert_eq!(none.content, "No matches found");
+}
+
+#[tokio::test]
+async fn glob_hidden_flag_behavior() {
+	let dir = TempDir::new("glob-hidden");
+	std::fs::write(dir.path.join("visible.txt"), "hello").expect("write visible");
+	std::fs::write(dir.path.join(".hidden.txt"), "secret").expect("write hidden");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Default includes hidden files
+	let res_default = GlobTool.execute(&json!({"path": "*"}), &ctx).await.expect("glob default");
+	assert!(!res_default.is_error);
+	assert!(res_default.content.contains("visible.txt"));
+	assert!(res_default.content.contains(".hidden.txt"));
+
+	// Explicit hidden: true
+	let res_hidden_true = GlobTool.execute(&json!({"path": "*", "hidden": true}), &ctx).await.expect("glob hidden true");
+	assert!(!res_hidden_true.is_error);
+	assert!(res_hidden_true.content.contains("visible.txt"));
+	assert!(res_hidden_true.content.contains(".hidden.txt"));
+
+	// Explicit hidden: false excludes hidden files
+	let res_hidden_false = GlobTool.execute(&json!({"path": "*", "hidden": false}), &ctx).await.expect("glob hidden false");
+	assert!(!res_hidden_false.is_error);
+	assert!(res_hidden_false.content.contains("visible.txt"));
+	assert!(!res_hidden_false.content.contains(".hidden.txt"));
+}
+
+#[tokio::test]
+async fn glob_gitignore_behavior() {
+	let dir = TempDir::new("glob-gitignore");
+	std::fs::write(dir.path.join(".gitignore"), "ignored.log\n.env\n").expect("write gitignore");
+	std::fs::write(dir.path.join("tracked.txt"), "tracked").expect("write tracked");
+	std::fs::write(dir.path.join("ignored.log"), "ignore me").expect("write ignored");
+	std::fs::write(dir.path.join(".env"), "secret=1").expect("write env");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Default respects gitignore
+	let res_default = GlobTool.execute(&json!({"path": "*"}), &ctx).await.expect("glob default");
+	assert!(!res_default.is_error);
+	assert!(res_default.content.contains("tracked.txt"));
+	assert!(!res_default.content.contains("ignored.log"));
+	assert!(!res_default.content.contains(".env"));
+
+	// gitignore: false includes ignored files
+	let res_no_ignore = GlobTool.execute(&json!({"path": "*", "gitignore": false}), &ctx).await.expect("glob no ignore");
+	assert!(!res_no_ignore.is_error);
+	assert!(res_no_ignore.content.contains("tracked.txt"));
+	assert!(res_no_ignore.content.contains("ignored.log"));
+	assert!(res_no_ignore.content.contains(".env"));
+}
+
+#[tokio::test]
+async fn glob_limits_and_validation() {
+	let dir = TempDir::new("glob-limits");
+	for i in 1..=5 {
+		std::fs::write(dir.path.join(format!("file_{i}.txt")), "data").expect("write file");
+	}
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Negative limit rejected with error
+	let res_neg = GlobTool.execute(&json!({"path": "*", "limit": -5}), &ctx).await.expect("glob neg");
+	assert!(res_neg.is_error);
+	assert_eq!(res_neg.content, "Limit must be a positive number");
+
+	// Zero limit rejected with error
+	let res_zero = GlobTool.execute(&json!({"path": "*", "limit": 0}), &ctx).await.expect("glob zero");
+	assert!(res_zero.is_error);
+	assert_eq!(res_zero.content, "Limit must be a positive number");
+
+	// Valid limit caps results
+	let res_capped = GlobTool.execute(&json!({"path": "*", "limit": 2}), &ctx).await.expect("glob capped");
+	assert!(!res_capped.is_error);
+	let lines: Vec<&str> = res_capped.content.lines().filter(|l| !l.is_empty()).collect();
+	assert_eq!(lines.len(), 2);
+
+	// Ceiling clamped to 200 without error
+	let res_ceiling = GlobTool.execute(&json!({"path": "*", "limit": 5000}), &ctx).await.expect("glob ceiling");
+	assert!(!res_ceiling.is_error);
+}
+
+#[tokio::test]
+async fn glob_multiple_paths_and_missing_paths() {
+	let dir = TempDir::new("glob-multipath");
+	std::fs::create_dir_all(dir.path.join("src")).expect("mkdir src");
+	std::fs::create_dir_all(dir.path.join("test")).expect("mkdir test");
+	std::fs::write(dir.path.join("src/lib.rs"), "pub fn lib() {}").expect("write src");
+	std::fs::write(dir.path.join("test/lib_test.rs"), "pub fn test() {}").expect("write test");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Semicolon-delimited multi-path
+	let res_semi = GlobTool.execute(&json!({"path": "src/**/*.rs; test/**/*.rs"}), &ctx).await.expect("glob semi");
+	assert!(!res_semi.is_error);
+	assert!(res_semi.content.contains("lib.rs"));
+	assert!(res_semi.content.contains("lib_test.rs"));
+
+	// Array multi-path
+	let res_arr = GlobTool.execute(&json!({"path": ["src/**/*.rs", "test/**/*.rs"]}), &ctx).await.expect("glob arr");
+	assert!(!res_arr.is_error);
+	assert!(res_arr.content.contains("lib.rs"));
+	assert!(res_arr.content.contains("lib_test.rs"));
+
+	// Partial missing path: surviving path returns results, missing path noted as warning
+	let res_partial = GlobTool.execute(&json!({"path": "src/**/*.rs; missing_dir/**/*.rs"}), &ctx).await.expect("glob partial");
+	assert!(!res_partial.is_error);
+	assert!(res_partial.content.contains("lib.rs"));
+	assert!(res_partial.content.contains("Skipped missing paths: missing_dir/**/*.rs"));
+
+	// All missing paths: fails with error
+	let res_all_missing = GlobTool.execute(&json!({"path": "missing_a; missing_b"}), &ctx).await.expect("glob all missing");
+	assert!(res_all_missing.is_error);
+	assert_eq!(res_all_missing.content, "Path not found: missing_a, missing_b");
+}
+
+#[tokio::test]
+async fn glob_root_guard() {
+	let dir = TempDir::new("glob-root");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Root "/" rejected
+	let res_root = GlobTool.execute(&json!({"path": "/"}), &ctx).await.expect("glob root");
+	assert!(res_root.is_error);
+	assert_eq!(res_root.content, "Searching from root directory '/' is not allowed");
+
+	// Multi-slash "///" rejected
+	let res_slashes = GlobTool.execute(&json!({"path": "///"}), &ctx).await.expect("glob slashes");
+	assert!(res_slashes.is_error);
+	assert_eq!(res_slashes.content, "Searching from root directory '/' is not allowed");
+
+	// Absolute path inside valid non-root directory stays legal
+	std::fs::write(dir.path.join("ok.txt"), "ok").expect("write ok");
+	let abs_path = format!("{}/*.txt", dir.path.display());
+	let res_abs = GlobTool.execute(&json!({"path": abs_path}), &ctx).await.expect("glob abs");
+	assert!(!res_abs.is_error);
+	assert!(res_abs.content.contains("ok.txt"));
+}
+
+#[tokio::test]
+async fn glob_single_missing_path_and_file_handling() {
+	let dir = TempDir::new("glob-file");
+	std::fs::write(dir.path.join("regular.txt"), "content").expect("write regular");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Single missing path returns Path not found error
+	let res_missing = GlobTool.execute(&json!({"path": "does_not_exist"}), &ctx).await.expect("glob missing");
+	assert!(res_missing.is_error);
+	assert_eq!(res_missing.content, "Path not found: does_not_exist");
+
+	// Single file path without glob returns the file
+	let res_file = GlobTool.execute(&json!({"path": "regular.txt"}), &ctx).await.expect("glob file");
+	assert!(!res_file.is_error);
+	assert_eq!(res_file.content, "regular.txt");
+
+	// File with glob appended fails because it is not a directory
+	let res_not_dir = GlobTool.execute(&json!({"path": "regular.txt/*.rs"}), &ctx).await.expect("glob not dir");
+	assert!(res_not_dir.is_error);
+	assert!(res_not_dir.content.contains("Path is not a directory"));
+}
+
+#[tokio::test]
+async fn glob_cancellation_and_legacy_args() {
+	let dir = TempDir::new("glob-cancel");
+	std::fs::create_dir_all(dir.path.join("sub")).expect("mkdir sub");
+	std::fs::write(dir.path.join("sub/item.rs"), "item").expect("write item");
+	let mut ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Legacy pattern + path arguments
+	let res_legacy = GlobTool.execute(&json!({"path": "sub", "pattern": "*.rs"}), &ctx).await.expect("glob legacy");
+	assert!(!res_legacy.is_error);
+	assert!(res_legacy.content.contains("item.rs"));
+
+	// Empty path error
+	let res_empty = GlobTool.execute(&json!({"path": ""}), &ctx).await.expect("glob empty");
+	assert!(res_empty.is_error);
+	assert_eq!(res_empty.content, "`path` must contain non-empty globs or paths");
+
+	// Cancellation aborts with error result
+	ctx.cancellation_token.cancel();
+	let res_cancel = GlobTool.execute(&json!({"path": "sub"}), &ctx).await.expect("glob cancel");
+	assert!(res_cancel.is_error);
+	assert_eq!(res_cancel.content, "Glob scan cancelled");
 }
 
 #[test]

@@ -31,8 +31,10 @@ const MAX_WRITE_BYTES: usize = 1024 * 1024;
 const MAX_EDIT_BYTES: usize = 4 * 1024 * 1024;
 /// Characters of the search string echoed back in an `edit` error.
 const MAX_EDIT_PREVIEW_CHARS: usize = 120;
-/// Entries returned by `glob`.
-const MAX_GLOB_ENTRIES: usize = 1000;
+/// Default and maximum entries returned by `glob`.
+const DEFAULT_GLOB_LIMIT: usize = 200;
+const MAX_GLOB_LIMIT: usize = 200;
+const MAX_GLOB_ENTRIES: usize = MAX_GLOB_LIMIT;
 /// Files scanned and bytes read per file by `grep`.
 const MAX_GREP_FILES: usize = 500;
 const MAX_GREP_FILE_BYTES: usize = 256 * 1024;
@@ -738,6 +740,205 @@ fn preview(text: &str) -> String {
 		.replace('\n', "\\n")
 }
 
+fn normalize_path_like_input(input: &str) -> String {
+	let trimmed = input.trim();
+	let stripped = if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
+		&trimmed[1..trimmed.len() - 1]
+	} else {
+		trimmed
+	};
+	stripped.trim().replace('\\', "/")
+}
+
+fn split_top_level_delimited(entry: &str) -> Vec<String> {
+	let mut parts = Vec::new();
+	let mut brace_depth = 0;
+	let mut start = 0;
+	let chars: Vec<char> = entry.chars().collect();
+	let mut i = 0;
+	while i < chars.len() {
+		let ch = chars[i];
+		if ch == '\\' && i + 1 < chars.len() {
+			i += 2;
+			continue;
+		}
+		if ch == '{' {
+			brace_depth += 1;
+		} else if ch == '}' {
+			if brace_depth > 0 {
+				brace_depth -= 1;
+			}
+		} else if brace_depth == 0 && ch == ';' {
+			let part: String = chars[start..i].iter().collect();
+			let trimmed = normalize_path_like_input(&part);
+			if !trimmed.is_empty() {
+				parts.push(trimmed);
+			}
+			start = i + 1;
+		}
+		i += 1;
+	}
+	let last: String = chars[start..].iter().collect();
+	let trimmed = normalize_path_like_input(&last);
+	if !trimmed.is_empty() {
+		parts.push(trimmed);
+	}
+	if parts.is_empty() {
+		vec![entry.to_string()]
+	} else {
+		parts
+	}
+}
+
+fn has_glob_path_chars(s: &str) -> bool {
+	s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
+}
+
+fn fix_unclosed_braces(mut pattern: String) -> String {
+	let mut depth = 0;
+	for ch in pattern.chars() {
+		if ch == '{' {
+			depth += 1;
+		} else if ch == '}' && depth > 0 {
+			depth -= 1;
+		}
+	}
+	for _ in 0..depth {
+		pattern.push('}');
+	}
+	pattern
+}
+
+fn walk_depth_bound(pattern: &str) -> usize {
+	if pattern.contains("**") || pattern.contains('{') {
+		return usize::MAX;
+	}
+	pattern
+		.split('/')
+		.filter(|seg| !seg.is_empty())
+		.count()
+		.max(1)
+}
+
+struct ParsedFindPattern {
+	base_path: String,
+	glob_pattern: String,
+	has_glob: bool,
+}
+
+fn parse_find_pattern(pattern: &str) -> ParsedFindPattern {
+	let normalized = pattern.replace('\\', "/");
+	let segments: Vec<&str> = normalized.split('/').collect();
+	let mut first_glob_index = None;
+	for (i, segment) in segments.iter().enumerate() {
+		if has_glob_path_chars(segment) {
+			first_glob_index = Some(i);
+			break;
+		}
+	}
+
+	match first_glob_index {
+		None => ParsedFindPattern {
+			base_path: normalized,
+			glob_pattern: "**/*".to_string(),
+			has_glob: false,
+		},
+		Some(0) => {
+			let needs_recursive = !normalized.starts_with("**/");
+			let glob_pattern = if needs_recursive {
+				format!("**/{normalized}")
+			} else {
+				normalized
+			};
+			ParsedFindPattern {
+				base_path: ".".to_string(),
+				glob_pattern,
+				has_glob: true,
+			}
+		},
+		Some(idx) => {
+			let base_path = segments[..idx].join("/");
+			let glob_pattern = segments[idx..].join("/");
+			ParsedFindPattern {
+				base_path: if base_path.is_empty() { ".".to_string() } else { base_path },
+				glob_pattern,
+				has_glob: true,
+			}
+		},
+	}
+}
+
+fn resolve_to_cwd(base_path: &str, cwd: &Path) -> PathBuf {
+	if base_path.is_empty() || base_path == "." {
+		cwd.to_path_buf()
+	} else {
+		let p = Path::new(base_path);
+		if p.is_absolute() {
+			p.to_path_buf()
+		} else {
+			cwd.join(p)
+		}
+	}
+}
+
+fn format_path_relative_to_cwd(path: &Path, cwd: &Path, is_dir: bool) -> String {
+	let mut rel = match path.strip_prefix(cwd) {
+		Ok(p) => p.to_string_lossy().replace('\\', "/"),
+		Err(_) => path.to_string_lossy().replace('\\', "/"),
+	};
+	if rel.is_empty() {
+		rel = ".".to_string();
+	}
+	if is_dir && !rel.ends_with('/') {
+		rel.push('/');
+	}
+	rel
+}
+
+fn extract_raw_paths(args: &Value) -> Vec<String> {
+	if let (Some(path_val), Some(pat_val)) = (args.get("path"), args.get("pattern")) {
+		if let (Some(p), Some(pat)) = (path_val.as_str(), pat_val.as_str()) {
+			if !has_glob_path_chars(p) && has_glob_path_chars(pat) {
+				let combined = if p == "." || p.is_empty() {
+					pat.to_string()
+				} else {
+					format!("{p}/{pat}")
+				};
+				return vec![combined];
+			}
+		}
+	}
+
+	if let Some(arr) = args.get("path").and_then(Value::as_array) {
+		let list: Vec<String> = arr
+			.iter()
+			.filter_map(Value::as_str)
+			.map(|s| s.to_string())
+			.collect();
+		if !list.is_empty() {
+			return list;
+		}
+	}
+
+	if let Some(path_str) = args.get("path").and_then(Value::as_str) {
+		let trimmed = path_str.trim();
+		if trimmed.starts_with('[') && trimmed.ends_with(']') {
+			if let Ok(parsed) = serde_json::from_str::<Vec<String>>(trimmed) {
+				if !parsed.is_empty() {
+					return parsed;
+				}
+			}
+		}
+		return vec![path_str.to_string()];
+	}
+
+	if let Some(pattern_str) = args.get("pattern").and_then(Value::as_str) {
+		return vec![pattern_str.to_string()];
+	}
+
+	vec![".".to_string()]
+}
+
 /// Builtin glob matching tool powered by pi-walker.
 pub struct GlobTool;
 
@@ -755,57 +956,238 @@ impl Tool for GlobTool {
 		serde_json::json!({
 			"type": "object",
 			"properties": {
-				"pattern": {
-					"type": "string",
-					"description": "Glob pattern (e.g. *.rs, **/*.txt)"
-				},
 				"path": {
 					"type": "string",
-					"description": "Subdirectory to scan"
+					"description": "glob, file, or directory to search — a single path or a semicolon-delimited list (\"src/**/*.ts; test/**/*.ts\"). Omitted -> searches the workspace root (\".\")"
+				},
+				"hidden": {
+					"type": "boolean",
+					"description": "include hidden files"
+				},
+				"gitignore": {
+					"type": "boolean",
+					"description": "respect gitignore"
 				},
 				"limit": {
 					"type": "number",
-					"description": "Maximum number of entries to return"
+					"description": "max results"
 				}
 			}
 		})
 	}
 
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
-		let sub_dir = args.get("path").and_then(Value::as_str).unwrap_or(".");
-		let pattern = args.get("pattern").and_then(Value::as_str);
-		let limit = args
-			.get("limit")
-			.and_then(Value::as_u64)
-			.unwrap_or(200)
-			.clamp(1, MAX_GLOB_ENTRIES as u64) as usize;
+		if ctx.cancellation_token.is_cancelled() {
+			return Ok(tool_result("Glob scan cancelled", true));
+		}
 
-		let root = ctx.cwd.join(sub_dir);
-		let mut request = pi_walker::WalkRequest::new(root).limit(limit);
-
-		if let Some(pattern) = pattern {
-			match pi_walker::CompiledWalkGlob::new([pattern]) {
-				Ok(compiled) => request = request.filter(pi_walker::WalkFilter::all().glob(compiled)),
-				Err(err) => {
-					return Ok(tool_result(format!("Invalid glob pattern '{pattern}': {err}"), true));
-				},
+		if let Some(limit_val) = args.get("limit") {
+			let is_non_positive = limit_val.as_i64().map_or(false, |v| v <= 0)
+				|| limit_val.as_f64().map_or(false, |v| v <= 0.0);
+			if is_non_positive {
+				return Ok(tool_result("Limit must be a positive number", true));
 			}
 		}
 
-		match request.collect() {
-			Ok(outcome) => {
-				let paths: Vec<String> = outcome
-					.entries
-					.into_iter()
-					.map(|entry| entry.path)
-					.collect();
-				match serde_json::to_string_pretty(&paths) {
-					Ok(body) => Ok(tool_result(body, false)),
-					Err(err) => Ok(tool_result(format!("Failed to format glob result: {err}"), true)),
-				}
-			},
-			Err(err) => Ok(tool_result(format!("Glob scan error: {err}"), true)),
+		let limit = args
+			.get("limit")
+			.and_then(Value::as_u64)
+			.unwrap_or(DEFAULT_GLOB_LIMIT as u64)
+			.clamp(1, MAX_GLOB_LIMIT as u64) as usize;
+
+		let raw_paths = extract_raw_paths(args);
+		let mut expanded_patterns = Vec::new();
+		for raw in raw_paths {
+			let norm = normalize_path_like_input(&raw);
+			if norm.is_empty() {
+				expanded_patterns.push(String::new());
+				continue;
+			}
+			let literal_path = resolve_to_cwd(&norm, &ctx.cwd);
+			if literal_path.exists() {
+				expanded_patterns.push(norm);
+			} else {
+				expanded_patterns.extend(split_top_level_delimited(&norm));
+			}
 		}
+
+		if expanded_patterns.is_empty() || expanded_patterns.iter().any(|p| p.is_empty()) {
+			return Ok(tool_result("`path` must contain non-empty globs or paths", true));
+		}
+
+		if expanded_patterns.iter().any(|p| p.chars().all(|c| c == '/')) {
+			return Ok(tool_result("Searching from root directory '/' is not allowed", true));
+		}
+
+		let parsed_targets: Vec<(String, ParsedFindPattern, PathBuf)> = expanded_patterns
+			.into_iter()
+			.map(|pat| {
+				let parsed = parse_find_pattern(&pat);
+				let search_path = resolve_to_cwd(&parsed.base_path, &ctx.cwd);
+				(pat, parsed, search_path)
+			})
+			.collect();
+
+		for (_, _, search_path) in &parsed_targets {
+			if search_path == Path::new("/") {
+				return Ok(tool_result("Searching from root directory '/' is not allowed", true));
+			}
+		}
+
+		let is_single = parsed_targets.len() == 1;
+		let mut valid_targets = Vec::new();
+		let mut missing_paths = Vec::new();
+
+		if is_single {
+			let (pat, parsed, search_path) = parsed_targets.into_iter().next().unwrap();
+			if !search_path.exists() {
+				return Ok(tool_result(format!("Path not found: {pat}"), true));
+			}
+			valid_targets.push((pat, parsed, search_path));
+		} else {
+			for (pat, parsed, search_path) in parsed_targets {
+				if search_path.exists() {
+					valid_targets.push((pat, parsed, search_path));
+				} else {
+					missing_paths.push(pat);
+				}
+			}
+			if valid_targets.is_empty() {
+				return Ok(tool_result(format!("Path not found: {}", missing_paths.join(", ")), true));
+			}
+		}
+
+		let include_hidden = args.get("hidden").and_then(Value::as_bool).unwrap_or(true);
+		let use_gitignore = args.get("gitignore").and_then(Value::as_bool).unwrap_or(true);
+
+		let mut all_collected: Vec<(String, f64)> = Vec::new();
+
+		for (pat, parsed, search_path) in valid_targets {
+			if ctx.cancellation_token.is_cancelled() {
+				return Ok(tool_result("Glob scan cancelled", true));
+			}
+
+			if search_path.is_file() {
+				if !parsed.has_glob {
+					let rel = format_path_relative_to_cwd(&search_path, &ctx.cwd, false);
+					let mtime = search_path
+						.metadata()
+						.ok()
+						.and_then(|m| m.modified().ok())
+						.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+						.map(|d| d.as_secs_f64() * 1000.0)
+						.unwrap_or(0.0);
+					all_collected.push((rel, mtime));
+					continue;
+				} else if is_single {
+					return Ok(tool_result(format!("Path is not a directory: {}", search_path.display()), true));
+				} else {
+					continue;
+				}
+			}
+
+			if !search_path.is_dir() {
+				if is_single {
+					return Ok(tool_result(format!("Path is not a directory: {}", search_path.display()), true));
+				} else {
+					continue;
+				}
+			}
+
+			let fixed_pattern = fix_unclosed_braces(parsed.glob_pattern.clone());
+			let walk_glob = match pi_walker::CompiledWalkGlob::new([&fixed_pattern]) {
+				Ok(compiled) => compiled,
+				Err(err) => {
+					return Ok(tool_result(format!("Invalid glob pattern '{pat}': {err}"), true));
+				},
+			};
+
+			let mentions_node_modules = parsed.glob_pattern.contains("node_modules");
+			let depth_bound = walk_depth_bound(&parsed.glob_pattern);
+			let request = pi_walker::WalkRequest::new(&search_path)
+				.hidden(include_hidden)
+				.gitignore(use_gitignore)
+				.skip_git(true)
+				.skip_node_modules(!mentions_node_modules)
+				.follow_links(pi_walker::FollowLinks::Never)
+				.detail(pi_walker::WalkDetail::Full)
+				.order(pi_walker::WalkOrder::Path)
+				.emit_root(false)
+				.depth(1, depth_bound)
+				.directory_errors(pi_walker::DirectoryErrorMode::SkipSkippable)
+				.empty_recheck(pi_walker::EmptyRecheck::Configured)
+				.limit(limit)
+				.filter(
+					pi_walker::WalkFilter::all()
+						.glob(walk_glob)
+						.node_modules_unless_mentioned(mentions_node_modules),
+				);
+
+			let heartbeat = || {
+				if ctx.cancellation_token.is_cancelled() {
+					Err("Glob scan cancelled".to_string())
+				} else {
+					Ok(())
+				}
+			};
+
+			let outcome = match request.collect_with_heartbeat(heartbeat) {
+				Ok(outcome) => outcome,
+				Err(err) => {
+					if ctx.cancellation_token.is_cancelled() {
+						return Ok(tool_result("Glob scan cancelled", true));
+					}
+					return Ok(tool_result(format!("Glob scan error: {err}"), true));
+				},
+			};
+
+			for entry in outcome.entries {
+				let abs_path = entry.absolute_path(&search_path);
+				let is_dir = entry.file_type == pi_walker::FileType::Dir;
+				let rel_path = format_path_relative_to_cwd(&abs_path, &ctx.cwd, is_dir);
+				let mtime = entry.mtime.unwrap_or(0.0);
+				all_collected.push((rel_path, mtime));
+			}
+		}
+
+		let mut seen = std::collections::HashSet::new();
+		let mut deduped = Vec::new();
+		for (path, mtime) in all_collected {
+			if seen.insert(path.clone()) {
+				deduped.push((path, mtime));
+			}
+		}
+
+		deduped.sort_by(|a, b| {
+			b.1.partial_cmp(&a.1)
+				.unwrap_or(std::cmp::Ordering::Equal)
+				.then_with(|| a.0.cmp(&b.0))
+		});
+		deduped.truncate(limit);
+		let final_paths: Vec<String> = deduped.into_iter().map(|(p, _)| p).collect();
+
+		let missing_note = if !missing_paths.is_empty() {
+			Some(format!("Skipped missing paths: {}", missing_paths.join(", ")))
+		} else {
+			None
+		};
+
+		if final_paths.is_empty() {
+			let mut msg = "No files found matching pattern".to_string();
+			if let Some(note) = missing_note {
+				msg.push('\n');
+				msg.push_str(&note);
+			}
+			return Ok(tool_result(msg, false));
+		}
+
+		let base_output = final_paths.join("\n");
+		let output = if let Some(note) = missing_note {
+			format!("{base_output}\n\n{note}")
+		} else {
+			base_output
+		};
+		Ok(tool_result(output, false))
 	}
 }
 
