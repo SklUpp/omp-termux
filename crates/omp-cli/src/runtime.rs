@@ -18,8 +18,9 @@ use pi_agent::{
 	GrepTool, ModelProvider, OpenAiCompatibleProvider, ReadTool, SteeringEvent, TodoTool, Tool,
 	ToolRegistry, WriteTool,
 	mcp::{
-		MCPContent, MCPServerConfig, McpConnection, McpToolOriginSource, connect_to_server,
-		create_mcp_tool_name, get_mcp_tool_origin_key,
+		MCPContent, MCPServerConfig, MCPStdioServerConfig, McpConnection, McpToolOriginSource,
+		connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key,
+		sanitize_mcp_tool_name_part,
 	},
 };
 
@@ -116,6 +117,21 @@ impl SignalDispatcher {
 		TurnSignalRegistration { active_turn: Arc::clone(&self.active_turn) }
 	}
 }
+struct TimerGuard(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for TimerGuard {
+	fn drop(&mut self) {
+		if let Some(handle) = &self.0 {
+			handle.abort();
+		}
+	}
+}
+
+impl TimerGuard {
+	fn disarm(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+		self.0.take()
+	}
+}
 
 impl AgentRunner for PiAgentRunner {
 	fn run(&self, request: &RunRequest) -> Result<EventStream> {
@@ -133,21 +149,28 @@ impl AgentRunner for PiAgentRunner {
 
 		let timeout_cancel = cancellation_token.clone();
 		let timed_out_clone = Arc::clone(&timed_out);
-		let timer_handle = request.max_time.map(|budget| {
+		let mut timer_guard = TimerGuard(request.max_time.map(|budget| {
 			self.runtime.spawn(async move {
 				tokio::time::sleep(budget).await;
 				timed_out_clone.store(true, Ordering::SeqCst);
 				timeout_cancel.cancel();
 			})
-		});
+		}));
 
 		let mcp_tools = if request.tools_enabled {
-			self.runtime.block_on(load_and_filter_mcp_tools(
+			match self.runtime.block_on(load_and_filter_mcp_tools(
 				&request.cwd,
 				&request.config,
 				&request.approvals,
 				&cancellation_token,
-			))?
+			)) {
+				Ok(tools) => tools,
+				Err(err) => {
+					drop(discovery_sig_reg);
+					sig_watcher.abort();
+					return Err(err);
+				}
+			}
 		} else {
 			Vec::new()
 		};
@@ -418,7 +441,7 @@ impl AgentRunner for PiAgentRunner {
 			steering_tx,
 			cancel_watcher,
 			dialog_abort,
-			timer_handle,
+			timer_handle: timer_guard.disarm(),
 			_signal_reg: signal_reg,
 			runtime_handle,
 		});
@@ -880,6 +903,280 @@ pub fn deduplicate_mcp_tools_with_warning(tools: Vec<McpTool>) -> Vec<McpTool> {
 	dedup
 }
 
+fn collect_all_configured_server_names(
+	cwd: &Path,
+	discovered: &[crate::config::DiscoveredMcpServer],
+) -> Vec<String> {
+	let mut names = std::collections::HashSet::new();
+	for s in discovered {
+		names.insert(s.name.clone());
+	}
+	let candidate_paths = [
+		cwd.join(".omp").join("mcp.json"),
+		cwd.join(".omp").join(".mcp.json"),
+		cwd.join("mcp.json"),
+		cwd.join(".mcp.json"),
+	];
+	for path in &candidate_paths {
+		if let Ok(content) = std::fs::read_to_string(path) {
+			if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+				if let Some(obj) = val.get("mcpServers").and_then(|v| v.as_object()) {
+					for key in obj.keys() {
+						names.insert(key.clone());
+					}
+				}
+			}
+		}
+	}
+	names.into_iter().collect()
+}
+fn mcp_tool_match_score(server_name: &str, tool_name: &str) -> usize {
+	let sanitized = sanitize_mcp_tool_name_part(server_name, "server");
+	let exact_prefix = format!("mcp__{sanitized}_");
+	if tool_name.starts_with(&exact_prefix) {
+		return exact_prefix.len();
+	}
+
+	// Bounded tool name: create_mcp_tool_name caps at 64 chars with _{hash}.
+	// If the server prefix was truncated, match the prefix preserved before the hash.
+	if tool_name.len() == 64 && tool_name.starts_with("mcp__") {
+		if let Some(last_underscore) = tool_name.rfind('_') {
+			if last_underscore >= 5 {
+				let prefix_in_tool = &tool_name[..last_underscore];
+				let full_prefix = format!("mcp__{sanitized}");
+				if full_prefix.starts_with(prefix_in_tool) {
+					return prefix_in_tool.len();
+				}
+			}
+		}
+	}
+
+	0
+}
+
+fn mcp_server_matches_tools(
+	server_name: &str,
+	all_servers: &[String],
+	approvals: &crate::approve::Approvals,
+	requested_tools: &[String],
+) -> bool {
+	requested_tools.iter().any(|req| {
+		let my_score = mcp_tool_match_score(server_name, req);
+		if my_score == 0 {
+			return false;
+		}
+
+		let mut top_score = 0;
+		let mut candidates = Vec::new();
+		for s in all_servers {
+			let score = mcp_tool_match_score(s, req);
+			if score > 0 {
+				if score > top_score {
+					top_score = score;
+					candidates.clear();
+					candidates.push(s.as_str());
+				} else if score == top_score {
+					candidates.push(s.as_str());
+				}
+			}
+		}
+
+		if my_score < top_score {
+			return false;
+		}
+
+		if candidates.len() == 1 {
+			return candidates[0] == server_name;
+		}
+
+		let explicitly_allowed: Vec<&str> = candidates
+			.iter()
+			.copied()
+			.filter(|s| {
+				approvals.allow.contains(*s)
+					|| approvals.allow.contains(&format!("mcp:{s}"))
+					|| approvals.allow.contains(&format!("mcp-server:{s}"))
+			})
+			.collect();
+
+		explicitly_allowed.len() == 1 && explicitly_allowed[0] == server_name
+	})
+}
+
+pub fn is_stdio_mcp_launch_allowed(
+	server_name: &str,
+	approvals: &crate::approve::Approvals,
+) -> bool {
+	is_stdio_mcp_launch_allowed_with_servers(server_name, &[server_name.to_string()], approvals)
+}
+
+pub fn is_stdio_mcp_launch_allowed_with_servers(
+	server_name: &str,
+	all_servers: &[String],
+	approvals: &crate::approve::Approvals,
+) -> bool {
+	if approvals.mode == crate::approve::ApprovalMode::Yolo {
+		return true;
+	}
+
+	// Explicit server-level allow is always definitive and unambiguous.
+	let prompt_name = format!("mcp-server:{server_name}");
+	if approvals.allow.contains(server_name)
+		|| approvals.allow.contains(&format!("mcp:{server_name}"))
+		|| approvals.allow.contains(&prompt_name)
+	{
+		return true;
+	}
+
+	// Unambiguous colon-delimited tool allow (e.g. mcp:foo:read).
+	let colon_prefix = format!("mcp:{server_name}:");
+	if approvals.allow.iter().any(|a| a.starts_with(&colon_prefix)) {
+		return true;
+	}
+
+	// Per-entry tool allow matching:
+	// A tool-level allow entry (e.g. `mcp__foo_bar_read` or bounded `mcp__common..._{hash}`)
+	// authorizes server_name ONLY if server_name is the sole matching candidate among all_servers.
+	// If multiple servers match the entry prefix (e.g. `foo` and `foo_bar` both match
+	// `mcp__foo_bar_read`, or two servers collide at 55-byte cap limit), identity is ambiguous
+	// and fail-closed: requires explicit server-level allow.
+	// Bare server form `mcp__{X}` matching any configured server name (including disabled/suppressed
+	// servers collected from config layers) is excluded from tool-matching to prevent discovery-shaping
+	// bypasses.
+	// ponytail: tool-level allow maps to server launch before tools/list; add per-tool RPC authorization once protocol supports it.
+	approvals.allow.iter().any(|entry| {
+		if let Some(rest) = entry.strip_prefix("mcp__") {
+			if all_servers.iter().any(|s| {
+				let s_san = sanitize_mcp_tool_name_part(s, "server");
+				rest == s_san || rest == s.as_str()
+			}) {
+				eprintln!("ambiguous MCP allow \"{entry}\", use mcp:<server> for server-level");
+				return false;
+			}
+		}
+
+		let my_score = mcp_tool_match_score(server_name, entry);
+		if my_score == 0 {
+			return false;
+		}
+
+		let matching_candidates = all_servers
+			.iter()
+			.filter(|s| {
+				mcp_tool_match_score(s, entry) > 0
+					|| entry == &format!("mcp__{}", sanitize_mcp_tool_name_part(s, "server"))
+					|| entry == &format!("mcp__{s}")
+			})
+			.count();
+
+		matching_candidates == 1
+	})
+}
+
+#[cfg(unix)]
+fn poll_stdin_readable(timeout_ms: i32) -> bool {
+	#[repr(C)]
+	struct PollFd {
+		fd: std::os::raw::c_int,
+		events: std::os::raw::c_short,
+		revents: std::os::raw::c_short,
+	}
+	const POLLIN: std::os::raw::c_short = 0x0001;
+	extern "C" {
+		fn poll(fds: *mut PollFd, nfds: usize, timeout: std::os::raw::c_int) -> std::os::raw::c_int;
+	}
+	let mut pfd = PollFd {
+		fd: 0,
+		events: POLLIN,
+		revents: 0,
+	};
+	let ret = unsafe { poll(&mut pfd, 1, timeout_ms) };
+	ret > 0 && (pfd.revents & POLLIN) != 0
+}
+
+#[cfg(unix)]
+fn read_stdin_byte() -> Option<u8> {
+	extern "C" {
+		fn read(fd: std::os::raw::c_int, buf: *mut u8, count: usize) -> isize;
+	}
+	let mut b = 0u8;
+	let ret = unsafe { read(0, &mut b, 1) };
+	if ret == 1 { Some(b) } else { None }
+}
+
+async fn check_or_prompt_stdio_mcp_launch(
+	server_name: &str,
+	all_servers: &[String],
+	stdio: &MCPStdioServerConfig,
+	approvals: &crate::approve::Approvals,
+	cancel_token: &pi_agent::CancellationToken,
+) -> Result<bool> {
+	if cancel_token.is_cancelled() {
+		return Err(Error::new("MCP discovery interrupted"));
+	}
+
+	if is_stdio_mcp_launch_allowed_with_servers(server_name, all_servers, approvals) {
+		return Ok(true);
+	}
+
+	use std::io::IsTerminal;
+	if !std::io::stdin().is_terminal() {
+		return Ok(false);
+	}
+
+	use std::io::Write;
+	let prompt_name = format!("mcp-server:{server_name}");
+	let detail = format!("{} {}", stdio.command, stdio.args.join(" "));
+	eprint!("Approve {prompt_name} ({detail})? [y/N] ");
+	let _ = std::io::stderr().flush();
+
+	let cancel_clone = cancel_token.clone();
+	let mut prompt_fut = Box::pin(tokio::task::spawn_blocking(move || {
+		let mut buf = Vec::new();
+		loop {
+			if cancel_clone.is_cancelled() {
+				return Ok(false);
+			}
+			#[cfg(unix)]
+			{
+				if poll_stdin_readable(100) {
+					match read_stdin_byte() {
+						Some(b'\n') => break,
+						Some(b'\r') => {},
+						Some(b) => buf.push(b),
+						None => return Ok(false),
+					}
+				}
+			}
+			#[cfg(not(unix))]
+			{
+				break;
+			}
+		}
+
+		if cancel_clone.is_cancelled() {
+			return Ok(false);
+		}
+
+		let answer = String::from_utf8_lossy(&buf).trim().to_ascii_lowercase();
+		Ok(matches!(answer.as_str(), "y" | "yes"))
+	}));
+
+	tokio::select! {
+		_ = cancel_token.cancelled() => {
+			let _ = prompt_fut.await;
+			Err(Error::new("MCP discovery interrupted"))
+		}
+		res = &mut prompt_fut => {
+			match res {
+				Ok(Ok(confirmed)) => Ok(confirmed),
+				Ok(Err(err)) => Err(Error::with_source("failed reading approval", err)),
+				Err(_) => Ok(false),
+			}
+		}
+	}
+}
+
 pub async fn filter_and_spawn_mcp_servers(
 	discovered: Vec<crate::config::DiscoveredMcpServer>,
 	cwd: &Path,
@@ -888,14 +1185,74 @@ pub async fn filter_and_spawn_mcp_servers(
 	cancel_token: &pi_agent::CancellationToken,
 ) -> Result<Vec<McpTool>> {
 	let mut all_tools = Vec::new();
+	let mut server_errors: Vec<(String, String)> = Vec::new();
+	let all_server_names = collect_all_configured_server_names(cwd, &discovered);
+	if let Some(requested_tools) = &config.tools {
+		for req in requested_tools {
+			let mut top_score = 0;
+			let mut candidates = Vec::new();
+			for s in &all_server_names {
+				let score = mcp_tool_match_score(s, req);
+				if score > 0 {
+					if score > top_score {
+						top_score = score;
+						candidates.clear();
+						candidates.push(s.as_str());
+					} else if score == top_score {
+						candidates.push(s.as_str());
+					}
+				}
+			}
+			if candidates.len() > 1 {
+				let explicitly_allowed: Vec<&str> = candidates
+					.iter()
+					.copied()
+					.filter(|s| {
+						approvals.allow.contains(*s)
+							|| approvals.allow.contains(&format!("mcp:{s}"))
+							|| approvals.allow.contains(&format!("mcp-server:{s}"))
+					})
+					.collect();
+				if explicitly_allowed.len() != 1 {
+					return Err(Error::new(format!(
+						"Ambiguous tool \"{}\" in --tools: matches multiple servers ({}). Disambiguate by explicitly allowing the intended server with --allow <server>.",
+						req,
+						candidates.join(", ")
+					)));
+				}
+			}
+		}
+	}
 
 	for server in discovered {
 		if cancel_token.is_cancelled() {
 			break;
 		}
 
+		if let Some(requested_tools) = &config.tools {
+			if !mcp_server_matches_tools(&server.name, &all_server_names, approvals, requested_tools) {
+				continue;
+			}
+		}
+
 		let mut server_config = server.config;
 		if let MCPServerConfig::Stdio(stdio) = &mut server_config {
+			let allowed = check_or_prompt_stdio_mcp_launch(
+				&server.name,
+				&all_server_names,
+				stdio,
+				approvals,
+				cancel_token,
+			).await?;
+			if !allowed {
+				let err_msg = format!(
+					"MCP server \"{}\" was not launched: stdio launch was not approved",
+					server.name
+				);
+				eprintln!("{err_msg}");
+				server_errors.push((server.name.clone(), err_msg));
+				continue;
+			}
 			if stdio.cwd.is_none() {
 				stdio.cwd = Some(cwd.to_string_lossy().to_string());
 			}
@@ -907,7 +1264,9 @@ pub async fn filter_and_spawn_mcp_servers(
 			res = connect_fut => match res {
 				Ok(connection) => Arc::new(connection),
 				Err(err) => {
-					eprintln!("Failed to connect to MCP server \"{}\": {err}", server.name);
+					let err_msg = format!("Failed to connect to MCP server \"{}\": {err}", server.name);
+					eprintln!("{err_msg}");
+					server_errors.push((server.name.clone(), err_msg));
 					continue;
 				}
 			}
@@ -919,7 +1278,9 @@ pub async fn filter_and_spawn_mcp_servers(
 			res = list_fut => match res {
 				Ok(defs) => defs,
 				Err(err) => {
-					eprintln!("Failed to list tools from MCP server \"{}\": {err}", server.name);
+					let err_msg = format!("Failed to list tools from MCP server \"{}\": {err}", server.name);
+					eprintln!("{err_msg}");
+					server_errors.push((server.name.clone(), err_msg));
 					continue;
 				}
 			}
@@ -934,6 +1295,10 @@ pub async fn filter_and_spawn_mcp_servers(
 	}
 
 	let mut unique_tools = deduplicate_mcp_tools_with_warning(all_tools);
+	if cancel_token.is_cancelled() {
+		return Ok(unique_tools);
+	}
+
 
 	if let Some(requested_tools) = &config.tools {
 		let mut known_tools: Vec<String> = BUILTIN_TOOLS.iter().map(|(n, _)| n.to_string()).collect();
@@ -946,6 +1311,11 @@ pub async fn filter_and_spawn_mcp_servers(
 			.cloned()
 			.collect();
 		if !unknown.is_empty() {
+			for (failed_server, err_msg) in &server_errors {
+				if mcp_server_matches_tools(failed_server, &all_server_names, approvals, &unknown) {
+					return Err(Error::new(err_msg.clone()));
+				}
+			}
 			let plural = if unknown.len() == 1 { "" } else { "s" };
 			return Err(Error::new(format!(
 				"Unknown tool{} in --tools: {}. Valid tools: {}.",
@@ -957,7 +1327,7 @@ pub async fn filter_and_spawn_mcp_servers(
 
 		unique_tools.retain(|tool| requested_tools.iter().any(|allowed| allowed == tool.name()));
 	}
-	let _ = approvals;
+
 	Ok(unique_tools)
 }
 
@@ -1682,5 +2052,43 @@ mod tests {
 
 		let err = stream.next().expect("error event").err().expect("is error");
 		assert!(err.to_string().contains("interrupted"));
+	}
+	#[test]
+	fn timer_guard_aborts_on_early_discovery_error() {
+		let mut req = request(yolo());
+		req.max_time = Some(std::time::Duration::from_millis(50));
+		let cancel_token = pi_agent::CancellationToken::new();
+		req.cancellation_token = Some(cancel_token.clone());
+		req.config.tools = Some(vec!["unknown_tool_for_test".to_string()]);
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let res = runner.run(&req);
+		assert!(res.is_err());
+
+		std::thread::sleep(std::time::Duration::from_millis(100));
+		assert!(!cancel_token.is_cancelled(), "orphaned timer must not cancel caller token");
+	}
+
+	#[test]
+	fn timer_guard_aborts_on_provider_setup_error() {
+		let mut req = request(yolo());
+		req.max_time = Some(std::time::Duration::from_millis(50));
+		let cancel_token = pi_agent::CancellationToken::new();
+		req.cancellation_token = Some(cancel_token.clone());
+		req.config.providers.insert(
+			"local".to_string(),
+			ProviderConfig {
+				base_url: Some("invalid url with space and :::".to_string()),
+				api_key: Some("sk-test".to_string()),
+				..ProviderConfig::default()
+			},
+		);
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let res = runner.run(&req);
+		assert!(res.is_err());
+
+		std::thread::sleep(std::time::Duration::from_millis(100));
+		assert!(!cancel_token.is_cancelled(), "orphaned timer must not cancel caller token");
 	}
 }
