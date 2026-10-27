@@ -1082,7 +1082,7 @@ fn poll_stdin_readable(timeout_ms: i32) -> bool {
 		revents: std::os::raw::c_short,
 	}
 	const POLLIN: std::os::raw::c_short = 0x0001;
-	extern "C" {
+	unsafe extern "C" {
 		fn poll(fds: *mut PollFd, nfds: usize, timeout: std::os::raw::c_int) -> std::os::raw::c_int;
 	}
 	let mut pfd = PollFd {
@@ -1096,7 +1096,7 @@ fn poll_stdin_readable(timeout_ms: i32) -> bool {
 
 #[cfg(unix)]
 fn read_stdin_byte() -> Option<u8> {
-	extern "C" {
+	unsafe extern "C" {
 		fn read(fd: std::os::raw::c_int, buf: *mut u8, count: usize) -> isize;
 	}
 	let mut b = 0u8;
@@ -1131,8 +1131,8 @@ async fn check_or_prompt_stdio_mcp_launch(
 	let _ = std::io::stderr().flush();
 
 	let cancel_clone = cancel_token.clone();
-	let mut prompt_fut = Box::pin(tokio::task::spawn_blocking(move || {
-		let mut buf = Vec::new();
+	let mut prompt_fut = Box::pin(tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+		let mut buf: Vec<u8> = Vec::new();
 		loop {
 			if cancel_clone.is_cancelled() {
 				return Ok(false);
