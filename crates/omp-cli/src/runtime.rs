@@ -19,7 +19,7 @@ use pi_agent::{
 	ToolRegistry, WriteTool,
 	mcp::{
 		MCPContent, MCPServerConfig, MCPStdioServerConfig, McpConnection, McpToolOriginSource,
-		connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key,
+		connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key, mcp_tool_match_score,
 		sanitize_mcp_tool_name_part,
 	},
 };
@@ -157,14 +157,14 @@ impl AgentRunner for PiAgentRunner {
 			})
 		}));
 
-		let mcp_tools = if request.tools_enabled {
-			match self.runtime.block_on(load_and_filter_mcp_tools(
+		let mcp_spawn = if request.tools_enabled {
+			match self.runtime.block_on(load_and_filter_mcp_tools_detailed(
 				&request.cwd,
 				&request.config,
 				&request.approvals,
 				&cancellation_token,
 			)) {
-				Ok(tools) => tools,
+				Ok(spawn) => spawn,
 				Err(err) => {
 					drop(discovery_sig_reg);
 					sig_watcher.abort();
@@ -172,7 +172,11 @@ impl AgentRunner for PiAgentRunner {
 				}
 			}
 		} else {
-			Vec::new()
+			McpSpawnResult {
+				tools: Vec::new(),
+				server_errors: Vec::new(),
+				all_server_names: Vec::new(),
+			}
 		};
 
 		drop(discovery_sig_reg);
@@ -185,8 +189,13 @@ impl AgentRunner for PiAgentRunner {
 			return Err(Error::new("MCP discovery interrupted"));
 		}
 
-		let plan = RunPlan::resolve_with_mcp(request, !mcp_tools.is_empty())?;
-		let registry = build_registry_with_mcp(&plan.tools, mcp_tools)?;
+		let plan = RunPlan::resolve_with_mcp(request, !mcp_spawn.tools.is_empty())?;
+		let registry = build_registry_with_mcp_and_diagnostics(
+			&plan.tools,
+			mcp_spawn.tools,
+			mcp_spawn.server_errors,
+			mcp_spawn.all_server_names,
+		)?;
 		let cwd = request.cwd.clone();
 		let prompt = request.prompt.clone();
 		let mut messages = history_messages(&request.history);
@@ -676,6 +685,15 @@ pub fn build_registry_with_mcp(
 	tools: &[&'static str],
 	mcp_tools: Vec<McpTool>,
 ) -> Result<ToolRegistry> {
+	build_registry_with_mcp_and_diagnostics(tools, mcp_tools, Vec::new(), Vec::new())
+}
+
+pub fn build_registry_with_mcp_and_diagnostics(
+	tools: &[&'static str],
+	mcp_tools: Vec<McpTool>,
+	server_errors: Vec<(String, String)>,
+	all_server_names: Vec<String>,
+) -> Result<ToolRegistry> {
 	let mut registry = ToolRegistry::new();
 	for name in tools {
 		let tool: Arc<dyn Tool> = match *name {
@@ -697,6 +715,10 @@ pub fn build_registry_with_mcp(
 	for mcp_tool in mcp_tools {
 		registry.register(Arc::new(mcp_tool));
 	}
+	for (server, err) in server_errors {
+		registry.register_server_error(server, err);
+	}
+	registry.set_configured_servers(all_server_names);
 	Ok(registry)
 }
 
@@ -930,29 +952,7 @@ fn collect_all_configured_server_names(
 	}
 	names.into_iter().collect()
 }
-fn mcp_tool_match_score(server_name: &str, tool_name: &str) -> usize {
-	let sanitized = sanitize_mcp_tool_name_part(server_name, "server");
-	let exact_prefix = format!("mcp__{sanitized}_");
-	if tool_name.starts_with(&exact_prefix) {
-		return exact_prefix.len();
-	}
-
-	// Bounded tool name: create_mcp_tool_name caps at 64 chars with _{hash}.
-	// If the server prefix was truncated, match the prefix preserved before the hash.
-	if tool_name.len() == 64 && tool_name.starts_with("mcp__") {
-		if let Some(last_underscore) = tool_name.rfind('_') {
-			if last_underscore >= 5 {
-				let prefix_in_tool = &tool_name[..last_underscore];
-				let full_prefix = format!("mcp__{sanitized}");
-				if full_prefix.starts_with(prefix_in_tool) {
-					return prefix_in_tool.len();
-				}
-			}
-		}
-	}
-
-	0
-}
+// mcp_tool_match_score re-exported from pi_agent::mcp
 
 fn mcp_server_matches_tools(
 	server_name: &str,
@@ -1177,13 +1177,20 @@ async fn check_or_prompt_stdio_mcp_launch(
 	}
 }
 
-pub async fn filter_and_spawn_mcp_servers(
+#[derive(Debug, Clone)]
+pub struct McpSpawnResult {
+	pub tools: Vec<McpTool>,
+	pub server_errors: Vec<(String, String)>,
+	pub all_server_names: Vec<String>,
+}
+
+pub async fn filter_and_spawn_mcp_servers_detailed(
 	discovered: Vec<crate::config::DiscoveredMcpServer>,
 	cwd: &Path,
 	config: &crate::config::Config,
 	approvals: &crate::approve::Approvals,
 	cancel_token: &pi_agent::CancellationToken,
-) -> Result<Vec<McpTool>> {
+) -> Result<McpSpawnResult> {
 	let mut all_tools = Vec::new();
 	let mut server_errors: Vec<(String, String)> = Vec::new();
 	let all_server_names = collect_all_configured_server_names(cwd, &discovered);
@@ -1266,7 +1273,7 @@ pub async fn filter_and_spawn_mcp_servers(
 				Err(err) => {
 					let err_msg = format!("Failed to connect to MCP server \"{}\": {err}", server.name);
 					eprintln!("{err_msg}");
-					server_errors.push((server.name.clone(), err_msg));
+					server_errors.push((server.name.clone(), format!("Failed to connect to MCP server \"{}\": connection failed", server.name)));
 					continue;
 				}
 			}
@@ -1280,7 +1287,7 @@ pub async fn filter_and_spawn_mcp_servers(
 				Err(err) => {
 					let err_msg = format!("Failed to list tools from MCP server \"{}\": {err}", server.name);
 					eprintln!("{err_msg}");
-					server_errors.push((server.name.clone(), err_msg));
+					server_errors.push((server.name.clone(), format!("Failed to list tools from MCP server \"{}\": tool discovery failed", server.name)));
 					continue;
 				}
 			}
@@ -1296,9 +1303,12 @@ pub async fn filter_and_spawn_mcp_servers(
 
 	let mut unique_tools = deduplicate_mcp_tools_with_warning(all_tools);
 	if cancel_token.is_cancelled() {
-		return Ok(unique_tools);
+		return Ok(McpSpawnResult {
+			tools: unique_tools,
+			server_errors,
+			all_server_names,
+		});
 	}
-
 
 	if let Some(requested_tools) = &config.tools {
 		let mut known_tools: Vec<String> = BUILTIN_TOOLS.iter().map(|(n, _)| n.to_string()).collect();
@@ -1328,7 +1338,38 @@ pub async fn filter_and_spawn_mcp_servers(
 		unique_tools.retain(|tool| requested_tools.iter().any(|allowed| allowed == tool.name()));
 	}
 
-	Ok(unique_tools)
+	Ok(McpSpawnResult {
+		tools: unique_tools,
+		server_errors,
+		all_server_names,
+	})
+}
+
+pub async fn filter_and_spawn_mcp_servers(
+	discovered: Vec<crate::config::DiscoveredMcpServer>,
+	cwd: &Path,
+	config: &crate::config::Config,
+	approvals: &crate::approve::Approvals,
+	cancel_token: &pi_agent::CancellationToken,
+) -> Result<Vec<McpTool>> {
+	let res = filter_and_spawn_mcp_servers_detailed(discovered, cwd, config, approvals, cancel_token).await?;
+	Ok(res.tools)
+}
+
+pub async fn load_and_filter_mcp_tools_detailed(
+	cwd: &Path,
+	config: &crate::config::Config,
+	approvals: &crate::approve::Approvals,
+	cancel_token: &pi_agent::CancellationToken,
+) -> Result<McpSpawnResult> {
+	let discovered = match crate::config::discover_mcp_servers(cwd) {
+		Ok(s) => s,
+		Err(err) => {
+			eprintln!("Error discovering MCP servers: {err}");
+			Vec::new()
+		},
+	};
+	filter_and_spawn_mcp_servers_detailed(discovered, cwd, config, approvals, cancel_token).await
 }
 
 pub async fn load_and_filter_mcp_tools(
@@ -1337,14 +1378,22 @@ pub async fn load_and_filter_mcp_tools(
 	approvals: &crate::approve::Approvals,
 	cancel_token: &pi_agent::CancellationToken,
 ) -> Result<Vec<McpTool>> {
-	let discovered = match crate::config::discover_mcp_servers(cwd) {
-		Ok(s) => s,
-		Err(err) => {
-			eprintln!("Error discovering MCP servers: {err}");
-			Vec::new()
-		},
-	};
-	filter_and_spawn_mcp_servers(discovered, cwd, config, approvals, cancel_token).await
+	let res = load_and_filter_mcp_tools_detailed(cwd, config, approvals, cancel_token).await?;
+	Ok(res.tools)
+}
+
+pub async fn load_and_filter_mcp_tools_with_paths_detailed(
+	cwd: &Path,
+	agent_dir: &Path,
+	config: &crate::config::Config,
+	approvals: &crate::approve::Approvals,
+	cancel_token: &pi_agent::CancellationToken,
+) -> Result<McpSpawnResult> {
+	let report = crate::config::discover_mcp_servers_with_paths(cwd, agent_dir);
+	for warning in &report.warnings {
+		eprintln!("{warning}");
+	}
+	filter_and_spawn_mcp_servers_detailed(report.servers, cwd, config, approvals, cancel_token).await
 }
 
 pub async fn load_and_filter_mcp_tools_with_paths(
@@ -1354,11 +1403,8 @@ pub async fn load_and_filter_mcp_tools_with_paths(
 	approvals: &crate::approve::Approvals,
 	cancel_token: &pi_agent::CancellationToken,
 ) -> Result<Vec<McpTool>> {
-	let report = crate::config::discover_mcp_servers_with_paths(cwd, agent_dir);
-	for warning in &report.warnings {
-		eprintln!("{warning}");
-	}
-	filter_and_spawn_mcp_servers(report.servers, cwd, config, approvals, cancel_token).await
+	let res = load_and_filter_mcp_tools_with_paths_detailed(cwd, agent_dir, config, approvals, cancel_token).await?;
+	Ok(res.tools)
 }
 
 /// File-resolved prompt pieces joined into one system message.
