@@ -58,7 +58,14 @@ impl ToolScheduler {
 		let Some(tool) = self.registry.get(&call.name) else {
 			return ToolResult {
 				tool_call_id: call.id.clone(),
-				content: format!("Tool not found: {}", call.name),
+				content: if call.name.starts_with("mcp__") {
+					format!(
+						"MCP tool unavailable: {} (server not launched or tool does not exist)",
+						call.name
+					)
+				} else {
+					format!("Tool not found: {}", call.name)
+				},
 				is_error: true,
 			};
 		};

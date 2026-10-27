@@ -368,14 +368,12 @@ while True:
 	assert!(tool_results[0].3.is_some(), "MCP tool must be denied");
 	assert!(
 		!tool_results[0].2.contains("Tool not found"),
-		"MCP tool must exist in registry, not be hidden: result was '{}'",
+		"MCP tool rejection must be explicit, not hidden as not-found: result was '{}'",
 		tool_results[0].2
 	);
 	assert!(
-		tool_results[0].2.to_lowercase().contains("denied")
-			|| tool_results[0].2.to_lowercase().contains("approval")
-			|| tool_results[0].2.to_lowercase().contains("closed"),
-		"rejection must come from approval gate: result was '{}'",
+		tool_results[0].2.to_lowercase().contains("not launched"),
+		"rejection must come from the stdio launch gate: result was '{}'",
 		tool_results[0].2
 	);
 	assert!(
