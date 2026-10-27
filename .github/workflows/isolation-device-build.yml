@@ -116,6 +116,9 @@ jobs:
       - name: Install JS dependencies
         run: bun install --minimum-release-age 0
 
+      - name: Build host native addon for tests
+        run: bun --cwd=packages/natives run build
+
       - name: Verify isolated task schema and merge
         run: bun test packages/coding-agent/test/repo-root-isolation.test.ts packages/coding-agent/test/isolation-merge-three-way.test.ts
 

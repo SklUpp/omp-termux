@@ -61,6 +61,7 @@ jobs:
             ./packages/coding-agent/test/android-helpers.test.ts \
             ./packages/coding-agent/test/generator-android.test.ts \
             ./packages/coding-agent/test/repo-root-isolation.test.ts \
+            ./packages/coding-agent/test/isolation-merge-three-way.test.ts \
             ./packages/coding-agent/test/custom-controller-termux.test.ts \
             ./packages/coding-agent/test/custom-service-termux.test.ts \
             ./packages/coding-agent/test/custom-service-extended.test.ts \
