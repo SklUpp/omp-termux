@@ -372,13 +372,74 @@ while True:
 		tool_results[0].2
 	);
 	assert!(
-		tool_results[0].2.to_lowercase().contains("not launched"),
-		"rejection must come from the stdio launch gate: result was '{}'",
+		tool_results[0].2.contains("MCP server \"mock\" was not launched: stdio launch was not approved")
+			&& tool_results[0].2.contains("tool existence not confirmed"),
+		"rejection must report exact server not launched message and tool existence not confirmed: result was '{}'",
 		tool_results[0].2
 	);
 	assert!(
 		!marker_file.exists(),
 		"MCP server must NOT be called when approval denied"
+	);
+
+	// 1b. Truly unknown tool under write mode reports Tool not found, NOT launch denial
+	let (addr_unknown, handle_unknown) =
+		spawn_mock_model_server("mcp__unknown_danger_tool", json!({}));
+	let req_unknown = make_run_request(
+		addr_unknown,
+		&project_dir,
+		Approvals::new(ApprovalMode::Write, Vec::new()),
+	);
+	let stream_unknown = runner.run(&req_unknown).expect("run unknown mcp");
+	let mut tool_results_unknown = Vec::new();
+	for ev in stream_unknown {
+		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+			tool_results_unknown.push((id, tool, result, error));
+		}
+	}
+	handle_unknown.join().unwrap();
+
+	assert_eq!(tool_results_unknown.len(), 1);
+	assert_eq!(tool_results_unknown[0].1, "mcp__unknown_danger_tool");
+	assert!(tool_results_unknown[0].3.is_some(), "unknown tool must error");
+	assert_eq!(
+		tool_results_unknown[0].2,
+		"Tool not found: mcp__unknown_danger_tool",
+		"truly unknown MCP tool must return 'Tool not found', not launch denial: result was '{}'",
+		tool_results_unknown[0].2
+	);
+	assert!(
+		!tool_results_unknown[0].2.contains("not launched"),
+		"truly unknown tool must not report launch denial: result was '{}'",
+		tool_results_unknown[0].2
+	);
+
+	// 1c. Unknown tool with prefix of denied server still reports server not launched and existence not confirmed
+	let (addr_prefix_unknown, handle_prefix_unknown) =
+		spawn_mock_model_server("mcp__mock_nonexistent_subtool", json!({}));
+	let req_prefix_unknown = make_run_request(
+		addr_prefix_unknown,
+		&project_dir,
+		Approvals::new(ApprovalMode::Write, Vec::new()),
+	);
+	let stream_prefix_unknown = runner.run(&req_prefix_unknown).expect("run prefix unknown mcp");
+	let mut tool_results_prefix_unknown = Vec::new();
+	for ev in stream_prefix_unknown {
+		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+			tool_results_prefix_unknown.push((id, tool, result, error));
+		}
+	}
+	handle_prefix_unknown.join().unwrap();
+
+	assert_eq!(tool_results_prefix_unknown.len(), 1);
+	assert_eq!(tool_results_prefix_unknown[0].1, "mcp__mock_nonexistent_subtool");
+	assert!(tool_results_prefix_unknown[0].3.is_some());
+	assert!(
+		tool_results_prefix_unknown[0].2.contains("mock")
+			&& tool_results_prefix_unknown[0].2.contains("was not launched")
+			&& tool_results_prefix_unknown[0].2.contains("tool existence not confirmed"),
+		"must report matching server not launched without asserting whether tool exists: result was '{}'",
+		tool_results_prefix_unknown[0].2
 	);
 
 	// 2. With explicit --allow mcp__mock_danger_tool, execution is permitted
@@ -413,6 +474,36 @@ while True:
 	);
 	let marker_content = fs::read_to_string(&marker_file).unwrap();
 	assert_eq!(marker_content, "called");
+
+	// 2b. When server is running, nonexistent tool on it reports Tool not found
+	let (addr2_unknown, handle2_unknown) =
+		spawn_mock_model_server("mcp__mock_nonexistent_subtool", json!({}));
+	let req2_unknown = make_run_request(
+		addr2_unknown,
+		&project_dir,
+		Approvals::new(
+			ApprovalMode::Write,
+			vec!["mcp__mock_danger_tool".to_string()],
+		),
+	);
+	let stream2_unknown = runner.run(&req2_unknown).expect("run running mcp nonexistent tool");
+	let mut tool_results2_unknown = Vec::new();
+	for ev in stream2_unknown {
+		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+			tool_results2_unknown.push((id, tool, result, error));
+		}
+	}
+	handle2_unknown.join().unwrap();
+
+	assert_eq!(tool_results2_unknown.len(), 1);
+	assert_eq!(tool_results2_unknown[0].1, "mcp__mock_nonexistent_subtool");
+	assert!(tool_results2_unknown[0].3.is_some());
+	assert_eq!(
+		tool_results2_unknown[0].2,
+		"Tool not found: mcp__mock_nonexistent_subtool",
+		"when server is running, unlisted tool must report Tool not found: result was '{}'",
+		tool_results2_unknown[0].2
+	);
 }
 
 #[test]
@@ -451,5 +542,138 @@ fn test_canceled_execution_aborts_cleanly() {
 	assert!(
 		tool_results[0].1.is_some(),
 		"canceled execution must report error on tool"
+	);
+}
+
+#[test]
+fn test_mcp_tool_ambiguous_prefix_names_no_server() {
+	let temp = TempDir::new("mcp-ambiguous");
+	let project_dir = temp.path.join("proj");
+	let omp_dir = project_dir.join(".omp");
+	fs::create_dir_all(&omp_dir).unwrap();
+
+	fs::write(
+		omp_dir.join("mcp.json"),
+		json!({
+			"mcpServers": {
+				"foo": {
+					"command": "python3",
+					"args": ["-c", "pass"]
+				},
+				"foo_bar": {
+					"command": "python3",
+					"args": ["-c", "pass"]
+				}
+			}
+		})
+		.to_string(),
+	)
+	.unwrap();
+
+	let (addr, handle) = spawn_mock_model_server("mcp__foo_bar_echo", json!({}));
+	let req = make_run_request(
+		addr,
+		&project_dir,
+		Approvals::new(ApprovalMode::Write, Vec::new()),
+	);
+
+	let runner = PiAgentRunner::new().expect("runner");
+	let stream = runner.run(&req).expect("run ambiguous mcp");
+	let mut tool_results = Vec::new();
+	for ev in stream {
+		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+			tool_results.push((id, tool, result, error));
+		}
+	}
+	handle.join().unwrap();
+
+	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results[0].1, "mcp__foo_bar_echo");
+	assert!(tool_results[0].3.is_some(), "ambiguous tool call must error");
+	assert_eq!(
+		tool_results[0].2,
+		"Tool not found: mcp__foo_bar_echo",
+		"ambiguous tool name must remain unknown: result was '{}'",
+		tool_results[0].2
+	);
+	assert!(
+		!tool_results[0].2.contains("matching server")
+			&& !tool_results[0].2.contains("was not launched"),
+		"must not attribute to any server when ambiguous"
+	);
+}
+
+#[test]
+fn test_mcp_tool_error_redacts_http_body_secrets() {
+	let temp = TempDir::new("mcp-secret");
+	let project_dir = temp.path.join("proj");
+	let omp_dir = project_dir.join(".omp");
+	fs::create_dir_all(&omp_dir).unwrap();
+
+	let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+	let srv_addr = listener.local_addr().unwrap();
+	let srv_handle = std::thread::spawn(move || {
+		if let Ok((mut socket, _)) = listener.accept() {
+			let mut buf = [0u8; 1024];
+			let _ = socket.read(&mut buf);
+			let body = r#"{"error":"db_failed","secret_token":"SUPER_SECRET_TOKEN_DO_NOT_LEAK"}"#;
+			let response = format!(
+				"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+				body.len(),
+				body
+			);
+			let _ = socket.write_all(response.as_bytes());
+			let _ = socket.flush();
+		}
+	});
+
+	fs::write(
+		omp_dir.join("mcp.json"),
+		json!({
+			"mcpServers": {
+				"secure_srv": {
+					"url": format!("http://{srv_addr}/sse")
+				}
+			}
+		})
+		.to_string(),
+	)
+	.unwrap();
+
+	let (addr, handle) = spawn_mock_model_server("mcp__secure_srv_any_tool", json!({}));
+	let req = make_run_request(
+		addr,
+		&project_dir,
+		Approvals::new(ApprovalMode::Write, Vec::new()),
+	);
+
+	let runner = PiAgentRunner::new().expect("runner");
+	let stream = runner.run(&req).expect("run");
+	let mut tool_results = Vec::new();
+	for ev in stream {
+		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+			tool_results.push((id, tool, result, error));
+		}
+	}
+	handle.join().unwrap();
+	srv_handle.join().unwrap();
+
+	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results[0].1, "mcp__secure_srv_any_tool");
+	assert!(tool_results[0].3.is_some(), "tool call must error");
+	assert!(
+		!tool_results[0].2.contains("SUPER_SECRET_TOKEN_DO_NOT_LEAK"),
+		"diagnostic must NOT leak raw HTTP response body or secrets: result was '{}'",
+		tool_results[0].2
+	);
+	assert!(
+		tool_results[0].2.contains("tool existence not confirmed"),
+		"diagnostic must state tool existence not confirmed: result was '{}'",
+		tool_results[0].2
+	);
+	assert!(
+		tool_results[0].2.contains("secure_srv"),
+		"diagnostic must identify matching server: result was '{}'",
+		tool_results[0].2
 	);
 }

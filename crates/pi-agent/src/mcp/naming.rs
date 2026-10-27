@@ -203,3 +203,25 @@ pub fn deduplicate_mcp_tools_by_name<T: McpToolOriginSource + Clone>(tools: &[T]
 
     deduplicated
 }
+
+pub fn mcp_tool_match_score(server_name: &str, tool_name: &str) -> usize {
+    let sanitized = sanitize_mcp_tool_name_part(server_name, "server");
+    let exact_prefix = format!("mcp__{sanitized}_");
+    if tool_name.starts_with(&exact_prefix) {
+        return exact_prefix.len();
+    }
+
+    if tool_name.len() == MAX_MCP_TOOL_NAME_LENGTH && tool_name.starts_with("mcp__") {
+        if let Some(last_underscore) = tool_name.rfind('_') {
+            if last_underscore >= 5 {
+                let prefix_in_tool = &tool_name[..last_underscore];
+                let full_prefix = format!("mcp__{sanitized}");
+                if full_prefix.starts_with(prefix_in_tool) {
+                    return prefix_in_tool.len();
+                }
+            }
+        }
+    }
+
+    0
+}
