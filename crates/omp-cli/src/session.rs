@@ -1955,7 +1955,7 @@ fn find_session_by_id_or_stem(dir: &Path, id_or_stem: &str) -> Result<Option<Pat
 			continue;
 		};
 		let is_match = stem == id_or_stem
-			|| stem.rfind('_').map_or(false, |pos| &stem[pos + 1..] == id_or_stem);
+			|| stem.split_once('_').map_or(false, |(_, id)| id == id_or_stem);
 		if is_match {
 			let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
 			matches.push((mtime, path));
