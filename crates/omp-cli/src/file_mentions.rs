@@ -1219,7 +1219,7 @@ mod tests {
 
 		let formatted = format_prompt_block(&msg);
 		assert!(formatted.contains("<file path=\"src/main.rs\">\nfn main() {}\n</file>"));
-		assert!(formatted.contains("<file path=\"pic.png\">\n\n</file>"));
+		assert!(formatted.contains("<file path=\"pic.png\">\n</file>"));
 	}
 
 	#[test]

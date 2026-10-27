@@ -262,7 +262,7 @@ fn test_format_prompt_block_xml_structure() {
 	let prompt_block = format_prompt_block(&msg);
 	assert_eq!(
 		prompt_block,
-		"<file path=\"hello.txt\">\nhello world\n</file>\n<file path=\"empty.txt\">\n\n</file>"
+		"<file path=\"hello.txt\">\nhello world\n</file>\n<file path=\"empty.txt\">\n</file>"
 	);
 }
 
