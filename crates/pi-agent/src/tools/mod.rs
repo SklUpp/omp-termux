@@ -857,10 +857,19 @@ fn parse_find_pattern(pattern: &str) -> ParsedFindPattern {
 			}
 		},
 		Some(idx) => {
-			let base_path = segments[..idx].join("/");
+			let raw_base = segments[..idx].join("/");
+			let base_path = if raw_base.is_empty() {
+				if normalized.starts_with('/') {
+					"/".to_string()
+				} else {
+					".".to_string()
+				}
+			} else {
+				raw_base
+			};
 			let glob_pattern = segments[idx..].join("/");
 			ParsedFindPattern {
-				base_path: if base_path.is_empty() { ".".to_string() } else { base_path },
+				base_path,
 				glob_pattern,
 				has_glob: true,
 			}
@@ -880,6 +889,26 @@ fn resolve_to_cwd(base_path: &str, cwd: &Path) -> PathBuf {
 		}
 	}
 }
+fn is_root_path(path: &Path) -> bool {
+	if path == Path::new("/") {
+		return true;
+	}
+	if let Ok(canon) = path.canonicalize() {
+		return canon == Path::new("/") || (canon.parent().is_none() && canon.is_absolute());
+	}
+	let mut normalized = PathBuf::new();
+	for comp in path.components() {
+		match comp {
+			std::path::Component::CurDir => {},
+			std::path::Component::ParentDir => {
+				normalized.pop();
+			},
+			c => normalized.push(c.as_os_str()),
+		}
+	}
+	normalized == Path::new("/") || (normalized.parent().is_none() && normalized.is_absolute())
+}
+
 
 fn format_path_relative_to_cwd(path: &Path, cwd: &Path, is_dir: bool) -> String {
 	let mut rel = match path.strip_prefix(cwd) {
@@ -896,18 +925,6 @@ fn format_path_relative_to_cwd(path: &Path, cwd: &Path, is_dir: bool) -> String 
 }
 
 fn extract_raw_paths(args: &Value) -> Vec<String> {
-	if let (Some(path_val), Some(pat_val)) = (args.get("path"), args.get("pattern")) {
-		if let (Some(p), Some(pat)) = (path_val.as_str(), pat_val.as_str()) {
-			if !has_glob_path_chars(p) && has_glob_path_chars(pat) {
-				let combined = if p == "." || p.is_empty() {
-					pat.to_string()
-				} else {
-					format!("{p}/{pat}")
-				};
-				return vec![combined];
-			}
-		}
-	}
 
 	if let Some(arr) = args.get("path").and_then(Value::as_array) {
 		let list: Vec<String> = arr
@@ -932,9 +949,6 @@ fn extract_raw_paths(args: &Value) -> Vec<String> {
 		return vec![path_str.to_string()];
 	}
 
-	if let Some(pattern_str) = args.get("pattern").and_then(Value::as_str) {
-		return vec![pattern_str.to_string()];
-	}
 
 	vec![".".to_string()]
 }
@@ -995,41 +1009,71 @@ impl Tool for GlobTool {
 			.unwrap_or(DEFAULT_GLOB_LIMIT as u64)
 			.clamp(1, MAX_GLOB_LIMIT as u64) as usize;
 
-		let raw_paths = extract_raw_paths(args);
-		let mut expanded_patterns = Vec::new();
-		for raw in raw_paths {
-			let norm = normalize_path_like_input(&raw);
-			if norm.is_empty() {
-				expanded_patterns.push(String::new());
-				continue;
+		let legacy_pattern = args
+			.get("pattern")
+			.and_then(Value::as_str)
+			.filter(|s| !s.is_empty());
+
+		let parsed_targets: Vec<(String, ParsedFindPattern, PathBuf)> = if let Some(pat) = legacy_pattern {
+			let search_base = args.get("path").and_then(Value::as_str).unwrap_or(".");
+			let base = if search_base.is_empty() { "." } else { search_base };
+			let search_path = resolve_to_cwd(base, &ctx.cwd);
+			let parsed = ParsedFindPattern {
+				base_path: base.to_string(),
+				glob_pattern: pat.to_string(),
+				has_glob: true,
+			};
+			vec![(base.to_string(), parsed, search_path)]
+		} else {
+			let raw_paths = extract_raw_paths(args);
+			let mut target_inputs: Vec<(String, bool)> = Vec::new();
+			for raw in raw_paths {
+				let norm = normalize_path_like_input(&raw);
+				if norm.is_empty() {
+					target_inputs.push((String::new(), false));
+					continue;
+				}
+				let literal_path = resolve_to_cwd(&norm, &ctx.cwd);
+				if literal_path.exists() {
+					target_inputs.push((norm, true));
+				} else {
+					for item in split_top_level_delimited(&norm) {
+						let item_exists = resolve_to_cwd(&item, &ctx.cwd).exists();
+						target_inputs.push((item, item_exists));
+					}
+				}
 			}
-			let literal_path = resolve_to_cwd(&norm, &ctx.cwd);
-			if literal_path.exists() {
-				expanded_patterns.push(norm);
-			} else {
-				expanded_patterns.extend(split_top_level_delimited(&norm));
+
+			if target_inputs.is_empty() || target_inputs.iter().any(|(p, _)| p.is_empty()) {
+				return Ok(tool_result("`path` must contain non-empty globs or paths", true));
 			}
-		}
 
-		if expanded_patterns.is_empty() || expanded_patterns.iter().any(|p| p.is_empty()) {
-			return Ok(tool_result("`path` must contain non-empty globs or paths", true));
-		}
+			if target_inputs.iter().any(|(p, _)| p.chars().all(|c| c == '/')) {
+				return Ok(tool_result("Searching from root directory '/' is not allowed", true));
+			}
 
-		if expanded_patterns.iter().any(|p| p.chars().all(|c| c == '/')) {
-			return Ok(tool_result("Searching from root directory '/' is not allowed", true));
-		}
-
-		let parsed_targets: Vec<(String, ParsedFindPattern, PathBuf)> = expanded_patterns
-			.into_iter()
-			.map(|pat| {
-				let parsed = parse_find_pattern(&pat);
-				let search_path = resolve_to_cwd(&parsed.base_path, &ctx.cwd);
-				(pat, parsed, search_path)
-			})
-			.collect();
+			target_inputs
+				.into_iter()
+				.map(|(pat, is_literal)| {
+					if is_literal {
+						let search_path = resolve_to_cwd(&pat, &ctx.cwd);
+						let parsed = ParsedFindPattern {
+							base_path: pat.clone(),
+							glob_pattern: "**/*".to_string(),
+							has_glob: false,
+						};
+						(pat, parsed, search_path)
+					} else {
+						let parsed = parse_find_pattern(&pat);
+						let search_path = resolve_to_cwd(&parsed.base_path, &ctx.cwd);
+						(pat, parsed, search_path)
+					}
+				})
+				.collect()
+		};
 
 		for (_, _, search_path) in &parsed_targets {
-			if search_path == Path::new("/") {
+			if is_root_path(search_path) {
 				return Ok(tool_result("Searching from root directory '/' is not allowed", true));
 			}
 		}
@@ -1060,7 +1104,7 @@ impl Tool for GlobTool {
 		let include_hidden = args.get("hidden").and_then(Value::as_bool).unwrap_or(true);
 		let use_gitignore = args.get("gitignore").and_then(Value::as_bool).unwrap_or(true);
 
-		let mut all_collected: Vec<(String, f64)> = Vec::new();
+		let mut all_collected: Vec<(String, Option<f64>)> = Vec::new();
 
 		for (pat, parsed, search_path) in valid_targets {
 			if ctx.cancellation_token.is_cancelled() {
@@ -1075,8 +1119,7 @@ impl Tool for GlobTool {
 						.ok()
 						.and_then(|m| m.modified().ok())
 						.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-						.map(|d| d.as_secs_f64() * 1000.0)
-						.unwrap_or(0.0);
+						.map(|d| d.as_secs_f64() * 1000.0);
 					all_collected.push((rel, mtime));
 					continue;
 				} else if is_single {
@@ -1116,7 +1159,6 @@ impl Tool for GlobTool {
 				.depth(1, depth_bound)
 				.directory_errors(pi_walker::DirectoryErrorMode::SkipSkippable)
 				.empty_recheck(pi_walker::EmptyRecheck::Configured)
-				.limit(limit)
 				.filter(
 					pi_walker::WalkFilter::all()
 						.glob(walk_glob)
@@ -1131,10 +1173,16 @@ impl Tool for GlobTool {
 				}
 			};
 
-			let outcome = match request.collect_with_heartbeat(heartbeat) {
+			let outcome = match request.collect_ranked_with_heartbeat(
+				pi_walker::WalkRank::MtimeDescPathAsc,
+				limit,
+				heartbeat,
+			) {
 				Ok(outcome) => outcome,
 				Err(err) => {
-					if ctx.cancellation_token.is_cancelled() {
+					if ctx.cancellation_token.is_cancelled()
+						|| matches!(&err, pi_walker::WalkError::Interrupted(_))
+					{
 						return Ok(tool_result("Glob scan cancelled", true));
 					}
 					return Ok(tool_result(format!("Glob scan error: {err}"), true));
@@ -1145,7 +1193,7 @@ impl Tool for GlobTool {
 				let abs_path = entry.absolute_path(&search_path);
 				let is_dir = entry.file_type == pi_walker::FileType::Dir;
 				let rel_path = format_path_relative_to_cwd(&abs_path, &ctx.cwd, is_dir);
-				let mtime = entry.mtime.unwrap_or(0.0);
+				let mtime = entry.mtime;
 				all_collected.push((rel_path, mtime));
 			}
 		}
@@ -1159,9 +1207,13 @@ impl Tool for GlobTool {
 		}
 
 		deduped.sort_by(|a, b| {
-			b.1.partial_cmp(&a.1)
-				.unwrap_or(std::cmp::Ordering::Equal)
-				.then_with(|| a.0.cmp(&b.0))
+			let mtime_order = match (a.1, b.1) {
+				(Some(left), Some(right)) => right.total_cmp(&left),
+				(Some(_), None) => std::cmp::Ordering::Less,
+				(None, Some(_)) => std::cmp::Ordering::Greater,
+				(None, None) => std::cmp::Ordering::Equal,
+			};
+			mtime_order.then_with(|| a.0.cmp(&b.0))
 		});
 		deduped.truncate(limit);
 		let final_paths: Vec<String> = deduped.into_iter().map(|(p, _)| p).collect();

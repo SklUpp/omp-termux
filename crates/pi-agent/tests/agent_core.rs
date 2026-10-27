@@ -1006,6 +1006,41 @@ async fn glob_root_guard() {
 	assert!(res_slashes.is_error);
 	assert_eq!(res_slashes.content, "Searching from root directory '/' is not allowed");
 
+	// Absolute glob pattern starting with root "/" rejected
+	let res_abs_root_glob = GlobTool.execute(&json!({"path": "/*.txt"}), &ctx).await.expect("glob abs root");
+	assert!(res_abs_root_glob.is_error);
+	assert_eq!(res_abs_root_glob.content, "Searching from root directory '/' is not allowed");
+
+	// Parent directory traversal resolving to root rejected
+	let res_parent_root = GlobTool.execute(&json!({"path": "/tmp/.."}), &ctx).await.expect("glob parent root");
+	assert!(res_parent_root.is_error);
+	assert_eq!(res_parent_root.content, "Searching from root directory '/' is not allowed");
+
+	#[cfg(unix)]
+	{
+		let root_symlink = dir.path.join("link_to_root");
+		std::os::unix::fs::symlink("/", &root_symlink).expect("create root symlink");
+		let res_symlink = GlobTool.execute(&json!({"path": "link_to_root"}), &ctx).await.expect("glob symlink");
+		assert!(res_symlink.is_error);
+		assert_eq!(res_symlink.content, "Searching from root directory '/' is not allowed");
+
+		// Symlink pointing to a deeper directory where lexical traversal would hit root,
+		// but canonical resolution follows symlink target and avoids false-positive root rejection.
+		let deeper_dir = dir.path.join("d1/d2/d3");
+		std::fs::create_dir_all(&deeper_dir).expect("mkdir deeper_dir");
+		let deep_link = dir.path.join("deep_link");
+		std::os::unix::fs::symlink(&deeper_dir, &deep_link).expect("symlink deeper");
+
+		let ups = dir.path.components().count();
+		let res_deep_canonical = GlobTool
+			.execute(
+				&json!({"path": format!("{}/deep_link{}/*.txt", dir.path.display(), "/..".repeat(ups))}),
+				&ctx,
+			)
+			.await
+			.expect("glob deep canonical");
+		assert!(!res_deep_canonical.is_error);
+	}
 	// Absolute path inside valid non-root directory stays legal
 	std::fs::write(dir.path.join("ok.txt"), "ok").expect("write ok");
 	let abs_path = format!("{}/*.txt", dir.path.display());
@@ -1048,7 +1083,43 @@ async fn glob_cancellation_and_legacy_args() {
 	assert!(!res_legacy.is_error);
 	assert!(res_legacy.content.contains("item.rs"));
 
+	// Legacy pattern with exact filename (no wildcard) must filter accurately
+	std::fs::write(dir.path.join("sub/README.md"), "readme").expect("write readme");
+	let res_legacy_exact = GlobTool.execute(&json!({"path": "sub", "pattern": "README.md"}), &ctx).await.expect("glob legacy exact");
+	assert!(!res_legacy_exact.is_error);
+	assert_eq!(res_legacy_exact.content, "sub/README.md");
+	assert!(!res_legacy_exact.content.contains("item.rs"));
+
+
+	// Legacy pattern with non-matching filename: returns empty result (not Path not found)
+	let res_legacy_missing = GlobTool.execute(&json!({"path": "sub", "pattern": "MISSING.md"}), &ctx).await.expect("glob legacy missing");
+	assert!(!res_legacy_missing.is_error);
+	assert_eq!(res_legacy_missing.content, "No files found matching pattern");
+
+	// Legacy pattern matching a directory: returns the directory itself, not its descendants
+	let sub_docs = dir.path.join("sub/docs");
+	std::fs::create_dir_all(&sub_docs).expect("mkdir sub/docs");
+	std::fs::write(sub_docs.join("child.txt"), "child").expect("write child");
+	let res_legacy_dir = GlobTool.execute(&json!({"path": "sub", "pattern": "docs"}), &ctx).await.expect("glob legacy dir");
+	assert!(!res_legacy_dir.is_error);
+	assert!(res_legacy_dir.content.contains("sub/docs"));
+	assert!(!res_legacy_dir.content.contains("child.txt"));
+
+	// Legacy pattern with non-existent path: returns Path not found error for the path
+	let res_legacy_no_path = GlobTool.execute(&json!({"path": "nonexistent_sub", "pattern": "README.md"}), &ctx).await.expect("glob legacy no path");
+	assert!(res_legacy_no_path.is_error);
+	assert_eq!(res_legacy_no_path.content, "Path not found: nonexistent_sub");
 	// Empty path error
+	// Pattern-only call defaults path to "." and filters accurately
+	std::fs::write(dir.path.join("root_file.txt"), "root").expect("write root_file");
+	let res_pattern_only = GlobTool.execute(&json!({"pattern": "root_file.txt"}), &ctx).await.expect("glob pattern only");
+	assert!(!res_pattern_only.is_error);
+	assert_eq!(res_pattern_only.content, "root_file.txt");
+
+	let res_pattern_only_missing = GlobTool.execute(&json!({"pattern": "missing_root.txt"}), &ctx).await.expect("glob pattern only missing");
+	assert!(!res_pattern_only_missing.is_error);
+	assert_eq!(res_pattern_only_missing.content, "No files found matching pattern");
+
 	let res_empty = GlobTool.execute(&json!({"path": ""}), &ctx).await.expect("glob empty");
 	assert!(res_empty.is_error);
 	assert_eq!(res_empty.content, "`path` must contain non-empty globs or paths");
@@ -1058,6 +1129,54 @@ async fn glob_cancellation_and_legacy_args() {
 	let res_cancel = GlobTool.execute(&json!({"path": "sub"}), &ctx).await.expect("glob cancel");
 	assert!(res_cancel.is_error);
 	assert_eq!(res_cancel.content, "Glob scan cancelled");
+}
+
+#[tokio::test]
+async fn glob_ranking_by_mtime_before_limit() {
+	let dir = TempDir::new("glob-mtime-rank");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	let old_file_path = dir.path.join("a_older.txt");
+	let new_file_path = dir.path.join("z_newer.txt");
+
+	let old_file = std::fs::File::create(&old_file_path).expect("create old");
+	let new_file = std::fs::File::create(&new_file_path).expect("create new");
+
+	let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+	old_file.set_times(std::fs::FileTimes::new().set_modified(past)).expect("set old file mtime");
+	new_file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now())).expect("set new file mtime");
+	drop(old_file);
+	drop(new_file);
+
+	// Limit 1 must select newer file (z_newer.txt) instead of first lexicographical entry (a_older.txt)
+	let res = GlobTool.execute(&json!({"path": "*.txt", "limit": 1}), &ctx).await.expect("glob mtime rank");
+	assert!(!res.is_error);
+	assert_eq!(res.content.trim(), "z_newer.txt");
+}
+
+#[tokio::test]
+async fn glob_literal_paths_with_metacharacters() {
+	let dir = TempDir::new("glob-literal-meta");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	let id_dir = dir.path.join("[id]");
+	std::fs::create_dir_all(&id_dir).expect("mkdir [id]");
+	std::fs::write(id_dir.join("page.tsx"), "export default function Page() {}").expect("write page");
+	std::fs::write(dir.path.join("[id].txt"), "literal file").expect("write [id].txt");
+
+	// Existing literal directory containing [id] must not be parsed as character class matching 'i' or 'd'
+	let res_dir = GlobTool.execute(&json!({"path": "[id]"}), &ctx).await.expect("glob dir literal");
+	assert!(!res_dir.is_error);
+	assert!(res_dir.content.contains("[id]/page.tsx"));
+
+	// Existing literal file containing [id].txt returned directly
+	let res_file = GlobTool.execute(&json!({"path": "[id].txt"}), &ctx).await.expect("glob file literal");
+	assert!(!res_file.is_error);
+	assert_eq!(res_file.content, "[id].txt");
+	// Existing literal directory containing [id] combined with pattern filters by pattern
+	let res_dir_pattern = GlobTool.execute(&json!({"path": "[id]", "pattern": "*.tsx"}), &ctx).await.expect("glob dir literal pattern");
+	assert!(!res_dir_pattern.is_error);
+	assert_eq!(res_dir_pattern.content, "[id]/page.tsx");
 }
 
 #[test]
