@@ -30,6 +30,8 @@ pub enum ProviderError {
 	Serialization(#[from] serde_json::Error),
 	#[error("Stream protocol error: {0}")]
 	Protocol(String),
+	#[error("Invalid base URL: {0}")]
+	InvalidBaseUrl(String),
 }
 
 /// Delta chunk emitted by streaming completions.
@@ -98,6 +100,15 @@ impl OpenAiCompatibleProvider {
 		api_key: impl Into<String>,
 		model: impl Into<String>,
 	) -> Result<Self, ProviderError> {
+		let base_url = base_url.into();
+		let parsed = reqwest::Url::parse(&base_url)
+			.map_err(|err| ProviderError::InvalidBaseUrl(err.to_string()))?;
+		if parsed.scheme() != "http" && parsed.scheme() != "https" {
+			return Err(ProviderError::InvalidBaseUrl(format!(
+				"unsupported scheme `{}`",
+				parsed.scheme()
+			)));
+		}
 		let http = reqwest::Client::builder()
 			.connect_timeout(CONNECT_TIMEOUT)
 			.build()
