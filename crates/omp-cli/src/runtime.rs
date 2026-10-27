@@ -1097,10 +1097,10 @@ fn poll_stdin_readable(timeout_ms: i32) -> bool {
 #[cfg(unix)]
 fn read_stdin_byte() -> Option<u8> {
 	unsafe extern "C" {
-		fn read(fd: std::os::raw::c_int, buf: *mut u8, count: usize) -> isize;
+		fn read(fd: std::os::raw::c_int, buf: *mut std::os::raw::c_void, count: usize) -> isize;
 	}
 	let mut b = 0u8;
-	let ret = unsafe { read(0, &mut b, 1) };
+	let ret = unsafe { read(0, &mut b as *mut u8 as *mut std::os::raw::c_void, 1) };
 	if ret == 1 { Some(b) } else { None }
 }
 

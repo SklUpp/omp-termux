@@ -8,7 +8,30 @@ use omp_cli::approve::{ApprovalMode, Approvals};
 use omp_cli::config::{Config, DiscoveredMcpServer};
 use omp_cli::runtime::filter_and_spawn_mcp_servers;
 use pi_agent::mcp::{MCPServerConfig, MCPStdioServerConfig, create_mcp_tool_name};
-use tempfile::TempDir;
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+	fn new() -> Self {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("time before epoch")
+			.as_nanos();
+		let path =
+			std::env::temp_dir().join(format!("omp-test-mcp-launch-{}-{nanos}", std::process::id()));
+		fs::create_dir_all(&path).expect("create temp dir");
+		Self(path)
+	}
+
+	fn path(&self) -> &Path {
+		&self.0
+	}
+}
+
+impl Drop for TempDir {
+	fn drop(&mut self) {
+		let _ = fs::remove_dir_all(&self.0);
+	}
+}
 
 fn make_mock_stdio_server(dir: &Path, server_name: &str) -> (DiscoveredMcpServer, std::path::PathBuf) {
 	let marker_file = dir.join(format!("{server_name}_spawned.marker"));
@@ -59,7 +82,7 @@ for line in sys.stdin:
 
 #[test]
 fn test_stdio_mcp_launch_denied_without_allow_or_yolo() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server, marker_file) = make_mock_stdio_server(temp_dir.path(), "mock");
 
 	let rt = tokio::runtime::Builder::new_current_thread()
@@ -90,7 +113,7 @@ fn test_stdio_mcp_launch_denied_without_allow_or_yolo() {
 
 #[test]
 fn test_stdio_mcp_launch_denied_under_write_mode_without_allow() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server, marker_file) = make_mock_stdio_server(temp_dir.path(), "mock");
 
 	let rt = tokio::runtime::Builder::new_current_thread()
@@ -121,7 +144,7 @@ fn test_stdio_mcp_launch_denied_under_write_mode_without_allow() {
 
 #[test]
 fn test_stdio_mcp_launch_allowed_with_yolo() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server, marker_file) = make_mock_stdio_server(temp_dir.path(), "mock");
 
 	let rt = tokio::runtime::Builder::new_current_thread()
@@ -153,7 +176,7 @@ fn test_stdio_mcp_launch_allowed_with_yolo() {
 
 #[test]
 fn test_stdio_mcp_launch_allowed_with_explicit_server_allow() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server, marker_file) = make_mock_stdio_server(temp_dir.path(), "mock");
 
 	let rt = tokio::runtime::Builder::new_current_thread()
@@ -185,7 +208,7 @@ fn test_stdio_mcp_launch_allowed_with_explicit_server_allow() {
 
 #[test]
 fn test_stdio_mcp_launch_allowed_with_explicit_tool_allow() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server, marker_file) = make_mock_stdio_server(temp_dir.path(), "mock");
 
 	let rt = tokio::runtime::Builder::new_current_thread()
@@ -217,7 +240,7 @@ fn test_stdio_mcp_launch_allowed_with_explicit_tool_allow() {
 
 #[test]
 fn test_stdio_mcp_skipped_when_tools_filter_excludes_it() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server, marker_file) = make_mock_stdio_server(temp_dir.path(), "mock");
 
 	let rt = tokio::runtime::Builder::new_current_thread()
@@ -250,7 +273,7 @@ fn test_stdio_mcp_skipped_when_tools_filter_excludes_it() {
 
 #[test]
 fn test_truthful_connection_error_when_server_fails() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let broken_config = MCPServerConfig::Stdio(MCPStdioServerConfig {
 		command: "/nonexistent/binary_path_that_fails".to_string(),
 		args: Vec::new(),
@@ -298,7 +321,7 @@ fn test_truthful_connection_error_when_server_fails() {
 
 #[test]
 fn test_truthful_error_when_denied_server_tool_requested_in_tools() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server, marker_file) = make_mock_stdio_server(temp_dir.path(), "mock");
 
 	let rt = tokio::runtime::Builder::new_current_thread()
@@ -337,7 +360,7 @@ fn test_truthful_error_when_denied_server_tool_requested_in_tools() {
 
 #[test]
 fn test_exact_server_identity_prevents_sanitized_collision() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server_dash, marker_dash) = make_mock_stdio_server(temp_dir.path(), "foo-bar");
 	let (server_dot, marker_dot) = make_mock_stdio_server(temp_dir.path(), "foo.bar");
 
@@ -367,7 +390,7 @@ fn test_exact_server_identity_prevents_sanitized_collision() {
 
 #[test]
 fn test_tool_level_allow_ambiguous_prefix_denies_both_servers() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server_foo, marker_foo) = make_mock_stdio_server(temp_dir.path(), "foo");
 	let (server_foo_bar, marker_foo_bar) = make_mock_stdio_server(temp_dir.path(), "foo_bar");
 
@@ -398,7 +421,7 @@ fn test_tool_level_allow_ambiguous_prefix_denies_both_servers() {
 
 #[test]
 fn test_explicit_server_allow_resolves_ambiguity_between_prefix_servers() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server_foo, marker_foo) = make_mock_stdio_server(temp_dir.path(), "foo");
 	let (server_foo_bar, marker_foo_bar) = make_mock_stdio_server(temp_dir.path(), "foo_bar");
 
@@ -430,7 +453,7 @@ fn test_explicit_server_allow_resolves_ambiguity_between_prefix_servers() {
 
 #[test]
 fn test_tools_prefilter_does_not_launch_unrelated_prefix_server() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server_foo, marker_foo) = make_mock_stdio_server(temp_dir.path(), "foo");
 	let (server_foo_bar, marker_foo_bar) = make_mock_stdio_server(temp_dir.path(), "foo_bar");
 
@@ -463,7 +486,7 @@ fn test_tools_prefilter_does_not_launch_unrelated_prefix_server() {
 
 #[test]
 fn test_tools_prefilter_matches_bounded_64_char_tool_name() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let long_name = "a_very_long_mcp_server_name_that_exceeds_fifty_characters_in_total";
 	let (server, marker) = make_mock_stdio_server(temp_dir.path(), long_name);
 
@@ -497,7 +520,7 @@ fn test_tools_prefilter_matches_bounded_64_char_tool_name() {
 
 #[test]
 fn test_cancellation_aborts_discovery_without_spawning() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server, marker) = make_mock_stdio_server(temp_dir.path(), "mock");
 
 	let rt = tokio::runtime::Builder::new_current_thread()
@@ -526,7 +549,7 @@ fn test_cancellation_aborts_discovery_without_spawning() {
 
 #[test]
 fn test_two_long_servers_differing_in_prefix_spawns_only_requested_server() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let name_a = "long_server_alpha_name_exceeding_fifty_characters_in_total";
 	let name_b = "long_server_beta_name_exceeding_fifty_characters_in_total";
 	let (server_a, marker_a) = make_mock_stdio_server(temp_dir.path(), name_a);
@@ -563,7 +586,7 @@ fn test_two_long_servers_differing_in_prefix_spawns_only_requested_server() {
 
 #[test]
 fn test_two_long_servers_uncapped_exact_length_64_prefilter_spawns_only_requested() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let name_a = "shared_prefix_exceeding_fifty_characters_in_total_aaaa";
 	let name_b = "shared_prefix_exceeding_fifty_characters_in_total_bbbb";
 	let (server_a, marker_a) = make_mock_stdio_server(temp_dir.path(), name_a);
@@ -600,7 +623,7 @@ fn test_two_long_servers_uncapped_exact_length_64_prefilter_spawns_only_requeste
 
 #[test]
 fn test_two_long_servers_sharing_first_50_chars_tool_allow_spawns_only_requested() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let name_a = "shared_prefix_exceeding_fifty_characters_in_total_aaaa";
 	let name_b = "shared_prefix_exceeding_fifty_characters_in_total_bbbb";
 	let (server_a, marker_a) = make_mock_stdio_server(temp_dir.path(), name_a);
@@ -636,7 +659,7 @@ fn test_two_long_servers_sharing_first_50_chars_tool_allow_spawns_only_requested
 
 #[test]
 fn test_real_capped_tie_tool_allow_ambiguous_denies_both() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let prefix = "common_prefix_long_enough_to_exceed_the_fifty_limit_";
 	let name_a = format!("{prefix}xxxxxx");
 	let name_b = format!("{prefix}yyyyyy");
@@ -672,7 +695,7 @@ fn test_real_capped_tie_tool_allow_ambiguous_denies_both() {
 
 #[test]
 fn test_real_capped_tie_prefilter_returns_ambiguity_error_under_yolo() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let prefix = "common_prefix_long_enough_to_exceed_the_fifty_limit_";
 	let name_a = format!("{prefix}xxxxxx");
 	let name_b = format!("{prefix}yyyyyy");
@@ -712,7 +735,7 @@ fn test_real_capped_tie_prefilter_returns_ambiguity_error_under_yolo() {
 
 #[test]
 fn test_real_capped_tie_disambiguated_by_server_allow_spawns_only_a() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let prefix = "common_prefix_long_enough_to_exceed_the_fifty_limit_";
 	let name_a = format!("{prefix}xxxxxx");
 	let name_b = format!("{prefix}yyyyyy");
@@ -750,7 +773,7 @@ fn test_real_capped_tie_disambiguated_by_server_allow_spawns_only_a() {
 
 #[test]
 fn test_tool_level_allow_with_exact_tool_name_does_not_launch_distinct_server() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	let (server_foo, marker_foo) = make_mock_stdio_server(temp_dir.path(), "foo");
 	let (server_foo_bar, marker_foo_bar) = make_mock_stdio_server(temp_dir.path(), "foo_bar");
 
@@ -783,7 +806,7 @@ fn test_tool_level_allow_with_exact_tool_name_does_not_launch_distinct_server() 
 
 #[test]
 fn test_tool_level_allow_with_matching_tool_launches_when_server_identity_unambiguous() {
-	let temp_dir = TempDir::new().unwrap();
+	let temp_dir = TempDir::new();
 	// Discovery-shaping resistance: foo_bar is configured in .omp/mcp.json but disabled.
 	// A naive check seeing only discovered server "foo" would mistake `mcp__foo_bar` for tool
 	// "bar" on "foo" and launch foo. omp inspects all config layers, detects collision with
