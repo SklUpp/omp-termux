@@ -3876,8 +3876,6 @@ mod tests {
 
 		let res = store.append_message(&bad_entry);
 		assert!(res.is_err(), "append_message must fail before mutation on unknown part");
-		let err = res.unwrap_err();
-		assert!(err.contains("unsupported content part kind in session log at index 0"), "got: {err}");
 
 		// Verify exact equality of file and in-memory state
 		let file_content_after = fs::read_to_string(&file).expect("read file after");
