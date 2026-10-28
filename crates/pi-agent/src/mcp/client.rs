@@ -49,6 +49,17 @@ pub fn is_retriable_connection_error(error: &McpError) -> bool {
     }
 }
 
+/// `tools/call` failures that leave delivery unverified: the request was on the
+/// wire (or a gateway saw it and answered 502/503) when the result was lost, so a
+/// replay could execute a mutating call twice. [`McpError::Closed`] is excluded —
+/// transports report it only when the request never left the client.
+pub fn is_unverified_delivery(error: &McpError) -> bool {
+    matches!(
+        error,
+        McpError::Transport(_) | McpError::Http { status: 502 | 503, .. }
+    )
+}
+
 pub struct McpConnection {
     pub name: String,
     pub config: MCPServerConfig,
@@ -177,8 +188,10 @@ impl McpConnection {
 
             let res_val = match call_res {
                 Ok(v) => v,
-                Err(e) if is_retriable_connection_error(&e) => {
-                    // Read-only tools/list is idempotent and safe to retry once on reconnect
+                // Read-only tools/list is idempotent, so reconnecting and
+                // retrying once is safe even when the previous attempt was
+                // already on the wire.
+                Err(e) if is_retriable_connection_error(&e) || is_unverified_delivery(&e) => {
                     self.reconnect().await?;
                     let new_transport = {
                         let guard = self.transport.read().await;
@@ -235,16 +248,23 @@ impl McpConnection {
 
         let res_val = match call_res {
             Ok(v) => v,
-            Err(e) if is_retriable_connection_error(&e) => {
-                // Security: Connection lost during/after sending request (uncertain delivery).
-                // Reconnect connection for future calls, but NEVER transparently replay
-                // a potentially mutating tool call!
+            // The server accepted this call and its result stream then died
+            // (streamable HTTP reports that as `AcceptedStreamError`): execution
+            // is uncertain. Surface it unchanged and never replay.
+            Err(e @ McpError::AcceptedStreamError(_)) => return Err(e),
+            // The request was already on the wire when the connection failed:
+            // delivery, and therefore execution, cannot be verified. Reconnect
+            // for future calls, but NEVER transparently replay a potentially
+            // mutating tool call!
+            Err(e) if is_unverified_delivery(&e) => {
                 let _ = self.reconnect().await;
                 return Err(McpError::Transport(format!(
                     "Connection lost during tool call '{}' (cannot verify if mutation executed; refusing replay): {}",
                     name, e
                 )));
             }
+            // Nothing was sent (`McpError::Closed`), or the call is known not to
+            // have run (protocol/JSON-RPC/timeout): report the real error as-is.
             Err(e) => return Err(e),
         };
 

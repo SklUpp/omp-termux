@@ -209,8 +209,13 @@ impl StdioTransport {
 
             closed_reader.store(true, Ordering::Release);
             let mut map = pending_clone.lock().unwrap();
+            // These requests were already dispatched when the stream died, so
+            // their delivery is unverified. `McpError::Closed` is reserved for
+            // requests that never left the client (see `request`/`close`).
             for (_, tx) in map.drain() {
-                let _ = tx.send(Err(McpError::Closed));
+                let _ = tx.send(Err(McpError::Transport(
+                    "Connection lost while awaiting response".to_string(),
+                )));
             }
         });
 
@@ -274,7 +279,7 @@ impl McpTransport for StdioTransport {
                 .send(line)
                 .await
                 .map_err(|e| McpError::Transport(format!("Failed to write to stdin: {}", e)))?;
-            rx.await.map_err(|_| McpError::Closed)?
+            rx.await.map_err(|_| McpError::Transport("Connection lost while awaiting response".to_string()))?
         };
 
         let res = if let Some(dur) = timeout {

@@ -584,8 +584,13 @@ impl LegacySseTransport {
                 let mut ep = inner.endpoint_url.write().unwrap();
                 *ep = None;
                 let mut map = inner.pending_requests.lock().unwrap();
+                // The POSTs behind these pending requests were already accepted
+                // when the event stream died: delivery is unverified. Requests
+                // that never left the client still see `McpError::Closed`.
                 for (_, tx) in map.drain() {
-                    let _ = tx.send(Err(McpError::Closed));
+                    let _ = tx.send(Err(McpError::Transport(
+                        "Connection lost while awaiting response".to_string(),
+                    )));
                 }
             }
         });
@@ -672,7 +677,7 @@ impl McpTransport for LegacySseTransport {
             None => {
                 return rx
                     .await
-                    .map_err(|_| McpError::Closed)?
+                    .map_err(|_| McpError::Transport("Connection lost while awaiting response".to_string()))?
                     .map(|v| {
                         guard.active = false;
                         v
@@ -682,7 +687,7 @@ impl McpTransport for LegacySseTransport {
 
         match tokio::time::timeout(dur, rx).await {
             Ok(res) => res
-                .map_err(|_| McpError::Closed)?
+                .map_err(|_| McpError::Transport("Connection lost while awaiting response".to_string()))?
                 .map(|v| {
                     guard.active = false;
                     v
