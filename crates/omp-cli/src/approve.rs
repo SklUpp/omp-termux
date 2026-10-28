@@ -152,6 +152,15 @@ impl Approvals {
 		Self { mode, allow: allow.into_iter().collect() }
 	}
 
+	/// Authorize a registered MCP tool name if the exact colon tool allow
+	/// `mcp:<server_name>:<tool_name>` was permitted.
+	pub fn allow_mcp_tool_origin(&mut self, server_name: &str, tool_name: &str, registered_name: &str) {
+		let colon_allow = format!("mcp:{server_name}:{tool_name}");
+		if self.allow.contains(&colon_allow) {
+			self.allow.insert(registered_name.to_string());
+		}
+	}
+
 	/// Resolve approval decision given explicit tool tier.
 	#[must_use]
 	pub fn decide_tier(&self, tool: &str, tier: ToolTier) -> Decision {
@@ -331,5 +340,26 @@ mod tests {
 		let allow_bash = approvals(ApprovalMode::AlwaysAsk, &["bash"]);
 		assert_eq!(allow_bash.decide_tier("bash", ToolTier::Exec), Decision::Auto);
 		assert_eq!(allow_bash.decide_tier("write", ToolTier::Write), Decision::Ask);
+	}
+
+	#[test]
+	fn test_allow_mcp_tool_origin_matches_exact_colon_syntax() {
+		let mut app = approvals(ApprovalMode::AlwaysAsk, &["mcp:my_server:my_tool"]);
+		// Server-level allow does NOT auto-authorize all tools
+		let mut server_level = approvals(ApprovalMode::AlwaysAsk, &["mcp:my_server"]);
+		server_level.allow_mcp_tool_origin("my_server", "my_tool", "mcp__my_server_my_tool");
+		assert_eq!(server_level.decide("mcp__my_server_my_tool", false), Decision::Ask);
+
+		// Other tool on same server is NOT authorized
+		app.allow_mcp_tool_origin("my_server", "other_tool", "mcp__my_server_other_tool");
+		assert_eq!(app.decide("mcp__my_server_other_tool", false), Decision::Ask);
+
+		// Same tool on other server is NOT authorized
+		app.allow_mcp_tool_origin("other_server", "my_tool", "mcp__other_server_my_tool");
+		assert_eq!(app.decide("mcp__other_server_my_tool", false), Decision::Ask);
+
+		// Exact origin match authorizes execution
+		app.allow_mcp_tool_origin("my_server", "my_tool", "mcp__my_server_my_tool");
+		assert_eq!(app.decide("mcp__my_server_my_tool", false), Decision::Auto);
 	}
 }

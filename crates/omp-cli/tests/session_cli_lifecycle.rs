@@ -592,46 +592,6 @@ fn test_cli_file_arg_missing_file_fails_honestly() {
 	let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn test_cli_file_arg_image_fails_with_explicit_error() {
-	let temp = temp_dir("image-file");
-	let agent_dir = temp.join("agent");
-	let work_dir = temp.join("work");
-	fs::create_dir_all(&agent_dir).expect("create agent dir");
-	fs::create_dir_all(&work_dir).expect("create work dir");
-	setup_mock_agent_dir(&agent_dir, 9999);
-
-	let png_path = work_dir.join("photo.png");
-	let png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4";
-	fs::write(&png_path, png_bytes).expect("write png");
-
-	let output = omp()
-		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
-		.args([
-			"--cwd",
-			work_dir.to_str().unwrap(),
-			"@photo.png",
-		])
-		.output()
-		.expect("run omp with image file");
-
-	assert_eq!(
-		output.status.code(),
-		Some(1),
-		"image file arg must exit 1 when image wire unavailable"
-	);
-	let stderr = String::from_utf8_lossy(&output.stderr);
-	assert!(
-		stderr.contains("image attachments are not supported yet:"),
-		"stderr must explicitly report unsupported image wire, got: {stderr}"
-	);
-	assert!(
-		stderr.contains("photo.png"),
-		"stderr must include image path, got: {stderr}"
-	);
-
-	let _ = fs::remove_dir_all(temp);
-}
 
 #[test]
 fn test_cli_file_arg_svg_treated_as_text_matching_ts() {

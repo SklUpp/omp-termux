@@ -217,9 +217,21 @@ fn test_cli_positional_image_wire_and_session_resume() {
 	assert!(url.starts_with("data:image/png;base64,"));
 
 	// Check session file on disk
-	let log_path = session_dir.join("session-img-1.jsonl");
+	let session_files = fs::read_dir(&session_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| {
+			p.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+				&& p.file_stem()
+					.and_then(|s| s.to_str())
+					.map_or(false, |s| s.ends_with("session-img-1"))
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(session_files.len(), 1, "session file must exist");
+	let log_path = &session_files[0];
 	assert!(log_path.is_file(), "session file must exist");
-	let log_content = fs::read_to_string(&log_path).expect("read session log");
+	let log_content = fs::read_to_string(log_path).expect("read session log");
 	assert!(log_content.contains("\"type\":\"image\""));
 	assert!(log_content.contains("\"mimeType\":\"image/png\""));
 
@@ -444,6 +456,53 @@ fn test_positional_file_contents_do_not_trigger_file_mentions() {
 	let content = messages[0]["content"].as_str().expect("must be pure string, no image_url");
 	assert!(content.contains("Document mentions @secret.png in body"));
 	assert!(!content.contains("<file path=\"secret.png\">"));
+
+	server.stop();
+	let _ = fs::remove_dir_all(&base);
+}
+#[test]
+fn test_json_mode_agent_end_outputs_typed_image_parts() {
+	let server = MockWireServer::start();
+	let base = temp_dir("json-mode-agent-end");
+	let (agent_dir, session_dir, cwd) = setup_dirs(&base, server.port);
+
+	let img_path = cwd.join("photo.png");
+	fs::write(&img_path, TINY_PNG).expect("write photo");
+
+	let mut cmd = omp();
+	cmd.env("PI_CODING_AGENT_DIR", &agent_dir);
+	cmd.args([
+		"--cwd",
+		cwd.to_str().unwrap(),
+		"--session-dir",
+		session_dir.to_str().unwrap(),
+		"--no-session",
+		"--mode",
+		"json",
+		"--no-tools",
+		"@photo.png",
+		"describe image",
+	]);
+	let out = cmd.output().expect("run json mode");
+	assert!(out.status.success(), "run json mode must succeed: {}", String::from_utf8_lossy(&out.stderr));
+
+	let stdout_str = String::from_utf8_lossy(&out.stdout);
+	let agent_end_line = stdout_str
+		.lines()
+		.find(|l| l.contains(r#""type":"agent_end""#))
+		.expect("agent_end frame in stdout");
+	let ae: serde_json::Value = serde_json::from_str(agent_end_line).expect("parse agent_end JSON");
+	let messages = ae["messages"].as_array().expect("messages in agent_end");
+	assert!(!messages.is_empty(), "agent_end must contain messages");
+
+	let user_msg = &messages[0];
+	assert_eq!(user_msg["role"], "user");
+	let content_parts = user_msg["content"].as_array().expect("user content parts");
+	assert_eq!(content_parts.len(), 2, "must have text part and image part in order");
+	assert_eq!(content_parts[0]["type"], "text");
+	assert_eq!(content_parts[1]["type"], "image");
+	assert_eq!(content_parts[1]["mimeType"], "image/png");
+	assert!(content_parts[1]["data"].as_str().unwrap().starts_with("iVBORw0KGgo"));
 
 	server.stop();
 	let _ = fs::remove_dir_all(&base);

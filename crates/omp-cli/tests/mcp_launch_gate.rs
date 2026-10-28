@@ -185,7 +185,7 @@ fn test_stdio_mcp_launch_allowed_with_explicit_server_allow() {
 		.unwrap();
 
 	let config = Config::default();
-	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["mock".to_string()]);
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["mcp:mock".to_string()]);
 	let cancel_token = pi_agent::CancellationToken::new();
 
 	let tools = rt
@@ -371,7 +371,7 @@ fn test_exact_server_identity_prevents_sanitized_collision() {
 
 	let config = Config::default();
 	// Explicitly allow ONLY "foo-bar", NOT "foo.bar"
-	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["foo-bar".to_string()]);
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["mcp:foo-bar".to_string()]);
 	let cancel_token = pi_agent::CancellationToken::new();
 
 	let _tools = rt
@@ -432,7 +432,7 @@ fn test_explicit_server_allow_resolves_ambiguity_between_prefix_servers() {
 
 	let config = Config::default();
 	// Explicit server-level allow resolves the ambiguity conservatively
-	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["foo_bar".to_string()]);
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["mcp:foo_bar".to_string()]);
 	let cancel_token = pi_agent::CancellationToken::new();
 
 	let tools = rt
@@ -752,7 +752,7 @@ fn test_real_capped_tie_disambiguated_by_server_allow_spawns_only_a() {
 
 	let mut config = Config::default();
 	config.tools = Some(vec![tool_a.clone()]);
-	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec![name_a.clone()]);
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec![format!("mcp:{name_a}")]);
 	let cancel_token = pi_agent::CancellationToken::new();
 
 	let tools = rt
@@ -858,4 +858,106 @@ fn test_tool_level_allow_with_matching_tool_launches_when_server_identity_unambi
 
 	assert_eq!(tools_colon.len(), 1);
 	assert!(marker_foo_2.exists(), "server foo must spawn when authorized via unambiguous colon syntax");
+}
+
+#[test]
+fn test_agent_dir_disabled_server_participates_in_ambiguity_check() {
+	let temp_dir = TempDir::new();
+	let agent_dir = TempDir::new();
+	let agent_mcp_json = agent_dir.path().join("mcp.json");
+	fs::write(
+		&agent_mcp_json,
+		r#"{"mcpServers":{"foo_bar":{"command":"true","enabled":false}}}"#,
+	)
+	.unwrap();
+
+	let (server_foo, marker_foo) = make_mock_stdio_server(temp_dir.path(), "foo");
+
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+
+	let config = Config::default();
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["mcp__foo_bar".to_string()]);
+	let cancel_token = pi_agent::CancellationToken::new();
+
+	let tools = rt
+		.block_on(omp_cli::runtime::filter_and_spawn_mcp_servers_with_paths_detailed(
+			vec![server_foo],
+			temp_dir.path(),
+			agent_dir.path(),
+			&config,
+			&approvals,
+			&cancel_token,
+		))
+		.expect("discovery should proceed");
+
+	assert!(tools.tools.is_empty(), "agent_dir disabled server must prevent ambiguous launch");
+	assert!(!marker_foo.exists(), "server foo must NOT spawn when agent_dir contains ambiguous foo_bar");
+}
+
+#[test]
+fn test_bare_server_name_read_does_not_launch_server() {
+	let temp_dir = TempDir::new();
+	let (server, marker_file) = make_mock_stdio_server(temp_dir.path(), "read");
+
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+
+	let config = Config::default();
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["read".to_string()]);
+	let cancel_token = pi_agent::CancellationToken::new();
+
+	let tools = rt
+		.block_on(filter_and_spawn_mcp_servers(
+			vec![server],
+			temp_dir.path(),
+			&config,
+			&approvals,
+			&cancel_token,
+		))
+		.expect("discovery should proceed");
+
+	assert!(tools.is_empty(), "bare allow 'read' must NOT spawn server named 'read'");
+	assert!(!marker_file.exists(), "marker must NOT exist when bare server allow is denied");
+}
+
+#[test]
+fn test_bare_server_name_mcp_prefixed_does_not_launch_server() {
+	let temp_dir = TempDir::new();
+	let agent_dir = TempDir::new();
+	let agent_mcp_json = agent_dir.path().join("mcp.json");
+	fs::write(
+		&agent_mcp_json,
+		r#"{"mcpServers":{"foo_bar":{"command":"true","enabled":false}}}"#,
+	)
+	.unwrap();
+
+	let (server, marker_file) = make_mock_stdio_server(temp_dir.path(), "mcp__foo_bar");
+
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+
+	let config = Config::default();
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["mcp__foo_bar".to_string()]);
+	let cancel_token = pi_agent::CancellationToken::new();
+
+	let tools = rt
+		.block_on(omp_cli::runtime::filter_and_spawn_mcp_servers_with_paths_detailed(
+			vec![server],
+			temp_dir.path(),
+			agent_dir.path(),
+			&config,
+			&approvals,
+			&cancel_token,
+		))
+		.expect("discovery should proceed");
+
+	assert!(tools.tools.is_empty(), "server named mcp__foo_bar must NOT spawn from bare allow mcp__foo_bar");
+	assert!(!marker_file.exists(), "marker must NOT exist when bare mcp__foo_bar allow is denied");
 }

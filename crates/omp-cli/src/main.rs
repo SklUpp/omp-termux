@@ -457,6 +457,7 @@ fn run() -> std::result::Result<(), CliError> {
 			return Err(CliError::from(error));
 		}
 	}
+	reporter.finish().map_err(CliError::from)
 }
 
 fn list_sessions_for_picker(dir: &Path) -> Vec<(PathBuf, Option<String>, String, String)> {
@@ -667,29 +668,36 @@ impl Session<'_> {
 
 		let has_images = parts.iter().any(ContentPart::is_image);
 		if has_images {
-			let bare_model = if let Some(p) = self.provider.as_deref() {
-				let prefix = format!("{p}/");
-				self.model
-					.as_deref()
-					.and_then(|m| m.strip_prefix(&prefix))
-					.or(self.model.as_deref())
-					.unwrap_or_default()
-			} else if let Some((_, bare)) = self.model.as_deref().and_then(|m| m.split_once('/')) {
-				bare
-			} else {
-				self.model.as_deref().unwrap_or_default()
-			};
-			let bare_id = bare_model.split(':').next().unwrap_or(bare_model);
-			let provider = self
-				.provider
-				.as_deref()
-				.or_else(|| self.model.as_deref().and_then(|m| m.split_once('/')).map(|(p, _)| p))
-				.unwrap_or_default();
-			let supports_images = self.catalog.supports_images(provider, bare_id).unwrap_or(true);
-			if !supports_images {
-				return Err(Error::new(format!(
-					"model '{provider}/{bare_id}' does not support image input"
-				)));
+			if let Some(requested) = self.model.as_deref() {
+				let (provider, model_id) = match self.provider.as_deref() {
+					Some(p) => {
+						let prefix = format!("{p}/");
+						let raw = requested.strip_prefix(&prefix).unwrap_or(requested);
+						let (id, _) = runtime::split_effort(raw);
+						(p.to_string(), id.to_string())
+					},
+					None => match requested.split_once('/') {
+						Some((p, id)) if !p.is_empty() && !id.is_empty() => {
+							let (id, _) = runtime::split_effort(id);
+							(p.to_string(), id.to_string())
+						},
+						_ => {
+							let (id, _) = runtime::split_effort(requested);
+							let p = self
+								.catalog
+								.provider_of(id)
+								.map(str::to_string)
+								.unwrap_or_default();
+							(p, id.to_string())
+						},
+					},
+				};
+				let supports_images = self.catalog.supports_images(&provider, &model_id).unwrap_or(true);
+				if !supports_images {
+					return Err(Error::new(format!(
+						"model '{provider}/{model_id}' does not support image input"
+					)));
+				}
 			}
 		}
 

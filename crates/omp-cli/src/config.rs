@@ -293,8 +293,9 @@ pub struct DiscoveredMcpServer {
 
 #[derive(Debug, Clone, Default)]
 pub struct McpDiscoveryReport {
-	pub servers:  Vec<DiscoveredMcpServer>,
-	pub warnings: Vec<String>,
+	pub servers:          Vec<DiscoveredMcpServer>,
+	pub all_server_names: Vec<String>,
+	pub warnings:         Vec<String>,
 }
 
 /// Validate server name against
@@ -738,6 +739,10 @@ pub fn discover_mcp_servers_with_paths(cwd: &Path, agent_dir: &Path) -> McpDisco
 			}
 		}
 	}
+	let mut all_names: Vec<String> = seen_servers.into_iter().collect();
+	all_names.sort();
+	report.all_server_names = all_names;
+
 
 	report
 }

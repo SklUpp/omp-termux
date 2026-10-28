@@ -18,9 +18,9 @@ use pi_agent::{
 	GrepTool, ModelProvider, OpenAiCompatibleProvider, ReadTool, SteeringEvent, TodoTool, Tool,
 	ToolRegistry, WriteTool,
 	mcp::{
-		MCPContent, MCPServerConfig, MCPStdioServerConfig, McpConnection, McpToolOriginSource,
-		connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key, mcp_tool_match_score,
-		sanitize_mcp_tool_name_part,
+		MCPContent, MCPServerConfig, MCPStdioServerConfig, McpConnection, McpError,
+		McpToolOriginSource, connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key,
+		mcp_tool_match_score, sanitize_mcp_tool_name_part,
 	},
 };
 
@@ -188,6 +188,11 @@ impl AgentRunner for PiAgentRunner {
 			}
 			return Err(Error::new("MCP discovery interrupted"));
 		}
+		let mut approvals = request.approvals.clone();
+		for tool in &mcp_spawn.tools {
+			approvals.allow_mcp_tool_origin(tool.server_name(), tool.tool_name(), tool.name());
+		}
+
 
 		let plan = RunPlan::resolve_with_mcp(request, !mcp_spawn.tools.is_empty())?;
 		let registry = build_registry_with_mcp_and_diagnostics(
@@ -267,7 +272,7 @@ impl AgentRunner for PiAgentRunner {
 			config,
 			provider,
 			registry,
-			Arc::new(request.approvals.clone()),
+			Arc::new(approvals),
 		);
 		let mut state = AgentState { messages, total_turns: 0 };
 
@@ -704,7 +709,7 @@ impl RunPlan {
 /// id.
 const EFFORT_SELECTORS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-fn split_effort(model: &str) -> (&str, Option<&str>) {
+pub fn split_effort(model: &str) -> (&str, Option<&str>) {
 	let Some((id, suffix)) = model.rsplit_once(':') else {
 		return (model, None);
 	};
@@ -783,6 +788,82 @@ pub fn build_registry_with_mcp_and_diagnostics(
 	}
 	registry.set_configured_servers(all_server_names);
 	Ok(registry)
+}
+
+fn format_mcp_infrastructure_error(server_name: &str, stage: &str, err: &McpError) -> String {
+	let category = match err {
+		McpError::Http { status, .. } => {
+			if *status == 401 || *status == 403 {
+				format!("HTTP error {status} (authentication/authorization failed)")
+			} else {
+				format!("HTTP error {status}")
+			}
+		},
+		McpError::Timeout(_) => {
+			if stage == "call" {
+				"request timed out (execution uncertain; do not replay)".to_string()
+			} else {
+				"request timed out".to_string()
+			}
+		},
+		McpError::AcceptedStreamError(_) => {
+			"stream disconnected after call accepted (non-replayable, execution uncertain)".to_string()
+		},
+		McpError::Protocol(_) => "protocol error".to_string(),
+		McpError::Transport(_) => "connection failed".to_string(),
+		McpError::Closed => "connection closed".to_string(),
+		McpError::JsonRpc { code, .. } => format!("JSON-RPC error {code}"),
+		McpError::Tool(_) => "tool execution error".to_string(),
+		McpError::Config(_) => "configuration error".to_string(),
+		McpError::OAuthUnsupported(_) => "OAuth unsupported".to_string(),
+		_ => "execution failed".to_string(),
+	};
+
+	match stage {
+		"connect" => format!("Failed to connect to MCP server \"{server_name}\": {category}"),
+		"list" => format!("Failed to list tools from MCP server \"{server_name}\": {category}"),
+		"call" => format!("MCP tool error: server \"{server_name}\" {category}"),
+		_ => format!("MCP error on server \"{server_name}\" during {stage}: {category}"),
+	}
+}
+
+#[cfg(test)]
+mod tests_mcp_infrastructure_error {
+	use super::*;
+
+	#[test]
+	fn test_json_rpc_error_redacts_message_secrets() {
+		let err = McpError::JsonRpc {
+			code: -32603,
+			message: "secret_db_password_12345".to_string(),
+			data: None,
+		};
+		let res = format_mcp_infrastructure_error("my_server", "call", &err);
+		assert!(!res.contains("secret_db_password_12345"));
+		assert_eq!(res, "MCP tool error: server \"my_server\" JSON-RPC error -32603");
+	}
+
+	#[test]
+	fn test_timeout_marks_uncertain_only_on_call() {
+		let err = McpError::Timeout("timed out waiting for response".to_string());
+		let call_res = format_mcp_infrastructure_error("my_server", "call", &err);
+		assert_eq!(
+			call_res,
+			"MCP tool error: server \"my_server\" request timed out (execution uncertain; do not replay)"
+		);
+
+		let connect_res = format_mcp_infrastructure_error("my_server", "connect", &err);
+		assert_eq!(
+			connect_res,
+			"Failed to connect to MCP server \"my_server\": request timed out"
+		);
+
+		let list_res = format_mcp_infrastructure_error("my_server", "list", &err);
+		assert_eq!(
+			list_res,
+			"Failed to list tools from MCP server \"my_server\": request timed out"
+		);
+	}
 }
 
 /// Dynamic MCP tool implementing pi-agent's `Tool` trait.
@@ -873,6 +954,7 @@ impl Tool for McpTool {
 				tool_call_id: String::new(),
 				content:      format!("MCP tool {} cancelled", self.name),
 				is_error:     true,
+				terminate:    false,
 			});
 		}
 
@@ -882,6 +964,7 @@ impl Tool for McpTool {
 					tool_call_id: String::new(),
 					content: format!("MCP tool {} cancelled", self.name),
 					is_error: true,
+					terminate: false,
 				})
 			}
 			res = self.connection.call_tool(&self.tool_name, args.clone()) => {
@@ -917,12 +1000,13 @@ impl Tool for McpTool {
 							}
 						}
 						let is_error = call_result.is_error.unwrap_or(false);
-						Ok(pi_agent::ToolResult { tool_call_id: String::new(), content, is_error })
+						Ok(pi_agent::ToolResult { tool_call_id: String::new(), content, is_error, terminate: false })
 					},
 					Err(err) => Ok(pi_agent::ToolResult {
 						tool_call_id: String::new(),
-						content: format!("MCP error: {err}"),
+						content: format_mcp_infrastructure_error(&self.server_name, "call", &err),
 						is_error: true,
+						terminate: false,
 					}),
 				}
 			}
@@ -990,15 +1074,20 @@ pub fn deduplicate_mcp_tools_with_warning(tools: Vec<McpTool>) -> Vec<McpTool> {
 
 fn collect_all_configured_server_names(
 	cwd: &Path,
+	agent_dir: Option<&Path>,
 	discovered: &[crate::config::DiscoveredMcpServer],
 ) -> Vec<String> {
 	let mut names = std::collections::HashSet::new();
 	for s in discovered {
 		names.insert(s.name.clone());
 	}
+	let default_agent_dir = crate::dirs::agent_dir();
+	let ad = agent_dir.unwrap_or(&default_agent_dir);
 	let candidate_paths = [
 		cwd.join(".omp").join("mcp.json"),
 		cwd.join(".omp").join(".mcp.json"),
+		ad.join("mcp.json"),
+		ad.join(".mcp.json"),
 		cwd.join("mcp.json"),
 		cwd.join(".mcp.json"),
 	];
@@ -1013,7 +1102,9 @@ fn collect_all_configured_server_names(
 			}
 		}
 	}
-	names.into_iter().collect()
+	let mut res: Vec<String> = names.into_iter().collect();
+	res.sort();
+	res
 }
 // mcp_tool_match_score re-exported from pi_agent::mcp
 
@@ -1056,8 +1147,7 @@ fn mcp_server_matches_tools(
 			.iter()
 			.copied()
 			.filter(|s| {
-				approvals.allow.contains(*s)
-					|| approvals.allow.contains(&format!("mcp:{s}"))
+				approvals.allow.contains(&format!("mcp:{s}"))
 					|| approvals.allow.contains(&format!("mcp-server:{s}"))
 			})
 			.collect();
@@ -1082,10 +1172,9 @@ pub fn is_stdio_mcp_launch_allowed_with_servers(
 		return true;
 	}
 
-	// Explicit server-level allow is always definitive and unambiguous.
+	// Explicit scoped server-level allow is always definitive and unambiguous.
 	let prompt_name = format!("mcp-server:{server_name}");
-	if approvals.allow.contains(server_name)
-		|| approvals.allow.contains(&format!("mcp:{server_name}"))
+	if approvals.allow.contains(&format!("mcp:{server_name}"))
 		|| approvals.allow.contains(&prompt_name)
 	{
 		return true;
@@ -1247,16 +1336,17 @@ pub struct McpSpawnResult {
 	pub all_server_names: Vec<String>,
 }
 
-pub async fn filter_and_spawn_mcp_servers_detailed(
+pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 	discovered: Vec<crate::config::DiscoveredMcpServer>,
 	cwd: &Path,
+	agent_dir: &Path,
 	config: &crate::config::Config,
 	approvals: &crate::approve::Approvals,
 	cancel_token: &pi_agent::CancellationToken,
 ) -> Result<McpSpawnResult> {
 	let mut all_tools = Vec::new();
 	let mut server_errors: Vec<(String, String)> = Vec::new();
-	let all_server_names = collect_all_configured_server_names(cwd, &discovered);
+	let all_server_names = collect_all_configured_server_names(cwd, Some(agent_dir), &discovered);
 	if let Some(requested_tools) = &config.tools {
 		for req in requested_tools {
 			let mut top_score = 0;
@@ -1278,14 +1368,13 @@ pub async fn filter_and_spawn_mcp_servers_detailed(
 					.iter()
 					.copied()
 					.filter(|s| {
-						approvals.allow.contains(*s)
-							|| approvals.allow.contains(&format!("mcp:{s}"))
+						approvals.allow.contains(&format!("mcp:{s}"))
 							|| approvals.allow.contains(&format!("mcp-server:{s}"))
 					})
 					.collect();
 				if explicitly_allowed.len() != 1 {
 					return Err(Error::new(format!(
-						"Ambiguous tool \"{}\" in --tools: matches multiple servers ({}). Disambiguate by explicitly allowing the intended server with --allow <server>.",
+						"Ambiguous tool \"{}\" in --tools: matches multiple servers ({}). Disambiguate by explicitly allowing the intended server with --allow mcp:<server>.",
 						req,
 						candidates.join(", ")
 					)));
@@ -1334,9 +1423,9 @@ pub async fn filter_and_spawn_mcp_servers_detailed(
 			res = connect_fut => match res {
 				Ok(connection) => Arc::new(connection),
 				Err(err) => {
-					let err_msg = format!("Failed to connect to MCP server \"{}\": {err}", server.name);
-					eprintln!("{err_msg}");
-					server_errors.push((server.name.clone(), format!("Failed to connect to MCP server \"{}\": connection failed", server.name)));
+					let safe_err = format_mcp_infrastructure_error(&server.name, "connect", &err);
+					eprintln!("{safe_err}");
+					server_errors.push((server.name.clone(), safe_err));
 					continue;
 				}
 			}
@@ -1348,9 +1437,9 @@ pub async fn filter_and_spawn_mcp_servers_detailed(
 			res = list_fut => match res {
 				Ok(defs) => defs,
 				Err(err) => {
-					let err_msg = format!("Failed to list tools from MCP server \"{}\": {err}", server.name);
-					eprintln!("{err_msg}");
-					server_errors.push((server.name.clone(), format!("Failed to list tools from MCP server \"{}\": tool discovery failed", server.name)));
+					let safe_err = format_mcp_infrastructure_error(&server.name, "list", &err);
+					eprintln!("{safe_err}");
+					server_errors.push((server.name.clone(), safe_err));
 					continue;
 				}
 			}
@@ -1408,6 +1497,17 @@ pub async fn filter_and_spawn_mcp_servers_detailed(
 	})
 }
 
+pub async fn filter_and_spawn_mcp_servers_detailed(
+	discovered: Vec<crate::config::DiscoveredMcpServer>,
+	cwd: &Path,
+	config: &crate::config::Config,
+	approvals: &crate::approve::Approvals,
+	cancel_token: &pi_agent::CancellationToken,
+) -> Result<McpSpawnResult> {
+	let agent_dir = crate::dirs::agent_dir();
+	filter_and_spawn_mcp_servers_with_paths_detailed(discovered, cwd, &agent_dir, config, approvals, cancel_token).await
+}
+
 pub async fn filter_and_spawn_mcp_servers(
 	discovered: Vec<crate::config::DiscoveredMcpServer>,
 	cwd: &Path,
@@ -1425,14 +1525,8 @@ pub async fn load_and_filter_mcp_tools_detailed(
 	approvals: &crate::approve::Approvals,
 	cancel_token: &pi_agent::CancellationToken,
 ) -> Result<McpSpawnResult> {
-	let discovered = match crate::config::discover_mcp_servers(cwd) {
-		Ok(s) => s,
-		Err(err) => {
-			eprintln!("Error discovering MCP servers: {err}");
-			Vec::new()
-		},
-	};
-	filter_and_spawn_mcp_servers_detailed(discovered, cwd, config, approvals, cancel_token).await
+	let agent_dir = crate::dirs::agent_dir();
+	load_and_filter_mcp_tools_with_paths_detailed(cwd, &agent_dir, config, approvals, cancel_token).await
 }
 
 pub async fn load_and_filter_mcp_tools(
@@ -1456,7 +1550,7 @@ pub async fn load_and_filter_mcp_tools_with_paths_detailed(
 	for warning in &report.warnings {
 		eprintln!("{warning}");
 	}
-	filter_and_spawn_mcp_servers_detailed(report.servers, cwd, config, approvals, cancel_token).await
+	filter_and_spawn_mcp_servers_with_paths_detailed(report.servers, cwd, agent_dir, config, approvals, cancel_token).await
 }
 
 pub async fn load_and_filter_mcp_tools_with_paths(
@@ -1490,43 +1584,51 @@ fn compose_system_prompt(request: &RunRequest) -> Option<String> {
 	(!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
+fn convert_content_parts(
+	parts: &[crate::session::ContentPart],
+	context_label: &str,
+) -> Result<Vec<pi_agent::ContentPart>, Error> {
+	let mut pi_parts = Vec::new();
+	for (index, p) in parts.iter().enumerate() {
+		if p.is_image() {
+			let Some(data) = p.data.as_deref() else {
+				return Err(Error::new(format!(
+					"{context_label} contains image part missing data at index {index}"
+				)));
+			};
+			let Some(mime) = p.mime_type.as_deref() else {
+				return Err(Error::new(format!(
+					"{context_label} contains image part missing mimeType at index {index}"
+				)));
+			};
+			let (clean_b64, norm_mime) = pi_agent::state::normalize_image_payload(data, mime)
+				.map_err(|err| Error::new(format!("{context_label} contains invalid image part at index {index}: {err}")))?;
+			pi_parts.push(pi_agent::ContentPart::Image {
+				data: clean_b64,
+				mime_type: norm_mime,
+			});
+		} else if p.kind == "text" {
+			let Some(text) = p.text.clone() else {
+				return Err(Error::new(format!(
+					"{context_label} contains malformed text part missing text at index {index}"
+				)));
+			};
+			pi_parts.push(pi_agent::ContentPart::Text { text });
+		} else {
+			return Err(Error::new(format!(
+				"{context_label} contains unsupported content part kind at index {index}"
+			)));
+		}
+	}
+	Ok(pi_parts)
+}
+
 /// Previous session turns as `pi-agent` history messages.
 pub fn history_messages(history: &[crate::session::TurnRecord]) -> Result<Vec<pi_agent::Message>, Error> {
 	let mut messages = Vec::new();
 	for turn in history {
 		if !turn.parts.is_empty() {
-			let mut pi_parts = Vec::new();
-			for (index, p) in turn.parts.iter().enumerate() {
-				if p.is_image() {
-					let Some(data) = p.data.as_deref() else {
-						return Err(Error::new(format!(
-							"session history contains image part missing data at index {index}"
-						)));
-					};
-					let Some(mime) = p.mime_type.as_deref() else {
-						return Err(Error::new(format!(
-							"session history contains image part missing mimeType at index {index}"
-						)));
-					};
-					let (clean_b64, norm_mime) = pi_agent::state::normalize_image_payload(data, mime)
-						.map_err(|err| Error::new(format!("session history contains invalid image part at index {index}: {err}")))?;
-					pi_parts.push(pi_agent::ContentPart::Image {
-						data: clean_b64,
-						mime_type: norm_mime,
-					});
-				} else if p.kind == "text" {
-					let Some(text) = p.text.clone() else {
-						return Err(Error::new(format!(
-							"session history contains malformed text part missing text at index {index}"
-						)));
-					};
-					pi_parts.push(pi_agent::ContentPart::Text { text });
-				} else {
-					return Err(Error::new(format!(
-						"session history contains unsupported content part kind at index {index}"
-					)));
-				}
-			}
+			let pi_parts = convert_content_parts(&turn.parts, "session history")?;
 			messages.push(pi_agent::Message::user_with_parts(pi_parts));
 		} else {
 			messages.push(pi_agent::Message::user(turn.prompt.clone()));
@@ -1550,12 +1652,24 @@ pub fn history_messages(history: &[crate::session::TurnRecord]) -> Result<Vec<pi
 					} else {
 						&call.name
 					};
-					messages.push(pi_agent::Message::tool_with_status(
-						call.id.clone(),
-						name,
-						call.result.clone(),
-						call.is_error,
-					));
+					let tool_msg = if !call.result_parts.is_empty() {
+						let pi_parts = convert_content_parts(&call.result_parts, "tool result history")?;
+						pi_agent::Message::tool_with_status_and_parts(
+							call.id.clone(),
+							name,
+							call.result.clone(),
+							pi_parts,
+							call.is_error,
+						)
+					} else {
+						pi_agent::Message::tool_with_status(
+							call.id.clone(),
+							name,
+							call.result.clone(),
+							call.is_error,
+						)
+					};
+					messages.push(tool_msg);
 				}
 			}
 			continue;
@@ -1582,12 +1696,24 @@ pub fn history_messages(history: &[crate::session::TurnRecord]) -> Result<Vec<pi
 			} else {
 				&call.name
 			};
-			messages.push(pi_agent::Message::tool_with_status(
-				call.id.clone(),
-				name,
-				call.result.clone(),
-				call.is_error,
-			));
+			let tool_msg = if !call.result_parts.is_empty() {
+				let pi_parts = convert_content_parts(&call.result_parts, "tool result history")?;
+				pi_agent::Message::tool_with_status_and_parts(
+					call.id.clone(),
+					name,
+					call.result.clone(),
+					pi_parts,
+					call.is_error,
+				)
+			} else {
+				pi_agent::Message::tool_with_status(
+					call.id.clone(),
+					name,
+					call.result.clone(),
+					call.is_error,
+				)
+			};
+			messages.push(tool_msg);
 		}
 	}
 	Ok(messages)
@@ -1838,6 +1964,7 @@ mod tests {
 				arguments: serde_json::json!({"path": "a.txt"}),
 				result:    "contents".to_string(),
 				is_error:  false,
+				result_parts: vec![],
 			}],
 			parts:       vec![],
 		}];
@@ -1880,6 +2007,7 @@ mod tests {
 				arguments: serde_json::json!({"path": "a.txt"}),
 				result:    "[Tool execution interrupted by user]".to_string(),
 				is_error:  true,
+				result_parts: vec![],
 			}],
 			parts:       vec![],
 		}];
@@ -1905,6 +2033,7 @@ mod tests {
 				arguments: serde_json::json!({"command": "false"}),
 				result:    "exit code 1".to_string(),
 				is_error:  true,
+				result_parts: vec![],
 			}],
 			parts:       vec![],
 		}];
@@ -1929,6 +2058,7 @@ mod tests {
 				arguments: serde_json::json!({"url": "http://invalid"}),
 				result:    "[Tool execution interrupted by user]".to_string(),
 				is_error:  true,
+				result_parts: vec![],
 			}],
 			parts:       vec![],
 		}];
@@ -2007,6 +2137,92 @@ mod tests {
 		assert!(
 			err.to_string().contains("external URLs are not permitted"),
 			"must reject external URL in history, got: {err}"
+		);
+	}
+
+	#[test]
+	fn history_messages_preserves_tool_result_image_parts() {
+		let history = vec![crate::session::TurnRecord {
+			prompt:      "inspect camera".to_string(),
+			assistant:   "taking photo".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls:  vec![crate::session::ToolCallRecord {
+				id:           "call-cam-1".to_string(),
+				name:         "camera".to_string(),
+				arguments:    serde_json::json!({}),
+				result:       "snapshot ready".to_string(),
+				is_error:     false,
+				result_parts: vec![
+					crate::session::ContentPart::text("snapshot ready"),
+					crate::session::ContentPart::image("aW1hZ2VkYXRh", "image/png"),
+				],
+			}],
+			parts:       vec![],
+		}];
+		let messages = history_messages(&history).expect("history messages");
+		assert_eq!(messages.len(), 3);
+		assert_eq!(messages[2].role, pi_agent::Role::Tool);
+		assert_eq!(messages[2].content, "snapshot ready");
+		assert_eq!(messages[2].parts.len(), 2);
+		assert!(matches!(messages[2].parts[0], pi_agent::ContentPart::Text { .. }));
+		assert!(matches!(messages[2].parts[1], pi_agent::ContentPart::Image { .. }));
+	}
+
+	#[test]
+	fn history_messages_rejects_malformed_tool_result_image_part() {
+		let history = vec![crate::session::TurnRecord {
+			prompt:      "inspect camera".to_string(),
+			assistant:   "taking photo".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls:  vec![crate::session::ToolCallRecord {
+				id:           "call-cam-1".to_string(),
+				name:         "camera".to_string(),
+				arguments:    serde_json::json!({}),
+				result:       "snapshot ready".to_string(),
+				is_error:     false,
+				result_parts: vec![crate::session::ContentPart {
+					kind:      "image".to_string(),
+					text:      None,
+					data:      Some("https://remote.server/bad.png".to_string()),
+					mime_type: Some("image/png".to_string()),
+					extra:     serde_json::Map::new(),
+				}],
+			}],
+			parts:       vec![],
+		}];
+		let err = history_messages(&history).unwrap_err();
+		assert!(
+			err.to_string().contains("external URLs are not permitted"),
+			"must reject external URL in tool result history, got: {err}"
+		);
+	}
+
+	#[test]
+	fn history_messages_rejects_unsupported_tool_result_part_kind() {
+		let history = vec![crate::session::TurnRecord {
+			prompt:      "inspect camera".to_string(),
+			assistant:   "taking photo".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls:  vec![crate::session::ToolCallRecord {
+				id:           "call-cam-1".to_string(),
+				name:         "camera".to_string(),
+				arguments:    serde_json::json!({}),
+				result:       "snapshot ready".to_string(),
+				is_error:     false,
+				result_parts: vec![crate::session::ContentPart {
+					kind:      "audio".to_string(),
+					text:      None,
+					data:      None,
+					mime_type: None,
+					extra:     serde_json::Map::new(),
+				}],
+			}],
+			parts:       vec![],
+		}];
+		let err = history_messages(&history).unwrap_err();
+		assert!(
+			err.to_string().contains("unsupported content part kind at index 0"),
+			"must reject unsupported part kind in tool result history, got: {err}"
 		);
 	}
 
@@ -2427,12 +2643,11 @@ mod tests {
 			crate::session::ContentPart::image("aW1hZ2VkYXRh", "image/png"),
 		];
 
-		let rt = tokio::runtime::Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("runtime");
-		let runner = PiAgentRunner::new(Arc::new(rt));
-		let err = runner.run(&req).unwrap_err();
+		let runner = PiAgentRunner::new().expect("runner");
+		let err = match runner.run(&req) {
+			Err(e) => e,
+			Ok(_) => panic!("expected runner to reject image on text-only model"),
+		};
 		assert!(
 			err.to_string().contains("does not support image input"),
 			"must fail explicitly for text-only model with images: {err}"
@@ -2441,68 +2656,63 @@ mod tests {
 
 	#[test]
 	fn runner_transfers_ordered_image_and_text_to_wire() {
-		let rt = tokio::runtime::Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("runtime");
-		let rt_handle = Arc::new(rt);
+		use std::io::{Read, Write};
 
-		let (url, rx) = rt_handle.block_on(async {
-			let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-			let port = listener.local_addr().expect("port").port();
-			let url = format!("http://127.0.0.1:{port}/v1");
-			let (tx, rx) = tokio::sync::oneshot::channel();
+		let (addr_tx, addr_rx) = std::sync::mpsc::channel::<std::net::SocketAddr>();
+		let (wire_tx, wire_rx) = std::sync::mpsc::channel::<serde_json::Value>();
 
-			tokio::spawn(async move {
-				use tokio::io::{AsyncReadExt, AsyncWriteExt};
-				if let Ok((mut stream, _)) = listener.accept().await {
-					let mut buf = vec![0u8; 16384];
-					let mut n_read = 0;
-					while n_read < buf.len() {
-						let n = stream.read(&mut buf[n_read..]).await.unwrap_or(0);
-						if n == 0 {
+		std::thread::spawn(move || {
+			let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+			addr_tx.send(listener.local_addr().expect("local addr")).expect("send addr");
+			if let Ok((mut stream, _)) = listener.accept() {
+				let mut buf = vec![0u8; 16384];
+				let mut n_read = 0;
+				while n_read < buf.len() {
+					let n = stream.read(&mut buf[n_read..]).unwrap_or(0);
+					if n == 0 {
+						break;
+					}
+					n_read += n;
+					if let Some(pos) = buf[..n_read].windows(4).position(|w| w == b"\r\n\r\n") {
+						let header = String::from_utf8_lossy(&buf[..pos]);
+						let content_len: usize = header
+							.lines()
+							.find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+							.and_then(|l| l.split(':').nth(1))
+							.and_then(|v| v.trim().parse().ok())
+							.unwrap_or(0);
+						if n_read >= pos + 4 + content_len {
+							let body = &buf[pos + 4..pos + 4 + content_len];
+							if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
+								let _ = wire_tx.send(json);
+							}
 							break;
 						}
-						n_read += n;
-						if let Some(pos) = buf[..n_read].windows(4).position(|w| w == b"\r\n\r\n") {
-							let header = String::from_utf8_lossy(&buf[..pos]);
-							let content_len: usize = header
-								.lines()
-								.find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-								.and_then(|l| l.split(':').nth(1))
-								.and_then(|v| v.trim().parse().ok())
-								.unwrap_or(0);
-							if n_read >= pos + 4 + content_len {
-								let body = &buf[pos + 4..pos + 4 + content_len];
-								if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-									let _ = tx.send(json);
-								}
-								break;
-							}
-						}
 					}
-					let resp = serde_json::json!({
-						"id": "cmpl-img",
-						"object": "chat.completion",
-						"created": 1,
-						"model": "vision-model",
-						"choices": [{
-							"index": 0,
-							"message": { "role": "assistant", "content": "I see the chart" },
-							"finish_reason": "stop"
-						}]
-					}).to_string();
-					let http_resp = format!(
-						"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-						resp.len(),
-						resp
-					);
-					let _ = stream.write_all(http_resp.as_bytes()).await;
-					let _ = stream.flush().await;
 				}
-			});
-			(url, rx)
+				let resp = serde_json::json!({
+					"id": "cmpl-img",
+					"object": "chat.completion",
+					"created": 1,
+					"model": "vision-model",
+					"choices": [{
+						"index": 0,
+						"message": { "role": "assistant", "content": "I see the chart" },
+						"finish_reason": "stop"
+					}]
+				}).to_string();
+				let http_resp = format!(
+					"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+					resp.len(),
+					resp
+				);
+				let _ = stream.write_all(http_resp.as_bytes());
+				let _ = stream.flush();
+			}
 		});
+
+		let addr = addr_rx.recv().expect("recv addr");
+		let url = format!("http://{addr}/v1");
 
 		let mut cat = catalog_with_connection("local", &url, Some("sk-test"));
 		let mut models = BTreeMap::new();
@@ -2514,6 +2724,13 @@ mod tests {
 		cat.providers.insert("local".to_string(), models);
 
 		let mut req = request(Approvals::default());
+		let mut config = Config::default();
+		config.providers.insert("local".to_string(), ProviderConfig {
+			base_url: Some(url.clone()),
+			api_key: Some("sk-test".to_string()),
+			..ProviderConfig::default()
+		});
+		req.config = config;
 		req.catalog = Arc::new(cat);
 		req.model = Some("local/vision-model".to_string());
 		req.parts = vec![
@@ -2521,14 +2738,19 @@ mod tests {
 			crate::session::ContentPart::image("aW1hZ2VkYXRh", "image/png"),
 		];
 
-		let runner = PiAgentRunner::new(Arc::clone(&rt_handle));
+		let runner = PiAgentRunner::new().expect("runner");
 		let stream = runner.run(&req).expect("run runner");
 		let _events: Vec<_> = stream.collect();
 
-		let wire_json = rt_handle.block_on(rx).expect("received wire json");
+		let wire_json = wire_rx
+			.recv_timeout(std::time::Duration::from_secs(5))
+			.expect("received wire json");
 		let messages = wire_json["messages"].as_array().expect("messages");
-		assert_eq!(messages.len(), 1);
-		let content = messages[0]["content"].as_array().expect("content parts");
+		let user_msg = messages
+			.iter()
+			.find(|m| m["role"] == "user")
+			.expect("user message in wire payload");
+		let content = user_msg["content"].as_array().expect("content parts");
 		assert_eq!(content.len(), 2);
 		assert_eq!(content[0]["type"], "text");
 		assert_eq!(content[0]["text"], "describe this");

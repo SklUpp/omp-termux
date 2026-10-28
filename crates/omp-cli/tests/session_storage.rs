@@ -696,6 +696,7 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 				arguments: serde_json::json!({"path": "foo"}),
 				result: "contents".to_string(),
 				is_error: false,
+				result_parts: Vec::new(),
 			}],
 			parts: Vec::new(),
 		})
@@ -734,6 +735,93 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 	assert_eq!(hist.len(), 2);
 	assert_eq!(hist[0].stop_reason, "stop");
 	assert_eq!(hist[1].stop_reason, "toolUse");
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn session_storage_preserves_and_replays_tool_result_images() {
+	let temp = temp_dir("tool-img");
+
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work/img"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("tool-img-test".to_string()),
+		continue_latest: false,
+	});
+	assert!(store.enabled());
+
+	store
+		.append_turn(&TurnRecord {
+			prompt: "capture screen".to_string(),
+			assistant: "calling screenshot".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![ToolCallRecord {
+				id: "call-sc-1".to_string(),
+				name: "screenshot".to_string(),
+				arguments: serde_json::json!({}),
+				result: "Captured screen".to_string(),
+				is_error: false,
+				result_parts: vec![
+					omp_cli::session::ContentPart::text("Captured screen"),
+					omp_cli::session::ContentPart::image("aW1nMQ==", "image/png"),
+				],
+			}],
+			parts: Vec::new(),
+		})
+		.expect("append turn with tool image");
+
+	let file = store.file().expect("file").to_path_buf();
+	let content = fs::read_to_string(&file).expect("read log");
+	assert!(content.contains(r#""role":"toolResult""#));
+	assert!(content.contains(r#""data":"aW1nMQ==""#));
+	assert!(content.contains(r#""mimeType":"image/png""#));
+
+	// Reopen session and check history
+	let reopened = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work/img"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("tool-img-test".to_string()),
+		continue_latest: false,
+	});
+	assert!(reopened.enabled());
+	let hist = reopened.history();
+	assert_eq!(hist.len(), 1);
+	assert_eq!(hist[0].tool_calls.len(), 1);
+	assert_eq!(hist[0].tool_calls[0].result_parts.len(), 2);
+	assert_eq!(hist[0].tool_calls[0].result, "Captured screen");
+	assert_eq!(hist[0].tool_calls[0].result_parts[1].data.as_deref(), Some("aW1nMQ=="));
+
+	// Replay through runtime history messages and wire conversion
+	let msgs = omp_cli::runtime::history_messages(&hist).expect("history messages");
+	assert_eq!(msgs.len(), 3);
+	assert_eq!(msgs[2].role, pi_agent::Role::Tool);
+	assert_eq!(msgs[2].parts.len(), 2);
+
+	let wire = pi_agent::to_openai_messages(&msgs).expect("to wire");
+	assert_eq!(wire.len(), 4);
+	assert_eq!(wire[2].role, "tool");
+	assert_eq!(wire[2].content, Some(pi_agent::OpenAiContent::Text("Captured screen".to_string())));
+	assert_eq!(wire[3].role, "user");
+	if let Some(pi_agent::OpenAiContent::Parts(parts)) = &wire[3].content {
+		assert_eq!(parts.len(), 2);
+		assert_eq!(parts[0], pi_agent::OpenAiContentPart::Text {
+			text: "Attached image(s) from tool result:".to_string(),
+		});
+		assert_eq!(parts[1], pi_agent::OpenAiContentPart::ImageUrl {
+			image_url: pi_agent::OpenAiImageUrl {
+				url: "data:image/png;base64,aW1nMQ==".to_string(),
+			},
+		});
+	} else {
+		panic!("expected OpenAiContent::Parts");
+	}
 
 	fs::remove_dir_all(temp).ok();
 }

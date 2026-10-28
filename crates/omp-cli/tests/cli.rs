@@ -207,6 +207,7 @@ impl AgentRunner for ScriptedRunner {
 					tool_call_id: "call-1".to_string(),
 					content: "contents".to_string(),
 					is_error: false,
+					terminate: false,
 				}],
 				"stop",
 			),

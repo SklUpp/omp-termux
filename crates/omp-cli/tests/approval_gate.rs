@@ -55,26 +55,48 @@ fn spawn_mock_model_server(
 	let (addr_tx, addr_rx) = std::sync::mpsc::channel::<SocketAddr>();
 	let handle = std::thread::spawn(move || {
 		let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+		let _ = listener.set_nonblocking(true);
 		addr_tx.send(listener.local_addr().unwrap()).unwrap();
-		let (mut socket, _) = listener.accept().expect("accept connection");
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		let mut socket = loop {
+			if std::time::Instant::now() >= deadline {
+				return;
+			}
+			match listener.accept() {
+				Ok((sock, _)) => break sock,
+				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+					std::thread::sleep(Duration::from_millis(10));
+				}
+				Err(_) => return,
+			}
+		};
+		let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
+		let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
 		let mut buf = [0u8; 4096];
-		let _ = socket.read(&mut buf).unwrap();
+		while std::time::Instant::now() < deadline {
+			match socket.read(&mut buf) {
+				Ok(0) => break,
+				Ok(_) => break,
+				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+					continue;
+				}
+				Err(_) => break,
+			}
+		}
 
 		let escaped_args = serde_json::to_string(&tool_args.to_string()).unwrap();
 		let response_body = format!(
 			"data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"{tool_name}\",\"arguments\":{escaped_args}}}}}]}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
 		);
 
-		socket
-			.write_all(
-				format!(
-					"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
-					response_body
-				)
-				.as_bytes(),
+		let _ = socket.write_all(
+			format!(
+				"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
+				response_body
 			)
-			.unwrap();
-		socket.flush().unwrap();
+			.as_bytes(),
+		);
+		let _ = socket.flush();
 	});
 
 	let addr = addr_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -505,6 +527,59 @@ while True:
 		"when server is running, unlisted tool must report Tool not found: result was '{}'",
 		tool_results2_unknown[0].2
 	);
+
+	// 2c. With tool-level colon allow --allow mcp:mock:danger_tool, execution is permitted
+	let (addr3, handle3) = spawn_mock_model_server("mcp__mock_danger_tool", json!({}));
+	let req3 = make_run_request(
+		addr3,
+		&project_dir,
+		Approvals::new(
+			ApprovalMode::AlwaysAsk,
+			vec!["mcp:mock:danger_tool".to_string()],
+		),
+	);
+	let stream3 = runner.run(&req3).expect("run mcp allowed via colon syntax");
+	let mut tool_results3 = Vec::new();
+	for ev in stream3 {
+		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+			tool_results3.push((id, tool, result, error));
+		}
+	}
+	handle3.join().unwrap();
+
+	assert_eq!(tool_results3.len(), 1);
+	assert_eq!(tool_results3[0].1, "mcp__mock_danger_tool");
+	assert!(
+		tool_results3[0].3.is_none(),
+		"MCP tool must be permitted with tool-level colon allow without prompt"
+	);
+
+	// 2d. Server-level allow --allow mcp:mock launches server, but execution requires approval
+	// which fails closed with closed stdin
+	let (addr4, handle4) = spawn_mock_model_server("mcp__mock_danger_tool", json!({}));
+	let req4 = make_run_request(
+		addr4,
+		&project_dir,
+		Approvals::new(
+			ApprovalMode::AlwaysAsk,
+			vec!["mcp:mock".to_string()],
+		),
+	);
+	let stream4 = runner.run(&req4).expect("run server level allow");
+	let mut tool_results4 = Vec::new();
+	for ev in stream4 {
+		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+			tool_results4.push((id, tool, result, error));
+		}
+	}
+	handle4.join().unwrap();
+
+	assert_eq!(tool_results4.len(), 1);
+	assert_eq!(tool_results4[0].1, "mcp__mock_danger_tool");
+	assert!(
+		tool_results4[0].3.is_some(),
+		"server-level allow must NOT auto-approve tool execution under AlwaysAsk"
+	);
 }
 
 #[test]
@@ -614,9 +689,30 @@ fn test_mcp_tool_error_redacts_http_body_secrets() {
 	let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
 	let srv_addr = listener.local_addr().unwrap();
 	let srv_handle = std::thread::spawn(move || {
-		if let Ok((mut socket, _)) = listener.accept() {
+		let _ = listener.set_nonblocking(true);
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		while std::time::Instant::now() < deadline {
+			let (mut socket, _) = match listener.accept() {
+				Ok(conn) => conn,
+				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+					std::thread::sleep(Duration::from_millis(10));
+					continue;
+				}
+				Err(_) => break,
+			};
+			let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
+			let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
 			let mut buf = [0u8; 1024];
-			let _ = socket.read(&mut buf);
+			while std::time::Instant::now() < deadline {
+				match socket.read(&mut buf) {
+					Ok(0) => break,
+					Ok(_) => break,
+					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+						continue;
+					}
+					Err(_) => break,
+				}
+			}
 			let body = r#"{"error":"db_failed","secret_token":"SUPER_SECRET_TOKEN_DO_NOT_LEAK"}"#;
 			let response = format!(
 				"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -625,6 +721,7 @@ fn test_mcp_tool_error_redacts_http_body_secrets() {
 			);
 			let _ = socket.write_all(response.as_bytes());
 			let _ = socket.flush();
+			break;
 		}
 	});
 
@@ -675,6 +772,363 @@ fn test_mcp_tool_error_redacts_http_body_secrets() {
 	assert!(
 		tool_results[0].2.contains("secure_srv"),
 		"diagnostic must identify matching server: result was '{}'",
+		tool_results[0].2
+	);
+}
+
+#[test]
+fn test_mcp_tool_call_error_redacts_http_body_secrets() {
+	let temp = TempDir::new("mcp-call-secret");
+	let project_dir = temp.path.join("proj");
+	let omp_dir = project_dir.join(".omp");
+	fs::create_dir_all(&omp_dir).unwrap();
+
+	let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+	let srv_addr = listener.local_addr().unwrap();
+	let srv_handle = std::thread::spawn(move || {
+		let _ = listener.set_nonblocking(true);
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		let mut done = false;
+		while !done && std::time::Instant::now() < deadline {
+			let (mut socket, _) = match listener.accept() {
+				Ok(conn) => conn,
+				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+					std::thread::sleep(Duration::from_millis(10));
+					continue;
+				}
+				Err(_) => break,
+			};
+			let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
+			let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
+			let mut buf = Vec::new();
+			let mut tmp = [0u8; 1024];
+			while !done && std::time::Instant::now() < deadline {
+				let n = match socket.read(&mut tmp) {
+					Ok(0) => break,
+					Ok(n) => n,
+					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+						continue;
+					}
+					Err(_) => break,
+				};
+				buf.extend_from_slice(&tmp[..n]);
+
+				while let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+					let header_str = String::from_utf8_lossy(&buf[..header_end]);
+					let content_len = header_str
+						.lines()
+						.find_map(|line| {
+							let l = line.to_ascii_lowercase();
+							if l.starts_with("content-length:") {
+								l.split(':').nth(1)?.trim().parse::<usize>().ok()
+							} else {
+								None
+							}
+						})
+						.unwrap_or(0);
+
+					let body_start = header_end + 4;
+					if buf.len() < body_start + content_len {
+						break;
+					}
+
+					let body_bytes = &buf[body_start..body_start + content_len];
+					let json_body: serde_json::Value =
+						serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null);
+					let method = json_body.get("method").and_then(|v| v.as_str()).unwrap_or("");
+					let req_id = json_body.get("id").cloned().unwrap_or(serde_json::Value::from(1));
+
+					buf.drain(..body_start + content_len);
+
+					if method == "initialize" {
+						let resp = json!({
+							"jsonrpc": "2.0",
+							"id": req_id,
+							"result": {
+								"protocolVersion": "2024-11-05",
+								"capabilities": { "tools": {} },
+								"serverInfo": { "name": "secure_call_srv", "version": "1.0.0" }
+							}
+						});
+						let resp_bytes = serde_json::to_vec(&resp).unwrap();
+						let http_resp = format!(
+							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+							resp_bytes.len()
+						);
+						let _ = socket.write_all(http_resp.as_bytes());
+						let _ = socket.write_all(&resp_bytes);
+						let _ = socket.flush();
+					} else if method == "notifications/initialized" {
+						let http_resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+						let _ = socket.write_all(http_resp.as_bytes());
+						let _ = socket.flush();
+					} else if method == "tools/list" {
+						let resp = json!({
+							"jsonrpc": "2.0",
+							"id": req_id,
+							"result": {
+								"tools": [{
+									"name": "call_secret_tool",
+									"description": "tool that fails with secret in body",
+									"inputSchema": { "type": "object" }
+								}]
+							}
+						});
+						let resp_bytes = serde_json::to_vec(&resp).unwrap();
+						let http_resp = format!(
+							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+							resp_bytes.len()
+						);
+						let _ = socket.write_all(http_resp.as_bytes());
+						let _ = socket.write_all(&resp_bytes);
+						let _ = socket.flush();
+					} else if method == "tools/call" {
+						let body = r#"{"error":"internal_failure","secret_token":"CALL_TIME_SUPER_SECRET_TOKEN"}"#;
+						let http_resp = format!(
+							"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+							body.len(),
+							body
+						);
+						let _ = socket.write_all(http_resp.as_bytes());
+						let _ = socket.flush();
+						done = true;
+						break;
+					}
+				}
+				if done {
+					break;
+				}
+			}
+		}
+	});
+
+	fs::write(
+		omp_dir.join("mcp.json"),
+		json!({
+			"mcpServers": {
+				"secure_call_srv": {
+					"url": format!("http://{srv_addr}/")
+				}
+			}
+		})
+		.to_string(),
+	)
+	.unwrap();
+
+	let (addr, handle) = spawn_mock_model_server("mcp__secure_call_srv_call_secret_tool", json!({}));
+	let req = make_run_request(
+		addr,
+		&project_dir,
+		Approvals::new(
+			ApprovalMode::Write,
+			vec!["mcp__secure_call_srv_call_secret_tool".to_string()],
+		),
+	);
+
+	let runner = PiAgentRunner::new().expect("runner");
+	let stream = runner.run(&req).expect("run");
+	let mut tool_results = Vec::new();
+	for ev in stream {
+		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+			tool_results.push((id, tool, result, error));
+		}
+	}
+	handle.join().unwrap();
+	srv_handle.join().unwrap();
+
+	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results[0].1, "mcp__secure_call_srv_call_secret_tool");
+	assert!(tool_results[0].3.is_some(), "tool call must report error on HTTP 500");
+	assert!(
+		!tool_results[0].2.contains("CALL_TIME_SUPER_SECRET_TOKEN"),
+		"tool call result must NOT leak raw HTTP response body or secrets: result was '{}'",
+		tool_results[0].2
+	);
+	assert!(
+		tool_results[0].2.contains("HTTP error 500"),
+		"tool call result must safely state HTTP error status: result was '{}'",
+		tool_results[0].2
+	);
+}
+
+#[test]
+fn test_mcp_tool_call_json_rpc_error_redacts_message_secrets() {
+	let temp = TempDir::new("mcp-jsonrpc-secret");
+	let project_dir = temp.path.join("proj");
+	let omp_dir = project_dir.join(".omp");
+	fs::create_dir_all(&omp_dir).unwrap();
+
+	let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+	let srv_addr = listener.local_addr().unwrap();
+	let srv_handle = std::thread::spawn(move || {
+		let _ = listener.set_nonblocking(true);
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		let mut done = false;
+		while !done && std::time::Instant::now() < deadline {
+			let (mut socket, _) = match listener.accept() {
+				Ok(conn) => conn,
+				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+					std::thread::sleep(Duration::from_millis(10));
+					continue;
+				}
+				Err(_) => break,
+			};
+			let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
+			let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
+			let mut buf = Vec::new();
+			let mut tmp = [0u8; 1024];
+			while !done && std::time::Instant::now() < deadline {
+				let n = match socket.read(&mut tmp) {
+					Ok(0) => break,
+					Ok(n) => n,
+					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+						continue;
+					}
+					Err(_) => break,
+				};
+				buf.extend_from_slice(&tmp[..n]);
+
+				while let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+					let header_str = String::from_utf8_lossy(&buf[..header_end]);
+					let content_len = header_str
+						.lines()
+						.find_map(|line| {
+							let l = line.to_ascii_lowercase();
+							if l.starts_with("content-length:") {
+								l.split(':').nth(1)?.trim().parse::<usize>().ok()
+							} else {
+								None
+							}
+						})
+						.unwrap_or(0);
+					let body_start = header_end + 4;
+					if buf.len() < body_start + content_len {
+						break;
+					}
+
+					let body_bytes = &buf[body_start..body_start + content_len];
+					let json_body: serde_json::Value =
+						serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null);
+					let method = json_body.get("method").and_then(|v| v.as_str()).unwrap_or("");
+					let req_id = json_body.get("id").cloned().unwrap_or(serde_json::Value::from(1));
+
+					buf.drain(..body_start + content_len);
+
+					if method == "initialize" {
+						let resp = json!({
+							"jsonrpc": "2.0",
+							"id": req_id,
+							"result": {
+								"protocolVersion": "2024-11-05",
+								"capabilities": { "tools": {} },
+								"serverInfo": { "name": "secure_rpc_srv", "version": "1.0.0" }
+							}
+						});
+						let resp_bytes = serde_json::to_vec(&resp).unwrap();
+						let http_resp = format!(
+							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+							resp_bytes.len()
+						);
+						let _ = socket.write_all(http_resp.as_bytes());
+						let _ = socket.write_all(&resp_bytes);
+						let _ = socket.flush();
+					} else if method == "notifications/initialized" {
+						let http_resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+						let _ = socket.write_all(http_resp.as_bytes());
+						let _ = socket.flush();
+					} else if method == "tools/list" {
+						let resp = json!({
+							"jsonrpc": "2.0",
+							"id": req_id,
+							"result": {
+								"tools": [{
+									"name": "call_rpc_tool",
+									"description": "tool that fails with JSON-RPC secret error",
+									"inputSchema": { "type": "object" }
+								}]
+							}
+						});
+						let resp_bytes = serde_json::to_vec(&resp).unwrap();
+						let http_resp = format!(
+							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+							resp_bytes.len()
+						);
+						let _ = socket.write_all(http_resp.as_bytes());
+						let _ = socket.write_all(&resp_bytes);
+						let _ = socket.flush();
+					} else if method == "tools/call" {
+						let resp = json!({
+							"jsonrpc": "2.0",
+							"id": req_id,
+							"error": {
+								"code": -32603,
+								"message": "database error: secret_key=SUPER_SECRET_JSONRPC_TOKEN"
+							}
+						});
+						let resp_bytes = serde_json::to_vec(&resp).unwrap();
+						let http_resp = format!(
+							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+							resp_bytes.len()
+						);
+						let _ = socket.write_all(http_resp.as_bytes());
+						let _ = socket.write_all(&resp_bytes);
+						let _ = socket.flush();
+						done = true;
+						break;
+					}
+				}
+				if done {
+					break;
+				}
+			}
+		}
+	});
+
+	fs::write(
+		omp_dir.join("mcp.json"),
+		json!({
+			"mcpServers": {
+				"secure_rpc_srv": {
+					"url": format!("http://{srv_addr}/")
+				}
+			}
+		})
+		.to_string(),
+	)
+	.unwrap();
+
+	let (addr, handle) = spawn_mock_model_server("mcp__secure_rpc_srv_call_rpc_tool", json!({}));
+	let req = make_run_request(
+		addr,
+		&project_dir,
+		Approvals::new(
+			ApprovalMode::Write,
+			vec!["mcp__secure_rpc_srv_call_rpc_tool".to_string()],
+		),
+	);
+
+	let runner = PiAgentRunner::new().expect("runner");
+	let stream = runner.run(&req).expect("run");
+	let mut tool_results = Vec::new();
+	for ev in stream {
+		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+			tool_results.push((id, tool, result, error));
+		}
+	}
+	handle.join().unwrap();
+	srv_handle.join().unwrap();
+
+	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results[0].1, "mcp__secure_rpc_srv_call_rpc_tool");
+	assert!(tool_results[0].3.is_some(), "tool call must report error on JSON-RPC error");
+	assert!(
+		!tool_results[0].2.contains("SUPER_SECRET_JSONRPC_TOKEN"),
+		"tool call result must NOT leak raw JSON-RPC error message or secrets: result was '{}'",
+		tool_results[0].2
+	);
+	assert!(
+		tool_results[0].2.contains("JSON-RPC error -32603"),
+		"tool call result must preserve numeric JSON-RPC error code: result was '{}'",
 		tool_results[0].2
 	);
 }

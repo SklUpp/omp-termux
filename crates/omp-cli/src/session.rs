@@ -523,6 +523,24 @@ impl SessionMessage {
 						missing.join("/")
 					));
 				}
+				if let MessageContent::Parts(parts) = &self.content {
+					for (index, p) in parts.iter().enumerate() {
+						if p.is_image() {
+							if p.data.is_none() {
+								return Err(format!("cannot persist message: image part missing data at index {index}"));
+							}
+							if p.mime_type.is_none() {
+								return Err(format!("cannot persist message: image part missing mimeType at index {index}"));
+							}
+						} else if p.kind == "text" {
+							if p.text.is_none() {
+								return Err(format!("cannot persist message: text part missing text at index {index}"));
+							}
+						} else {
+							return Err(format!("cannot persist message: unsupported content part kind at index {index}"));
+						}
+					}
+				}
 			},
 			other => {
 				if ts_missing {
@@ -600,6 +618,12 @@ pub struct ToolCallRecord {
 	pub arguments: serde_json::Value,
 	pub result: String,
 	pub is_error: bool,
+	#[serde(
+		default,
+		deserialize_with = "deserialize_turn_parts",
+		skip_serializing_if = "Vec::is_empty"
+	)]
+	pub result_parts: Vec<ContentPart>,
 }
 
 fn deserialize_turn_parts<'de, D>(deserializer: D) -> Result<Vec<ContentPart>, D::Error>
@@ -766,6 +790,7 @@ impl TurnBuilder {
 					arguments: args.clone(),
 					result: String::new(),
 					is_error: false,
+					result_parts: Vec::new(),
 				});
 			},
 			Event::ToolEnd { id, result, error, .. } => {
@@ -1397,6 +1422,40 @@ impl SessionStore {
 
 			for tc in &turn.tool_calls {
 				let res_id = format!("msg-{}", output::session_id());
+				let content = if !tc.result_parts.is_empty() {
+					let mut normalized_parts = Vec::with_capacity(tc.result_parts.len());
+					for (index, part) in tc.result_parts.iter().enumerate() {
+						if part.is_image() {
+							let Some(data) = part.data.as_deref() else {
+								return Err(format!(
+									"tool result image part at index {index} missing base64 data"
+								));
+							};
+							let Some(mime) = part.mime_type.as_deref() else {
+								return Err(format!(
+									"tool result image part at index {index} missing mimeType"
+								));
+							};
+							let (clean_b64, norm_mime) = pi_agent::state::normalize_image_payload(data, mime)?;
+							normalized_parts.push(ContentPart::image(clean_b64, norm_mime));
+						} else if part.kind == "text" {
+							let Some(text) = part.text.clone() else {
+								return Err(format!(
+									"tool result text part at index {index} missing text string"
+								));
+							};
+							normalized_parts.push(ContentPart::text(text));
+						} else {
+							return Err(format!(
+								"unsupported content part kind {:?} in tool result at index {index}",
+								part.kind
+							));
+						}
+					}
+					MessageContent::Parts(normalized_parts)
+				} else {
+					MessageContent::Text(tc.result.clone())
+				};
 				entries.push(MessageEntry::new(
 					res_id.clone(),
 					parent_id.take(),
@@ -1406,7 +1465,7 @@ impl SessionStore {
 						..SessionMessage::tool_result(
 							tc.id.clone(),
 							tc.name.clone(),
-							MessageContent::Text(tc.result.clone()),
+							content,
 							tc.is_error,
 							now_ms,
 						)
@@ -1979,6 +2038,7 @@ fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnRecord>, Str
 								.unwrap_or(serde_json::Value::Null),
 							result: String::new(),
 							is_error: false,
+							result_parts: Vec::new(),
 						});
 					}
 				}
@@ -1989,11 +2049,55 @@ fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnRecord>, Str
 			},
 			"toolResult" => {
 				let call_id = entry.message.tool_call_id.as_deref().unwrap_or_default();
-				let result = entry.message.content.text();
 				let is_error = entry.message.is_error.unwrap_or(false);
+				let (result_text, result_parts) = match &entry.message.content {
+					MessageContent::Text(text) => (text.clone(), Vec::new()),
+					MessageContent::Parts(parts) => {
+						let mut text_parts = Vec::new();
+						for (index, p) in parts.iter().enumerate() {
+							if p.is_image() {
+								let Some(data) = p.data.as_deref() else {
+									return Err(format!(
+										"malformed image part in toolResult at index {index}: missing data"
+									));
+								};
+								let Some(mime) = p.mime_type.as_deref() else {
+									return Err(format!(
+										"malformed image part in toolResult at index {index}: missing mimeType"
+									));
+								};
+								pi_agent::state::normalize_image_payload(data, mime).map_err(|err| {
+									format!("invalid image part in toolResult at index {index}: {err}")
+								})?;
+							} else if p.kind == "text" {
+								let Some(t) = p.text.as_deref() else {
+									return Err(format!(
+										"malformed text part in toolResult at index {index}: missing text"
+									));
+								};
+								text_parts.push(t);
+							} else {
+								return Err(format!(
+									"unsupported content part kind in toolResult at index {index}"
+								));
+							}
+						}
+						let text = if !text_parts.is_empty() {
+							text_parts.join("\n")
+						} else {
+							String::new()
+						};
+						(text, parts.clone())
+					}
+					MessageContent::Raw(_) => {
+						return Err("unsupported or malformed raw message content shape in toolResult".to_string());
+					}
+				};
+
 				for call in &mut current_tool_calls {
 					if call.id == call_id {
-						call.result = result.clone();
+						call.result = result_text.clone();
+						call.result_parts = result_parts.clone();
 						call.is_error = is_error;
 						break;
 					}
@@ -2988,6 +3092,11 @@ pub fn import_legacy_v1(
 
 			for (tc_idx, tc) in turn.tool_calls.iter().enumerate() {
 				let res_id = format!("msg-tool-res-{turn_idx}-{tc_idx}");
+				let content = if !tc.result_parts.is_empty() {
+					MessageContent::Parts(tc.result_parts.clone())
+				} else {
+					MessageContent::Text(tc.result.clone())
+				};
 				let res_entry = MessageEntry::new(
 					res_id.clone(),
 					parent_id.take(),
@@ -2997,7 +3106,7 @@ pub fn import_legacy_v1(
 						..SessionMessage::tool_result(
 							tc.id.clone(),
 							tc.name.clone(),
-							MessageContent::Text(tc.result.clone()),
+							content,
 							tc.is_error,
 							0,
 						)
@@ -3125,6 +3234,7 @@ mod tests {
 				arguments: json!({"path": "a.txt"}),
 				result: "contents".to_string(),
 				is_error: false,
+				result_parts: Vec::new(),
 			}],
 			parts: Vec::new(),
 		}
@@ -3885,6 +3995,113 @@ mod tests {
 		assert_eq!(store.messages.len(), messages_len_before, "messages must not mutate");
 		assert_eq!(store.entries.len(), entries_len_before, "entries must not mutate");
 		assert_eq!(store.history().len(), history_len_before, "history must not mutate");
+
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn session_preserves_tool_result_image_parts_and_roundtrips() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("tool-image-roundtrip")));
+		assert!(store.enabled());
+
+		let turn_record = TurnRecord {
+			prompt: "take picture".to_string(),
+			assistant: "calling camera".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![ToolCallRecord {
+				id: "call-cam-1".to_string(),
+				name: "camera".to_string(),
+				arguments: json!({}),
+				result: "snapshot".to_string(),
+				is_error: false,
+				result_parts: vec![
+					ContentPart::text("snapshot"),
+					ContentPart::image("aW1nMQ==", "image/png"),
+				],
+			}],
+			parts: vec![],
+		};
+		store.append_turn(&turn_record).expect("append turn with tool image");
+
+		// 1. Verify JSONL content on disk
+		let file = store.file().expect("file").to_path_buf();
+		let file_content = fs::read_to_string(&file).expect("read file");
+		assert!(file_content.contains(r#""role":"toolResult""#));
+		assert!(file_content.contains(r#""mimeType":"image/png""#));
+		assert!(file_content.contains(r#""data":"aW1nMQ==""#));
+
+		// 2. Reopen session and check history
+		let reopened = SessionStore::open(&options(dir.clone(), Some("tool-image-roundtrip")));
+		assert!(reopened.enabled());
+		let history = reopened.history();
+		assert_eq!(history.len(), 1);
+		assert_eq!(history[0].tool_calls.len(), 1);
+		assert_eq!(history[0].tool_calls[0].result_parts.len(), 2);
+		assert_eq!(history[0].tool_calls[0].result, "snapshot");
+		assert_eq!(history[0].tool_calls[0].result_parts[0].text.as_deref(), Some("snapshot"));
+		assert_eq!(history[0].tool_calls[0].result_parts[1].data.as_deref(), Some("aW1nMQ=="));
+
+		// 3. Replay through history_messages and to_openai_messages
+		let pi_messages = crate::runtime::history_messages(&history).expect("history messages");
+		assert_eq!(pi_messages.len(), 3);
+		assert_eq!(pi_messages[2].role, pi_agent::Role::Tool);
+		assert_eq!(pi_messages[2].parts.len(), 2);
+
+		let wire = pi_agent::to_openai_messages(&pi_messages).expect("to wire");
+		assert_eq!(wire.len(), 4);
+		assert_eq!(wire[2].role, "tool");
+		assert_eq!(wire[2].content, Some(pi_agent::OpenAiContent::Text("snapshot".to_string())));
+
+		assert_eq!(wire[3].role, "user");
+		if let Some(pi_agent::OpenAiContent::Parts(parts)) = &wire[3].content {
+			assert_eq!(parts.len(), 2);
+			assert_eq!(parts[0], pi_agent::OpenAiContentPart::Text {
+				text: "Attached image(s) from tool result:".to_string(),
+			});
+			assert_eq!(parts[1], pi_agent::OpenAiContentPart::ImageUrl {
+				image_url: pi_agent::OpenAiImageUrl {
+					url: "data:image/png;base64,aW1nMQ==".to_string(),
+				},
+			});
+		} else {
+			panic!("expected OpenAiContent::Parts");
+		}
+
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn append_turn_rejects_malformed_tool_result_image_and_preserves_session() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("tool-image-bad")));
+		assert!(store.enabled());
+
+		let bad_turn = TurnRecord {
+			prompt: "take picture".to_string(),
+			assistant: "calling camera".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![ToolCallRecord {
+				id: "call-cam-1".to_string(),
+				name: "camera".to_string(),
+				arguments: json!({}),
+				result: "snapshot".to_string(),
+				is_error: false,
+				result_parts: vec![
+					ContentPart {
+						kind: "image".to_string(),
+						text: None,
+						data: Some("http://attacker.com/evil.png".to_string()),
+						mime_type: Some("image/png".to_string()),
+						extra: serde_json::Map::new(),
+					},
+				],
+			}],
+			parts: vec![],
+		};
+		let res = store.append_turn(&bad_turn);
+		assert!(res.is_err(), "external URL image in tool result must be rejected");
+		assert_eq!(store.history().len(), 0);
 
 		fs::remove_dir_all(dir).ok();
 	}

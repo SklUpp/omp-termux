@@ -349,16 +349,35 @@ fn format_ts_message(
 	timestamp: u64,
 ) -> serde_json::Value {
 	match message.role {
-		pi_agent::Role::User => serde_json::json!({
-			"role": "user",
-			"content": [
-				{
+		pi_agent::Role::User => {
+			let content = if message.parts.is_empty() {
+				vec![serde_json::json!({
 					"type": "text",
 					"text": message.content,
-				}
-			],
-			"timestamp": timestamp,
-		}),
+				})]
+			} else {
+				message
+					.parts
+					.iter()
+					.map(|part| match part {
+						pi_agent::ContentPart::Text { text } => serde_json::json!({
+							"type": "text",
+							"text": text,
+						}),
+						pi_agent::ContentPart::Image { data, mime_type } => serde_json::json!({
+							"type": "image",
+							"data": data,
+							"mimeType": mime_type,
+						}),
+					})
+					.collect()
+			};
+			serde_json::json!({
+				"role": "user",
+				"content": content,
+				"timestamp": timestamp,
+			})
+		},
 		pi_agent::Role::Assistant => format_ts_assistant_message(message, api, provider, model, None, timestamp),
 		pi_agent::Role::Tool => format_ts_tool_result(
 			message.tool_call_id.as_deref().unwrap_or_default(),
@@ -510,6 +529,7 @@ mod tests {
 						tool_call_id: "call_1".to_string(),
 						content: "file data".to_string(),
 						is_error: false,
+						terminate: false,
 					}],
 					stop_reason: "tool_use".to_string(),
 					api: None,
@@ -586,6 +606,40 @@ mod tests {
 		let err = String::from_utf8(err).expect("utf8");
 		assert!(err.contains("Working..."));
 		assert!(err.contains("→ read"));
+	}
+
+	#[test]
+	fn agent_end_preserves_ordered_image_and_text_parts() {
+		let mut out = Vec::new();
+		let mut err = Vec::new();
+		{
+			let mut reporter = Reporter::new(OutputMode::Json, &mut out, &mut err);
+			let user_msg = pi_agent::Message::user_with_parts(vec![
+				pi_agent::ContentPart::text("describe this image:"),
+				pi_agent::ContentPart::image("aW1hZ2VkYXRh", "image/png").unwrap(),
+			]);
+			reporter
+				.event(&Event::AgentEnd {
+					messages: vec![user_msg, pi_agent::Message::assistant("I see the image")],
+					api: Some("openai-completions".to_string()),
+					provider: Some("local".to_string()),
+					model: Some("vision-model".to_string()),
+				})
+				.unwrap();
+		}
+		let out_str = String::from_utf8(out).expect("utf8");
+		let ae: serde_json::Value = serde_json::from_str(out_str.trim()).unwrap();
+		assert_eq!(ae["type"], "agent_end");
+		let msgs = ae["messages"].as_array().expect("messages");
+		assert_eq!(msgs.len(), 2);
+
+		let user_content = msgs[0]["content"].as_array().expect("user content array");
+		assert_eq!(user_content.len(), 2, "must have text and image parts");
+		assert_eq!(user_content[0]["type"], "text");
+		assert_eq!(user_content[0]["text"], "describe this image:");
+		assert_eq!(user_content[1]["type"], "image");
+		assert_eq!(user_content[1]["data"], "aW1hZ2VkYXRh");
+		assert_eq!(user_content[1]["mimeType"], "image/png");
 	}
 
 	#[test]
