@@ -60,6 +60,7 @@ impl ToolScheduler {
 				tool_call_id: call.id.clone(),
 				content: self.registry.missing_tool_diagnostic(&call.name),
 				is_error: true,
+				terminate: false,
 			};
 		};
 
@@ -70,6 +71,7 @@ impl ToolScheduler {
 					tool_call_id: call.id.clone(),
 					content: format!("Tool execution denied: {denial}"),
 					is_error: true,
+					terminate: false,
 				};
 			}
 		}
@@ -91,5 +93,6 @@ fn tool_error_result(tool_call_id: &str, err: ToolError) -> ToolResult {
 		tool_call_id: tool_call_id.to_string(),
 		content: format!("Tool error: {err}"),
 		is_error: true,
+		terminate: false,
 	}
 }

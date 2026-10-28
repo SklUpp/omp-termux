@@ -50,6 +50,8 @@ pub enum AgentError {
 	Interrupted,
 	#[error("Model provider error: {0}")]
 	Provider(#[from] ProviderError),
+	#[error("Internal error: {0}")]
+	Internal(String),
 }
 
 /// Control event to steer or interrupt a running dialog.
@@ -313,17 +315,24 @@ impl AgentLoop {
 					.await;
 			}
 
+			let should_terminate = outcome.results.iter().any(|r| r.terminate);
+
 			turn_results.push(TurnResult {
 				message: assistant,
 				tool_results: outcome.results,
-				is_completed: false,
+				is_completed: should_terminate,
 			});
-
 
 			if outcome.interrupted {
 				cancellation_token.cancel();
 				return Err(AgentError::Interrupted);
 			}
+
+			if should_terminate {
+				return Ok(turn_results);
+			}
+
+
 		}
 
 		Err(AgentError::MaxTurnsExceeded(self.config.max_turns))
@@ -390,6 +399,7 @@ impl AgentLoop {
 					tool_call_id: call.id.clone(),
 					content: INTERRUPTED_TOOL_RESULT.to_string(),
 					is_error: true,
+					terminate: false,
 				}),
 			}
 		}

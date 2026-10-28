@@ -31,6 +31,8 @@ pub struct ToolResult {
 	pub content: String,
 	#[serde(default)]
 	pub is_error: bool,
+	#[serde(default)]
+	pub terminate: bool,
 }
 
 /// Completion status of an assistant turn.
@@ -479,6 +481,23 @@ impl Message {
 			role: Role::Tool,
 			content: content.into(),
 			parts: Vec::new(),
+			name: Some(name.into()),
+			tool_calls: Vec::new(),
+			tool_call_id: Some(tool_call_id.into()),
+			is_error,
+		}
+	}
+	pub fn tool_with_status_and_parts(
+		tool_call_id: impl Into<String>,
+		name: impl Into<String>,
+		content: impl Into<String>,
+		parts: Vec<ContentPart>,
+		is_error: bool,
+	) -> Self {
+		Self {
+			role: Role::Tool,
+			content: content.into(),
+			parts,
 			name: Some(name.into()),
 			tool_calls: Vec::new(),
 			tool_call_id: Some(tool_call_id.into()),

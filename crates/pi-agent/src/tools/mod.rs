@@ -1,5 +1,10 @@
 pub mod registry;
 pub mod scheduler;
+pub mod task;
+pub mod yield_tool;
+
+pub use task::TaskTool;
+pub use yield_tool::YieldTool;
 
 use std::{
 	io::Write,
@@ -11,7 +16,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
@@ -36,7 +41,7 @@ const DEFAULT_GLOB_LIMIT: usize = 200;
 const MAX_GLOB_LIMIT: usize = 200;
 const MAX_GLOB_ENTRIES: usize = MAX_GLOB_LIMIT;
 /// Files scanned and bytes read per file by `grep`.
-const MAX_GREP_FILES: usize = 500;
+const MAX_GREP_FILES: usize = 2000;
 const MAX_GREP_FILE_BYTES: usize = 256 * 1024;
 /// Matches and characters returned by `grep`.
 const MAX_GREP_MATCHES: usize = 100;
@@ -125,7 +130,7 @@ fn skip_note(base: &str, skipped: usize) -> String {
 }
 
 fn tool_result(content: impl Into<String>, is_error: bool) -> ToolResult {
-	ToolResult { tool_call_id: String::new(), content: content.into(), is_error }
+	ToolResult { tool_call_id: String::new(), content: content.into(), is_error, terminate: false }
 }
 
 /// Builtin bash execution tool.
@@ -889,12 +894,9 @@ fn resolve_to_cwd(base_path: &str, cwd: &Path) -> PathBuf {
 		}
 	}
 }
-fn is_root_path(path: &Path) -> bool {
-	if path == Path::new("/") {
-		return true;
-	}
+fn normalize_path(path: &Path) -> PathBuf {
 	if let Ok(canon) = path.canonicalize() {
-		return canon == Path::new("/") || (canon.parent().is_none() && canon.is_absolute());
+		return canon;
 	}
 	let mut normalized = PathBuf::new();
 	for comp in path.components() {
@@ -906,7 +908,15 @@ fn is_root_path(path: &Path) -> bool {
 			c => normalized.push(c.as_os_str()),
 		}
 	}
-	normalized == Path::new("/") || (normalized.parent().is_none() && normalized.is_absolute())
+	normalized
+}
+
+fn is_root_path(path: &Path) -> bool {
+	if path == Path::new("/") {
+		return true;
+	}
+	let norm = normalize_path(path);
+	norm == Path::new("/") || (norm.parent().is_none() && norm.is_absolute())
 }
 
 
@@ -996,10 +1006,19 @@ impl Tool for GlobTool {
 		}
 
 		if let Some(limit_val) = args.get("limit") {
-			let is_non_positive = limit_val.as_i64().map_or(false, |v| v <= 0)
-				|| limit_val.as_f64().map_or(false, |v| v <= 0.0);
-			if is_non_positive {
-				return Ok(tool_result("Limit must be a positive number", true));
+			if limit_val.is_null() {
+				// null defaults to DEFAULT_GLOB_LIMIT
+			} else {
+				let is_valid_positive = if let Some(v) = limit_val.as_i64() {
+					v > 0
+				} else if let Some(v) = limit_val.as_f64() {
+					v > 0.0 && v.is_finite()
+				} else {
+					false
+				};
+				if !is_valid_positive {
+					return Ok(tool_result("Limit must be a positive number", true));
+				}
 			}
 		}
 
@@ -1266,7 +1285,19 @@ impl Tool for GrepTool {
 				},
 				"path": {
 					"type": "string",
-					"description": "Subdirectory or file path"
+					"description": "glob, file, or directory to search — a single path or a semicolon-delimited list (\"src/**/*.ts; test/**/*.ts\"). Omitted -> searches the workspace root (\".\")"
+				},
+				"case": {
+					"type": "boolean",
+					"description": "case-sensitive search"
+				},
+				"gitignore": {
+					"type": "boolean",
+					"description": "respect gitignore"
+				},
+				"skip": {
+					"type": "number",
+					"description": "files to skip before collecting results — use to paginate when the prior call hit the file limit"
 				}
 			},
 			"required": ["pattern"]
@@ -1274,83 +1305,333 @@ impl Tool for GrepTool {
 	}
 
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+		if ctx.cancellation_token.is_cancelled() {
+			return Ok(tool_result("Grep search cancelled", true));
+		}
+
 		let pattern = args
 			.get("pattern")
 			.and_then(Value::as_str)
 			.ok_or_else(|| ToolError::InvalidArguments("missing 'pattern' parameter".to_string()))?;
-		let regex = match Regex::new(pattern) {
+		if pattern.trim().is_empty() {
+			return Ok(tool_result("Pattern must not be empty", true));
+		}
+
+		let case_sensitive = args.get("case").and_then(Value::as_bool).unwrap_or(true);
+		let ignore_case = !case_sensitive;
+
+		let regex = match RegexBuilder::new(pattern).case_insensitive(ignore_case).build() {
 			Ok(regex) => regex,
 			Err(err) => {
 				return Ok(tool_result(format!("Invalid regex pattern '{pattern}': {err}"), true));
 			},
 		};
 
-		let sub_dir = args.get("path").and_then(Value::as_str).unwrap_or(".");
-		let root = ctx.cwd.join(sub_dir);
-
-		let candidates: Vec<PathBuf> = if root.is_file() {
-			vec![root.clone()]
-		} else {
-			match pi_walker::WalkRequest::new(root.clone())
-				.limit(MAX_GREP_FILES)
-				.collect()
-			{
-				Ok(outcome) => outcome
-					.entries
-					.into_iter()
-					.filter(|entry| entry.is_file())
-					.filter(|entry| entry.size.unwrap_or(0.0) <= MAX_GREP_FILE_BYTES as f64)
-					.map(|entry| entry.absolute_path(&root))
-					.collect(),
-				Err(err) => return Ok(tool_result(format!("Walk error: {err}"), true)),
+		let skip = if let Some(skip_val) = args.get("skip") {
+			if skip_val.is_null() {
+				0
+			} else if let Some(n) = skip_val.as_i64() {
+				if n < 0 {
+					return Ok(tool_result("Skip must be a non-negative number", true));
+				}
+				n as usize
+			} else if let Some(f) = skip_val.as_f64() {
+				if f < 0.0 || !f.is_finite() {
+					return Ok(tool_result("Skip must be a non-negative number", true));
+				}
+				f as usize
+			} else {
+				return Ok(tool_result("Skip must be a non-negative number", true));
 			}
+		} else {
+			0
 		};
+
+		let use_gitignore = args.get("gitignore").and_then(Value::as_bool).unwrap_or(true);
+
+		let raw_paths = extract_raw_paths(args);
+		let mut target_inputs: Vec<(String, bool)> = Vec::new();
+		for raw in raw_paths {
+			let norm = normalize_path_like_input(&raw);
+			if norm.is_empty() {
+				target_inputs.push((String::new(), false));
+				continue;
+			}
+			let literal_path = resolve_to_cwd(&norm, &ctx.cwd);
+			if literal_path.exists() {
+				target_inputs.push((norm, true));
+			} else {
+				for item in split_top_level_delimited(&norm) {
+					let item_exists = resolve_to_cwd(&item, &ctx.cwd).exists();
+					target_inputs.push((item, item_exists));
+				}
+			}
+		}
+
+		if target_inputs.is_empty() || target_inputs.iter().any(|(p, _)| p.is_empty()) {
+			return Ok(tool_result("`path` must contain non-empty globs or paths", true));
+		}
+
+		if target_inputs.iter().any(|(p, _)| !p.is_empty() && p.chars().all(|c| c == '/')) {
+			return Ok(tool_result("Searching from root directory '/' is not allowed", true));
+		}
+
+		let is_single = target_inputs.len() == 1;
+		let parsed_targets: Vec<(String, ParsedFindPattern, PathBuf)> = target_inputs
+			.into_iter()
+			.map(|(pat, is_literal)| {
+				if is_literal {
+					let search_path = resolve_to_cwd(&pat, &ctx.cwd);
+					let parsed = ParsedFindPattern {
+						base_path: pat.clone(),
+						glob_pattern: "**/*".to_string(),
+						has_glob: false,
+					};
+					(pat, parsed, search_path)
+				} else {
+					let parsed = parse_find_pattern(&pat);
+					let search_path = resolve_to_cwd(&parsed.base_path, &ctx.cwd);
+					(pat, parsed, search_path)
+				}
+			})
+			.collect();
+
+		for (_, _, search_path) in &parsed_targets {
+			if is_root_path(search_path) {
+				return Ok(tool_result("Searching from root directory '/' is not allowed", true));
+			}
+		}
+
+		let mut valid_targets = Vec::new();
+		let mut missing_paths = Vec::new();
+
+		if is_single {
+			let (pat, parsed, search_path) = parsed_targets.into_iter().next().unwrap();
+			if !search_path.exists() {
+				return Ok(tool_result(format!("Path not found: {pat}"), true));
+			}
+			valid_targets.push((pat, parsed, search_path));
+		} else {
+			for (pat, parsed, search_path) in parsed_targets {
+				if search_path.exists() {
+					valid_targets.push((pat, parsed, search_path));
+				} else {
+					missing_paths.push(pat);
+				}
+			}
+			if valid_targets.is_empty() {
+				return Ok(tool_result(format!("Path not found: {}", missing_paths.join(", ")), true));
+			}
+		}
+
+		let is_single_file =
+			valid_targets.len() == 1 && !valid_targets[0].1.has_glob && valid_targets[0].2.is_file();
+		let can_paginate = !is_single_file;
+
+		let mut limit_reached = false;
+		let mut candidates: Vec<PathBuf> = Vec::new();
+		let mut seen_candidates = std::collections::HashSet::new();
+
+		for (pat, parsed, search_path) in &valid_targets {
+			if ctx.cancellation_token.is_cancelled() {
+				return Ok(tool_result("Grep search cancelled", true));
+			}
+			if search_path.is_file() {
+				if !parsed.has_glob {
+					let abs = search_path.clone();
+					let norm = normalize_path(&abs);
+					if !seen_candidates.contains(&norm) {
+						if candidates.len() < MAX_GREP_FILES {
+							seen_candidates.insert(norm);
+							candidates.push(abs);
+						} else {
+							limit_reached = true;
+							break;
+						}
+					}
+				} else if is_single {
+					return Ok(tool_result(format!("Path is not a directory: {}", search_path.display()), true));
+				}
+			} else if search_path.is_dir() {
+				let heartbeat = || {
+					if ctx.cancellation_token.is_cancelled() {
+						Err("Grep search cancelled".to_string())
+					} else {
+						Ok(())
+					}
+				};
+
+				let mut filter = pi_walker::WalkFilter::files_only();
+				if parsed.has_glob {
+					let fixed_pattern = fix_unclosed_braces(parsed.glob_pattern.clone());
+					let walk_glob = match pi_walker::CompiledWalkGlob::new([&fixed_pattern]) {
+						Ok(compiled) => compiled,
+						Err(err) => {
+							return Ok(tool_result(format!("Invalid glob pattern '{pat}': {err}"), true));
+						},
+					};
+					let mentions_node_modules = parsed.glob_pattern.contains("node_modules");
+					filter = filter
+						.glob(walk_glob)
+						.node_modules_unless_mentioned(mentions_node_modules);
+				}
+
+				let request = pi_walker::WalkRequest::new(search_path.clone())
+					.hidden(true)
+					.gitignore(use_gitignore)
+					.skip_git(true)
+					.follow_links(pi_walker::FollowLinks::Never)
+					.order(pi_walker::WalkOrder::Path)
+					.filter(filter);
+
+				let mut has_unseen = false;
+				let walk_res = request.for_each_entry_with_heartbeat(
+					heartbeat,
+					|meta| {
+						if meta.file_type == pi_walker::FileType::File
+							&& meta.size.unwrap_or(0.0) <= MAX_GREP_FILE_BYTES as f64
+						{
+							let abs = meta.absolute_path.into_owned();
+							let norm = normalize_path(&abs);
+							if !seen_candidates.contains(&norm) {
+								if candidates.len() < MAX_GREP_FILES {
+									seen_candidates.insert(norm);
+									candidates.push(abs);
+								} else {
+									has_unseen = true;
+									return Ok(pi_walker::WalkDecision::Stop);
+								}
+							}
+						}
+						Ok(pi_walker::WalkDecision::Include)
+					},
+					|_| Ok(pi_walker::WalkDecision::Include),
+				);
+
+				match walk_res {
+					Ok(_) => {
+						if has_unseen {
+							limit_reached = true;
+							break;
+						}
+					},
+					Err(err) => {
+						if ctx.cancellation_token.is_cancelled()
+							|| matches!(&err, pi_walker::WalkError::Interrupted(_))
+						{
+							return Ok(tool_result("Grep search cancelled", true));
+						}
+						return Ok(tool_result(format!("Walk error: {err}"), true));
+					},
+				}
+			}
+		}
+
+		candidates.sort();
 
 		let mut sink = BoundedText::new(MAX_GREP_OUTPUT_BYTES);
 		let mut matches = 0usize;
 		let mut skipped = 0usize;
+		let mut total_matching_files = 0usize;
+
 		for path in candidates {
-			if ctx.cancellation_token.is_cancelled() || matches >= MAX_GREP_MATCHES {
+			if ctx.cancellation_token.is_cancelled() {
+				return Ok(tool_result("Grep search cancelled", true));
+			}
+			if matches >= MAX_GREP_MATCHES {
 				break;
 			}
 			let Ok((bytes, size)) = read_capped(&path, MAX_GREP_FILE_BYTES).await else {
 				skipped += 1;
 				continue;
 			};
-			// Re-check the real size: a file can grow after the walk saw it, and a
-			// truncated buffer would report misleading matches.
 			if size > MAX_GREP_FILE_BYTES as u64 {
 				skipped += 1;
 				continue;
 			}
 			let text = String::from_utf8_lossy(&bytes);
-			let display = path
-				.strip_prefix(&ctx.cwd)
-				.unwrap_or(&path)
-				.display()
-				.to_string();
+			let normalized = normalize_path(&path);
+			let display = format_path_relative_to_cwd(&normalized, &ctx.cwd, false);
+
+			let is_skipping_file = can_paginate && total_matching_files < skip;
+			let mut file_matched = false;
+			let mut file_matches = Vec::new();
+
 			for (number, line) in text.lines().enumerate() {
-				if matches >= MAX_GREP_MATCHES {
-					break;
+				if ctx.cancellation_token.is_cancelled() {
+					return Ok(tool_result("Grep search cancelled", true));
 				}
 				if !regex.is_match(line) {
 					continue;
 				}
-				matches += 1;
-				let mut line = line.trim();
-				if line.chars().count() > MAX_GREP_LINE_CHARS {
-					line = &line[..floor_char_boundary(line, MAX_GREP_LINE_CHARS)];
+				file_matched = true;
+				if is_skipping_file {
+					break;
 				}
-				sink.push(&format!("{display}:{}: {line}\n", number + 1));
+				let mut line_str = line.trim();
+				if line_str.chars().count() > MAX_GREP_LINE_CHARS {
+					line_str = &line_str[..floor_char_boundary(line_str, MAX_GREP_LINE_CHARS)];
+				}
+				file_matches.push(format!("{display}:{}: {line_str}\n", number + 1));
+				if matches + file_matches.len() >= MAX_GREP_MATCHES {
+					break;
+				}
+			}
+
+			if file_matched {
+				total_matching_files += 1;
+				if !is_skipping_file {
+					for m in file_matches {
+						if matches >= MAX_GREP_MATCHES {
+							break;
+						}
+						sink.push(&m);
+						matches += 1;
+					}
+					if matches >= MAX_GREP_MATCHES {
+						break;
+					}
+				}
 			}
 		}
 
+		let missing_note = if !missing_paths.is_empty() {
+			Some(format!("Skipped missing paths: {}", missing_paths.join(", ")))
+		} else {
+			None
+		};
+
+		let skip_past_end =
+			can_paginate && skip > 0 && total_matching_files > 0 && skip >= total_matching_files;
+
 		if matches == 0 {
-			return Ok(tool_result(skip_note("No matches found", skipped), false));
+			let base_msg = if limit_reached {
+				format!(
+					"Search limit reached ({MAX_GREP_FILES} files scanned); scan truncated, more matching files may exist beyond this window"
+				)
+			} else if skip_past_end {
+				format!("No more results ({total_matching_files} files total; skip={skip} is past the end)")
+			} else {
+				"No matches found".to_string()
+			};
+			let mut msg = skip_note(&base_msg, skipped);
+			if let Some(note) = missing_note {
+				msg.push('\n');
+				msg.push_str(&note);
+			}
+			return Ok(tool_result(msg, false));
 		}
+
 		if skipped > 0 {
-			sink.push(&format!("[{skipped} file(s) skipped: unreadable or above the size limit]"));
+			sink.push(&format!("[{skipped} file(s) skipped: unreadable or above the size limit]\n"));
 		}
+		if limit_reached {
+			sink.push(&format!("[Search limit reached: {MAX_GREP_FILES} files scanned; scan truncated]\n"));
+		}
+		if let Some(note) = missing_note {
+			sink.push(&format!("\n{note}"));
+		}
+
 		Ok(tool_result(sink.finish(), false))
 	}
 }

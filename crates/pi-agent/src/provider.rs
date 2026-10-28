@@ -476,49 +476,28 @@ pub struct OpenAiStreamFunctionCall {
 
 /// Convert pi-agent domain messages into OpenAI API messages.
 pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, ProviderError> {
-	messages
-		.iter()
-		.map(|m| {
-			let role = match m.role {
-				Role::System => "system",
-				Role::User => "user",
-				Role::Assistant => "assistant",
-				Role::Tool => "tool",
-			};
-
-			let tool_calls = if m.tool_calls.is_empty() {
-				None
-			} else {
-				Some(
-					m.tool_calls
-						.iter()
-						.map(|tc| OpenAiToolCall {
-							id: tc.id.clone(),
-							call_type: "function".to_string(),
-							function: OpenAiFunctionCall {
-								name: tc.name.clone(),
-								arguments: tc.arguments.to_string(),
-							},
-						})
-						.collect(),
-				)
-			};
-
-			let content = if m.has_image() || !m.parts.is_empty() {
-				let mut parts = Vec::new();
-				for part in &m.parts {
+	let mut out = Vec::new();
+	let mut i = 0;
+	while i < messages.len() {
+		let m = &messages[i];
+		if m.role == Role::Tool {
+			let mut j = i;
+			let mut image_parts = Vec::new();
+			while j < messages.len() && messages[j].role == Role::Tool {
+				let tm = &messages[j];
+				let mut this_tool_images = Vec::new();
+				let mut text_parts = Vec::new();
+				for part in &tm.parts {
 					match part {
 						crate::state::ContentPart::Text { text } => {
 							if !text.is_empty() {
-								parts.push(OpenAiContentPart::Text {
-									text: text.clone(),
-								});
+								text_parts.push(text.clone());
 							}
 						}
 						crate::state::ContentPart::Image { data, mime_type } => {
 							let (clean_b64, mime) = crate::state::normalize_image_payload(data, mime_type)
 								.map_err(|err| ProviderError::UnsupportedImage(format!("invalid image payload: {err}")))?;
-							parts.push(OpenAiContentPart::ImageUrl {
+							this_tool_images.push(OpenAiContentPart::ImageUrl {
 								image_url: OpenAiImageUrl {
 									url: format!("data:{mime};base64,{clean_b64}"),
 								},
@@ -526,32 +505,124 @@ pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Pr
 						}
 					}
 				}
-				if !m.content.is_empty()
-					&& !parts.iter().any(|p| matches!(p, OpenAiContentPart::Text { .. }))
-				{
-					parts.insert(
-						0,
-						OpenAiContentPart::Text {
-							text: m.content.clone(),
-						},
-					);
-				}
-				Some(OpenAiContent::Parts(parts))
-			} else if m.content.is_empty() && tool_calls.is_some() {
-				None
-			} else {
-				Some(OpenAiContent::Text(m.content.clone()))
-			};
+				let has_images = !this_tool_images.is_empty();
+				let text_result = if !tm.parts.is_empty() {
+					text_parts.join("\n")
+				} else {
+					tm.content.clone()
+				};
+				let content_str = if !text_result.is_empty() {
+					text_result
+				} else if has_images {
+					"(see attached image)".to_string()
+				} else {
+					tm.content.clone()
+				};
 
-			Ok(OpenAiMessage {
-				role: role.to_string(),
-				name: m.name.clone(),
-				content,
-				tool_calls,
-				tool_call_id: m.tool_call_id.clone(),
-			})
-		})
-		.collect()
+				out.push(OpenAiMessage {
+					role: "tool".to_string(),
+					name: tm.name.clone(),
+					content: Some(OpenAiContent::Text(content_str)),
+					tool_calls: None,
+					tool_call_id: tm.tool_call_id.clone(),
+				});
+				image_parts.extend(this_tool_images);
+				j += 1;
+			}
+
+			if !image_parts.is_empty() {
+				let mut user_parts = Vec::with_capacity(1 + image_parts.len());
+				user_parts.push(OpenAiContentPart::Text {
+					text: "Attached image(s) from tool result:".to_string(),
+				});
+				user_parts.extend(image_parts);
+				out.push(OpenAiMessage {
+					role: "user".to_string(),
+					name: None,
+					content: Some(OpenAiContent::Parts(user_parts)),
+					tool_calls: None,
+					tool_call_id: None,
+				});
+			}
+
+			i = j;
+			continue;
+		}
+
+		let role = match m.role {
+			Role::System => "system",
+			Role::User => "user",
+			Role::Assistant => "assistant",
+			Role::Tool => unreachable!(),
+		};
+
+		let tool_calls = if m.tool_calls.is_empty() {
+			None
+		} else {
+			Some(
+				m.tool_calls
+					.iter()
+					.map(|tc| OpenAiToolCall {
+						id: tc.id.clone(),
+						call_type: "function".to_string(),
+						function: OpenAiFunctionCall {
+							name: tc.name.clone(),
+							arguments: tc.arguments.to_string(),
+						},
+					})
+					.collect(),
+			)
+		};
+
+		let content = if m.has_image() || !m.parts.is_empty() {
+			let mut parts = Vec::new();
+			for part in &m.parts {
+				match part {
+					crate::state::ContentPart::Text { text } => {
+						if !text.is_empty() {
+							parts.push(OpenAiContentPart::Text {
+								text: text.clone(),
+							});
+						}
+					}
+					crate::state::ContentPart::Image { data, mime_type } => {
+						let (clean_b64, mime) = crate::state::normalize_image_payload(data, mime_type)
+							.map_err(|err| ProviderError::UnsupportedImage(format!("invalid image payload: {err}")))?;
+						parts.push(OpenAiContentPart::ImageUrl {
+							image_url: OpenAiImageUrl {
+								url: format!("data:{mime};base64,{clean_b64}"),
+							},
+						});
+					}
+				}
+			}
+			if !m.content.is_empty()
+				&& !parts.iter().any(|p| matches!(p, OpenAiContentPart::Text { .. }))
+			{
+				parts.insert(
+					0,
+					OpenAiContentPart::Text {
+						text: m.content.clone(),
+					},
+				);
+			}
+			Some(OpenAiContent::Parts(parts))
+		} else if m.content.is_empty() && tool_calls.is_some() {
+			None
+		} else {
+			Some(OpenAiContent::Text(m.content.clone()))
+		};
+
+		out.push(OpenAiMessage {
+			role: role.to_string(),
+			name: m.name.clone(),
+			content,
+			tool_calls,
+			tool_call_id: m.tool_call_id.clone(),
+		});
+		i += 1;
+	}
+	Ok(out)
 }
 
 /// Convert an OpenAI response message into a domain assistant [`Message`].
@@ -748,5 +819,85 @@ mod tests {
 		assert_eq!(msg.content, "text");
 		assert_eq!(msg.tool_calls.len(), 1);
 		assert_eq!(msg.tool_calls[0].name, "read");
+	}
+
+	#[test]
+	fn to_openai_messages_groups_tool_results_and_hoists_images() {
+		let t1 = Message::tool_with_status_and_parts(
+			"c1",
+			"tool1",
+			"text 1",
+			vec![
+				crate::state::ContentPart::text("text 1"),
+				crate::state::ContentPart::image("aW1hZ2Ux", "image/png").unwrap(),
+			],
+			false,
+		);
+		let t2 = Message::tool_with_status_and_parts(
+			"c2",
+			"tool2",
+			"text 2",
+			vec![crate::state::ContentPart::text("text 2")],
+			false,
+		);
+		let wire = to_openai_messages(&[t1, t2]).expect("to wire");
+		assert_eq!(wire.len(), 3);
+		assert_eq!(wire[0].role, "tool");
+		assert_eq!(wire[0].tool_call_id.as_deref(), Some("c1"));
+		assert_eq!(wire[0].content, Some(OpenAiContent::Text("text 1".to_string())));
+
+		assert_eq!(wire[1].role, "tool");
+		assert_eq!(wire[1].tool_call_id.as_deref(), Some("c2"));
+		assert_eq!(wire[1].content, Some(OpenAiContent::Text("text 2".to_string())));
+
+		assert_eq!(wire[2].role, "user");
+		assert_eq!(wire[2].tool_call_id, None);
+		if let Some(OpenAiContent::Parts(parts)) = &wire[2].content {
+			assert_eq!(parts.len(), 2);
+			assert_eq!(parts[0], OpenAiContentPart::Text {
+				text: "Attached image(s) from tool result:".to_string(),
+			});
+			assert_eq!(parts[1], OpenAiContentPart::ImageUrl {
+				image_url: OpenAiImageUrl {
+					url: "data:image/png;base64,aW1hZ2Ux".to_string(),
+				},
+			});
+		} else {
+			panic!("expected OpenAiContent::Parts for user image message");
+		}
+	}
+
+	#[test]
+	fn to_openai_messages_image_only_tool_result_placeholder() {
+		let t1 = Message::tool_with_status_and_parts(
+			"c1",
+			"tool1",
+			"",
+			vec![crate::state::ContentPart::image("aW1hZ2Ux", "image/png").unwrap()],
+			false,
+		);
+		let wire = to_openai_messages(&[t1]).expect("to wire");
+		assert_eq!(wire.len(), 2);
+		assert_eq!(wire[0].role, "tool");
+		assert_eq!(wire[0].content, Some(OpenAiContent::Text("(see attached image)".to_string())));
+		assert_eq!(wire[1].role, "user");
+	}
+
+	#[test]
+	fn to_openai_messages_tool_result_fails_closed_on_invalid_image() {
+		let t1 = Message {
+			role: Role::Tool,
+			content: String::new(),
+			parts: vec![crate::state::ContentPart::Image {
+				data: "not-base64!".to_string(),
+				mime_type: "image/png".to_string(),
+			}],
+			name: Some("tool".to_string()),
+			tool_calls: Vec::new(),
+			tool_call_id: Some("c1".to_string()),
+			is_error: false,
+		};
+		let err = to_openai_messages(&[t1]).unwrap_err();
+		assert!(matches!(err, ProviderError::UnsupportedImage(_)));
 	}
 }

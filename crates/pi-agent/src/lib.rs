@@ -4,6 +4,7 @@ pub mod mcp;
 pub mod loop_module;
 pub mod provider;
 pub mod state;
+pub mod supervisor;
 pub mod tokenizer;
 pub mod tools;
 
@@ -20,7 +21,8 @@ pub use state::{
 	ToolCall, ToolResult, TurnResult, TurnStatus,
 };
 pub use tokenizer::Tokenizer;
+pub use supervisor::{ChildGuard, ChildRecord, ChildStatus, DelegationLimits, Supervisor};
 pub use tools::{
-	BashTool, EditTool, GlobTool, GrepTool, ReadTool, TodoTool, Tool, ToolError, WriteTool,
-	registry::ToolRegistry, scheduler::ToolScheduler,
+	BashTool, EditTool, GlobTool, GrepTool, ReadTool, TaskTool, TodoTool, Tool, ToolError,
+	WriteTool, YieldTool, registry::ToolRegistry, scheduler::ToolScheduler,
 };

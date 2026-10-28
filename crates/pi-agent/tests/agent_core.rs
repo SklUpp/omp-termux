@@ -11,7 +11,7 @@ use futures::StreamExt;
 use pi_agent::provider::OpenAiChatRequest;
 use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
-	CancellationToken, ChunkStream, EditTool, GlobTool, ImagePart, Message, ModelProvider,
+	CancellationToken, ChunkStream, EditTool, GlobTool, GrepTool, ImagePart, Message, ModelProvider,
 	OpenAiCompatibleProvider, ProviderError, ReadTool, Role, SteeringEvent,
 	StreamAssembler, StreamChunk, Tool, ToolCall, ToolCallDelta, ToolRegistry, TurnStatus,
 	WriteTool, parse_sse_line, sse_stream,
@@ -880,6 +880,547 @@ async fn grep_uses_regex_and_skips_non_files() {
 }
 
 #[tokio::test]
+async fn grep_pattern_and_skip_validation() {
+	let dir = TempDir::new("grep-validation");
+	std::fs::write(dir.path.join("file.txt"), "hello world\n").expect("write");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Empty pattern rejected
+	let res_empty = GrepTool.execute(&json!({"pattern": ""}), &ctx).await.expect("grep empty");
+	assert!(res_empty.is_error);
+	assert_eq!(res_empty.content, "Pattern must not be empty");
+
+	// Whitespace-only pattern rejected
+	let res_ws = GrepTool.execute(&json!({"pattern": "   \t \n "}), &ctx).await.expect("grep ws");
+	assert!(res_ws.is_error);
+	assert_eq!(res_ws.content, "Pattern must not be empty");
+
+	// Invalid regex pattern rejected
+	let res_inv = GrepTool.execute(&json!({"pattern": "(unclosed"}), &ctx).await.expect("grep invalid");
+	assert!(res_inv.is_error);
+	assert!(res_inv.content.starts_with("Invalid regex pattern '(unclosed':"));
+
+	// Negative skip rejected
+	let res_neg_skip = GrepTool.execute(&json!({"pattern": "hello", "skip": -1}), &ctx).await.expect("grep neg skip");
+	assert!(res_neg_skip.is_error);
+	assert_eq!(res_neg_skip.content, "Skip must be a non-negative number");
+
+	// Negative float skip rejected
+	let res_neg_float = GrepTool.execute(&json!({"pattern": "hello", "skip": -0.5}), &ctx).await.expect("grep neg float");
+	assert!(res_neg_float.is_error);
+	assert_eq!(res_neg_float.content, "Skip must be a non-negative number");
+
+	// String skip rejected
+	let res_str_skip = GrepTool.execute(&json!({"pattern": "hello", "skip": "bad"}), &ctx).await.expect("grep str skip");
+	assert!(res_str_skip.is_error);
+	assert_eq!(res_str_skip.content, "Skip must be a non-negative number");
+
+	// Boolean skip rejected
+	let res_bool_skip = GrepTool.execute(&json!({"pattern": "hello", "skip": true}), &ctx).await.expect("grep bool skip");
+	assert!(res_bool_skip.is_error);
+	assert_eq!(res_bool_skip.content, "Skip must be a non-negative number");
+
+	// Null skip accepted and defaults to 0
+	let res_null_skip = GrepTool.execute(&json!({"pattern": "hello", "skip": null}), &ctx).await.expect("grep null skip");
+	assert!(!res_null_skip.is_error);
+	assert!(res_null_skip.content.contains("file.txt:1: hello world"));
+}
+
+#[tokio::test]
+async fn grep_case_sensitivity() {
+	let dir = TempDir::new("grep-case");
+	std::fs::write(dir.path.join("upper.txt"), "HELLO WORLD\n").expect("write upper");
+	std::fs::write(dir.path.join("lower.txt"), "hello world\n").expect("write lower");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Default: case-sensitive
+	let res_def = GrepTool.execute(&json!({"pattern": "hello"}), &ctx).await.expect("grep def");
+	assert!(!res_def.is_error);
+	assert!(res_def.content.contains("lower.txt:1: hello world"));
+	assert!(!res_def.content.contains("upper.txt"));
+
+	// Explicit case: true -> case-sensitive
+	let res_case_true = GrepTool.execute(&json!({"pattern": "hello", "case": true}), &ctx).await.expect("grep case true");
+	assert!(!res_case_true.is_error);
+	assert!(res_case_true.content.contains("lower.txt:1: hello world"));
+	assert!(!res_case_true.content.contains("upper.txt"));
+
+	// Explicit case: false -> case-insensitive
+	let res_case_false = GrepTool.execute(&json!({"pattern": "hello", "case": false}), &ctx).await.expect("grep case false");
+	assert!(!res_case_false.is_error);
+	assert!(res_case_false.content.contains("lower.txt:1: hello world"));
+	assert!(res_case_false.content.contains("upper.txt:1: HELLO WORLD"));
+}
+
+#[tokio::test]
+async fn grep_gitignore_behavior() {
+	let dir = TempDir::new("grep-gitignore");
+	std::fs::write(dir.path.join(".gitignore"), "secret.txt\n").expect("write gitignore");
+	std::fs::write(dir.path.join("tracked.txt"), "common needle\n").expect("write tracked");
+	std::fs::write(dir.path.join("secret.txt"), "common needle\n").expect("write secret");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Default: respects gitignore
+	let res_def = GrepTool.execute(&json!({"pattern": "common needle"}), &ctx).await.expect("grep gitignore def");
+	assert!(!res_def.is_error);
+	assert!(res_def.content.contains("tracked.txt:1: common needle"));
+	assert!(!res_def.content.contains("secret.txt"));
+
+	// Explicit gitignore: true
+	let res_git_true = GrepTool.execute(&json!({"pattern": "common needle", "gitignore": true}), &ctx).await.expect("grep gitignore true");
+	assert!(!res_git_true.is_error);
+	assert!(res_git_true.content.contains("tracked.txt:1: common needle"));
+	assert!(!res_git_true.content.contains("secret.txt"));
+
+	// Explicit gitignore: false -> finds in ignored files too
+	let res_git_false = GrepTool.execute(&json!({"pattern": "common needle", "gitignore": false}), &ctx).await.expect("grep gitignore false");
+	assert!(!res_git_false.is_error);
+	assert!(res_git_false.content.contains("tracked.txt:1: common needle"));
+	assert!(res_git_false.content.contains("secret.txt:1: common needle"));
+}
+
+#[tokio::test]
+async fn grep_skip_pagination() {
+	let dir = TempDir::new("grep-pagination");
+	std::fs::write(dir.path.join("a.txt"), "item match\n").expect("write a");
+	std::fs::write(dir.path.join("b.txt"), "item match\n").expect("write b");
+	std::fs::write(dir.path.join("c.txt"), "item match\n").expect("write c");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// skip: 0 returns all matching files
+	let res_0 = GrepTool.execute(&json!({"pattern": "item match", "skip": 0}), &ctx).await.expect("grep skip 0");
+	assert!(!res_0.is_error);
+	assert!(res_0.content.contains("a.txt:1: item match"));
+	assert!(res_0.content.contains("b.txt:1: item match"));
+	assert!(res_0.content.contains("c.txt:1: item match"));
+
+	// skip: 1 skips first matching file (a.txt)
+	let res_1 = GrepTool.execute(&json!({"pattern": "item match", "skip": 1}), &ctx).await.expect("grep skip 1");
+	assert!(!res_1.is_error);
+	assert!(!res_1.content.contains("a.txt:"));
+	assert!(res_1.content.contains("b.txt:1: item match"));
+	assert!(res_1.content.contains("c.txt:1: item match"));
+
+	// skip: 2 skips first two matching files (a.txt, b.txt)
+	let res_2 = GrepTool.execute(&json!({"pattern": "item match", "skip": 2}), &ctx).await.expect("grep skip 2");
+	assert!(!res_2.is_error);
+	assert!(!res_2.content.contains("a.txt:"));
+	assert!(!res_2.content.contains("b.txt:"));
+	assert!(res_2.content.contains("c.txt:1: item match"));
+
+	// skip: 3 is past the end -> informative notice, not error
+	let res_3 = GrepTool.execute(&json!({"pattern": "item match", "skip": 3}), &ctx).await.expect("grep skip 3");
+	assert!(!res_3.is_error);
+	assert_eq!(res_3.content, "No more results (3 files total; skip=3 is past the end)");
+
+	// Single-file scope does not paginate with skip
+	let res_file_skip = GrepTool.execute(&json!({"pattern": "item match", "path": "a.txt", "skip": 5}), &ctx).await.expect("grep file skip");
+	assert!(!res_file_skip.is_error);
+	assert_eq!(res_file_skip.content.trim(), "a.txt:1: item match");
+}
+
+#[tokio::test]
+async fn grep_root_guard() {
+	let dir = TempDir::new("grep-root");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Root "/" rejected
+	let res_root = GrepTool.execute(&json!({"pattern": "test", "path": "/"}), &ctx).await.expect("grep root");
+	assert!(res_root.is_error);
+	assert_eq!(res_root.content, "Searching from root directory '/' is not allowed");
+
+	// Multi-slash "///" rejected
+	let res_slashes = GrepTool.execute(&json!({"pattern": "test", "path": "///"}), &ctx).await.expect("grep slashes");
+	assert!(res_slashes.is_error);
+	assert_eq!(res_slashes.content, "Searching from root directory '/' is not allowed");
+
+	// Parent directory traversal resolving to root rejected
+	let res_parent = GrepTool.execute(&json!({"pattern": "test", "path": "/tmp/.."}), &ctx).await.expect("grep parent");
+	assert!(res_parent.is_error);
+	assert_eq!(res_parent.content, "Searching from root directory '/' is not allowed");
+
+	#[cfg(unix)]
+	{
+		let root_symlink = dir.path.join("root_link");
+		std::os::unix::fs::symlink("/", &root_symlink).expect("create root symlink");
+		let res_sym = GrepTool.execute(&json!({"pattern": "test", "path": "root_link"}), &ctx).await.expect("grep symlink");
+		assert!(res_sym.is_error);
+		assert_eq!(res_sym.content, "Searching from root directory '/' is not allowed");
+	}
+}
+
+#[tokio::test]
+async fn grep_path_validation_and_multipath() {
+	let dir = TempDir::new("grep-multipath");
+	std::fs::create_dir_all(dir.path.join("sub_a")).expect("mkdir sub_a");
+	std::fs::create_dir_all(dir.path.join("sub_b")).expect("mkdir sub_b");
+	std::fs::write(dir.path.join("sub_a/file1.txt"), "target word\n").expect("write file1");
+	std::fs::write(dir.path.join("sub_b/file2.txt"), "target word\n").expect("write file2");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Empty path rejected
+	let res_empty = GrepTool.execute(&json!({"pattern": "target", "path": ""}), &ctx).await.expect("grep empty path");
+	assert!(res_empty.is_error);
+	assert_eq!(res_empty.content, "`path` must contain non-empty globs or paths");
+
+	// Single missing path returns Path not found error
+	let res_missing = GrepTool.execute(&json!({"pattern": "target", "path": "nonexistent"}), &ctx).await.expect("grep missing");
+	assert!(res_missing.is_error);
+	assert_eq!(res_missing.content, "Path not found: nonexistent");
+
+	// Semicolon-delimited multi-path searches both targets
+	let res_multi = GrepTool.execute(&json!({"pattern": "target", "path": "sub_a; sub_b"}), &ctx).await.expect("grep multi");
+	assert!(!res_multi.is_error);
+	assert!(res_multi.content.contains("sub_a/file1.txt:1: target word"));
+	assert!(res_multi.content.contains("sub_b/file2.txt:1: target word"));
+
+	// Partial missing path: surviving target searched, missing path noted
+	let res_partial = GrepTool.execute(&json!({"pattern": "target", "path": "sub_a; missing_sub"}), &ctx).await.expect("grep partial");
+	assert!(!res_partial.is_error);
+	assert!(res_partial.content.contains("sub_a/file1.txt:1: target word"));
+	assert!(res_partial.content.contains("Skipped missing paths: missing_sub"));
+
+	// All missing paths returns Path not found error
+	let res_all_missing = GrepTool.execute(&json!({"pattern": "target", "path": "missing_1; missing_2"}), &ctx).await.expect("grep all missing");
+	assert!(res_all_missing.is_error);
+	assert_eq!(res_all_missing.content, "Path not found: missing_1, missing_2");
+}
+
+#[tokio::test]
+async fn grep_cancellation() {
+	let dir = TempDir::new("grep-cancel");
+	std::fs::write(dir.path.join("data.txt"), "searchable text\n").expect("write data");
+	let mut ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	ctx.cancellation_token.cancel();
+	let res = GrepTool.execute(&json!({"pattern": "searchable"}), &ctx).await.expect("grep cancel");
+	assert!(res.is_error);
+	assert_eq!(res.content, "Grep search cancelled");
+}
+
+#[tokio::test]
+async fn grep_glob_path_pattern() {
+	let dir = TempDir::new("grep-glob");
+	std::fs::create_dir_all(dir.path.join("src")).expect("mkdir src");
+	std::fs::create_dir_all(dir.path.join("tests")).expect("mkdir tests");
+	std::fs::write(dir.path.join("src/a.ts"), "target_code\n").expect("write a");
+	std::fs::write(dir.path.join("src/b.rs"), "target_code\n").expect("write b");
+	std::fs::write(dir.path.join("tests/c.ts"), "target_code\n").expect("write c");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Single glob path filters to matching extension under base dir
+	let res_glob = GrepTool
+		.execute(&json!({"pattern": "target_code", "path": "src/**/*.ts"}), &ctx)
+		.await
+		.expect("grep glob");
+	assert!(!res_glob.is_error);
+	assert!(res_glob.content.contains("src/a.ts:1: target_code"));
+	assert!(!res_glob.content.contains("src/b.rs"));
+	assert!(!res_glob.content.contains("tests/c.ts"));
+
+	// Multi-path with glob and plain directory
+	let res_multi = GrepTool
+		.execute(&json!({"pattern": "target_code", "path": "src/**/*.ts; tests"}), &ctx)
+		.await
+		.expect("grep multi glob");
+	assert!(!res_multi.is_error);
+	assert!(res_multi.content.contains("src/a.ts:1: target_code"));
+	assert!(!res_multi.content.contains("src/b.rs"));
+	assert!(res_multi.content.contains("tests/c.ts:1: target_code"));
+
+	// Missing base dir returns Path not found
+	let res_missing = GrepTool
+		.execute(&json!({"pattern": "target_code", "path": "nonexistent_dir/**/*.ts"}), &ctx)
+		.await
+		.expect("grep missing glob base");
+	assert!(res_missing.is_error);
+	assert_eq!(res_missing.content, "Path not found: nonexistent_dir/**/*.ts");
+}
+
+#[tokio::test]
+async fn grep_pagination_beyond_500_candidates() {
+	let dir = TempDir::new("grep-pag-500");
+	for i in 0..=500 {
+		std::fs::write(dir.path.join(format!("file_{i:04}.txt")), "paged_needle\n").expect("write file");
+	}
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// skip: 500 must return the 501st file (file_0500.txt) rather than cutting off at 500 files
+	let res_500 = GrepTool
+		.execute(&json!({"pattern": "paged_needle", "skip": 500}), &ctx)
+		.await
+		.expect("grep skip 500");
+	assert!(!res_500.is_error);
+	assert!(res_500.content.contains("file_0500.txt:1: paged_needle"));
+
+	// skip: 501 is past the end of all 501 files
+	let res_501 = GrepTool
+		.execute(&json!({"pattern": "paged_needle", "skip": 501}), &ctx)
+		.await
+		.expect("grep skip 501");
+	assert!(!res_501.is_error);
+	assert_eq!(res_501.content, "No more results (501 files total; skip=501 is past the end)");
+}
+
+#[tokio::test]
+async fn grep_dedup_normalized_paths() {
+	let dir = TempDir::new("grep-dedup");
+	std::fs::create_dir_all(dir.path.join("nested")).expect("mkdir nested");
+	std::fs::write(dir.path.join("a.txt"), "dedup_token\n").expect("write a");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// "a.txt" and "nested/../a.txt" reference the same file and must not duplicate results
+	let res = GrepTool
+		.execute(&json!({"pattern": "dedup_token", "path": "a.txt; nested/../a.txt"}), &ctx)
+		.await
+		.expect("grep dedup");
+	assert!(!res.is_error);
+	let match_lines: Vec<&str> = res.content.lines().filter(|l| l.contains("dedup_token")).collect();
+	assert_eq!(match_lines.len(), 1);
+	assert_eq!(match_lines[0], "a.txt:1: dedup_token");
+
+	// skip: 1 past the single unique file reports 1 file total, not 2
+	let res_skip = GrepTool
+		.execute(&json!({"pattern": "dedup_token", "path": "a.txt; nested/../a.txt", "skip": 1}), &ctx)
+		.await
+		.expect("grep dedup skip");
+	assert!(!res_skip.is_error);
+	assert_eq!(res_skip.content, "No more results (1 files total; skip=1 is past the end)");
+}
+
+#[tokio::test]
+async fn grep_bounded_file_matches_and_active_cancel() {
+	let dir = TempDir::new("grep-bounded");
+	// Write file with 300 matching lines
+	let mut content = String::new();
+	for i in 1..=300 {
+		content.push_str(&format!("line {i} match_bulk\n"));
+	}
+	std::fs::write(dir.path.join("big.txt"), content).expect("write big");
+	let mut ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Result must be capped at MAX_GREP_MATCHES (100)
+	let res = GrepTool
+		.execute(&json!({"pattern": "match_bulk", "path": "big.txt"}), &ctx)
+		.await
+		.expect("grep bulk");
+	assert!(!res.is_error);
+	let match_count = res.content.lines().filter(|l| l.contains("match_bulk")).count();
+	assert_eq!(match_count, 100);
+
+	// Cancellation stops scanning immediately
+	ctx.cancellation_token.cancel();
+	let res_cancel = GrepTool
+		.execute(&json!({"pattern": "match_bulk", "path": "big.txt"}), &ctx)
+		.await
+		.expect("grep cancel");
+	assert!(res_cancel.is_error);
+	assert_eq!(res_cancel.content, "Grep search cancelled");
+}
+
+#[tokio::test]
+async fn grep_sparse_matches_pagination() {
+	let dir = TempDir::new("grep-sparse");
+	for i in 0..1000 {
+		let line = if i == 0 || i == 999 {
+			"sparse_target_needle\n"
+		} else {
+			"regular content\n"
+		};
+		std::fs::write(dir.path.join(format!("file_{i:04}.txt")), line).expect("write");
+	}
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// skip: 1 skips first matching file (file_0000.txt) and successfully finds the late match in file_0999.txt
+	let res_1 = GrepTool
+		.execute(&json!({"pattern": "sparse_target_needle", "skip": 1}), &ctx)
+		.await
+		.expect("grep sparse skip 1");
+	assert!(!res_1.is_error);
+	assert!(res_1.content.contains("file_0999.txt:1: sparse_target_needle"));
+	assert!(!res_1.content.contains("file_0000.txt"));
+	assert!(!res_1.content.contains("past the end"));
+
+	// skip: 2 is past the end of the 2 matching files
+	let res_2 = GrepTool
+		.execute(&json!({"pattern": "sparse_target_needle", "skip": 2}), &ctx)
+		.await
+		.expect("grep sparse skip 2");
+	assert!(!res_2.is_error);
+	assert_eq!(res_2.content, "No more results (2 files total; skip=2 is past the end)");
+}
+
+#[tokio::test]
+async fn grep_huge_skip_resource_ceiling() {
+	let dir = TempDir::new("grep-huge-skip");
+	std::fs::write(dir.path.join("a.txt"), "common_text\n").expect("write a");
+	std::fs::write(dir.path.join("b.txt"), "common_text\n").expect("write b");
+	std::fs::write(dir.path.join("c.txt"), "other\n").expect("write c");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Enormous skip does not breach resource ceilings or hang
+	let res = GrepTool
+		.execute(&json!({"pattern": "common_text", "skip": 1_000_000}), &ctx)
+		.await
+		.expect("grep huge skip");
+	assert!(!res.is_error);
+	assert_eq!(res.content, "No more results (2 files total; skip=1000000 is past the end)");
+}
+
+#[tokio::test]
+async fn grep_truncated_result_on_budget_limit() {
+	let dir = TempDir::new("grep-truncation");
+	for i in 0..2005 {
+		let line = if i < 2 {
+			"limit_target\n"
+		} else {
+			"filler\n"
+		};
+		std::fs::write(dir.path.join(format!("t_{i:04}.txt")), line).expect("write");
+	}
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Exceeding MAX_GREP_FILES (2000) surfaces scan truncated notice with matches
+	let res = GrepTool
+		.execute(&json!({"pattern": "limit_target"}), &ctx)
+		.await
+		.expect("grep limit");
+	assert!(!res.is_error);
+	assert!(res.content.contains("t_0000.txt:1: limit_target"));
+	assert!(res.content.contains("[Search limit reached: 2000 files scanned; scan truncated]"));
+
+	// Empty matches on truncated scan honestly reports truncation, never claiming "past the end"
+	let res_skip_trunc = GrepTool
+		.execute(&json!({"pattern": "limit_target", "skip": 5000}), &ctx)
+		.await
+		.expect("grep skip trunc");
+	assert!(!res_skip_trunc.is_error);
+	assert!(res_skip_trunc.content.contains("Search limit reached (2000 files scanned); scan truncated"));
+	assert!(!res_skip_trunc.content.contains("past the end"));
+}
+
+#[tokio::test]
+async fn grep_shared_budget_across_multiple_scopes() {
+	let dir = TempDir::new("grep-multi-scope-budget");
+	std::fs::create_dir_all(dir.path.join("scope_a")).expect("mkdir a");
+	std::fs::create_dir_all(dir.path.join("scope_b")).expect("mkdir b");
+	for i in 0..1500 {
+		std::fs::write(dir.path.join(format!("scope_a/a_{i:04}.txt")), "filler_content\n").expect("write a");
+	}
+	for i in 0..1000 {
+		let line = if i == 999 {
+			"beyond_budget_needle\n"
+		} else {
+			"filler_content\n"
+		};
+		std::fs::write(dir.path.join(format!("scope_b/b_{i:04}.txt")), line).expect("write b");
+	}
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Total files across scope_a (1500) and scope_b (1000) is 2500, which exceeds the shared 2000 budget.
+	// The late match in scope_b/b_0999.txt lies beyond the 2000 budget window.
+	// It must report search limit reached and truncation, never falsely claiming 'past the end' or 'No matches found'.
+	let res = GrepTool
+		.execute(
+			&json!({"pattern": "beyond_budget_needle", "path": "scope_a; scope_b"}),
+			&ctx,
+		)
+		.await
+		.expect("grep multi scope budget");
+	assert!(!res.is_error);
+	assert!(res.content.contains("Search limit reached (2000 files scanned); scan truncated"));
+	assert!(!res.content.contains("past the end"));
+}
+
+#[tokio::test]
+async fn grep_exact_2000_files_no_false_truncation() {
+	let dir = TempDir::new("grep-exact-2000");
+	for i in 0..2000 {
+		std::fs::write(dir.path.join(format!("f_{i:04}.txt")), "exact_match\n").expect("write f");
+	}
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Exactly 2000 files fully inspected with zero discarded entries must not trigger false truncation
+	let res_past_end = GrepTool
+		.execute(&json!({"pattern": "exact_match", "skip": 5000}), &ctx)
+		.await
+		.expect("grep exact 2000 skip");
+	assert!(!res_past_end.is_error);
+	assert_eq!(
+		res_past_end.content,
+		"No more results (2000 files total; skip=5000 is past the end)"
+	);
+	assert!(!res_past_end.content.contains("Search limit reached"));
+	assert!(!res_past_end.content.contains("scan truncated"));
+}
+
+#[tokio::test]
+async fn grep_exact_2000_files_overlapping_and_subsequent_scopes() {
+	let dir = TempDir::new("grep-exact-2000-overlap");
+	let dir_a = dir.path.join("a");
+	let dir_b = dir.path.join("b");
+	let dir_empty = dir.path.join("empty_dir");
+	std::fs::create_dir_all(&dir_a).expect("mkdir a");
+	std::fs::create_dir_all(&dir_b).expect("mkdir b");
+	std::fs::create_dir_all(&dir_empty).expect("mkdir empty");
+
+	for i in 0..2000 {
+		std::fs::write(dir_a.join(format!("f_{i:04}.txt")), "exact_match\n").expect("write a");
+	}
+	std::fs::write(dir_b.join("new_file.txt"), "exact_match\n").expect("write b");
+
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Case 1: "a; a" (duplicate directory scope with 2000 files in a) => no truncation notice
+	let res_dup_dir = GrepTool
+		.execute(&json!({"pattern": "exact_match", "path": "a; a", "skip": 5000}), &ctx)
+		.await
+		.expect("grep a; a");
+	assert!(!res_dup_dir.is_error);
+	assert_eq!(
+		res_dup_dir.content,
+		"No more results (2000 files total; skip=5000 is past the end)"
+	);
+	assert!(!res_dup_dir.content.contains("Search limit reached"));
+	assert!(!res_dup_dir.content.contains("scan truncated"));
+
+	// Case 2: "a; a/f_0001.txt" (directory scope + duplicate direct file) => no truncation notice
+	let res_dup_file = GrepTool
+		.execute(&json!({"pattern": "exact_match", "path": "a; a/f_0001.txt", "skip": 5000}), &ctx)
+		.await
+		.expect("grep a; a/f_0001.txt");
+	assert!(!res_dup_file.is_error);
+	assert_eq!(
+		res_dup_file.content,
+		"No more results (2000 files total; skip=5000 is past the end)"
+	);
+	assert!(!res_dup_file.content.contains("Search limit reached"));
+	assert!(!res_dup_file.content.contains("scan truncated"));
+
+	// Case 3: "a; empty_dir" (directory scope + empty directory) => no truncation notice
+	let res_empty = GrepTool
+		.execute(&json!({"pattern": "exact_match", "path": "a; empty_dir", "skip": 5000}), &ctx)
+		.await
+		.expect("grep a; empty_dir");
+	assert!(!res_empty.is_error);
+	assert_eq!(
+		res_empty.content,
+		"No more results (2000 files total; skip=5000 is past the end)"
+	);
+	assert!(!res_empty.content.contains("Search limit reached"));
+	assert!(!res_empty.content.contains("scan truncated"));
+
+	// Case 4: "a; b" (directory a with 2000 files + directory b with new file) => honest truncation notice
+	let res_new_file = GrepTool
+		.execute(&json!({"pattern": "exact_match", "path": "a; b", "skip": 5000}), &ctx)
+		.await
+		.expect("grep a; b");
+	assert!(!res_new_file.is_error);
+	assert!(res_new_file.content.contains("Search limit reached (2000 files scanned); scan truncated"));
+	assert!(!res_new_file.content.contains("past the end"));
+}
+
+#[tokio::test]
 async fn glob_hidden_flag_behavior() {
 	let dir = TempDir::new("glob-hidden");
 	std::fs::write(dir.path.join("visible.txt"), "hello").expect("write visible");
@@ -956,6 +1497,20 @@ async fn glob_limits_and_validation() {
 	// Ceiling clamped to 200 without error
 	let res_ceiling = GlobTool.execute(&json!({"path": "*", "limit": 5000}), &ctx).await.expect("glob ceiling");
 	assert!(!res_ceiling.is_error);
+
+	// Non-numeric limit rejected with error
+	let res_bad = GlobTool.execute(&json!({"path": "*", "limit": "invalid"}), &ctx).await.expect("glob bad limit");
+	assert!(res_bad.is_error);
+	assert_eq!(res_bad.content, "Limit must be a positive number");
+
+	// Boolean limit rejected with error
+	let res_bool = GlobTool.execute(&json!({"path": "*", "limit": false}), &ctx).await.expect("glob bool limit");
+	assert!(res_bool.is_error);
+	assert_eq!(res_bool.content, "Limit must be a positive number");
+
+	// Null limit defaults without error
+	let res_null = GlobTool.execute(&json!({"path": "*", "limit": null}), &ctx).await.expect("glob null limit");
+	assert!(!res_null.is_error);
 }
 
 #[tokio::test]
