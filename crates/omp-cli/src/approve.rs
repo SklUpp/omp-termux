@@ -130,6 +130,10 @@ pub fn classify_tool(name: &str, args: &serde_json::Value) -> ToolTier {
 				ToolTier::Write
 			}
 		},
+		// Previewing an AST rewrite mutates files only after `write
+		// xd://resolve`; the staging call itself is a write-tier action, and the
+		// dispatch stays Read like `write`.
+		"ast_edit" => ToolTier::Write,
 		"bash" => ToolTier::Exec,
 		// MCP tools and unknown tools default to conservative Exec
 		_ => ToolTier::Exec,
@@ -386,6 +390,12 @@ mod tests {
 		assert_eq!(
 			classify_tool("write", &json!({"path": "ssh://box/f.txt"})),
 			ToolTier::Exec
+		);
+		// Staging an AST preview is a write; only the later `write xd://resolve`
+		// is read tier.
+		assert_eq!(
+			classify_tool("ast_edit", &json!({"ops": [], "paths": ["src"]})),
+			ToolTier::Write
 		);
 		assert_eq!(classify_tool("bash", &json!({"command": "ls"})), ToolTier::Exec);
 		assert_eq!(classify_tool("mcp__server_tool", &json!({})), ToolTier::Exec);

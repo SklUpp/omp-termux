@@ -48,11 +48,12 @@ pub const DEFAULT_CONTEXT_LIMIT: usize = 32_768;
 /// `pi-agent` has no approval hook, so the registry *is* the approval gate:
 /// a tool is offered to the model only when the approval matrix would
 /// auto-approve it.
-pub const BUILTIN_TOOLS: [(&str, bool); 9] = [
+pub const BUILTIN_TOOLS: [(&str, bool); 10] = [
 	("read", true),
 	("glob", true),
 	("grep", true),
 	("ast_grep", true),
+	("ast_edit", false),
 	("write", false),
 	("edit", false),
 	("bash", false),
@@ -94,13 +95,18 @@ struct RunnerSession {
 	snapshots: Arc<SnapshotStore>,
 	edit:      Arc<EditTool>,
 	pending:   Arc<PendingStore>,
+	/// Session-owned soft requirement policy: a staged preview must keep
+	/// reminding and forcing across prompt turns whose registry is rebuilt.
+	policy:    Arc<dyn pi_agent::state::ToolPolicy>,
 }
 
 impl RunnerSession {
 	fn new(options: EditToolOptions) -> Self {
 		let snapshots = Arc::new(SnapshotStore::new());
 		let edit = Arc::new(EditTool::with_options(snapshots.clone(), options));
-		Self { snapshots, edit, pending: Arc::new(PendingStore::new()) }
+		let pending = Arc::new(PendingStore::new());
+		let policy = Arc::new(pi_agent::state::StagedPreviewPolicy::new(Arc::clone(&pending)));
+		Self { snapshots, edit, pending, policy }
 	}
 }
 
@@ -1487,6 +1493,13 @@ fn build_registry_full(
 			"glob" => Arc::new(GlobTool),
 			"grep" => Arc::new(GrepTool),
 			"ast_grep" => Arc::new(AstGrepTool),
+			"ast_edit" => Arc::new(pi_agent::tools::AstEditTool::with_display(
+				Arc::clone(&snapshots),
+				Arc::clone(&pending),
+				// `read` above always mounts a snapshot sink, i.e. hashline
+				// display; the preview must match so its tags anchor `edit`.
+				pi_agent::tools::PreviewDisplay::Hashline,
+			)),
 			"write" => Arc::new(WriteTool::with_pending(Arc::clone(&pending))),
 			"edit" => match session {
 				Some(session) => session.edit.clone(),
@@ -1510,6 +1523,13 @@ fn build_registry_full(
 		registry.register_server_error(server, err);
 	}
 	registry.set_configured_servers(all_server_names);
+	// The soft requirement must follow the same queue: a root turn keeps the
+	// session policy, while a standalone registry (tests, helpers) gets one
+	// bound to the fresh queue it just created.
+	match session {
+		Some(session) => registry.set_policy(Arc::clone(&session.policy)),
+		None => registry.set_policy(Arc::new(pi_agent::state::StagedPreviewPolicy::new(pending))),
+	}
 	Ok(registry)
 }
 
@@ -4075,6 +4095,18 @@ mod tests {
 			let _turn1 = build(Some(&session));
 			session.pending.register(Arc::new(Stage { path: target.clone(), calls: calls.clone() }));
 			let turn2 = build(Some(&session));
+
+			// The session policy follows the rebuilt registry: same queue head,
+			// so the loop can remind/force without recreating state per prompt.
+			let head = session.pending.peek_head().expect("staged head");
+			let policy = turn2.policy().expect("session policy mounted");
+			let requirement = pi_agent::state::ToolPolicy::requirement(policy.as_ref())
+				.expect("requirement");
+			assert_eq!(
+				(requirement.id, requirement.generation),
+				(head.id, head.generation)
+			);
+			assert_eq!(requirement.tool_name, "write");
 
 			let applied = turn2
 				.get("write")

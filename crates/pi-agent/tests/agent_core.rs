@@ -2820,6 +2820,45 @@ async fn spawn_recording_openai_server(
 	(url, rx)
 }
 
+/// Serve one canned assistant `message` object per request and forward each
+/// parsed request body, so a test can drive the real HTTP wire end to end.
+async fn spawn_scripted_chat_server(
+	responses: Vec<serde_json::Value>,
+) -> (String, tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>) {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+	let port = listener.local_addr().expect("local addr").port();
+	let url = format!("http://127.0.0.1:{port}");
+	let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+	tokio::spawn(async move {
+		for message in responses {
+			let Ok((mut stream, _)) = listener.accept().await else {
+				return;
+			};
+			if let Some(body) = read_http_json_request(&mut stream).await {
+				let _ = tx.send(body);
+			}
+			let resp_body = json!({
+				"id": "chatcmpl-test",
+				"object": "chat.completion",
+				"created": 12345,
+				"model": "gpt-4o",
+				"choices": [{ "index": 0, "message": message, "finish_reason": "tool_calls" }]
+			});
+			let resp_str = resp_body.to_string();
+			let http_response = format!(
+				"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+				resp_str.len(),
+				resp_str
+			);
+			let _ = stream.write_all(http_response.as_bytes()).await;
+			let _ = stream.flush().await;
+		}
+	});
+
+	(url, rx)
+}
+
 #[tokio::test]
 async fn openai_request_with_image_serializes_multipart_data_uri() {
 	let (server_url, rx) = spawn_mock_openai_server().await;
@@ -2995,6 +3034,70 @@ async fn openai_forced_tool_choice_does_not_stick_to_the_next_request() {
 		auto.get("tool_choice").is_none(),
 		"forced choice must not leak into a later request: {auto}"
 	);
+}
+
+#[tokio::test]
+async fn soft_requirement_forces_one_write_request_on_the_wire_after_a_detour() {
+	let dir = TempDir::new("soft-wire");
+	let pending = Arc::new(pi_agent::PendingStore::new());
+	let applied = Arc::new(Mutex::new(Vec::new()));
+	stage(&pending, &applied, None);
+	let detour = dir.path.join("wire-detour.txt");
+
+	let (server_url, mut requests) = spawn_scripted_chat_server(vec![
+		// Detour: a plain file write while a preview is pending.
+		json!({
+			"role": "assistant",
+			"content": "",
+			"tool_calls": [{
+				"id": "wire_detour",
+				"type": "function",
+				"function": {
+					"name": "write",
+					"arguments": "{\"path\":\"wire-detour.txt\",\"content\":\"must not run\"}"
+				}
+			}]
+		}),
+		// Compliant resolution of the staged preview.
+		json!({
+			"role": "assistant",
+			"content": "",
+			"tool_calls": [{
+				"id": "wire_resolve",
+				"type": "function",
+				"function": {
+					"name": "write",
+					"arguments": "{\"path\":\"xd://resolve\",\"content\":\"wire apply\"}"
+				}
+			}]
+		}),
+		json!({ "role": "assistant", "content": "done" }),
+	])
+	.await;
+	let provider = OpenAiCompatibleProvider::new(server_url, "fake-key", "gpt-4o")
+		.expect("provider build");
+	let agent = AgentLoop::new(config(&dir.path, 8), Arc::new(provider), soft_registry(&pending));
+	let mut state = AgentState::default();
+	agent.run_dialog("go", &mut state, None).await.expect("dialog");
+
+	let first = requests.recv().await.expect("first request");
+	let second = requests.recv().await.expect("forced request");
+	let third = requests.recv().await.expect("third request");
+	assert!(
+		first.get("tool_choice").is_none(),
+		"the reminder request must stay on auto: {first}"
+	);
+	assert_eq!(
+		second["tool_choice"],
+		json!({"type": "function", "function": {"name": "write"}}),
+		"the escalated request must force write on the wire"
+	);
+	assert!(
+		third.get("tool_choice").is_none(),
+		"the force must not stick past the single request: {third}"
+	);
+	assert!(!detour.exists(), "the detour write must never reach the filesystem");
+	assert_eq!(*applied.lock().expect("applied"), vec!["wire apply".to_string()]);
 }
 
 #[tokio::test]
@@ -3294,4 +3397,408 @@ fn image_mime_and_base64_validation_strict_logic() {
 	assert!(!is_valid_base64_payload("ab="));
 	assert!(!is_valid_base64_payload("a"));
 	assert!(!is_valid_base64_payload("not-b64-???"));
+}
+
+/// Scripted provider that records the provider-facing request for every call,
+/// so soft-requirement tests can assert the wire choice and reminder placement.
+struct RecordingProvider {
+	turns:    Mutex<VecDeque<Result<Message, ProviderError>>>,
+	requests: Mutex<Vec<(ToolChoice, Vec<Message>)>>,
+}
+
+impl RecordingProvider {
+	fn new(turns: Vec<Result<Message, ProviderError>>) -> Self {
+		Self { turns: Mutex::new(turns.into()), requests: Mutex::new(Vec::new()) }
+	}
+
+	fn choices(&self) -> Vec<ToolChoice> {
+		self
+			.requests
+			.lock()
+			.expect("requests")
+			.iter()
+			.map(|(choice, _)| choice.clone())
+			.collect()
+	}
+
+	fn requests(&self) -> Vec<(ToolChoice, Vec<Message>)> {
+		self.requests.lock().expect("requests").clone()
+	}
+}
+
+#[async_trait]
+impl ModelProvider for RecordingProvider {
+	async fn complete(
+		&self,
+		messages: &[Message],
+		_tools: &[serde_json::Value],
+		tool_choice: &ToolChoice,
+	) -> Result<Message, ProviderError> {
+		self
+			.requests
+			.lock()
+			.expect("requests")
+			.push((tool_choice.clone(), messages.to_vec()));
+		self
+			.turns
+			.lock()
+			.expect("turns")
+			.pop_front()
+			.unwrap_or_else(|| Err(ProviderError::Protocol("script exhausted".to_string())))
+	}
+
+	async fn stream(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		Err(ProviderError::Protocol("recording provider has no stream".to_string()))
+	}
+}
+
+/// Staged preview under test: records every apply and can stage a follow-up
+/// head, which is how stacked previews change the requirement id mid-run.
+struct StageAction {
+	applied:   Arc<Mutex<Vec<String>>>,
+	source:    &'static str,
+	follow_up: Option<(Arc<pi_agent::PendingStore>, std::path::PathBuf)>,
+}
+
+#[async_trait]
+impl pi_agent::PendingAction for StageAction {
+	fn label(&self) -> &str {
+		"staged ast_edit preview"
+	}
+
+	fn source_tool(&self) -> &str {
+		self.source
+	}
+
+	async fn apply(
+		&self,
+		_ctx: &pi_agent::AgentContext,
+		reason: &str,
+	) -> Result<pi_agent::ToolResult, pi_agent::ToolError> {
+		self.applied.lock().expect("applied").push(reason.to_string());
+		if let Some((store, path)) = &self.follow_up {
+			std::fs::write(path, "staged").expect("stage follow-up");
+			store.register(Arc::new(StageAction {
+				applied:   Arc::clone(&self.applied),
+				source:    "ast_edit",
+				follow_up: None,
+			}));
+		}
+		Ok(pi_agent::ToolResult {
+			tool_call_id: String::new(),
+			content: "applied".to_string(),
+			is_error: false,
+			terminate: false,
+			details: None,
+		})
+	}
+}
+
+fn has_preview_reminder(messages: &[Message]) -> bool {
+	messages
+		.iter()
+		.any(|message| message.role == Role::User && message.content.contains("PREVIEW — no files changed"))
+}
+
+fn soft_registry(pending: &Arc<pi_agent::PendingStore>) -> ToolRegistry {
+	let mut registry = ToolRegistry::new();
+	registry.register(Arc::new(WriteTool::with_pending(Arc::clone(pending))));
+	registry.set_policy(Arc::new(pi_agent::state::StagedPreviewPolicy::new(Arc::clone(pending))));
+	registry
+}
+
+fn stage(
+	pending: &Arc<pi_agent::PendingStore>,
+	applied: &Arc<Mutex<Vec<String>>>,
+	follow_up: Option<(Arc<pi_agent::PendingStore>, std::path::PathBuf)>,
+) -> Arc<StageAction> {
+	let action = Arc::new(StageAction {
+		applied: Arc::clone(applied),
+		source: "ast_edit",
+		follow_up,
+	});
+	pending.register(action.clone());
+	action
+}
+
+#[tokio::test]
+async fn staged_preview_reminds_then_forces_one_write_request_and_skips_detours() {
+	let dir = TempDir::new("soft-reminder");
+	let pending = Arc::new(pi_agent::PendingStore::new());
+	let applied = Arc::new(Mutex::new(Vec::new()));
+	stage(&pending, &applied, None);
+	let detour = dir.path.join("detour.txt");
+	let provider = Arc::new(RecordingProvider::new(vec![
+		Ok(Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id:        "call_detour".to_string(),
+				name:      "write".to_string(),
+				arguments: json!({"path": "detour.txt", "content": "must not run"}),
+			}],
+		)),
+		Ok(Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id:        "call_resolve".to_string(),
+				name:      "write".to_string(),
+				arguments: json!({"path": "xd://resolve", "content": "apply it"}),
+			}],
+		)),
+		Ok(Message::assistant("done")),
+	]));
+	let agent = AgentLoop::new(config(&dir.path, 8), provider.clone(), soft_registry(&pending));
+	let mut state = AgentState::default();
+	let turns = agent.run_dialog("go", &mut state, None).await.expect("dialog");
+
+	assert_eq!(provider.choices(), vec![
+		ToolChoice::Auto,
+		ToolChoice::Tool { name: "write".to_string() },
+		ToolChoice::Auto,
+	]);
+	// The detour batch never executed a side effect; it is paired with a skip
+	// result so the history keeps every tool_call answered.
+	assert!(!detour.exists(), "detour write must not run while the preview is pending");
+	assert!(turns[0].tool_results[0].is_error);
+	assert!(
+		turns[0].tool_results[0].content.starts_with("Not executed: call the `write` tool"),
+		"{}",
+		turns[0].tool_results[0].content
+	);
+	assert!(!turns[0].is_completed);
+	assert_eq!(*applied.lock().expect("applied"), vec!["apply it".to_string()]);
+	assert!(pending.is_empty());
+
+	let requests = provider.requests();
+	assert_eq!(requests.len(), 3);
+	assert!(has_preview_reminder(&requests[0].1), "first request must carry the reminder");
+	// One reminder per head: later requests inherit the same single message.
+	assert_eq!(
+		state
+			.messages
+			.iter()
+			.filter(|message| message.role == Role::User && message.content.contains("PREVIEW — no files changed"))
+			.count(),
+		1
+	);
+}
+
+#[tokio::test]
+async fn new_preview_head_reinjects_reminder_and_resets_escalation() {
+	let dir = TempDir::new("soft-head-change");
+	let pending = Arc::new(pi_agent::PendingStore::new());
+	let applied = Arc::new(Mutex::new(Vec::new()));
+	let second = dir.path.join("second.txt");
+	stage(&pending, &applied, Some((Arc::clone(&pending), second)));
+	let provider = Arc::new(RecordingProvider::new(vec![
+		Ok(Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id:        "resolve_first".to_string(),
+				name:      "write".to_string(),
+				arguments: json!({"path": "xd://resolve", "content": "first"}),
+			}],
+		)),
+		Ok(Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id:        "resolve_second".to_string(),
+				name:      "write".to_string(),
+				arguments: json!({"path": "xd://resolve", "content": "second"}),
+			}],
+		)),
+		Ok(Message::assistant("done")),
+	]));
+	let agent = AgentLoop::new(config(&dir.path, 8), provider.clone(), soft_registry(&pending));
+	let mut state = AgentState::default();
+	agent.run_dialog("go", &mut state, None).await.expect("dialog");
+
+	// Every request stays on auto: resolving the pending preview is compliant,
+	// and the follow-up head is a new id, never a forced escalation.
+	assert_eq!(provider.choices(), vec![ToolChoice::Auto; 3]);
+	assert_eq!(*applied.lock().expect("applied"), vec!["first".to_string(), "second".to_string()]);
+	let reminders = state
+		.messages
+		.iter()
+		.filter(|message| message.role == Role::User && message.content.contains("PREVIEW — no files changed"))
+		.count();
+	assert_eq!(reminders, 2, "each staged head injects its own reminder once");
+}
+
+#[tokio::test]
+async fn soft_requirement_is_dropped_when_write_is_unavailable() {
+	let dir = TempDir::new("soft-no-write");
+	let pending = Arc::new(pi_agent::PendingStore::new());
+	let applied = Arc::new(Mutex::new(Vec::new()));
+	stage(&pending, &applied, None);
+	let mut registry = ToolRegistry::new();
+	registry.set_policy(Arc::new(pi_agent::state::StagedPreviewPolicy::new(Arc::clone(&pending))));
+	let provider = Arc::new(RecordingProvider::new(vec![Ok(Message::assistant("nothing to do"))]));
+	let agent = AgentLoop::new(config(&dir.path, 4), provider.clone(), registry);
+	let mut state = AgentState::default();
+	agent.run_dialog("go", &mut state, None).await.expect("dialog");
+
+	// No reminder, no invalid forced `write`, and no hang: the preview stays
+	// pending for a later prompt that can actually resolve it.
+	assert_eq!(provider.choices(), vec![ToolChoice::Auto]);
+	assert!(!has_preview_reminder(&state.messages));
+	assert_eq!(pending.len(), 1);
+	assert!(applied.lock().expect("applied").is_empty());
+}
+
+#[tokio::test]
+async fn failed_prompt_keeps_preview_pending_but_resets_force_for_the_next_prompt() {
+	let dir = TempDir::new("soft-cross-prompt");
+	let pending = Arc::new(pi_agent::PendingStore::new());
+	let applied = Arc::new(Mutex::new(Vec::new()));
+	stage(&pending, &applied, None);
+	let registry = soft_registry(&pending);
+
+	let failing = Arc::new(RecordingProvider::new(vec![Err(ProviderError::Protocol(
+		"network down".to_string(),
+	))]));
+	let agent = AgentLoop::new(config(&dir.path, 6), failing, registry.clone());
+	let mut state = AgentState::default();
+	agent.run_dialog("go", &mut state, None).await.expect_err("provider failure");
+	assert_eq!(pending.len(), 1, "a failed prompt must not drop the preview");
+
+	// A rebuilt loop for the next prompt re-reads the same session queue: the
+	// first request is auto with a fresh reminder, never a leaked forced write.
+	let provider = Arc::new(RecordingProvider::new(vec![
+		Ok(Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id:        "resolve_next".to_string(),
+				name:      "write".to_string(),
+				arguments: json!({"path": "xd://resolve", "content": "next prompt"}),
+			}],
+		)),
+		Ok(Message::assistant("done")),
+	]));
+	let agent = AgentLoop::new(config(&dir.path, 6), provider.clone(), registry);
+	let mut state = AgentState::default();
+	agent.run_dialog("go again", &mut state, None).await.expect("dialog");
+	assert_eq!(provider.choices()[0], ToolChoice::Auto);
+	assert!(has_preview_reminder(&provider.requests()[0].1));
+	assert_eq!(*applied.lock().expect("applied"), vec!["next prompt".to_string()]);
+}
+
+#[tokio::test]
+async fn cancelled_prompt_leaves_preview_pending_for_the_next_prompt() {
+	let dir = TempDir::new("soft-cancel");
+	let pending = Arc::new(pi_agent::PendingStore::new());
+	let applied = Arc::new(Mutex::new(Vec::new()));
+	stage(&pending, &applied, None);
+	let registry = soft_registry(&pending);
+
+	let provider = Arc::new(RecordingProvider::new(vec![Ok(Message::assistant("unused"))]));
+	let agent = AgentLoop::new(config(&dir.path, 6), provider.clone(), registry.clone());
+	let token = CancellationToken::new();
+	token.cancel();
+	let mut state = AgentState::default();
+	let cancelled = agent
+		.run_dialog_message_with_cancel(Message::user("go"), &mut state, None, None, token)
+		.await;
+	assert!(matches!(cancelled, Err(Interrupted)), "cancel must surface Interrupted");
+	assert!(provider.requests().is_empty(), "a cancelled prompt must not hit the provider");
+	assert!(
+		!has_preview_reminder(&state.messages),
+		"a cancelled prompt must not append the reminder before bailing out"
+	);
+	assert_eq!(pending.len(), 1);
+
+	let provider = Arc::new(RecordingProvider::new(vec![
+		Ok(Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id:        "resolve_after_cancel".to_string(),
+				name:      "write".to_string(),
+				arguments: json!({"path": "xd://reject", "content": "discard"}),
+			}],
+		)),
+		Ok(Message::assistant("done")),
+	]));
+	let agent = AgentLoop::new(config(&dir.path, 6), provider.clone(), registry);
+	let mut state = AgentState::default();
+	agent.run_dialog("go", &mut state, None).await.expect("dialog");
+	assert_eq!(provider.choices(), vec![ToolChoice::Auto, ToolChoice::Auto]);
+	assert!(pending.is_empty());
+	assert!(applied.lock().expect("applied").is_empty(), "reject must not apply");
+}
+
+/// Preview whose first apply fails, then counts further attempts.
+struct FailingStage {
+	attempts: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl pi_agent::PendingAction for FailingStage {
+	fn label(&self) -> &str {
+		"failing ast_edit preview"
+	}
+
+	fn source_tool(&self) -> &str {
+		"ast_edit"
+	}
+
+	async fn apply(
+		&self,
+		_ctx: &pi_agent::AgentContext,
+		_reason: &str,
+	) -> Result<pi_agent::ToolResult, pi_agent::ToolError> {
+		if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+			return Err(pi_agent::ToolError::ExecutionFailed(
+				"overlapping replacements".to_string(),
+			));
+		}
+		Ok(pi_agent::ToolResult {
+			tool_call_id: String::new(),
+			content: "applied".to_string(),
+			is_error: false,
+			terminate: false,
+			details: None,
+		})
+	}
+}
+
+#[tokio::test]
+async fn apply_failure_leaves_preview_pending_for_a_later_reject() {
+	let dir = TempDir::new("soft-apply-failure");
+	let pending = Arc::new(pi_agent::PendingStore::new());
+	let attempts = Arc::new(AtomicUsize::new(0));
+	pending.register(Arc::new(FailingStage { attempts: Arc::clone(&attempts) }));
+	let provider = Arc::new(RecordingProvider::new(vec![
+		Ok(Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id:        "resolve_fails".to_string(),
+				name:      "write".to_string(),
+				arguments: json!({"path": "xd://resolve", "content": "try"}),
+			}],
+		)),
+		Ok(Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id:        "reject_after_failure".to_string(),
+				name:      "write".to_string(),
+				arguments: json!({"path": "xd://reject", "content": "discard"}),
+			}],
+		)),
+		Ok(Message::assistant("done")),
+	]));
+	let agent = AgentLoop::new(config(&dir.path, 8), provider.clone(), soft_registry(&pending));
+	let mut state = AgentState::default();
+	let turns = agent.run_dialog("go", &mut state, None).await.expect("dialog");
+
+	// A failed apply keeps the same head: the loop never re-forces nor loses
+	// the preview, so the next turn can reject it.
+	assert_eq!(attempts.load(Ordering::SeqCst), 1);
+	assert!(turns[0].tool_results[0].is_error, "{}", turns[0].tool_results[0].content);
+	assert_eq!(provider.choices(), vec![ToolChoice::Auto; 3]);
+	assert!(pending.is_empty());
 }

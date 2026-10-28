@@ -28,6 +28,15 @@ Dispatch invokes the pending queue head through `runResolveInvocation(...)`.
 - Resolving with no pending action throws.
 - An apply callback's ordinary error becomes `ToolError("Apply failed: ...")`; an existing `ToolError` is preserved.
 
+## Rust runtime (`crates/pi-agent`, `crates/omp-cli`)
+
+The Rust port enforces the same soft requirement without a `resolve` tool:
+
+- `PendingStore` (`crates/pi-agent/src/tools/pending.rs`) owns the queue head identity `PendingHead { id, generation, source_tool, label }`. `clear` bumps the generation, so an in-flight apply cannot resurrect a discarded preview and a stale reminder never matches a new head.
+- `StagedPreviewPolicy` (`crates/pi-agent/src/state.rs`) is the session-owned `ToolPolicy`: it peeks the head and considers only `write` to `xd://resolve`/`xd://reject` (`is_resolution_device_path`) compliant. `build_registry_full` (`crates/omp-cli/src/runtime.rs`) mounts the policy from the runner session onto each rebuilt registry; `Supervisor::child_registry` binds a fresh policy, `write`, and `ast_edit` to one child queue and snapshot store so a child preview can never resolve against the root queue.
+- The loop (`crates/pi-agent/src/loop.rs`) injects the resolve reminder once per `(id, generation)`, keeps `tool_choice: auto` for the first request, marks every non-compliant batch as skipped (`is_error`, `Not executed: call the write tool…`) without running its calls, and forces `write` for exactly the next provider request. It aborts after three escalations, drops the requirement when `write` is absent from the active registry (upstream `agent.ts` gate), and keeps the per-run escalation state local so prompts and child agents cannot inherit a stale force.
+- `ast_edit` previews mount `PreviewDisplay::Hashline` to match `read`'s snapshot sink, so previewed tags anchor the next `edit`.
+
 ## Plan approval
 
 Plan mode installs a separate proposal handler through `setPlanProposalHandler(...)`.

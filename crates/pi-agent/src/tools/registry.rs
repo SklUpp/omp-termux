@@ -13,6 +13,9 @@ pub struct ToolRegistry {
 	tools: BTreeMap<String, Arc<dyn Tool>>,
 	server_errors: BTreeMap<String, String>,
 	configured_servers: Vec<String>,
+	/// Session-owned staged-preview policy. Registries are rebuilt per prompt,
+	/// so the loop reads the policy from here and the owner keeps the state.
+	policy: Option<Arc<dyn crate::state::ToolPolicy>>,
 }
 
 impl ToolRegistry {
@@ -38,6 +41,16 @@ impl ToolRegistry {
 	/// Unregister a tool by name, if present.
 	pub fn remove(&mut self, name: &str) {
 		self.tools.remove(name);
+	}
+
+	/// Mount the session's staged-preview policy on this registry.
+	pub fn set_policy(&mut self, policy: Arc<dyn crate::state::ToolPolicy>) {
+		self.policy = Some(policy);
+	}
+
+	/// Session policy consulted by the loop, when one is mounted.
+	pub fn policy(&self) -> Option<Arc<dyn crate::state::ToolPolicy>> {
+		self.policy.clone()
 	}
 
 	pub fn register_server_error(&mut self, server: impl Into<String>, error: impl Into<String>) {

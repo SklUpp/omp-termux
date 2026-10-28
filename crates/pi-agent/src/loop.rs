@@ -9,8 +9,8 @@ use crate::{
 	mailbox::{Mailbox, format_incoming},
 	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
 	state::{
-		AgentConfig, AgentContext, AgentState, Message, Role, ToolApprover, ToolCall, ToolResult,
-		TurnResult, TurnStatus,
+		AgentConfig, AgentContext, AgentState, Message, Role, SoftToolRequirement, ToolApprover,
+		ToolCall, ToolPolicy, ToolResult, TurnResult, TurnStatus,
 	},
 	supervisor::BackgroundResultSink,
 	tools::{registry::ToolRegistry, scheduler::ToolScheduler},
@@ -95,6 +95,46 @@ struct BatchOutcome {
 	interrupted: bool,
 }
 
+/// Upstream `MAX_SOFT_TOOL_ESCALATIONS`: abort instead of forcing forever.
+const MAX_SOFT_TOOL_ESCALATIONS: u32 = 3;
+
+/// Loop-local soft requirement lifecycle (upstream `SoftToolRequirementState`).
+///
+/// The host only peeks the queue head; everything that must not leak between
+/// prompts or child agents — the reminder sent for a head, the one-request
+/// force, and the escalation budget — lives here for exactly one dialog run.
+#[derive(Default)]
+struct SoftRequirementState {
+	head: Option<(u64, u64)>,
+	force_next: bool,
+	escalations: u32,
+}
+
+impl SoftRequirementState {
+	/// Adopt the current head. Returns `true` when it changed (or first
+	/// appeared), which is exactly when the reminder is injected.
+	fn sync(&mut self, requirement: Option<&SoftToolRequirement>) -> bool {
+		match requirement {
+			Some(requirement) => {
+				let head = (requirement.id, requirement.generation);
+				if self.head == Some(head) {
+					return false;
+				}
+				self.head = Some(head);
+				self.force_next = false;
+				self.escalations = 0;
+				true
+			},
+			None => {
+				self.head = None;
+				self.force_next = false;
+				self.escalations = 0;
+				false
+			},
+		}
+	}
+}
+
 /// Marks a loop's agent present in the shared mailbox while the dialog runs.
 /// Root (`Main`) turns and detached child loops both register here, so a peer
 /// `hub wait` can tell whether its counterpart still exists.
@@ -127,6 +167,8 @@ pub struct AgentLoop {
 	background_results: Option<Arc<dyn BackgroundResultSink>>,
 	/// Peer mailbox drained into the same boundary messages.
 	peer_inbox: Option<(Arc<Mailbox>, String)>,
+	/// Session-owned staged-preview policy (peeked from the registry).
+	policy: Option<Arc<dyn ToolPolicy>>,
 }
 
 impl AgentLoop {
@@ -136,6 +178,7 @@ impl AgentLoop {
 		registry: ToolRegistry,
 	) -> Self {
 		let scheduler = ToolScheduler::new(registry.clone());
+		let policy = registry.policy();
 		Self {
 			config,
 			provider,
@@ -143,6 +186,7 @@ impl AgentLoop {
 			registry,
 			background_results: None,
 			peer_inbox: None,
+			policy,
 		}
 	}
 
@@ -153,6 +197,7 @@ impl AgentLoop {
 		approver: Arc<dyn ToolApprover>,
 	) -> Self {
 		let scheduler = ToolScheduler::with_approver(registry.clone(), approver);
+		let policy = registry.policy();
 		Self {
 			config,
 			provider,
@@ -160,6 +205,7 @@ impl AgentLoop {
 			registry,
 			background_results: None,
 			peer_inbox: None,
+			policy,
 		}
 	}
 
@@ -278,6 +324,7 @@ impl AgentLoop {
 			self.scheduler.approver().cloned(),
 		);
 		let mut turn_results = Vec::new();
+		let mut soft = SoftRequirementState::default();
 
 		while state.total_turns < self.config.max_turns {
 			if let Some(rx) = &mut steering_rx {
@@ -294,6 +341,22 @@ impl AgentLoop {
 			// before this one, exactly once.
 			self.inject_boundary_messages(state);
 
+			// Peek the session queue before compaction so the reminder is part
+			// of this request and stays in the newest history. A requirement
+			// naming a tool this registry does not offer is dropped silently
+			// (upstream `agent.ts` gate): no reminder and no invalid force.
+			let soft_req = self
+				.policy
+				.as_ref()
+				.and_then(|policy| policy.requirement())
+				.filter(|requirement| self.registry.get(&requirement.tool_name).is_some());
+			if !cancellation_token.is_cancelled()
+				&& soft.sync(soft_req.as_ref())
+				&& let Some(requirement) = &soft_req
+			{
+				state.messages.push(requirement.reminder.clone());
+			}
+
 			state.messages =
 				Compactor::compact(&state.messages, self.config.context_limit, MIN_RECENT_MESSAGES);
 
@@ -301,11 +364,21 @@ impl AgentLoop {
 				return Err(AgentError::Interrupted);
 			}
 			let schemas = self.registry.schemas();
+			// A compliant turn pays zero tool_choice change; only the escalated
+			// turn forces `write`, and only for the single request below.
+			let tool_choice = match (&soft_req, soft.force_next) {
+				(Some(requirement), true) => {
+					soft.force_next = false;
+					ToolChoice::Tool { name: requirement.tool_name.clone() }
+				},
+				_ => ToolChoice::Auto,
+			};
 			let mut pending_injections = Vec::new();
 			let assistant = self
 				.next_assistant(
 					&state.messages,
 					&schemas,
+					&tool_choice,
 					events.as_ref(),
 					&cancellation_token,
 					steering_rx.as_mut(),
@@ -314,8 +387,23 @@ impl AgentLoop {
 				.await?;
 			state.messages.push(assistant.clone());
 			state.total_turns += 1;
+
+			// A turn is compliant only when it calls the required tool and
+			// nothing else, mirroring the forced request that can emit only
+			// that tool. A required+detour batch is non-compliant so detour
+			// side effects never run while the preview is still pending.
+			let soft_non_compliant = soft_req.as_ref().is_some_and(|requirement| {
+				assistant.tool_calls.is_empty()
+					|| !assistant.tool_calls.iter().all(|call| {
+						self
+							.policy
+							.as_ref()
+							.is_some_and(|policy| policy.satisfies(requirement, call))
+					})
+			});
+
 			if let Some(events_sink) = events.as_ref() {
-				let status = if assistant.tool_calls.is_empty() {
+				let status = if assistant.tool_calls.is_empty() && !soft_non_compliant {
 					TurnStatus::EndTurn
 				} else {
 					TurnStatus::ToolUse
@@ -323,6 +411,76 @@ impl AgentLoop {
 				let _ = events_sink
 					.send(AgentEvent::MessageEnd { message: assistant.clone(), status })
 					.await;
+			}
+
+			if soft_non_compliant
+				&& let Some(requirement) = &soft_req
+			{
+				if soft.escalations >= MAX_SOFT_TOOL_ESCALATIONS {
+					return Err(AgentError::Internal(format!(
+						"Soft tool requirement '{}' was not satisfied after \
+						 {MAX_SOFT_TOOL_ESCALATIONS} forced turns; aborting to avoid an unbounded force loop.",
+						requirement.tool_name
+					)));
+				}
+				let notice = format!(
+					"Not executed: call the `{}` tool to resolve the pending action before using other tools.",
+					requirement.tool_name
+				);
+				let mut results = Vec::with_capacity(assistant.tool_calls.len());
+				for call in &assistant.tool_calls {
+					if let Some(events_sink) = events.as_ref() {
+						let _ = events_sink
+							.send(AgentEvent::ToolStart {
+								id: call.id.clone(),
+								name: call.name.clone(),
+								arguments: call.arguments.clone(),
+							})
+							.await;
+						let _ = events_sink
+							.send(AgentEvent::ToolEnd {
+								id: call.id.clone(),
+								name: call.name.clone(),
+								result: notice.clone(),
+								is_error: true,
+							})
+							.await;
+					}
+					let result = ToolResult {
+						tool_call_id: call.id.clone(),
+						content: notice.clone(),
+						is_error: true,
+						terminate: false,
+						details: None,
+					};
+					state.messages.push(Message::tool_with_status(
+						&result.tool_call_id,
+						&call.name,
+						&result.content,
+						true,
+					));
+					results.push(result);
+				}
+				for message in pending_injections {
+					state.messages.push(Message::user(message));
+				}
+				soft.force_next = true;
+				soft.escalations += 1;
+				if let Some(events_sink) = events.as_ref() {
+					let _ = events_sink
+						.send(AgentEvent::TurnEnd {
+							message: assistant.clone(),
+							tool_results: results.clone(),
+							status: TurnStatus::ToolUse,
+						})
+						.await;
+				}
+				turn_results.push(TurnResult {
+					message: assistant,
+					tool_results: results,
+					is_completed: false,
+				});
+				continue;
 			}
 
 			if assistant.tool_calls.is_empty() {
@@ -522,6 +680,7 @@ impl AgentLoop {
 		&self,
 		messages: &[Message],
 		schemas: &[serde_json::Value],
+		tool_choice: &ToolChoice,
 		events: Option<&mpsc::Sender<AgentEvent>>,
 		cancellation_token: &CancellationToken,
 		mut steering_rx: Option<&mut mpsc::Receiver<SteeringEvent>>,
@@ -530,11 +689,8 @@ impl AgentLoop {
 		if cancellation_token.is_cancelled() {
 			return Err(AgentError::Interrupted);
 		}
-		// Tool forcing is not wired into the loop yet; every turn keeps the
-		// upstream auto default and the wire stays unchanged.
-		let tool_choice = ToolChoice::Auto;
 		let Some(events) = events else {
-			let complete_fut = self.provider.complete(messages, schemas, &tool_choice);
+			let complete_fut = self.provider.complete(messages, schemas, tool_choice);
 			tokio::pin!(complete_fut);
 			loop {
 				match steering_rx.as_deref_mut() {
@@ -569,7 +725,7 @@ impl AgentLoop {
 			}
 		};
 
-		let stream_fut = self.provider.stream(messages, schemas, &tool_choice);
+		let stream_fut = self.provider.stream(messages, schemas, tool_choice);
 		tokio::pin!(stream_fut);
 		let mut stream = loop {
 			match steering_rx.as_deref_mut() {

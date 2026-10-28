@@ -16,7 +16,7 @@ use crate::{
 	loop_module::SteeringEvent,
 	mailbox::Mailbox,
 	provider::ModelProvider,
-	state::ToolApprover,
+	state::{StagedPreviewPolicy, ToolApprover},
 	tools::{
 		BashTool, EditTool, HubTool, PendingStore, TaskTool, ThinkTool, WriteTool, YieldTool,
 		hashline::{self, NativeSnapshotSink, SnapshotStore},
@@ -695,15 +695,29 @@ impl Supervisor {
 		if reg.get("edit").is_some() {
 			let options = *self.edit_options.lock().unwrap();
 			reg.remove("edit");
-			reg.register(Arc::new(EditTool::with_options(snapshots, options)));
+			reg.register(Arc::new(EditTool::with_options(Arc::clone(&snapshots), options)));
 		}
 		// Staged previews are session-scoped like snapshots: a child gets its
 		// own queue for the life of its registry, never the parent's pending
-		// action (which only the root may resolve).
+		// action (which only the root may resolve). The soft requirement policy
+		// must point at that same child queue, or a child preview would remind
+		// against the root's head.
+		let child_pending = Arc::new(PendingStore::new());
+		if reg.get("ast_edit").is_some() {
+			reg.remove("ast_edit");
+			reg.register(Arc::new(crate::tools::AstEditTool::with_display(
+				Arc::clone(&snapshots),
+				Arc::clone(&child_pending),
+				// The child `read` above also mounts a snapshot sink, so its
+				// preview headers must be hashline tags.
+				crate::tools::PreviewDisplay::Hashline,
+			)));
+		}
 		if reg.get("write").is_some() {
 			reg.remove("write");
-			reg.register(Arc::new(WriteTool::with_pending(Arc::new(PendingStore::new()))));
+			reg.register(Arc::new(WriteTool::with_pending(Arc::clone(&child_pending))));
 		}
+		reg.set_policy(Arc::new(StagedPreviewPolicy::new(child_pending)));
 		// `todo` is parent-owned: the template shares one live `Arc<TodoTool>`
 		// instance, and child events/session details are not persisted. Dropping
 		// it here prevents descendants from mutating the parent list.
@@ -1279,8 +1293,15 @@ mod process_wiring_tests {
 			}
 		};
 
-		// The child's fresh queue cannot resolve the root's staged action.
-		let child = write(supervisor.child_registry(1, Some("child")), dir.clone()).await;
+		// The child's fresh queue cannot resolve the root's staged action, and
+		// its soft-requirement policy points at that same child queue.
+		let child_registry = supervisor.child_registry(1, Some("child"));
+		let child_policy = child_registry.policy().expect("child policy");
+		assert!(
+			crate::state::ToolPolicy::requirement(child_policy.as_ref()).is_none(),
+			"child policy must peek the child queue, never the root preview"
+		);
+		let child = write(child_registry, dir.clone()).await;
 		let error = child.expect_err("child queue is empty");
 		assert!(error.to_string().contains("No pending action to apply"));
 		assert!(!target.exists());

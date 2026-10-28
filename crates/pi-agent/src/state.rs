@@ -522,6 +522,86 @@ pub struct AgentConfig {
 	pub cwd: PathBuf,
 }
 
+/// A non-forcing requirement to call `tool_name` before the loop runs other
+/// tools or yields (upstream `SoftToolRequirement`).
+///
+/// Hosts return one while a staged preview awaits `write xd://resolve|reject`;
+/// the loop injects `reminder` once per `(id, generation)` head, keeps
+/// `tool_choice` on auto, and only escalates to a one-request forced call when
+/// the model ignores it. The generation makes a cleared queue invalidate the
+/// head even when ids wrap.
+#[derive(Debug, Clone)]
+pub struct SoftToolRequirement {
+	pub id:         u64,
+	pub generation: u64,
+	pub tool_name:  String,
+	pub reminder:   Message,
+}
+
+/// Host-owned policy consulted once per provider request.
+///
+/// The loop owns the reminder/escalation lifecycle for one dialog run; the host
+/// only exposes the current queue head and the exact invocation shape that
+/// satisfies it, so no force state can leak between prompts or child agents.
+pub trait ToolPolicy: Send + Sync {
+	/// Current soft requirement, or `None` when nothing is staged.
+	fn requirement(&self) -> Option<SoftToolRequirement>;
+
+	/// Whether one assistant tool call satisfies `requirement`. A host demands
+	/// the precise invocation shape here (e.g. `write` to a resolve device), not
+	/// merely the tool name.
+	fn satisfies(&self, requirement: &SoftToolRequirement, call: &ToolCall) -> bool;
+}
+
+/// Session-owned staged-preview policy (upstream `nextToolChoiceDirective`
+/// soft branch plus `isPreviewResolutionToolCall`).
+///
+/// Peeking is pure: the queue head and generation stay in the
+/// [`crate::tools::pending::PendingStore`], so rebuilding the tool registry for
+/// every prompt cannot forget a staged head.
+pub struct StagedPreviewPolicy {
+	pending: Arc<crate::tools::pending::PendingStore>,
+}
+
+impl StagedPreviewPolicy {
+	pub fn new(pending: Arc<crate::tools::pending::PendingStore>) -> Self {
+		Self { pending }
+	}
+}
+
+/// Upstream `resolve-reminder`: the single non-display reminder injected when a
+/// staged preview becomes the current head.
+pub fn resolve_reminder_message(source_tool: &str) -> Message {
+	Message::user(format!(
+		"`{source_tool}` result above: PREVIEW — no files changed. Finalize now with `write`: \
+		 write a one-sentence plain-text reason to `xd://resolve` to APPLY, or `xd://reject` to DISCARD."
+	))
+}
+
+impl ToolPolicy for StagedPreviewPolicy {
+	fn requirement(&self) -> Option<SoftToolRequirement> {
+		let head = self.pending.peek_head()?;
+		Some(SoftToolRequirement {
+			id:         head.id,
+			generation: head.generation,
+			tool_name:  "write".to_string(),
+			reminder:   resolve_reminder_message(&head.source_tool),
+		})
+	}
+
+	fn satisfies(&self, requirement: &SoftToolRequirement, call: &ToolCall) -> bool {
+		// Only the exact `write xd://resolve|reject` shape resolves the preview;
+		// a plain write elsewhere is a detour, and unknown `xd://` targets never
+		// count (the tool itself fails closed).
+		call.name == requirement.tool_name
+			&& call
+				.arguments
+				.get("path")
+				.and_then(serde_json::Value::as_str)
+				.is_some_and(crate::tools::pending::is_resolution_device_path)
+	}
+}
+
 /// Tool approval gate checked prior to executing side-effecting operations.
 #[async_trait]
 pub trait ToolApprover: Send + Sync {
