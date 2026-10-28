@@ -4,16 +4,17 @@
 
 ## Source
 - Entry: `packages/coding-agent/src/tools/ast-edit.ts`
+- Rust port: `crates/pi-agent/src/tools/ast_edit.rs`
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/ast-edit.md`
 - Key collaborators:
-  - `crates/pi-natives/src/ast.rs` — native rewrite planning and file mutation
-  - `crates/pi-ast/src/language/mod.rs` — language aliases and extension inference used by the native wrapper.
-  - `packages/coding-agent/src/tools/path-utils.ts` — path/glob parsing and multi-path resolution
-  - `packages/coding-agent/src/tools/resolve.ts` — preview/apply queueing
-  - `packages/coding-agent/src/tools/render-utils.ts` — parse-error dedupe and display caps
-  - `packages/coding-agent/src/utils/file-display-mode.ts` — hashline vs line-number diff references
-  - `packages/hashline/src/format.ts` — stable hashline header formatting for preview anchors
-  - `packages/natives/native/index.d.ts` — JS-visible native binding contract
+  - `crates/pi-agent/src/tools/ast_edit.rs` — preview compute, exact-byte stale gate, prepared-output apply
+  - `crates/pi-ast/src/ops.rs` — per-language pattern compilation, AST matching, rewrite edits
+  - `crates/pi-agent/src/tools/ast_grep.rs` — shared target planning, file-URL handling, root guard, candidate discovery
+  - `crates/pi-agent/src/tools/pending.rs` — staged action queue; failed applies requeue the same entry
+  - `crates/pi-agent/src/tools/mod.rs` — `write_atomic` (mode/symlink preserve) and builtin registration
+  - `crates/pi-natives/src/ast.rs` — upstream native rewrite reference
+  - `packages/coding-agent/src/tools/path-utils.ts` — upstream path/glob parsing and multi-path resolution
+  - `packages/coding-agent/src/tools/resolve.ts` — upstream preview/apply queueing
 
 ## Inputs
 
@@ -35,18 +36,19 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
 ## Outputs
 - Single-shot preview result from `ast_edit` itself. A non-empty proposal begins with `Staged as a proposal — files NOT modified yet...` and names the resolve/reject device paths.
 - Model-facing `content` is one text block showing proposed edits, grouped by file for directory/multi-file runs.
-  - Each change renders as two lines. Hashline mode uses `-LINE:before` / `+LINE:after` under a `[PATH#TAG]` header; plain mode uses `-LINE:COLUMN before` / `+LINE:COLUMN after`.
-  - Only the first line of each `before`/`after` snippet is shown, truncated to 120 characters in the wrapper.
+  - Each change renders as `-LINE:COLUMN before` / `+LINE:COLUMN after`; the Rust port always uses this plain form for previews. Successful apply appends fresh `[PATH#TAG]` snapshot headers for written files.
+  - Only the first line of each `before`/`after` snippet is shown, truncated to 120 characters.
   - `Limit reached; narrow paths.` and formatted parse issues are appended when applicable.
 - If no rewrites match, text is `No replacements made` plus formatted parse issues when present.
 - `details` includes aggregate preview metadata:
   - `totalReplacements`, `filesTouched`, `filesSearched`, `applied`, `limitReached`
-  - optional `parseErrors`, `parseErrorsTotal`, `scopePath`, `files`, `fileReplacements`, `displayContent`, `searchPath`, `cwd`, `meta`
+  - optional `parseErrors`, `parseErrorsTotal`, `scopePath`, `files`, `fileReplacements`, `searchPath`, `cwd`
+  - `changes`: per-match `path`, `before`, `after`, byte/line/column ranges, and metavariable `captures`
 - The tool always previews first (`applied: false` in the direct result). Actual file writes happen only later through a plain-text `write` to `xd://resolve`; the body is the reason.
 - When preview produced replacements, `ast_edit` also queues a pending resolve action. Successful apply returns a separate resolve dispatch result (on the `write` call), not another `ast_edit` result.
 
 ## Flow
-1. `AstEditTool.execute()` validates each op in `packages/coding-agent/src/tools/ast-edit.ts`:
+1. `AstEditTool.execute()` validates each op in `crates/pi-agent/src/tools/ast_edit.rs`:
    - empty `pat` fails,
    - at least one op is required,
    - duplicate `pat` values fail,
@@ -55,17 +57,20 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
 3. Path normalization, internal URL handling, missing-path partitioning, and multi-path resolution follow the same `path-utils.ts` flow as `ast_grep`.
 4. The scope's `isDirectory` flag (set by a stat in `resolveToolSearchScope`) decides whether to render grouped directory output.
 5. `runAstEditOnce(...)` always runs native `astEdit(...)` with `dryRun: true` and `failOnParseError: false` on the first pass.
-6. Native `ast_edit` in `crates/pi-natives/src/ast.rs`:
-   - normalizes the rewrite map and sorts rules by pattern string,
-   - resolves strictness (`smart` by default),
-   - collects candidate files from a file or gitignore-aware directory scan,
-   - infers a language independently for every candidate file unless `lang` was supplied internally,
-   - compiles each rewrite for every discovered language; a rule that cannot parse in one language skips that language's files and reports parse issues,
-   - parses each file, skips files with syntax-error trees, collects `replace_by(...)` edits for every match, enforces replacement and file caps, and returns textual before/after slices plus source ranges.
-7. The TS wrapper deduplicates and caps parse errors, groups changes by file, and renders preview diff lines.
-8. If preview found replacements and `applied` is false, `queueResolveHandler(...)` registers a non-forcing pending resolve invoker. While it is pending the session surfaces a `SoftToolRequirement` (`toolName: "write"` with an `xd://resolve` or `xd://reject` `satisfies` predicate) carrying the resolve reminder; the agent runtime injects the reminder and forces `write` only if the model declines that turn.
-9. On a `write xd://resolve` dispatch, the queued callback reruns the same rewrite set with `dryRun: false`, recomputes counts, and returns an error result if the live result no longer matches the preview (`stalePreview`). The current implementation compares replacement totals and per-file counts after the rerun; if the new run has already written different counts, the result is marked error.
-10. On a non-stale apply, the callback returns `Applied N replacements in M files.` (in hashline mode followed by fresh `[path#tag]` snapshot headers re-recorded from the post-apply content); on discard (`write xd://reject`), the dispatch returns a discard message without mutating files.
+6. Rust preview (`crates/pi-agent/src/tools/ast_edit.rs`):
+   - sorts `ops` by pattern string,
+   - resolves `smart` strictness and writes no files,
+   - reuses `ast_grep` target planning/candidate discovery (explicit errors for unknown/internal/SSH targets; `file://` maps locally; root guard preserved),
+   - infers a language per candidate and compiles each rule for every discovered language, reporting per-language parse issues,
+   - parses each file once, skips error trees, collects `replace_by(...)` edits, deduplicates byte-identical edits, and enforces the `maxFiles` cap,
+   - stores the **exact original bytes** of every affected file plus the prepared rewritten bytes; no content hash stands in for the bytes,
+   - renders `-LINE:COLUMN before` / `+LINE:COLUMN after` pairs and exposes captures in `details.changes`.
+7. Parse errors are deduplicated and capped at 20; `details.parseErrors` carries the capped list and `parseErrorsTotal` the pre-cap count.
+8. A non-zero preview registers `AstEditPending` in the session `PendingStore`. Zero replacements register nothing. Apply/discard is a plain `write` to `xd://resolve` / `xd://reject`.
+9. Apply first re-reads **all** affected files and compares bytes to the preview's originals. Any changed or unreadable file is stale: zero files are written and the action is requeued. A same-count content change fails this gate; counts alone never validate a preview.
+10. After the all-files gate, each prepared output is written through `write_atomic` (mode and symlink preserved). A per-file recheck narrows the gate-to-write window; there is no filesystem lock, so a writer racing inside that window can still be overwritten.
+11. A failure or cancellation after some writes is reported as a partial apply: it lists written files and snapshot invalidations, does not rewrite the remainder, and requeues the action. Retrying then fails the byte gate because already-written files no longer match the preview.
+12. On success the result is `Applied N replacements in M files.` followed by fresh `[path#TAG]` headers for snapshots re-recorded from the post-apply bytes; on discard (`write xd://reject`) no file is mutated.
 
 ## Modes / Variants
 - Single file: preview or apply against one file.
@@ -74,24 +79,26 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
 - Internal URL inputs: only supported when the router resolves them to a backing file path.
 - Preview mode: always the direct `ast_edit` tool result.
 - Apply mode: only reachable through the queued resolve callback (a `write` to `xd://resolve` or `xd://reject`) after a preview.
-- Hashline output mode vs plain line/column mode: controlled by `resolveFileDisplayMode()`.
+- Hashline output mode is not selected by the Rust port: previews are plain `LINE:COLUMN`; apply emits fresh snapshot headers.
 
 ## Side Effects
 - Filesystem
-  - Preview reads files and scans directories.
-  - Apply stages every changed file in memory, verifies the full pass, then writes the staged files; a later compute/overlap failure cannot partially mutate earlier files.
+  - Preview reads files and scans directories; it never writes.
+  - Apply verifies every affected file's exact bytes before the first write, then writes prepared outputs one by one. A compute/overlap failure happens in the preview phase, before any write. A write failure or cancellation after the first write is a partial apply and is reported honestly; it is not a multi-file transaction.
+  - Writes go through `write_atomic`: destination mode is preserved, symlinks are resolved to their target, and cancellation before the rename leaves the target untouched.
 - Session state (transcript, memory, jobs, checkpoints, registries)
-  - Registers a non-forcing pending resolve invoker through `queueResolveHandler(...)`.
-  - Surfaces a `SoftToolRequirement` (with the resolve reminder) while pending; the agent runtime forces `write` only on non-compliance — no steering message and no per-preview forced tool choice.
+  - Registers an `AstEditPending` action in the session `PendingStore` when the preview has replacements.
+  - Failed, stale, or cancelled applies requeue the same action; a successful resolve or a reject consumes it.
+  - The Rust port does not wire provider `tool_choice` forcing or a soft-tool reminder; that policy seam belongs to the runtime/approval step.
 - User-visible prompts / interactive UI
   - Direct `ast_edit` results are previews.
   - Follow-up apply/discard is exposed through writes to `xd://resolve` and `xd://reject`.
 - Background work / cancellation
-  - Native preview/apply work runs on a blocking worker via `task::blocking(...)`.
-  - Cancellation and optional native timeout are cooperative through `CancelToken::heartbeat()`.
+  - The Rust preview compute runs synchronously inside the tool call and checks the session cancellation token between candidates, rules, and matches.
+  - Apply checks cancellation before the all-files gate, between gate reads, and before each write; a cancellation after some writes returns a partial result instead of continuing.
 
 ## Limits & Caps
-- File cap exposed by the wrapper: `PI_MAX_AST_FILES`, default `1000`, in `packages/coding-agent/src/tools/ast-edit.ts`.
+- File cap: `PI_MAX_AST_FILES`, default `1000`; the Rust port reads it from the agent environment (`crates/pi-agent/src/tools/ast_edit.rs`), upstream from `packages/coding-agent/src/tools/ast-edit.ts`.
 - Native `maxFiles` and `maxReplacements` are both clamped to at least `1` when provided in `crates/pi-natives/src/ast.rs`.
 - The wrapper never sets `maxReplacements`; native behavior therefore defaults to effectively unbounded replacements for a run.
 - Parse issues are deduplicated and capped at `PARSE_ERRORS_LIMIT = 20` entries via `capParseErrors(...)` in `packages/coding-agent/src/tools/render-utils.ts`; `details.parseErrors` carries the capped list and `details.parseErrorsTotal` the pre-cap deduplicated count.
@@ -112,7 +119,8 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
 - With `failOnParseError: false` (the wrapper always uses this), pattern compile failures and file parse failures become `parseErrors` instead of aborting the whole run.
 - If every rewrite pattern fails to compile, native `ast_edit` returns a successful zero-replacement result with `parseErrors` populated.
 - Files containing tree-sitter error nodes are skipped for rewriting; they do not get partial edits.
-- Apply can fail after a successful preview if the preview becomes stale. The resolve callback compares replacement totals and per-file counts and returns an error result rather than silently reporting success for a mismatched preview.
+- Apply can fail after a successful preview if the preview becomes stale. The Rust gate compares the exact original bytes of every affected file; a same-count content change is stale and writes nothing. Counts are never used as the stale check.
+- A partial write/cancel result is an error and requeues the action; the next resolve fails the byte gate instead of reapplying already-written files.
 
 ## Notes
 - `ast_edit` does not expose the native `lang`, `strictness`, `selector`, `maxReplacements`, `failOnParseError`, or `timeoutMs` fields to the model. The runtime fixes the call shape to a preview-first, smart-strictness, best-effort parse mode.
@@ -120,4 +128,5 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
 - Idempotency is not enforced syntactically. A rewrite like `foo($A) -> foo($A)` previews zero changes because output equals input; a rewrite that keeps matching its own output may still produce replacements on repeated calls.
 - Rewrites are accumulated per file, then applied from the end of the file backward after an overlap check. Independent matches can coexist; overlapping matches abort the run.
 - Native rewrite rule order is by pattern-string sort, not by the original `ops` array order, because `normalize_rewrite_map(...)` sorts the `(pattern, rewrite)` pairs.
-- Preview/apply parity is validated by totals and per-file counts after the apply rerun, not by a byte-for-byte diff of every replacement payload.
+- Preview/apply parity is validated by byte-exact comparison of every affected file before the write phase; the prepared outputs are then written without rerunning the rewrite. Replacement totals and per-file counts are reporting only.
+- Display parity gap: upstream can render hashline preview headers; the Rust port renders plain `LINE:COLUMN` previews and emits hashline headers only for post-apply snapshots.

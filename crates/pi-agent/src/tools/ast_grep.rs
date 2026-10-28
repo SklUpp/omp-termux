@@ -78,16 +78,17 @@ impl Tool for AstGrepTool {
 	}
 }
 
-struct Target {
-	base:                 PathBuf,
-	glob:                 Option<String>,
-	is_file:              bool,
-	mentions_node_modules: bool,
+pub(super) struct Target {
+	pub(super) base:                 PathBuf,
+	pub(super) glob:                 Option<String>,
+	pub(super) is_file:              bool,
+	pub(super) mentions_node_modules: bool,
 }
 
-struct Candidate {
-	absolute: PathBuf,
-	display:  String,
+#[derive(Clone)]
+pub(super) struct Candidate {
+	pub(super) absolute: PathBuf,
+	pub(super) display:  String,
 }
 
 /// Deterministic match ordering, identical to upstream
@@ -405,9 +406,27 @@ fn report_parse_error(ast: &SourceAst, display: &str, errors: &mut Vec<String>) 
 	}
 }
 
-fn plan_targets(
+pub(super) fn plan_targets(
 	args: &Value,
 	cwd: &Path,
+) -> Result<(Vec<Target>, Vec<String>, String), ToolError> {
+	plan_targets_with(args, cwd, false)
+}
+
+/// Plan targets with per-entry `parseSearchPath` semantics: every expanded
+/// glob keeps its leading segment (`*.ts` stays top-level). `ast_edit` uses
+/// this for its `paths` array so each entry keeps single-path semantics.
+pub(super) fn plan_targets_single(
+	args: &Value,
+	cwd: &Path,
+) -> Result<(Vec<Target>, Vec<String>, String), ToolError> {
+	plan_targets_with(args, cwd, true)
+}
+
+fn plan_targets_with(
+	args: &Value,
+	cwd: &Path,
+	single_glob_semantics: bool,
 ) -> Result<(Vec<Target>, Vec<String>, String), ToolError> {
 	let mut normalized_inputs: Vec<(String, Vec<String>)> = Vec::new();
 	for raw in extract_raw_paths(args) {
@@ -466,7 +485,7 @@ fn plan_targets(
 		.collect::<Vec<_>>()
 		.join(", ");
 
-	let is_single = expanded.len() == 1;
+	let is_single = single_glob_semantics || expanded.len() == 1;
 	let mut targets: Vec<Target> = Vec::new();
 	let mut missing: Vec<String> = Vec::new();
 
@@ -658,7 +677,7 @@ fn is_non_local_scheme(item: &str) -> bool {
 		&& !scheme.eq_ignore_ascii_case("file")
 }
 
-fn collect_candidates(
+pub(super) fn collect_candidates(
 	targets: &[Target],
 	ctx: &AgentContext,
 ) -> Result<Option<Vec<Candidate>>, ToolError> {
@@ -758,7 +777,7 @@ fn collect_candidates(
 	Ok(Some(candidates))
 }
 
-fn common_base(targets: &[Target]) -> PathBuf {
+pub(super) fn common_base(targets: &[Target]) -> PathBuf {
 	let Some(first) = targets.first() else {
 		return PathBuf::from(".");
 	};

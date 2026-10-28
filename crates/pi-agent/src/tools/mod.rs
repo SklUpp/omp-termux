@@ -1,4 +1,5 @@
 pub mod ask;
+pub mod ast_edit;
 pub mod ast_grep;
 pub mod hashline;
 pub mod hub;
@@ -14,6 +15,7 @@ pub mod todo;
 pub mod yield_tool;
 
 pub use ask::AskTool;
+pub use ast_edit::AstEditTool;
 pub use ast_grep::AstGrepTool;
 pub use hub::HubTool;
 pub use pending::{PendingAction, PendingStore, REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH};
@@ -1928,11 +1930,12 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
 	vec![
 		Arc::new(BashTool::new()),
 		Arc::new(ReadTool::with_snapshot_sink(sink)),
-		Arc::new(WriteTool::with_pending(pending)),
-		Arc::new(EditTool::new(snapshots)),
+		Arc::new(WriteTool::with_pending(Arc::clone(&pending))),
+		Arc::new(EditTool::new(Arc::clone(&snapshots))),
 		Arc::new(GlobTool),
 		Arc::new(GrepTool),
 		Arc::new(AstGrepTool),
+		Arc::new(AstEditTool::new(snapshots, pending)),
 		Arc::new(TodoTool::new()),
 	]
 }
