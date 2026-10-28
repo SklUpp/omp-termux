@@ -482,6 +482,49 @@ pub enum Command {
 		#[arg(long = "no-gitignore")]
 		no_gitignore: bool,
 	},
+
+	/// List and control daemon-supervised background processes.
+	Ps {
+		/// `list` (default), `info`, `logs`, `stop`, `kill`, or `restart`.
+		#[arg(
+			value_name = "ACTION",
+			value_parser = ["list", "info", "logs", "stop", "kill", "restart"]
+		)]
+		action:  Option<String>,
+		/// Process name (required for every action except `list`).
+		#[arg(value_name = "NAME")]
+		name:    Option<String>,
+		/// List every project and global service scope (list).
+		#[arg(short = 'a', long)]
+		all:     bool,
+		/// Emit machine-readable JSON.
+		#[arg(short = 'j', long)]
+		json:    bool,
+		/// Static listing instead of the interactive monitor (list).
+		#[arg(long)]
+		plain:   bool,
+		/// Target another project directory instead of the current one.
+		#[arg(long, value_name = "DIR")]
+		dir:     Option<PathBuf>,
+		/// Target a machine-global service scope (e.g. `browser-relay`).
+		#[arg(long, value_name = "SERVICE")]
+		global:  Option<String>,
+		/// Keep streaming new output (logs).
+		#[arg(short = 'f', long)]
+		follow:  bool,
+		/// Read from the beginning instead of the tail (logs).
+		#[arg(long)]
+		head:    bool,
+		/// Number of log lines, max 1000 (logs).
+		#[arg(short = 'n', long, value_name = "N")]
+		lines:   Option<usize>,
+		/// Regex filter applied to log lines (logs).
+		#[arg(long, value_name = "PATTERN")]
+		grep:    Option<String>,
+		/// Grace period in seconds before hard kill (stop).
+		#[arg(long, value_name = "SECONDS")]
+		timeout: Option<u64>,
+	},
 }
 
 

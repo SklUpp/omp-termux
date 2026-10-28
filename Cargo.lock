@@ -5723,6 +5723,7 @@ dependencies = [
  "clap",
  "globset",
  "grep-searcher",
+ "libc",
  "pi-agent",
  "pi-grep-pattern",
  "pi-walker",

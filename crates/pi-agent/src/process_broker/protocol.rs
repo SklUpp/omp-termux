@@ -152,7 +152,12 @@ pub fn physical_runtime_dir_with(
 	}
 }
 
-fn short_runtime_base() -> Option<PathBuf> {
+/// Private per-user base for shortened runtime dirs (`$TMPDIR/omp-broker-<uid>`).
+///
+/// `None` when no absolute temp directory exists. `omp ps --all` enumerates
+/// only this base for scopes whose logical root is too long for a socket path.
+#[must_use]
+pub fn short_runtime_base() -> Option<PathBuf> {
 	let temp = std::env::var_os("TMPDIR")
 		.map(PathBuf::from)
 		.filter(|path| !path.as_os_str().is_empty())

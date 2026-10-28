@@ -238,7 +238,7 @@ Run `omp <command> --help` for each command's own flags and examples.
 | `join` | Join a shared collab session (same as `/join`). | [collab](./collab.md) |
 | `models` | Rust CLI: `omp models [ls\|list\|find <substring>] [--json] [--config <path>]` lists configured authenticated or keyless models, applying `disabledProviders`. Refresh and TypeScript extension loading return explicit prerequisite errors; they are not implemented by the Rust command. | [models](./models.md) |
 | `plugin` | Manage plugins (install, uninstall, list, etc.). | [extensions](./extensions.md), [marketplace](./marketplace.md) |
-| `ps` | List and control daemon-supervised background processes (logs, stop, kill, restart). | |
+| `ps` | Rust CLI: `omp ps [list\|info\|logs\|stop\|kill\|restart] [name]` controls existing broker scopes; `--all`, `--dir`, `--global`, `--json`, and log filters are supported. Listing never spawns a broker. Headless static listing only; logs use broker text, not terminal-row rendering. | |
 | `say` | Synthesize text with the local TTS engine and play it through the speakers. | [tts tool](./tools/tts.md) |
 | `share` | Share a saved session via an encrypted link (same as the `/share` slash command). | [session operations](./session-operations-export-share-fork-resume.md) |
 | `setup` | Run onboarding setup or install dependencies for optional features. | |

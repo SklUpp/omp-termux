@@ -20,6 +20,7 @@ pub mod file_mentions;
 pub mod foreign_session;
 pub mod local_models;
 pub mod output;
+pub mod process_cli;
 pub mod profile;
 pub mod prompts;
 pub mod repl;

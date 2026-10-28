@@ -22,6 +22,7 @@ use omp_cli::{
 	foreign_session::{self, ForeignSessionSource, ForeignSessionStore},
 	local_models,
 	output::{self, OutputMode, Reporter, session_id},
+	process_cli,
 	profile,
 	prompts::{self, Prompts},
 	repl,
@@ -206,6 +207,31 @@ fn run() -> std::result::Result<(), CliError> {
 			let mut out = io::BufWriter::new(stdout.lock());
 			tool_commands::run_grep(&request, &base, &mut out).map_err(CliError::fail)?;
 			return Ok(());
+		},
+		Some(Command::Ps {
+			action, name, all, json, plain, dir, global, follow, head, lines, grep, timeout,
+		}) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			let request = process_cli::PsRequest {
+				action: action.clone().unwrap_or_else(|| "list".to_string()),
+				name: name.clone(),
+				all: *all,
+				json: *json,
+				plain: *plain,
+				dir: dir.as_ref().map(|dir| dirs::absolute(&base, dir)),
+				global: global.clone(),
+				follow: *follow,
+				head: *head,
+				lines: *lines,
+				grep: grep.clone(),
+				timeout: *timeout,
+			};
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			return process_cli::run(&request, &mut out).map_err(CliError::fail);
 		},
 		Some(Command::Completions { shell }) => {
 			return completions::run(shell.as_deref()).map_err(|message| CliError::fail(message));

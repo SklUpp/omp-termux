@@ -259,7 +259,7 @@ impl StartIdentity {
 
 	/// True only when this exact kernel process is still the one occupying the
 	/// pid, alive (not a zombie) and token-matched.
-	fn still_matches(&self) -> bool {
+	pub fn still_matches(&self) -> bool {
 		self.pin().is_some()
 	}
 

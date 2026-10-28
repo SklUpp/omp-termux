@@ -25,6 +25,7 @@ async-trait.workspace = true
 clap.workspace = true
 globset.workspace = true
 grep-searcher.workspace = true
+libc.workspace = true
 pi-agent = { path = "../pi-agent" }
 pi-grep-pattern = { path = "../pi-grep-pattern" }
 pi-walker.workspace = true
