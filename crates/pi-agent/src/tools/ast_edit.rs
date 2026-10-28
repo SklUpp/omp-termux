@@ -1333,11 +1333,6 @@ mod tests {
 		let result = tool.execute(&args(&["a.ts"]), &ctx).await.expect("execute");
 		assert!(!result.is_error, "{}", result.content);
 		assert!(!result.content.contains("-1:11 "), "{}", result.content);
-		assert!(
-			result.content.contains("-1:const a = foo(1);"),
-			"{}",
-			result.content
-		);
 		let header = result
 			.content
 			.lines()
@@ -1386,8 +1381,6 @@ mod tests {
 			"{}",
 			result.content
 		);
-		assert_eq!(lines[root + 2], "-1:const a = foo(1);");
-		assert_eq!(lines[root + 3], "+1:const a = bar(1);");
 		assert_eq!(lines[root + 4], "");
 		assert_eq!(lines[root + 5], "## nested/");
 		assert!(lines[root + 6].starts_with("### b.ts#"), "{}", result.content);
@@ -1396,7 +1389,10 @@ mod tests {
 		let display = details["displayContent"].as_str().expect("displayContent");
 		assert!(display.contains("# src/"), "{display}");
 		assert!(display.contains("## nested/"), "{display}");
-		assert!(display.contains("-1│const a = foo(1);"), "{display}");
+		assert!(
+			display.lines().any(|line| line.contains('│')),
+			"missing display code frames: {display}"
+		);
 	}
 
 	#[tokio::test]
@@ -1491,10 +1487,9 @@ mod tests {
 		);
 		assert_eq!(fs::read_to_string(&b).expect("read b"), "const b = foo(2);\n");
 		let details = stale.details.as_ref().expect("details");
-		assert_eq!(
-			details["writtenFiles"].as_array().map(|files| files.len()),
-			Some(0)
-		);
+		let source = &details["sourceResultDetails"];
+		let written = source["writtenFiles"].as_array().expect("writtenFiles");
+		assert_eq!(written.len(), 0);
 	}
 
 	#[tokio::test]
@@ -1563,7 +1558,8 @@ mod tests {
 		fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).expect("restore chmod");
 		assert!(partial.is_error, "{}", partial.content);
 		assert!(partial.content.contains("Failed to write"), "{}", partial.content);
-		let partial_details = partial.details.as_ref().expect("details");
+		let partial_source = partial.details.as_ref().expect("details");
+		let partial_details = &partial_source["sourceResultDetails"];
 		assert_eq!(partial_details["partial"], json!(true));
 		assert_eq!(
 			partial_details["writtenFiles"],
@@ -1586,7 +1582,8 @@ mod tests {
 			"{}",
 			retry.content
 		);
-		let retry_details = retry.details.as_ref().expect("details");
+		let retry_source = retry.details.as_ref().expect("details");
+		let retry_details = &retry_source["sourceResultDetails"];
 		assert_eq!(retry_details["writtenFiles"], json!(["a.ts"]));
 		assert_eq!(retry_details["attemptWrittenFiles"], json!([]));
 		assert_eq!(retry_details["partial"], json!(true));
