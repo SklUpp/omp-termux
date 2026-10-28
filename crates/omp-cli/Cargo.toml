@@ -24,7 +24,10 @@ path = "src/main.rs"
 async-trait.workspace = true
 clap.workspace = true
 globset.workspace = true
+grep-searcher.workspace = true
 pi-agent = { path = "../pi-agent" }
+pi-grep-pattern = { path = "../pi-grep-pattern" }
+pi-walker.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite = { version = "0.33.0", features = ["bundled"] }

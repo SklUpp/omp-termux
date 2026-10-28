@@ -230,20 +230,20 @@ Run `omp <command> --help` for each command's own flags and examples.
 | `config` | Manage configuration settings. | [config usage](./config-usage.md), [settings](./settings.md) |
 | `dry-balance` | Dry-run OAuth account balancing across random session ids. | |
 | `gc` | Run storage garbage collection. | |
-| `grep` | Test the grep tool from the CLI. (The [`grep` tool](./tools/grep.md) is a separate agent tool.) | |
+| `grep` | Test the grep tool from the CLI: `omp grep [pattern] [path] [-g <glob>] [-l <matches>] [-C <lines>] [-f\|-c] [--no-gitignore]`. Count wins when both `-f` and `-c` are given; a missing pattern exits 1. (The [`grep` tool](./tools/grep.md) is a separate agent tool.) | |
 | `gallery` | Preview tool renderers across streaming, in-progress, success, and failure states. | |
 | `grievances` | View, clean, or push reported tool issues (auto-QA grievances). | |
 | `if-bench` | Benchmark instruction following and working memory: one cached thread of glyph array actions with a cat-sound directive that moves through the prompt. | |
 | `install` | Install or link an extension package (alias of `plugin install` / `plugin link`). | [extensions](./extensions.md) |
 | `join` | Join a shared collab session (same as `/join`). | [collab](./collab.md) |
-| `models` | List, search, and refresh available models. | [models](./models.md) |
+| `models` | Rust CLI: `omp models [ls\|list\|find <substring>] [--json] [--config <path>]` lists configured authenticated or keyless models, applying `disabledProviders`. Refresh and TypeScript extension loading return explicit prerequisite errors; they are not implemented by the Rust command. | [models](./models.md) |
 | `plugin` | Manage plugins (install, uninstall, list, etc.). | [extensions](./extensions.md), [marketplace](./marketplace.md) |
 | `ps` | List and control daemon-supervised background processes (logs, stop, kill, restart). | |
 | `say` | Synthesize text with the local TTS engine and play it through the speakers. | [tts tool](./tools/tts.md) |
 | `share` | Share a saved session via an encrypted link (same as the `/share` slash command). | [session operations](./session-operations-export-share-fork-resume.md) |
 | `setup` | Run onboarding setup or install dependencies for optional features. | |
 | `shell` | Interactive shell console. | |
-| `read` | Show what the read tool will return for a path, URL, or internal URI. (The [`read` tool](./tools/read.md) is a separate agent tool.) | |
+| `read` | Show what the read tool will return for a path, URL, or internal URI: `omp read <path[:selector]>`. The command runs before config, model, and session loading. (The [`read` tool](./tools/read.md) is a separate agent tool.) | |
 | `ssh` | Manage SSH host configurations. | |
 | `stats` | View usage statistics. | |
 | `update` | Check for and install updates. | |

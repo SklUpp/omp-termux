@@ -417,6 +417,63 @@ pub enum Command {
 		#[arg(long)]
 		json:        bool,
 	},
+
+	/// List and search available models.
+	Models {
+		/// `ls` (default) | `list` | `find` | `refresh` | `<provider>`.
+		#[arg(value_name = "ACTION")]
+		action:        Option<String>,
+		/// Search substring, provider name, or `ls` filter.
+		#[arg(value_name = "PATTERN")]
+		pattern:       Option<String>,
+		/// Print machine-readable JSON.
+		#[arg(long)]
+		json:          bool,
+		/// Load an extension file before listing (repeatable).
+		#[arg(short = 'e', long = "extension", value_name = "PATH")]
+		extension:     Vec<PathBuf>,
+		/// Disable extension discovery (headless builds never discover).
+		#[arg(long = "no-extensions")]
+		no_extensions: bool,
+		/// Load an extra config.yml-style overlay for this run (repeatable).
+		#[arg(long, value_name = "PATH")]
+		config:        Vec<PathBuf>,
+	},
+
+	/// Show what the read tool returns for a path or selector.
+	Read {
+		/// Path, optional selector, URL, or internal URI.
+		#[arg(value_name = "PATH")]
+		path: Option<String>,
+	},
+
+	/// Search files with the same engine and output modes as the grep tool.
+	Grep {
+		/// Regex pattern to search for.
+		#[arg(value_name = "PATTERN")]
+		pattern:      Option<String>,
+		/// Directory or file to search (default: `.`).
+		#[arg(value_name = "PATH")]
+		path:         Option<String>,
+		/// Filter files by glob pattern.
+		#[arg(short = 'g', long, value_name = "GLOB")]
+		glob:         Option<String>,
+		/// Maximum matches to emit (default: 20).
+		#[arg(short = 'l', long, default_value_t = 20, value_name = "N")]
+		limit:        u32,
+		/// Context lines before and after each match (default: 2).
+		#[arg(short = 'C', long, default_value_t = 2, value_name = "N")]
+		context:      u32,
+		/// Output matched file names only.
+		#[arg(short = 'f', long)]
+		files:        bool,
+		/// Output per-file match counts.
+		#[arg(short = 'c', long)]
+		count:        bool,
+		/// Include files excluded by `.gitignore`.
+		#[arg(long = "no-gitignore")]
+		no_gitignore: bool,
+	},
 }
 
 
@@ -702,6 +759,47 @@ mod tests {
 				project: false,
 				force:   false,
 				json:    false,
+			})
+		);
+	}
+
+	#[test]
+	fn read_and_grep_subcommands_parse() {
+		assert_eq!(
+			parse(&["omp", "read", "src/foo.ts:50-100"]).command,
+			Some(Command::Read { path: Some("src/foo.ts:50-100".to_string()) })
+		);
+		// Missing operands reach the command bodies so they exit 1 with the
+		// TS CLI's message instead of clap's exit 2.
+		assert_eq!(parse(&["omp", "read"]).command, Some(Command::Read { path: None }));
+		assert_eq!(
+			parse(&["omp", "grep"]).command,
+			Some(Command::Grep {
+				pattern:      None,
+				path:         None,
+				glob:         None,
+				limit:        20,
+				context:      2,
+				files:        false,
+				count:        false,
+				no_gitignore: false,
+			})
+		);
+		assert_eq!(
+			parse(&[
+				"omp", "grep", "TODO", "src", "-g", "*.rs", "-l", "5", "-C", "3", "-f", "-c",
+				"--no-gitignore",
+			])
+			.command,
+			Some(Command::Grep {
+				pattern:      Some("TODO".to_string()),
+				path:         Some("src".to_string()),
+				glob:         Some("*.rs".to_string()),
+				limit:        5,
+				context:      3,
+				files:        true,
+				count:        true,
+				no_gitignore: true,
 			})
 		);
 	}

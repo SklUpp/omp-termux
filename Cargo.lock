@@ -5722,7 +5722,10 @@ dependencies = [
  "async-trait",
  "clap",
  "globset",
+ "grep-searcher",
  "pi-agent",
+ "pi-grep-pattern",
+ "pi-walker",
  "rusqlite",
  "serde",
  "serde_json",
@@ -6380,6 +6383,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-grep-pattern"
+version = "18.0.9"
+dependencies = [
+ "grep-matcher",
+ "grep-pcre2",
+ "grep-regex",
+ "regex",
+]
+
+[[package]]
 name = "pi-iso"
 version = "18.0.9"
 dependencies = [
@@ -6412,8 +6425,6 @@ dependencies = [
  "futures",
  "globset",
  "grep-matcher",
- "grep-pcre2",
- "grep-regex",
  "grep-searcher",
  "heapless 0.9.3",
  "html-to-markdown-rs",
@@ -6435,6 +6446,7 @@ dependencies = [
  "pdf-inspector",
  "phf 0.13.1",
  "pi-ast",
+ "pi-grep-pattern",
  "pi-iso",
  "pi-shell",
  "pi-vcs",

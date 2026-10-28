@@ -6,7 +6,7 @@
 use std::{
 	collections::{BTreeMap, HashMap, HashSet},
 	env, fs,
-	path::{Path, PathBuf},
+	path::{Component, Path, PathBuf},
 };
 
 use pi_agent::mcp::{
@@ -59,6 +59,15 @@ impl ProviderConfig {
 		}
 		self.headers.extend(overlay.headers);
 	}
+}
+
+/// One `disabledProviders` entry: a bare provider id, or a path-scoped group
+/// (`{path|paths|pathPrefix|pathPrefixes, values|items|providers}`) like the
+/// upstream settings schema's path-scoped arrays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisabledProviderEntry {
+	All(String),
+	Scoped { prefixes: Vec<String>, providers: Vec<String> },
 }
 
 /// `edit` settings group consumed by the headless runtime.
@@ -167,6 +176,9 @@ pub struct Config {
 	pub extensions:           Option<Vec<PathBuf>>,
 	/// `task.disabledAgents`.
 	pub disabled_agents:      Option<Vec<String>>,
+	/// `disabledProviders`; path-scoped groups resolve against the run cwd in
+	/// [`Config::disabled_providers`].
+	pub disabled_providers:   Option<Vec<DisabledProviderEntry>>,
 	/// `task.agentModelOverrides` (string or list per agent).
 	pub agent_model_overrides: BTreeMap<String, Vec<String>>,
 	/// `task.maxRecursionDepth`.
@@ -208,6 +220,9 @@ impl Config {
 		}
 		if overlay.disabled_agents.is_some() {
 			self.disabled_agents = overlay.disabled_agents;
+		}
+		if overlay.disabled_providers.is_some() {
+			self.disabled_providers = overlay.disabled_providers;
 		}
 		for (agent, patterns) in overlay.agent_model_overrides {
 			self.agent_model_overrides.insert(agent, patterns);
@@ -391,9 +406,10 @@ impl Config {
 
 	/// Project `settings.json` is a `SETTINGS_SCHEMA` document, not the legacy
 	/// root-key dialect. Only fields this binary consumes are mapped:
-	/// `modelRoles.default` and `tools.approvalMode`. Root-level legacy keys and
-	/// other schema groups are intentionally ignored (they are either owned by
-	/// the full TS app or unsupported by the headless runtime).
+	/// `modelRoles.default`, `tools.approvalMode`, and `disabledProviders`.
+	/// Root-level legacy keys and other schema groups are intentionally ignored
+	/// (they are either owned by the full TS app or unsupported by the headless
+	/// runtime).
 	fn from_settings_value(value: &Value, path: &Path) -> Result<Self> {
 		let mut config = Self::default();
 		let Value::Map(_) = value else {
@@ -414,6 +430,37 @@ impl Config {
 	#[must_use]
 	pub fn resolve_api_key(&self, provider: &str) -> Option<String> {
 		self.providers.get(provider)?.resolve_api_key()
+	}
+
+	/// `disabledProviders` ids that apply to `cwd`: plain entries plus
+	/// path-scoped groups whose prefix contains it (upstream
+	/// `resolvePathScopedStringArray`). Paths are lexical — `.`/`..` collapse
+	/// without filesystem access, like `path.resolve`, so nonexistent and
+	/// symlinked paths still compare; no prefix escaping is allowed.
+	#[must_use]
+	pub fn disabled_providers(&self, cwd: &Path) -> Vec<String> {
+		let Some(entries) = &self.disabled_providers else {
+			return Vec::new();
+		};
+		let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+		let cwd = normalize_lexically(&dirs::absolute(&base, cwd));
+		let mut ids = Vec::new();
+		for entry in entries {
+			match entry {
+				DisabledProviderEntry::All(id) => ids.push(id.clone()),
+				DisabledProviderEntry::Scoped { prefixes, providers } => {
+					let applies = prefixes.iter().any(|prefix| {
+						let prefix =
+							normalize_lexically(&resolve_layer_path(&base, Path::new(prefix)));
+						cwd.starts_with(prefix)
+					});
+					if applies {
+						ids.extend(providers.iter().cloned());
+					}
+				},
+			}
+		}
+		ids
 	}
 
 	/// Apply dedicated CLI flags after the layered load. Runtime overrides are
@@ -451,6 +498,9 @@ impl Config {
 }
 
 fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Result<()> {
+	if let Some(disabled) = value.get("disabledProviders") {
+		config.disabled_providers = Some(parse_disabled_providers(disabled, path)?);
+	}
 	if let Some(roles) = value.get("modelRoles").and_then(Value::as_map) {
 		for (role, pattern) in roles {
 			let Some(pattern) = expect_text(pattern, &format!("modelRoles.{role}"), path)? else {
@@ -534,6 +584,49 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	Ok(())
 }
 
+/// `disabledProviders` entries: bare strings, plus path-scoped maps whose
+/// prefixes gate their `values`/`items`/`providers`. Other item shapes are
+/// skipped, matching the upstream resolver's isRecord guard.
+fn parse_disabled_providers(value: &Value, path: &Path) -> Result<Vec<DisabledProviderEntry>> {
+	if matches!(value, Value::Null) {
+		return Ok(Vec::new());
+	}
+	let Some(items) = value.as_list() else {
+		return Err(invalid(path, "disabledProviders", "expected a sequence"));
+	};
+	let mut entries = Vec::new();
+	for item in items {
+		match item {
+			Value::Str(id) => entries.push(DisabledProviderEntry::All(id.clone())),
+			Value::Map(_) => {
+				let prefixes: Vec<String> =
+					["path", "paths", "pathPrefix", "pathPrefixes"]
+						.iter()
+						.flat_map(|key| string_or_list(item.get(key)))
+						.collect();
+				if prefixes.is_empty() {
+					continue;
+				}
+				let providers = ["values", "items", "providers"]
+					.iter()
+					.flat_map(|key| string_or_list(item.get(key)))
+					.collect();
+				entries.push(DisabledProviderEntry::Scoped { prefixes, providers });
+			},
+			_ => {},
+		}
+	}
+	Ok(entries)
+}
+
+fn string_or_list(value: Option<&Value>) -> Vec<String> {
+	match value {
+		Some(Value::Str(text)) => vec![text.clone()],
+		Some(Value::List(items)) => items.iter().filter_map(Value::to_text).collect(),
+		_ => Vec::new(),
+	}
+}
+
 /// `ask.timeout` is seconds; legacy values above 1000 are migrated from
 /// milliseconds. `0` disables the timeout.
 fn parse_ask_timeout(value: &Value, key: &str, path: &Path) -> Result<Option<u64>> {
@@ -610,6 +703,31 @@ fn resolve_layer_path(cwd: &Path, raw: &Path) -> PathBuf {
 		raw.to_path_buf()
 	};
 	dirs::absolute(cwd, &expanded)
+}
+
+/// Lexically collapse `.`/`..` components without touching the filesystem
+/// (`path.resolve` semantics): a `..` above the root is dropped, and a
+/// relative path keeps its leading `..` components.
+fn normalize_lexically(path: &Path) -> PathBuf {
+	let mut normalized = PathBuf::new();
+	for component in path.components() {
+		match component {
+			Component::CurDir => {},
+			Component::ParentDir => {
+				let parent_is_normal = normalized
+					.components()
+					.next_back()
+					.is_some_and(|last| matches!(last, Component::Normal(_)));
+				if parent_is_normal {
+					normalized.pop();
+				} else if !normalized.has_root() {
+					normalized.push("..");
+				}
+			},
+			other => normalized.push(other),
+		}
+	}
+	normalized
 }
 
 /// Keep YAML diagnostics useful without echoing file contents (which may hold
@@ -1344,6 +1462,51 @@ mod tests {
 		// (setupVersion etc.) must not break the headless binary.
 		let config = parse_config("setupVersion: 3\ndefaultModel: m\n").expect("parse");
 		assert_eq!(config.default_model.as_deref(), Some("m"));
+	}
+
+	#[test]
+	fn disabled_providers_parse_plain_and_path_scoped_entries() {
+		let config = parse_config(
+			"disabledProviders:\n  - openai\n  - path: /work/project\n    providers: [local, acme]\n  - paths:\n      - /work\n    values:\n      - ollama\n  - providers: [ignored]\n",
+		)
+		.expect("disabledProviders");
+		assert_eq!(
+			config.disabled_providers(Path::new("/work/project/sub")),
+			["openai", "local", "acme", "ollama"]
+		);
+		assert_eq!(config.disabled_providers(Path::new("/elsewhere")), ["openai"]);
+
+		// Later layers replace the array, like every other settings scalar.
+		let mut base = parse_config("disabledProviders: [openai]\n").expect("base");
+		base.merge(parse_config("disabledProviders: [local]\n").expect("overlay"));
+		assert_eq!(base.disabled_providers(Path::new("/elsewhere")), ["local"]);
+
+		assert!(parse_config("disabledProviders: openai\n").is_err());
+	}
+
+	#[test]
+	fn disabled_provider_scope_normalizes_dot_and_parent_components() {
+		let config = parse_config(
+			"disabledProviders:\n  - path: /work/project\n    providers: [acme]\n",
+		)
+		.expect("scoped");
+		// cwd-side `..`/`.` collapse before the prefix check.
+		assert_eq!(
+			config.disabled_providers(Path::new("/work/../work/project/sub")),
+			["acme"]
+		);
+		assert_eq!(config.disabled_providers(Path::new("/work/./project")), ["acme"]);
+		// Escaping the prefix must not disable anything.
+		assert!(config.disabled_providers(Path::new("/work/project/../other")).is_empty());
+		assert!(config.disabled_providers(Path::new("/work/project/..")).is_empty());
+
+		// Prefix-side `..` collapses too.
+		let config = parse_config(
+			"disabledProviders:\n  - path: /work/../project\n    providers: [beta]\n",
+		)
+		.expect("scoped");
+		assert_eq!(config.disabled_providers(Path::new("/project/sub")), ["beta"]);
+		assert!(config.disabled_providers(Path::new("/project/../other")).is_empty());
 	}
 
 	#[test]

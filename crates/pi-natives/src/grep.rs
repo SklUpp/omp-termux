@@ -8,21 +8,14 @@
 //! global offsets, optional match limits, and per-file match summaries.
 
 use std::{
-	borrow::Cow,
 	cell::RefCell,
-	fmt,
 	fs::File,
 	io::{self, Read},
 	path::{Path, PathBuf},
-	sync::{
-		LazyLock,
-		atomic::{AtomicU64, Ordering},
-	},
+	sync::atomic::{AtomicU64, Ordering},
 };
 
 use grep_matcher::Matcher;
-use grep_pcre2::{RegexMatcher as PcreMatcher, RegexMatcherBuilder as PcreMatcherBuilder};
-use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{
 	BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
 };
@@ -33,18 +26,12 @@ use napi::{
 };
 use napi_derive::napi;
 use parking_lot::Mutex;
+use pi_grep_pattern::CompiledMatcher;
 use smallvec::SmallVec;
 
 use crate::{glob_util, iofs, task};
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
-/// PCRE2 JIT toggle: `OMP_PCRE2_JIT=1` forces JIT on, `0`/`false` forces it
-/// off. Unset, JIT stays on everywhere except macOS, where PCRE2's SLJIT
-/// executable allocator can fault while compiling patterns (issue #7399).
-static PCRE2_JIT_ENABLED: LazyLock<bool> = LazyLock::new(|| match std::env::var("OMP_PCRE2_JIT") {
-	Ok(v) if !v.is_empty() => v != "0" && !v.eq_ignore_ascii_case("false"),
-	_ => !cfg!(target_os = "macos"),
-});
 
 /// Output mode for [`search`] and [`grep`] (string values match JS callers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -544,50 +531,6 @@ struct SearchParams {
 	multiline:          bool,
 }
 
-enum CompiledMatcher {
-	Rust(RegexMatcher),
-	Pcre(PcreMatcher),
-}
-
-#[derive(Debug)]
-enum CompiledMatcherError {
-	Rust(grep_matcher::NoError),
-	Pcre(grep_pcre2::Error),
-}
-
-impl fmt::Display for CompiledMatcherError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::Rust(err) => err.fmt(formatter),
-			Self::Pcre(err) => err.fmt(formatter),
-		}
-	}
-}
-
-impl Matcher for CompiledMatcher {
-	type Captures = grep_matcher::NoCaptures;
-	type Error = CompiledMatcherError;
-
-	fn find_at(
-		&self,
-		haystack: &[u8],
-		at: usize,
-	) -> std::result::Result<Option<grep_matcher::Match>, Self::Error> {
-		match self {
-			Self::Rust(matcher) => matcher
-				.find_at(haystack, at)
-				.map_err(CompiledMatcherError::Rust),
-			Self::Pcre(matcher) => matcher
-				.find_at(haystack, at)
-				.map_err(CompiledMatcherError::Pcre),
-		}
-	}
-
-	fn new_captures(&self) -> std::result::Result<Self::Captures, Self::Error> {
-		Ok(grep_matcher::NoCaptures::new())
-	}
-}
-
 fn run_search<M: Matcher + Sync>(
 	matcher: &M,
 	content: &[u8],
@@ -817,252 +760,8 @@ pub(crate) struct GrepConfig {
 	pub(crate) max_count_per_file: Option<u32>,
 }
 
-// ---------------------------------------------------------------------------
-// Regex brace sanitization
-// ---------------------------------------------------------------------------
-
-/// Check if `bytes[start]` (which must be `b'{'`) begins a valid repetition
-/// quantifier: `{N}`, `{N,}`, or `{N,M}` where N and M are decimal digits.
-/// Returns the byte index of the closing `}` if valid.
-const fn find_valid_repetition(bytes: &[u8], start: usize) -> Option<usize> {
-	let len = bytes.len();
-	let mut i = start + 1;
-	// Must start with at least one digit.
-	if i >= len || !bytes[i].is_ascii_digit() {
-		return None;
-	}
-	while i < len && bytes[i].is_ascii_digit() {
-		i += 1;
-	}
-	if i >= len {
-		return None;
-	}
-	if bytes[i] == b'}' {
-		return Some(i);
-	}
-	if bytes[i] != b',' {
-		return None;
-	}
-	i += 1;
-	if i >= len {
-		return None;
-	}
-	// After comma: optional digits then `}`.
-	while i < len && bytes[i].is_ascii_digit() {
-		i += 1;
-	}
-	if i < len && bytes[i] == b'}' {
-		return Some(i);
-	}
-	None
-}
-
-const fn find_braced_escape_end(bytes: &[u8], start: usize) -> Option<usize> {
-	let mut i = start + 1;
-	while i < bytes.len() {
-		if bytes[i] == b'}' {
-			return Some(i);
-		}
-		i += 1;
-	}
-	None
-}
-
-/// Escape `{` and `}` that don't form valid repetition quantifiers.
-///
-/// Patterns like `${platform}` or `a{b}` contain braces the regex engine
-/// rejects as malformed repetitions. Since such braces can never be valid
-/// regex syntax, turning them into `\{` / `\}` is semantics-preserving
-/// and avoids confusing error messages for callers who pass literal text
-/// fragments (e.g. JS template strings).
-fn sanitize_braces(pattern: &str) -> Cow<'_, str> {
-	let bytes = pattern.as_bytes();
-	if !bytes.contains(&b'{') && !bytes.contains(&b'}') {
-		return Cow::Borrowed(pattern);
-	}
-
-	let len = bytes.len();
-	let mut result = String::with_capacity(len + 8);
-	let mut modified = false;
-	let mut i = 0;
-
-	while i < len {
-		// Pass escaped characters through unchanged.
-		if bytes[i] == b'\\' && i + 1 < len {
-			result.push('\\');
-			i += 1;
-			// The next character is the escaped literal; push it regardless.
-			// Safety: index is in bounds (checked above).
-			let ch = pattern[i..]
-				.chars()
-				.next()
-				.expect("non-empty slice has a char");
-			result.push(ch);
-			i += ch.len_utf8();
-			if matches!(ch, 'p' | 'P' | 'x' | 'u') && i < len && bytes[i] == b'{' {
-				if let Some(end) = find_braced_escape_end(bytes, i) {
-					result.push_str(&pattern[i..=end]);
-					i = end + 1;
-				} else {
-					result.push_str(&pattern[i..]);
-					i = len;
-				}
-			}
-			continue;
-		}
-
-		if bytes[i] == b'{' {
-			if let Some(end) = find_valid_repetition(bytes, i) {
-				result.push_str(&pattern[i..=end]);
-				i = end + 1;
-				continue;
-			}
-			result.push_str("\\{");
-			i += 1;
-			modified = true;
-			continue;
-		}
-
-		if bytes[i] == b'}' {
-			result.push_str("\\}");
-			i += 1;
-			modified = true;
-			continue;
-		}
-
-		let ch = pattern[i..]
-			.chars()
-			.next()
-			.expect("non-empty slice has a char");
-		result.push(ch);
-		i += ch.len_utf8();
-	}
-
-	if modified {
-		Cow::Owned(result)
-	} else {
-		Cow::Borrowed(pattern)
-	}
-}
-
-/// Escape unescaped parentheses after a group-syntax regex error.
-///
-/// Search patterns like `fetchAnthropicProvider(` are common literal snippets,
-/// but the regex engine parses the trailing `(` as the start of a capture
-/// group. When the parser already reported invalid group syntax, escaping any
-/// remaining literal parentheses preserves useful search behavior without
-/// changing valid regexes.
-fn escape_unescaped_parentheses(pattern: &str) -> Cow<'_, str> {
-	let bytes = pattern.as_bytes();
-	if !bytes.contains(&b'(') && !bytes.contains(&b')') {
-		return Cow::Borrowed(pattern);
-	}
-
-	let mut result = String::with_capacity(pattern.len() + 4);
-	let mut modified = false;
-	let mut i = 0;
-
-	while i < bytes.len() {
-		if bytes[i] == b'\\' && i + 1 < bytes.len() {
-			result.push('\\');
-			i += 1;
-			let ch = pattern[i..]
-				.chars()
-				.next()
-				.expect("non-empty slice has a char");
-			result.push(ch);
-			i += ch.len_utf8();
-			continue;
-		}
-
-		let ch = pattern[i..]
-			.chars()
-			.next()
-			.expect("non-empty slice has a char");
-		if matches!(ch, '(' | ')') {
-			result.push('\\');
-			modified = true;
-		}
-		result.push(ch);
-		i += ch.len_utf8();
-	}
-
-	if modified {
-		Cow::Owned(result)
-	} else {
-		Cow::Borrowed(pattern)
-	}
-}
-
-fn build_regex_matcher(
-	pattern: &str,
-	ignore_case: bool,
-	multiline: bool,
-) -> std::result::Result<RegexMatcher, grep_regex::Error> {
-	let build = |line_terminated| {
-		let mut builder = RegexMatcherBuilder::new();
-		builder.case_insensitive(ignore_case).multi_line(multiline);
-		if line_terminated {
-			builder.line_terminator(Some(b'\n'));
-		}
-		builder.build(pattern)
-	};
-
-	if !multiline && let Ok(matcher) = build(true) {
-		return Ok(matcher);
-	}
-	build(false)
-}
-
-fn build_pcre_matcher(
-	pattern: &str,
-	ignore_case: bool,
-	multiline: bool,
-) -> std::result::Result<PcreMatcher, grep_pcre2::Error> {
-	let mut builder = PcreMatcherBuilder::new();
-	builder
-		.caseless(ignore_case)
-		.multi_line(multiline)
-		.utf(true)
-		.ucp(true)
-		.jit_if_available(*PCRE2_JIT_ENABLED);
-	builder.build(pattern)
-}
-
 fn build_matcher(pattern: &str, ignore_case: bool, multiline: bool) -> Result<CompiledMatcher> {
-	let sanitized = sanitize_braces(pattern);
-	let err = match build_regex_matcher(sanitized.as_ref(), ignore_case, multiline) {
-		Ok(matcher) => return Ok(CompiledMatcher::Rust(matcher)),
-		Err(err) => err,
-	};
-
-	// PCRE2 supports features the Rust regex engine deliberately omits, such
-	// as lookaround and backreferences.
-	if let Ok(matcher) = build_pcre_matcher(sanitized.as_ref(), ignore_case, multiline) {
-		return Ok(CompiledMatcher::Pcre(matcher));
-	}
-
-	// Targeted retry: a stray `(`/`)` in an otherwise valid regex (e.g.
-	// `fetchProvider(`) — escape the parentheses but keep the rest of the regex
-	// working.
-	let message = err.to_string();
-	if message.contains("unclosed group") || message.contains("unopened group") {
-		let escaped = escape_unescaped_parentheses(sanitized.as_ref());
-		if escaped.as_ref() != sanitized.as_ref() {
-			if let Ok(matcher) = build_regex_matcher(escaped.as_ref(), ignore_case, multiline) {
-				return Ok(CompiledMatcher::Rust(matcher));
-			}
-			if let Ok(matcher) = build_pcre_matcher(escaped.as_ref(), ignore_case, multiline) {
-				return Ok(CompiledMatcher::Pcre(matcher));
-			}
-		}
-	}
-
-	// Final fallback: both engines rejected the pattern, so match it literally
-	// instead of failing the whole search.
-	build_regex_matcher(&regex::escape(pattern), ignore_case, multiline)
-		.map(CompiledMatcher::Rust)
-		.map_err(|_| Error::from_reason(format!("Regex error: {message}")))
+	pi_grep_pattern::build_matcher(pattern, ignore_case, multiline).map_err(Error::from_reason)
 }
 
 // ---------------------------------------------------------------------------
@@ -2259,11 +1958,8 @@ mod tests {
 		time::{Duration, SystemTime, UNIX_EPOCH},
 	};
 
-	use grep_matcher::Matcher;
-
 	#[cfg(unix)]
 	use super::{GrepConfig, GrepOutputMode, grep_sync};
-	use super::{escape_unescaped_parentheses, sanitize_braces};
 	#[cfg(unix)]
 	use crate::task;
 
@@ -2336,83 +2032,6 @@ mod tests {
 			mode:               None,
 			max_count_per_file: None,
 		}
-	}
-
-	#[test]
-	fn preserves_unicode_property_escapes() {
-		assert_eq!(sanitize_braces(r"\p{Greek}").as_ref(), r"\p{Greek}");
-	}
-
-	#[test]
-	fn preserves_hex_brace_escapes() {
-		assert_eq!(sanitize_braces(r"\x{41}").as_ref(), r"\x{41}");
-	}
-
-	#[test]
-	fn preserves_malformed_braced_escapes() {
-		assert_eq!(sanitize_braces(r"\p{Greek").as_ref(), r"\p{Greek");
-	}
-
-	#[test]
-	fn escapes_non_quantifier_braces() {
-		assert_eq!(sanitize_braces("${platform}").as_ref(), "$\\{platform\\}");
-	}
-
-	#[test]
-	fn preserves_valid_quantifiers() {
-		assert_eq!(sanitize_braces("a{2,4}").as_ref(), "a{2,4}");
-	}
-
-	#[test]
-	fn preserves_escaped_parentheses() {
-		assert_eq!(escape_unescaped_parentheses(r"foo\(bar\)").as_ref(), r"foo\(bar\)");
-	}
-
-	#[test]
-	fn escapes_literal_parentheses() {
-		assert_eq!(
-			escape_unescaped_parentheses("fetchAnthropicProvider(").as_ref(),
-			r"fetchAnthropicProvider\("
-		);
-		assert_eq!(
-			escape_unescaped_parentheses("fetchAnthropicProvider()").as_ref(),
-			r"fetchAnthropicProvider\(\)"
-		);
-	}
-
-	#[test]
-	fn invalid_regex_falls_back_to_literal() {
-		// Patterns that are not valid regex syntax (unclosed class, dangling
-		// quantifier, stray `)`) must degrade to a literal search rather than
-		// erroring.
-		for (pattern, hay, miss) in [
-			("foo[bar", &b"x foo[bar y"[..], &b"foobar"[..]),
-			("+++", &b"a+++b"[..], &b"ab"[..]),
-			("fail)", &b"(1 fail)"[..], &b"failure"[..]),
-		] {
-			let matcher = super::build_matcher(pattern, false, false)
-				.unwrap_or_else(|e| panic!("`{pattern}` should fall back to literal, got: {e}"));
-			assert!(matcher.is_match(hay).unwrap(), "`{pattern}` should match {hay:?}");
-			assert!(!matcher.is_match(miss).unwrap(), "`{pattern}` should not match {miss:?}");
-		}
-	}
-
-	#[test]
-	fn stray_parenthesis_preserves_surrounding_regex() {
-		// The targeted retry escapes the stray `(` but keeps `.*` as a regex.
-		let matcher =
-			super::build_matcher("foo.*(bar", false, false).expect("retry with escaped paren");
-		assert!(matcher.is_match(b"fooXYZ(bar").unwrap());
-		assert!(!matcher.is_match(b"foobar").unwrap());
-	}
-
-	#[test]
-	fn valid_regex_is_not_escaped() {
-		// A parseable pattern stays a regex: `fo+` matches repeats, which the
-		// literal `fo+` never would.
-		let matcher = super::build_matcher("fo+", false, false).expect("valid regex");
-		assert!(matcher.is_match(b"foooo").unwrap());
-		assert!(!matcher.is_match(b"bar").unwrap());
 	}
 
 	#[cfg(unix)]

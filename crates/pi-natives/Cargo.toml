@@ -31,8 +31,6 @@ heapless.workspace = true
 fontdue.workspace = true
 grep-matcher.workspace = true
 futures.workspace = true
-grep-pcre2.workspace = true
-grep-regex.workspace = true
 grep-searcher.workspace = true
 html-to-markdown-rs.workspace = true
 icy_sixel.workspace = true
@@ -50,6 +48,7 @@ pdf-inspector.workspace = true
 phf.workspace = true
 flume.workspace = true
 pi-ast.workspace = true
+pi-grep-pattern = { path = "../pi-grep-pattern" }
 pi-iso.workspace = true
 pi-shell.workspace = true
 pi-walker.workspace = true

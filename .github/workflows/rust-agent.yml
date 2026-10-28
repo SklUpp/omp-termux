@@ -40,6 +40,25 @@ jobs:
       - name: Test agent core and CLI
         run: cargo test --locked -p pi-agent -p omp-cli
 
+  test-native-grep:
+    name: Native grep and matcher tests (linux x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/ensure-rust-toolchain
+        with:
+          toolchain: nightly-2026-08-08
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rust-agent-native-grep
+      - name: Test grep pattern matcher
+        run: cargo test --locked -p pi-grep-pattern
+      - name: Test native grep
+        run: cargo test --locked -p pi-natives grep
+
   build-android:
     name: Android arm64 binary (bionic)
     runs-on: ubuntu-latest

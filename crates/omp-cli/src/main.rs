@@ -20,6 +20,7 @@ use omp_cli::{
 	dirs,
 	file_mentions,
 	foreign_session::{self, ForeignSessionSource, ForeignSessionStore},
+	local_models,
 	output::{self, OutputMode, Reporter, session_id},
 	profile,
 	prompts::{self, Prompts},
@@ -30,6 +31,7 @@ use omp_cli::{
 		SessionOptions, SessionStore, TurnBuilder, TurnRecord,
 	},
 	skills::{self, Skill},
+	tool_commands,
 };
 
 struct CliError {
@@ -114,9 +116,10 @@ fn run() -> std::result::Result<(), CliError> {
 		);
 		return Ok(());
 	}
-	// `agents`, completion commands run before the agent runtime, config, and
-	// sessions are loaded: unpacking definitions or generating a script must
-	// never boot a session, read config, or touch the network.
+	// `agents`, `models`, read/grep, and completion commands run before the agent
+	// runtime, config, and sessions are loaded: unpacking definitions, listing
+	// the catalog, or generating a script must never boot a session, read config,
+	// or touch the network.
 	match &cli.command {
 		Some(Command::Agents { action, dir, user, project, force, json }) => {
 			let base = match &cli.cwd {
@@ -142,6 +145,66 @@ fn run() -> std::result::Result<(), CliError> {
 				},
 			)?;
 			agents::print_unpack(&summary, *json)?;
+			return Ok(());
+		},
+		Some(Command::Models { action, pattern, json, extension, config, .. }) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			// Root `--config` (before the subcommand) plus command-level overlays,
+			// later files winning, like the run path.
+			let request = local_models::Request {
+				action: action.clone(),
+				pattern: pattern.clone(),
+				json: *json,
+				extensions: extension.clone(),
+				config: cli.config.iter().chain(config).cloned().collect(),
+			};
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			local_models::run(&request, &base, &mut out)
+				.map_err(|err| CliError::fail(err.to_string()))?;
+			return Ok(());
+		},
+		Some(Command::Read { path }) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			tool_commands::run_read(path.as_deref().unwrap_or(""), &base, &mut out)
+				.map_err(CliError::fail)?;
+			return Ok(());
+		},
+		Some(Command::Grep {
+			pattern,
+			path,
+			glob,
+			limit,
+			context,
+			files,
+			count,
+			no_gitignore,
+		}) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			let mode = tool_commands::cli_mode(*count, *files);
+			let request = tool_commands::GrepRequest {
+				pattern: pattern.clone().unwrap_or_default(),
+				path: path.clone().unwrap_or_else(|| ".".to_string()),
+				glob: glob.clone(),
+				limit: *limit,
+				context: *context,
+				mode,
+				gitignore: !*no_gitignore,
+			};
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			tool_commands::run_grep(&request, &base, &mut out).map_err(CliError::fail)?;
 			return Ok(());
 		},
 		Some(Command::Completions { shell }) => {

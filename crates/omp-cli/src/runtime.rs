@@ -2626,6 +2626,7 @@ mod tests {
 			provider:       "local".to_string(),
 			context_window: Some(8_192),
 			input:          None,
+			..ModelInfo::default()
 		});
 		providers.insert("local".to_string(), models);
 		Catalog { providers, connections: BTreeMap::new(), source: PathBuf::from("test-models.json") }
@@ -3604,6 +3605,7 @@ mod tests {
 			provider:       "local".to_string(),
 			context_window: Some(4096),
 			input:          Some(vec!["text".to_string()]),
+			..ModelInfo::default()
 		});
 		cat.providers.insert("local".to_string(), models);
 
@@ -3638,6 +3640,7 @@ mod tests {
 			provider:       "local".to_string(),
 			context_window: Some(4096),
 			input:          Some(vec!["text".to_string(), "image".to_string()]),
+			..ModelInfo::default()
 		});
 		cat.providers.insert("local".to_string(), models);
 
@@ -3657,6 +3660,7 @@ mod tests {
 			provider:       "local".to_string(),
 			context_window: Some(4096),
 			input:          None,
+			..ModelInfo::default()
 		});
 		cat.providers.insert("local".to_string(), models);
 
@@ -3679,6 +3683,7 @@ mod tests {
 			provider: "local".to_string(),
 			context_window: Some(4096),
 			input: Some(vec!["text".to_string()]),
+			..ModelInfo::default()
 		});
 		cat.providers.insert("local".to_string(), models);
 
@@ -3767,6 +3772,7 @@ mod tests {
 			provider: "local".to_string(),
 			context_window: Some(4096),
 			input: Some(vec!["text".to_string(), "image".to_string()]),
+			..ModelInfo::default()
 		});
 		cat.providers.insert("local".to_string(), models);
 
