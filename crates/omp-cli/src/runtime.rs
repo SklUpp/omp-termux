@@ -26,7 +26,10 @@ use pi_agent::{
 		mcp_tool_match_score, sanitize_mcp_tool_name_part,
 	},
 	tools::hashline::{NativeSnapshotSink, SnapshotStore, edit::EditToolOptions},
-	tools::task_catalog::{AgentCatalog, ChildModel, ChildModelFactory},
+	tools::task_catalog::{
+		AgentCatalog, ChildModel, ChildModelFactory, EFFORT_SELECTORS, parse_effort_prefix,
+		split_effort_selector,
+	},
 };
 
 use crate::{
@@ -1132,7 +1135,7 @@ impl CliChildModelFactory {
 	) -> std::result::Result<(String, String, String, String, bool, Option<String>), String> {
 		let (base, selector) = split_thinking(pattern, -1);
 		let effort = selector.and_then(|selector| match selector {
-			"inherit" | "auto" => None,
+			"inherit" | "auto" | "off" => None,
 			other => Some(other.to_string()),
 		});
 		let (provider, model) = match base.split_once('/') {
@@ -1318,26 +1321,67 @@ fn split_thinking(model: &str, min_colon_index: isize) -> (&str, Option<&'static
 }
 
 
-const EFFORT_SELECTORS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
+/// Root model-pattern suffix split, shared with the child catalog parser.
+///
+/// `off` and `auto` selectors strip from the model id but never reach the
+/// provider as an effort: `off` disables reasoning and `auto` defers to the
+/// endpoint (TS `toReasoningEffort`/`concreteThinkingLevel`).
 pub fn split_effort(model: &str) -> (&str, Option<&str>) {
-	let Some((id, suffix)) = model.rsplit_once(':') else {
-		return (model, None);
-	};
-	if id.is_empty() || suffix.len() < 2 {
-		return (model, None);
+	let (base, effort) = split_effort_selector(model);
+	if let Some(effort) = effort {
+		return (base, (effort != "off").then_some(effort));
 	}
-	let mut matching = EFFORT_SELECTORS
-		.iter()
-		.filter(|selector| selector.starts_with(suffix))
-		.copied();
-	let Some(selector) = matching.next() else {
-		return (model, None);
-	};
-	if matching.next().is_some() {
-		return (model, None);
+	match model.rsplit_once(':') {
+		Some((base, "auto")) if !base.is_empty() => (base, None),
+		_ => (model, None),
 	}
-	(id, Some(selector))
+}
+
+/// A validated `--thinking` selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliThinking {
+	Off,
+	Auto,
+	Effort(&'static str),
+}
+
+/// Parses a `--thinking` value exactly like TS `parseCliThinkingLevel`:
+/// case-sensitive unique prefixes of `off`..`max`, plus the exact `auto`
+/// sentinel. `inherit` is not a CLI selector.
+#[must_use]
+pub fn parse_cli_thinking(value: &str) -> Option<CliThinking> {
+	if value.is_empty() || value.trim() != value || value != value.to_ascii_lowercase() {
+		return None;
+	}
+	if value == "auto" {
+		return Some(CliThinking::Auto);
+	}
+	match parse_effort_prefix(value) {
+		Some("off") => Some(CliThinking::Off),
+		Some(effort) => Some(CliThinking::Effort(effort)),
+		None => None,
+	}
+}
+
+/// Rewrites a model selector so the explicit `--thinking` level wins over any
+/// `:level` suffix already on it (TS `main.ts` precedence).
+#[must_use]
+pub fn apply_thinking(model: &str, level: CliThinking) -> String {
+	let (base, _) = split_effort(model);
+	match level {
+		CliThinking::Effort(effort) => format!("{base}:{effort}"),
+		CliThinking::Off | CliThinking::Auto => base.to_string(),
+	}
+}
+
+/// Warning emitted for an unparseable `--thinking` value; the flag is ignored
+/// and the model suffix or endpoint default still applies (TS flag table).
+#[must_use]
+pub fn cli_thinking_warning(value: &str) -> String {
+	format!(
+		"warning: Invalid thinking level passed to --thinking: {value} (valid: {}, auto)",
+		EFFORT_SELECTORS.join(", ")
+	)
 }
 
 /// Which supervisor-backed tools this run may offer. `--tools` is a whitelist:

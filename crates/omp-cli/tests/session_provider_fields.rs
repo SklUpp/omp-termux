@@ -341,6 +341,77 @@ fn model_override_drops_inherited_header_cache_key() {
 }
 
 #[test]
+fn thinking_override_drops_inherited_header_cache_key() {
+	let fx = Fixture::new("thinking-shape");
+	write_session_header(&fx.sessions_dir, "thinking-session", Some("header-cache-1"));
+
+	let (body, output) = fx.run_capture(
+		&["--resume", "thinking-session", "--thinking", "high"],
+		"hello",
+	);
+	assert_success(&output);
+	assert!(
+		body.get("prompt_cache_key").is_none(),
+		"an explicit --thinking level changes the request shape and must drop the inherited key, got: {body}"
+	);
+
+	let (body, output) = fx.run_capture(
+		&["--fork", "thinking-session", "--thinking", "low"],
+		"forked turn",
+	);
+	assert_success(&output);
+	assert!(
+		body.get("prompt_cache_key").is_none(),
+		"forking with an explicit --thinking level must drop the inherited key, got: {body}"
+	);
+}
+
+#[test]
+fn thinking_override_keeps_explicit_cache_key() {
+	let fx = Fixture::new("thinking-explicit");
+	write_session_header(&fx.sessions_dir, "thinking-explicit", Some("header-cache-1"));
+
+	let (body, output) = fx.run_capture(
+		&[
+			"--resume",
+			"thinking-explicit",
+			"--thinking",
+			"medium",
+			"--prompt-cache-key",
+			"explicit-cache-1",
+		],
+		"hello",
+	);
+	assert_success(&output);
+	assert_eq!(
+		body["prompt_cache_key"], "explicit-cache-1",
+		"an explicit --prompt-cache-key must win over the thinking shape change"
+	);
+}
+
+#[test]
+fn invalid_thinking_keeps_inherited_header_cache_key() {
+	let fx = Fixture::new("thinking-invalid");
+	write_session_header(&fx.sessions_dir, "thinking-invalid", Some("header-cache-1"));
+
+	let (body, output) = fx.run_capture(
+		&["--resume", "thinking-invalid", "--thinking", "bogus"],
+		"hello",
+	);
+	assert_success(&output);
+	assert!(
+		String::from_utf8_lossy(&output.stderr)
+			.contains("Invalid thinking level passed to --thinking"),
+		"an invalid level must only warn: {}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(
+		body["prompt_cache_key"], "header-cache-1",
+		"an ignored --thinking value must not change the cache shape"
+	);
+}
+
+#[test]
 fn repl_model_switch_drops_inherited_key_but_keeps_explicit_key() {
 	let fx = Fixture::new("repl-switch");
 	write_session_header(&fx.sessions_dir, "repl-session", Some("header-cache-1"));

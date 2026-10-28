@@ -291,6 +291,13 @@ fn run() -> std::result::Result<(), CliError> {
 	let requested_model = cli.model.clone();
 	let requested_provider = cli.provider.clone();
 	let requested_api_key = cli.api_key.clone();
+	let thinking = cli.thinking.as_deref().and_then(|raw| {
+		let parsed = runtime::parse_cli_thinking(raw);
+		if parsed.is_none() {
+			eprintln!("{}", runtime::cli_thinking_warning(raw));
+		}
+		parsed
+	});
 	let session_dir = cli
 		.session_dir
 		.as_ref()
@@ -454,6 +461,7 @@ fn run() -> std::result::Result<(), CliError> {
 		model: None,
 		provider: None,
 		api_key: None,
+		thinking,
 		provider_session_id: None,
 		prompt_cache_key: None,
 		prompt_cache_key_source: None,
@@ -528,6 +536,7 @@ fn run() -> std::result::Result<(), CliError> {
 	// provider route and prompt/tool shape are unchanged.
 	let explicit_cache_key = cli.prompt_cache_key.clone().filter(|key| !key.is_empty());
 	let cache_shape_changed = cli.model.is_some()
+		|| session.thinking.is_some()
 		|| session.config.system_prompt.is_some()
 		|| session.config.append_system_prompt.is_some()
 		|| cli.tools.is_some()
@@ -743,6 +752,8 @@ struct Session<'a> {
 	model: Option<String>,
 	provider: Option<String>,
 	api_key: Option<String>,
+	/// Validated `--thinking` selector; wins over a model `:level` suffix.
+	thinking: Option<runtime::CliThinking>,
 	/// Provider-side sticky session id from `--provider-session-id`.
 	provider_session_id: Option<String>,
 	/// Explicit prompt-cache identity: flag value, else resumed/forked header.
@@ -796,12 +807,16 @@ impl Session<'_> {
 	}
 
 	fn request(&self, prompt: String, parts: Vec<ContentPart>, output_mode: OutputMode) -> RunRequest {
+		let model = match (self.model.as_deref(), self.thinking) {
+			(Some(model), Some(level)) => Some(runtime::apply_thinking(model, level)),
+			(model, _) => model.map(str::to_string),
+		};
 		RunRequest {
 			prompt,
 			parts,
 			cwd: self.cwd.clone(),
 			output_mode,
-			model: self.model.clone(),
+			model,
 			provider: self.provider.clone(),
 			api_key: self.api_key.clone(),
 			provider_session_id: self.provider_session_id.clone(),

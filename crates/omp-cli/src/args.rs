@@ -134,6 +134,10 @@ struct RawCli {
 	#[arg(long = "prompt-cache-key", value_name = "KEY")]
 	prompt_cache_key: Option<String>,
 
+	/// Thinking level: off, minimal, low, medium, high, xhigh, max, or auto.
+	#[arg(long, value_name = "LEVEL")]
+	thinking: Option<String>,
+
 	/// Disable session title generation.
 	#[arg(long = "no-title")]
 	no_title: bool,
@@ -246,6 +250,9 @@ pub struct Cli {
 	/// Provider prompt cache key.
 	pub prompt_cache_key: Option<String>,
 
+	/// Thinking level: off, minimal, low, medium, high, xhigh, max, or auto.
+	pub thinking: Option<String>,
+
 	/// Disable session title generation.
 	pub no_title: bool,
 
@@ -327,6 +334,7 @@ impl Cli {
 			from_codex: raw.from_codex,
 			provider_session_id: raw.provider_session_id,
 			prompt_cache_key: raw.prompt_cache_key,
+			thinking: raw.thinking,
 			no_title: raw.no_title,
 			session_dir: raw.session_dir,
 			session_id: raw.session_id,

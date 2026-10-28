@@ -107,7 +107,7 @@ See [providers](./providers.md) and [models](./models.md) for model resolution.
 
 | Flag | Description |
 | --- | --- |
-| `--thinking <level>` | Set the thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `auto`. |
+| `--thinking <level>` | Set the thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `auto`. Wins over any `:level` suffix on `--model`. Concrete levels are sent as `reasoning_effort`; `off` disables reasoning without sending the `off` selector, and `auto` leaves the endpoint default. An invalid level only warns and is ignored. |
 | `--hide-thinking` | Hide thinking blocks in TUI output (display only; does not disable model thinking). |
 | `--print-thoughts` | Include thinking blocks in print-mode text output. |
 | `--external-thinking` | Use a private scratchpad while disabling supported GPT/Claude/Gemini reasoning. Use at your own risk: providers have flagged this request shape as abuse. |
