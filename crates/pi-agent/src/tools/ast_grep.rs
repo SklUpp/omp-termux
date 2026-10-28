@@ -16,12 +16,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use pi_ast::{
-	SupportLang,
-	ops::{
-		AstMatch, Pattern, collect_matches, compile_search_patterns, has_parse_error,
-		is_supported_file, resolve_language,
-	},
+use pi_ast::ops::{
+	AstMatch, Pattern, SourceAst, collect_matches_in, compile_search_patterns,
+	is_supported_file, parse_source, resolve_language, tree_has_parse_error,
 };
 use pi_walker::{
 	CompiledWalkGlob, DirectoryErrorMode, EmptyRecheck, FollowLinks, WalkDetail, WalkError,
@@ -31,8 +28,9 @@ use serde_json::{Value, json};
 
 use super::{
 	ParsedFindPattern, Tool, ToolError, extract_raw_paths, fix_unclosed_braces,
-	format_path_relative_to_cwd, is_root_path, normalize_path, normalize_path_like_input,
-	parse_find_pattern, resolve_to_cwd, split_top_level_delimited, tool_result,
+	format_path_relative_to_cwd, has_glob_path_chars, is_root_path, normalize_path,
+	normalize_path_like_input, parse_find_pattern, resolve_to_cwd, split_top_level_delimited,
+	tool_result,
 };
 use crate::state::{AgentContext, ToolResult};
 
@@ -64,7 +62,7 @@ impl Tool for AstGrepTool {
 				},
 				"path": {
 					"type": "string",
-					"description": "file, directory, glob, or internal URL to search; pass several as a semicolon-delimited list (\"src; tests\"). Omitted -> searches the workspace root (\".\")"
+					"description": "file, directory, glob, or local file:// URL to search; pass several as a semicolon-delimited list (\"src; tests\"). Omitted -> searches the workspace root (\".\")"
 				},
 				"skip": {
 					"type": "number",
@@ -211,10 +209,12 @@ fn run_ast_grep(args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolErro
 			},
 		};
 
-		report_parse_error(&source, language, &candidate.display, &mut parse_errors);
+		let ast = parse_source(&source, language);
+
+		report_parse_error(&ast, &candidate.display, &mut parse_errors);
 
 		let mut seen: HashSet<MatchKey> = HashSet::new();
-		for matched in collect_deduped_matches(&source, language, patterns.as_slice()) {
+		for matched in collect_deduped_matches(&ast, patterns.as_slice()) {
 			if ctx.cancellation_token.is_cancelled() {
 				return Ok(tool_result("AST grep cancelled", true));
 			}
@@ -354,19 +354,15 @@ fn run_ast_grep(args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolErro
 /// expression statement), so later patterns only contribute matches whose
 /// start position the primary pattern did not already cover. Exact duplicate
 /// ranges are still filtered by the caller.
-fn collect_deduped_matches(
-	source: &str,
-	language: SupportLang,
-	patterns: &[Pattern],
-) -> Vec<AstMatch> {
+fn collect_deduped_matches(ast: &SourceAst, patterns: &[Pattern]) -> Vec<AstMatch> {
 	let Some((first, rest)) = patterns.split_first() else {
 		return Vec::new();
 	};
-	let mut matches = collect_matches(source, language, std::slice::from_ref(first));
+	let mut matches = collect_matches_in(ast, std::slice::from_ref(first));
 	let mut starts: HashSet<(usize, usize)> =
 		matches.iter().map(|matched| (matched.line, matched.column)).collect();
 	for pattern in rest {
-		for matched in collect_matches(source, language, std::slice::from_ref(pattern)) {
+		for matched in collect_matches_in(ast, std::slice::from_ref(pattern)) {
 			if starts.insert((matched.line, matched.column)) {
 				matches.push(matched);
 			}
@@ -399,20 +395,13 @@ fn append_parse_errors(message: &mut String, errors: &[String], total: usize) {
 	}
 }
 
-/// Detect tree-sitter error nodes without adding a second parser: the shared
-/// parse cache owns the only direct `Parser` call.
-fn report_parse_error(
-	source: &str,
-	language: SupportLang,
-	display: &str,
-	errors: &mut Vec<String>,
-) {
-	match has_parse_error(source, language) {
-		Ok(true) => errors.push(format!(
+/// Detect tree-sitter error nodes on the tree the matcher already parsed: one
+/// parse per file, and no cache entry is written for a tree nobody reuses.
+fn report_parse_error(ast: &SourceAst, display: &str, errors: &mut Vec<String>) {
+	if tree_has_parse_error(ast) {
+		errors.push(format!(
 			"{display}: parse error (syntax tree contains error nodes)"
-		)),
-		Ok(false) => {},
-		Err(error) => errors.push(format!("{display}: {error}")),
+		));
 	}
 }
 
@@ -420,7 +409,7 @@ fn plan_targets(
 	args: &Value,
 	cwd: &Path,
 ) -> Result<(Vec<Target>, Vec<String>, String), ToolError> {
-	let mut expanded: Vec<String> = Vec::new();
+	let mut normalized_inputs: Vec<(String, Vec<String>)> = Vec::new();
 	for raw in extract_raw_paths(args) {
 		let normalized = normalize_path_like_input(&raw);
 		if normalized.is_empty() {
@@ -428,11 +417,33 @@ fn plan_targets(
 				"`path` must contain non-empty globs or paths".to_string(),
 			));
 		}
+		// Resolve/validate every entry before any filesystem probe: this port
+		// has no internal-URL or remote resolver, so a scheme must never
+		// degrade into a relative path, and a mixed list (`"src; ssh://box/x"`)
+		// fails as a whole even when `src` exists.
+		let parts = split_top_level_delimited(&normalized)
+			.into_iter()
+			.map(|part| {
+				if is_non_local_scheme(&part) {
+					Err(ToolError::InvalidArguments(format!(
+						"Unsupported target: {part} (only local filesystem paths are supported)"
+					)))
+				} else {
+					file_url_to_path(&part).unwrap_or(Ok(part))
+						.map_err(ToolError::InvalidArguments)
+				}
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+		normalized_inputs.push((normalized, parts));
+	}
+
+	let mut expanded: Vec<String> = Vec::new();
+	for (normalized, parts) in normalized_inputs {
 		let literal = resolve_to_cwd(&normalized, cwd);
 		if literal.exists() {
 			expanded.push(normalized);
 		} else {
-			expanded.extend(split_top_level_delimited(&normalized));
+			expanded.extend(parts);
 		}
 	}
 	if expanded.is_empty() {
@@ -492,11 +503,15 @@ fn plan_targets(
 			continue;
 		}
 
-		if is_single {
-			return Err(ToolError::InvalidArguments(format!("Path not found: {item}")));
-		}
-
-		let ParsedFindPattern { base_path, glob_pattern, has_glob } = parse_find_pattern(item);
+		// Single targets mirror upstream `parseSearchPath`: a leading glob stays
+		// as written (`*.rs` is top-level only). Multi-target lists keep
+		// `parse_find_pattern`, which makes such a glob recursive.
+		let parsed = if is_single {
+			parse_single_target(item)
+		} else {
+			parse_find_pattern(item)
+		};
+		let ParsedFindPattern { base_path, glob_pattern, has_glob } = parsed;
 		let base = resolve_to_cwd(&base_path, cwd);
 		if !base.exists() {
 			missing.push(item.clone());
@@ -528,6 +543,119 @@ fn plan_targets(
 	}
 
 	Ok((targets, missing, scope_path))
+}
+
+/// Single-target glob parsing, mirroring upstream `parseSearchPath`: a leading
+/// glob is used as written, so `*.rs` matches only the search root.
+/// Multi-target lists keep [`parse_find_pattern`], which widens such globs
+/// recursively.
+fn parse_single_target(item: &str) -> ParsedFindPattern {
+	let normalized = item.replace('\\', "/");
+	let segments: Vec<&str> = normalized.split('/').collect();
+	let Some(index) = segments
+		.iter()
+		.position(|segment| has_glob_path_chars(segment))
+	else {
+		return ParsedFindPattern {
+			base_path:    normalized,
+			glob_pattern: "**/*".to_string(),
+			has_glob:     false,
+		};
+	};
+	if index == 0 {
+		return ParsedFindPattern {
+			base_path:    ".".to_string(),
+			glob_pattern: normalized,
+			has_glob:     true,
+		};
+	}
+	let raw_base = segments[..index].join("/");
+	// Same convention as `parse_find_pattern`: an absolute glob whose literal
+	// prefix is empty (`/*.rs`) has base `/`, so the root guard rejects it
+	// instead of silently searching the cwd.
+	let base_path = if raw_base.is_empty() {
+		if normalized.starts_with('/') {
+			"/".to_string()
+		} else {
+			".".to_string()
+		}
+	} else {
+		raw_base
+	};
+	ParsedFindPattern {
+		base_path,
+		glob_pattern: segments[index..].join("/"),
+		has_glob: true,
+	}
+}
+
+/// Map a local `file://` target to its filesystem path.
+///
+/// `None` when `item` is not a file URL. `Some(Err(..))` for file URLs this
+/// port cannot map locally: a non-local host, a missing absolute path, or a
+/// malformed percent escape. `file:///abs` and `file://localhost/abs` decode;
+/// percent escapes are decoded as UTF-8, matching upstream `fileURLToPath`.
+fn file_url_to_path(item: &str) -> Option<Result<String, String>> {
+	let (scheme, rest) = item.split_once("://")?;
+	if !scheme.eq_ignore_ascii_case("file") {
+		return None;
+	}
+	let (authority, path) = match rest.split_once('/') {
+		Some((authority, tail)) => (authority, format!("/{tail}")),
+		None => (rest, String::new()),
+	};
+	if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+		return Some(Err(format!(
+			"Unsupported file URL host in {item} (only local file:/// paths are supported)"
+		)));
+	}
+	if path.is_empty() {
+		return Some(Err(format!("file URL has no absolute path: {item}")));
+	}
+	Some(
+		percent_decode(&path)
+			.ok_or_else(|| format!("Invalid percent escape in file URL: {item}")),
+	)
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+	let bytes = value.as_bytes();
+	let mut decoded = Vec::with_capacity(bytes.len());
+	let mut index = 0;
+	while index < bytes.len() {
+		if bytes[index] == b'%' {
+			let hex = bytes.get(index + 1..index + 3)?;
+			if !hex.iter().all(u8::is_ascii_hexdigit) {
+				return None;
+			}
+			let byte = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+			decoded.push(byte);
+			index += 3;
+		} else {
+			decoded.push(bytes[index]);
+			index += 1;
+		}
+	}
+	String::from_utf8(decoded).ok()
+}
+
+/// Whether a target uses a URL scheme this port cannot resolve.
+///
+/// `file://` is a local path and is resolved by [`file_url_to_path`]; every
+/// other scheme (`ssh://`, `local://`, `skill://`, `https://`, ...) is
+/// unsupported here because it has no local backing path in this port.
+/// Single-letter schemes are treated as Windows drive paths, not URLs.
+fn is_non_local_scheme(item: &str) -> bool {
+	let Some((scheme, _)) = item.split_once("://") else {
+		return false;
+	};
+	let bytes = scheme.as_bytes();
+	bytes.len() >= 2
+		&& bytes[0].is_ascii_alphabetic()
+		&& bytes
+			.iter()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-'))
+		&& !scheme.eq_ignore_ascii_case("file")
 }
 
 fn collect_candidates(
@@ -680,6 +808,15 @@ mod tests {
 		source
 	}
 
+	fn assert_invalid_arguments(error: ToolError, needle: &str) {
+		match error {
+			ToolError::InvalidArguments(message) => {
+				assert!(message.contains(needle), "{message}");
+			},
+			other => panic!("expected invalid arguments containing {needle}, got {other:?}"),
+		}
+	}
+
 	#[tokio::test]
 	async fn reports_captures_paging_and_parse_errors() {
 		let dir = temp_dir("behavior");
@@ -721,5 +858,202 @@ mod tests {
 			"{}",
 			whole.content
 		);
+	}
+
+	#[tokio::test]
+	async fn single_glob_target_searches_its_literal_base() {
+		let dir = temp_dir("single-glob");
+		fs::create_dir_all(dir.join("src/nested")).expect("create src");
+		fs::write(dir.join("src/a.rs"), calls(1, 0)).expect("write a");
+		fs::write(dir.join("src/nested/b.rs"), calls(1, 10)).expect("write b");
+		fs::write(dir.join("top.rs"), calls(1, 20)).expect("write top");
+
+		let tool = AstGrepTool;
+		let ctx = AgentContext::new(dir.clone());
+
+		let result = tool
+			.execute(&json!({ "pat": "foo($A)", "path": "src/**/*.rs" }), &ctx)
+			.await
+			.expect("single glob executes");
+		assert!(!result.is_error, "{}", result.content);
+		let details = result.details.as_ref().expect("details");
+		assert_eq!(details["matchCount"].as_u64(), Some(2), "{}", result.content);
+		assert_eq!(details["filesSearched"].as_u64(), Some(2));
+		assert!(!result.content.contains("top.rs"), "{}", result.content);
+
+		// A single literal that really is absent still reports it verbatim.
+		let error = tool
+			.execute(&json!({ "pat": "foo($A)", "path": "missing.rs" }), &ctx)
+			.await
+			.expect_err("missing literal rejects");
+		assert_invalid_arguments(error, "Path not found: missing.rs");
+	}
+
+	#[tokio::test]
+	async fn single_target_glob_stays_at_the_search_root() {
+		let dir = temp_dir("single-root-glob");
+		fs::create_dir_all(dir.join("nested")).expect("create nested");
+		fs::write(dir.join("root.rs"), calls(1, 0)).expect("write root");
+		fs::write(dir.join("nested/inner.rs"), calls(1, 10)).expect("write inner");
+
+		let tool = AstGrepTool;
+		let ctx = AgentContext::new(dir.clone());
+
+		let single = tool
+			.execute(&json!({ "pat": "foo($A)", "path": "*.rs" }), &ctx)
+			.await
+			.expect("single glob executes");
+		assert!(!single.is_error, "{}", single.content);
+		let details = single.details.as_ref().expect("details");
+		assert_eq!(details["matchCount"].as_u64(), Some(1), "{}", single.content);
+		assert_eq!(details["filesSearched"].as_u64(), Some(1));
+		assert!(!single.content.contains("inner.rs"), "{}", single.content);
+
+		// Multi-target lists keep the recursive convention.
+		let multi = tool
+			.execute(&json!({ "pat": "foo($A)", "path": "*.rs; nested" }), &ctx)
+			.await
+			.expect("multi glob executes");
+		assert!(!multi.is_error, "{}", multi.content);
+		let details = multi.details.as_ref().expect("details");
+		assert_eq!(details["matchCount"].as_u64(), Some(2), "{}", multi.content);
+		assert_eq!(details["filesSearched"].as_u64(), Some(2));
+	}
+
+	#[tokio::test]
+	async fn absolute_glob_targets_hit_the_root_guard() {
+		let dir = temp_dir("root-guard");
+		fs::write(dir.join("root.rs"), calls(1, 0)).expect("write root");
+
+		let tool = AstGrepTool;
+		let ctx = AgentContext::new(dir.clone());
+
+		// An absolute glob with an empty literal prefix has base `/`, exactly
+		// like `parse_find_pattern`; it must fail the root guard instead of
+		// silently searching the cwd (where `root.rs` would match).
+		for path in ["/*.rs", "/*", "/{a,b}/*.rs", "//*.rs"] {
+			let error = tool
+				.execute(&json!({ "pat": "foo($A)", "path": path }), &ctx)
+				.await
+				.expect_err("absolute root glob rejects");
+			assert_invalid_arguments(error, "root directory '/'");
+		}
+	}
+
+	#[tokio::test]
+	async fn file_url_targets_decode_locally_and_reject_hosts() {
+		let dir = temp_dir("file-url");
+		let spaced = dir.join("file with space.rs");
+		fs::write(&spaced, calls(1, 0)).expect("write spaced");
+		fs::write(dir.join("one.rs"), calls(2, 10)).expect("write one");
+
+		let tool = AstGrepTool;
+		let ctx = AgentContext::new(dir.clone());
+
+		let encoded_path = spaced.to_string_lossy().replace(' ', "%20");
+		for url in [
+			format!("file://{encoded_path}"),
+			format!("file://localhost{encoded_path}"),
+		] {
+			let result = tool
+				.execute(&json!({ "pat": "foo($A)", "path": url }), &ctx)
+				.await
+				.expect("file URL executes");
+			assert!(!result.is_error, "{}", result.content);
+			let details = result.details.as_ref().expect("details");
+			assert_eq!(details["matchCount"].as_u64(), Some(1), "{}", result.content);
+			assert_eq!(details["filesSearched"].as_u64(), Some(1));
+		}
+
+		// A file URL mixed with a plain path searches both.
+		let mixed = format!("file://{encoded_path}; one.rs");
+		let result = tool
+			.execute(&json!({ "pat": "foo($A)", "path": mixed }), &ctx)
+			.await
+			.expect("mixed file URL executes");
+		assert!(!result.is_error, "{}", result.content);
+		let details = result.details.as_ref().expect("details");
+		assert_eq!(details["matchCount"].as_u64(), Some(3), "{}", result.content);
+		assert_eq!(details["fileCount"].as_u64(), Some(2));
+
+		// Non-local authorities are rejected, including inside a mixed list.
+		for path in [
+			"file://remote.example/tmp/x.rs",
+			"one.rs; file://remote.example/tmp/x.rs",
+		] {
+			let error = tool
+				.execute(&json!({ "pat": "foo($A)", "path": path }), &ctx)
+				.await
+				.expect_err("remote file URL rejects");
+			assert_invalid_arguments(error, "Unsupported file URL host");
+		}
+	}
+
+	#[tokio::test]
+	async fn non_local_schemes_reject_before_any_search() {
+		let dir = temp_dir("schemes");
+		fs::write(dir.join("one.rs"), calls(1, 0)).expect("write one");
+
+		let tool = AstGrepTool;
+		let ctx = AgentContext::new(dir.clone());
+
+		for path in [
+			"ssh://box/repo",
+			"local://name.md",
+			"skill://name",
+			"https://example.com/x.rs",
+		] {
+			let error = tool
+				.execute(&json!({ "pat": "foo($A)", "path": path }), &ctx)
+				.await
+				.expect_err("scheme target rejects");
+			assert_invalid_arguments(error, "Unsupported target");
+		}
+
+		// Mixed lists fail as a whole: `one.rs` exists and has a match, so a
+		// partial search would have succeeded instead of returning this error.
+		for path in ["one.rs; ssh://box/repo", "ssh://box/repo; one.rs"] {
+			let error = tool
+				.execute(&json!({ "pat": "foo($A)", "path": path }), &ctx)
+				.await
+				.expect_err("mixed scheme target rejects");
+			assert_invalid_arguments(error, "Unsupported target");
+		}
+		let error = tool
+			.execute(
+				&json!({ "pat": "foo($A)", "path": ["one.rs", "local://name.md"] }),
+				&ctx,
+			)
+			.await
+			.expect_err("mixed scheme array rejects");
+		assert_invalid_arguments(error, "Unsupported target");
+	}
+
+	#[tokio::test]
+	async fn parse_errors_and_matches_come_from_the_same_scan() {
+		let dir = temp_dir("parse-and-match");
+		// Unclosed block: the tree carries an error node and still contains the
+		// call, so a correct single-parse scan reports both.
+		fs::write(dir.join("half.rs"), "fn main() {\n    foo(a1);\n").expect("write half");
+
+		let tool = AstGrepTool;
+		let ctx = AgentContext::new(dir.clone());
+
+		let result = tool
+			.execute(&json!({ "pat": "foo($A)", "path": "half.rs" }), &ctx)
+			.await
+			.expect("ast_grep executes");
+		assert!(!result.is_error, "{}", result.content);
+		let details = result.details.as_ref().expect("details");
+		assert_eq!(details["matchCount"].as_u64(), Some(1), "{}", result.content);
+		assert_eq!(details["filesSearched"].as_u64(), Some(1));
+		assert!(
+			details["parseErrors"]
+				.as_array()
+				.is_some_and(|errors| !errors.is_empty()),
+			"{}",
+			result.content
+		);
+		assert!(result.content.contains("meta: A=a1"), "{}", result.content);
 	}
 }

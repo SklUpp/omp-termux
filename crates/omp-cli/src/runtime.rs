@@ -15,7 +15,8 @@ use std::{
 
 use async_trait::async_trait;
 use pi_agent::{
-	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, AskTool, BashTool, DelegationLimits,
+	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, AskTool, AstGrepTool, BashTool,
+	DelegationLimits,
 	EditTool, GlobTool, GrepTool, ModelProvider, OpenAiCompatibleProvider, ReadTool,
 	SteeringEvent, Supervisor, TodoTool, Tool, ToolApprover, ToolRegistry, WriteTool,
 	process_broker::BrokerProcessBackend,
@@ -47,10 +48,11 @@ pub const DEFAULT_CONTEXT_LIMIT: usize = 32_768;
 /// `pi-agent` has no approval hook, so the registry *is* the approval gate:
 /// a tool is offered to the model only when the approval matrix would
 /// auto-approve it.
-pub const BUILTIN_TOOLS: [(&str, bool); 8] = [
+pub const BUILTIN_TOOLS: [(&str, bool); 9] = [
 	("read", true),
 	("glob", true),
 	("grep", true),
+	("ast_grep", true),
 	("write", false),
 	("edit", false),
 	("bash", false),
@@ -1477,6 +1479,7 @@ fn build_registry_full(
 			"read" => Arc::new(ReadTool::with_snapshot_sink(read_sink.clone())),
 			"glob" => Arc::new(GlobTool),
 			"grep" => Arc::new(GrepTool),
+			"ast_grep" => Arc::new(AstGrepTool),
 			"write" => Arc::new(WriteTool),
 			"edit" => match session {
 				Some(session) => session.edit.clone(),
@@ -2744,7 +2747,7 @@ mod tests {
 		assert_eq!(plan.model, "llama3");
 		assert_eq!(plan.max_turns, 5);
 		assert_eq!(plan.context_limit, 8_192);
-		assert_eq!(plan.tools, ["bash", "edit", "glob", "grep", "read", "todo", "write"]);
+		assert_eq!(plan.tools, ["ast_grep", "bash", "edit", "glob", "grep", "read", "todo", "write"]);
 		assert_eq!(plan.effort, None);
 		let system = plan.system_prompt.expect("system prompt");
 		for part in ["base prompt", "appended", "repo rules", "skill body"] {
@@ -2973,14 +2976,14 @@ mod tests {
 	fn write_mode_offers_all_tools() {
 		let plan =
 			RunPlan::resolve(&request(Approvals::new(ApprovalMode::Write, Vec::new()))).expect("plan");
-		assert_eq!(plan.tools, ["bash", "edit", "glob", "grep", "read", "todo", "write"]);
+		assert_eq!(plan.tools, ["ast_grep", "bash", "edit", "glob", "grep", "read", "todo", "write"]);
 	}
 
 	#[test]
 	fn always_ask_offers_all_tools() {
 		let plan = RunPlan::resolve(&request(Approvals::new(ApprovalMode::AlwaysAsk, Vec::new())))
 			.expect("plan");
-		assert_eq!(plan.tools, ["bash", "edit", "glob", "grep", "read", "todo", "write"]);
+		assert_eq!(plan.tools, ["ast_grep", "bash", "edit", "glob", "grep", "read", "todo", "write"]);
 
 		let mut req = request(Approvals::new(ApprovalMode::AlwaysAsk, Vec::new()));
 		req.config.tools = Some(vec!["bash".to_string()]);

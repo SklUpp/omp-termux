@@ -93,7 +93,7 @@ pub fn has_ssh_target(args: &serde_json::Value) -> bool {
 /// Classify tool invocation into a capability tier.
 pub fn classify_tool(name: &str, args: &serde_json::Value) -> ToolTier {
 	match name {
-		"todo" | "glob" | "ask" => ToolTier::Read,
+		"todo" | "glob" | "ask" | "ast_grep" => ToolTier::Read,
 		"read" => {
 			if has_ssh_target(args) {
 				ToolTier::Exec

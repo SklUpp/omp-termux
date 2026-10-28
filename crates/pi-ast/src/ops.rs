@@ -5,7 +5,8 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use ast_grep_core::{
-	MatchStrictness, matcher::PatternError, source::Edit, tree_sitter::LanguageExt,
+	AstGrep, MatchStrictness, matcher::PatternError, source::Edit,
+	tree_sitter::{LanguageExt, StrDoc},
 };
 pub use ast_grep_core::matcher::Pattern;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -251,20 +252,31 @@ pub fn compile_rewrite_rules(
 		.collect()
 }
 
-/// Report whether `source` contains tree-sitter error nodes for `language`.
-///
-/// Uses the shared parse cache so a caller that only needs the verdict does not
-/// open a second parse path alongside [`collect_matches`].
-pub fn has_parse_error(source: &str, language: SupportLang) -> Result<bool> {
-	let Some(tree) = crate::parse_cache::parse_cached(source, language)? else {
-		return Ok(false);
-	};
-	Ok(tree.root_node().has_error())
+/// One tree-sitter parse of a source file, reused for error-node detection and
+/// every compiled pattern so a scan never parses the same bytes twice.
+pub type SourceAst = AstGrep<StrDoc<SupportLang>>;
+
+/// Parse `source` once for `language`.
+#[must_use]
+pub fn parse_source(source: &str, language: SupportLang) -> SourceAst {
+	language.ast_grep(source)
+}
+
+/// Whether a previously parsed tree contains tree-sitter error nodes.
+#[must_use]
+pub fn tree_has_parse_error(ast: &SourceAst) -> bool {
+	ast.root().get_inner_node().has_error()
 }
 
 #[must_use]
 pub fn collect_matches(source: &str, language: SupportLang, patterns: &[Pattern]) -> Vec<AstMatch> {
-	let ast = language.ast_grep(source);
+	collect_matches_in(&parse_source(source, language), patterns)
+}
+
+/// Collect matches against an existing parse so callers can share one tree
+/// across diagnostics and several patterns.
+#[must_use]
+pub fn collect_matches_in(ast: &SourceAst, patterns: &[Pattern]) -> Vec<AstMatch> {
 	let mut matches = Vec::new();
 	for pattern in patterns {
 		for matched in ast.root().find_all(pattern.clone()) {
