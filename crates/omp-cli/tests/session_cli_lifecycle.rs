@@ -6,7 +6,7 @@
 //! - nonTTY bare --resume error
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcCommand, Stdio};
@@ -498,6 +498,79 @@ fn test_cli_file_arg_print_mode_does_not_block_on_empty_stdin() {
 		"print output must contain mock answer, got: {stdout}"
 	);
 
+	let _ = fs::remove_dir_all(temp);
+}
+
+// EOF on piped stdin is not decidable in advance: an empty open pipe and a writer that will
+// write later look identical, and both are indistinguishable from an inherited supervisor pipe.
+// The contract (TS `readPipedInput`, main.ts:199-217) is therefore to keep reading to EOF, so the
+// process must announce what it is waiting for instead of hanging silently.
+#[test]
+fn test_cli_open_stdin_pipe_reports_waiting_for_eof() {
+	let server = MockSseServer::start();
+	let temp = temp_dir("stdin-wait-notice");
+	let agent_dir = temp.join("agent");
+	let sessions_dir = temp.join("sessions");
+	let work_dir = temp.join("work");
+	fs::create_dir_all(&agent_dir).expect("create agent dir");
+	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+	fs::create_dir_all(&work_dir).expect("create work dir");
+	setup_mock_agent_dir(&agent_dir, server.port);
+
+	let file_path = work_dir.join("code.rs");
+	fs::write(&file_path, "fn hello() {}").expect("write code file");
+
+	let mut child = omp()
+		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
+		.args([
+			"--session-dir",
+			sessions_dir.to_str().unwrap(),
+			"--session-id",
+			"stdin-wait-notice-session",
+			"--no-tools",
+			"--cwd",
+			work_dir.to_str().unwrap(),
+			"-p",
+			"@code.rs",
+		])
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.expect("spawn child with open stdin pipe");
+	// Keep the write end open: no EOF is ever delivered.
+	let _stdin = child.stdin.take().expect("child stdin pipe");
+	let stderr = child.stderr.take().expect("child stderr pipe");
+	let (tx, rx) = mpsc::channel();
+	thread::spawn(move || {
+		let mut reader = BufReader::new(stderr);
+		let mut line = String::new();
+		while reader.read_line(&mut line).unwrap_or(0) > 0 {
+			if tx.send(std::mem::take(&mut line)).is_err() {
+				return;
+			}
+		}
+	});
+
+	let mut seen = String::new();
+	let deadline = std::time::Instant::now() + Duration::from_secs(5);
+	while !seen.contains("waiting for EOF") {
+		let left = deadline.saturating_duration_since(std::time::Instant::now());
+		if left.is_zero() {
+			break;
+		}
+		match rx.recv_timeout(left) {
+			Ok(line) => seen.push_str(&line),
+			Err(_) => break,
+		}
+	}
+	let _ = child.kill();
+	let _ = child.wait();
+
+	assert!(
+		seen.contains("waiting for EOF"),
+		"must announce the stdin wait instead of hanging silently, stderr was: {seen:?}"
+	);
 	let _ = fs::remove_dir_all(temp);
 }
 

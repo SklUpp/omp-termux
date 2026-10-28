@@ -47,7 +47,9 @@ Argument handling:
 
 - `@<path>` attaches a file or image to the initial message.
 - Non-TTY stdin is read automatically as the initial prompt; do not add a `-`
-  marker.
+  marker. The read always runs to EOF; if a pipe stays open and silent the CLI
+  waits and reports `Reading prompt from piped stdin (waiting for EOF; ctrl+c to
+  abort)…` on stderr after 1 s (repeated every 10 s) instead of hanging silently.
 - `--` ends flag parsing; everything after it is literal message text, even if it
   looks like a flag.
 

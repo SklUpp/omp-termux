@@ -979,12 +979,88 @@ fn open_file_safe(path: &Path) -> std::io::Result<std::fs::File> {
 	std::fs::File::open(path)
 }
 
+// Mirrors TS `readPipedInput` (packages/coding-agent/src/main.ts:199-217): the read is
+// unbounded — a timer that stops early would silently drop input — but the wait must be
+// audible, so say what we are blocked on once per silent interval.
+const STDIN_WAIT_NOTICE_MS: std::os::raw::c_int = 1_000;
+const STDIN_WAIT_NOTICE_REPEAT_MS: i32 = 10_000;
+
+#[cfg(unix)]
+fn poll_stdin(timeout_ms: std::os::raw::c_int) -> std::io::Result<bool> {
+	#[repr(C)]
+	struct PollFd {
+		fd: std::os::raw::c_int,
+		events: std::os::raw::c_short,
+		revents: std::os::raw::c_short,
+	}
+	// `read` can proceed on any of these: a hangup means the writer closed (read yields 0/EOF),
+	// an error surfaces through `read` itself. Treating only POLLIN as ready would spin forever
+	// on an EOF'd pipe, where Linux reports POLLHUP and no POLLIN.
+	const READY: std::os::raw::c_short = 0x0001 | 0x0008 | 0x0010 | 0x0020; // POLLIN|POLLERR|POLLHUP|POLLNVAL
+	const EINTR: i32 = 4;
+	unsafe extern "C" {
+		fn poll(fds: *mut PollFd, nfds: usize, timeout_ms: std::os::raw::c_int) -> std::os::raw::c_int;
+	}
+	let mut pfd = PollFd {
+		fd: 0,
+		events: 0x0001,
+		revents: 0,
+	};
+	loop {
+		let ret = unsafe { poll(&mut pfd, 1, timeout_ms) };
+		if ret == 0 {
+			return Ok(false);
+		}
+		if ret > 0 {
+			return Ok((pfd.revents & READY) != 0);
+		}
+		// Interrupted by a signal: retry. Anything else must surface, not masquerade as a timeout.
+		let err = std::io::Error::last_os_error();
+		if err.raw_os_error() != Some(EINTR) {
+			return Err(err);
+		}
+		pfd.revents = 0;
+	}
+}
+
+/// Reads stdin to EOF, printing the wait notice while a pipe stays silent.
+#[cfg(unix)]
+fn read_stdin_to_eof() -> std::io::Result<Vec<u8>> {
+	let mut bytes = Vec::new();
+	let mut buf = [0u8; 8192];
+	let mut silent_ms: i32 = 0;
+	loop {
+		if !poll_stdin(STDIN_WAIT_NOTICE_MS)? {
+			silent_ms = silent_ms.saturating_add(STDIN_WAIT_NOTICE_MS);
+			if silent_ms == STDIN_WAIT_NOTICE_MS || silent_ms % STDIN_WAIT_NOTICE_REPEAT_MS == 0 {
+				eprintln!("Reading prompt from piped stdin (waiting for EOF; ctrl+c to abort)…");
+			}
+			continue;
+		}
+		silent_ms = 0;
+		match io::stdin().read(&mut buf) {
+			Ok(0) => break,
+			Ok(n) => bytes.extend_from_slice(&buf[..n]),
+			Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+			Err(err) => return Err(err),
+		}
+	}
+	Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_stdin_to_eof() -> std::io::Result<Vec<u8>> {
+	let mut bytes = Vec::new();
+	io::stdin().read_to_end(&mut bytes)?;
+	Ok(bytes)
+}
+
 fn read_piped_stdin() -> std::io::Result<Option<String>> {
 	if io::stdin().is_terminal() {
 		return Ok(None);
 	}
-	let mut text = String::new();
-	io::stdin().read_to_string(&mut text)?;
+	let bytes = read_stdin_to_eof()?;
+	let text = String::from_utf8(bytes).map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 	if text.trim().is_empty() {
 		Ok(None)
 	} else {
