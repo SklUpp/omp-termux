@@ -10,6 +10,7 @@
   - `crates/pi-agent/src/tools/ast_edit.rs` — preview compute, exact-byte stale gate, prepared-output apply
   - `crates/pi-ast/src/ops.rs` — per-language pattern compilation, AST matching, rewrite edits
   - `crates/pi-agent/src/tools/ast_grep.rs` — shared target planning, file-URL handling, root guard, candidate discovery
+  - `crates/pi-agent/src/tools/hashline/snapshot.rs` — tag minting and `[PATH#TAG]` header formatting reused by hashline previews
   - `crates/pi-agent/src/tools/pending.rs` — staged action queue; failed applies requeue the same entry
   - `crates/pi-agent/src/tools/mod.rs` — `write_atomic` (mode/symlink preserve) and builtin registration
   - `crates/pi-natives/src/ast.rs` — upstream native rewrite reference
@@ -36,13 +37,18 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
 ## Outputs
 - Single-shot preview result from `ast_edit` itself. A non-empty proposal begins with `Staged as a proposal — files NOT modified yet...` and names the resolve/reject device paths.
 - Model-facing `content` is one text block showing proposed edits, grouped by file for directory/multi-file runs.
-  - Each change renders as `-LINE:COLUMN before` / `+LINE:COLUMN after`; the Rust port always uses this plain form for previews. Successful apply appends fresh `[PATH#TAG]` snapshot headers for written files.
+  - Rendering follows the explicit `PreviewDisplay` input (`AstEditTool::with_display`):
+    - `Plain`: `-LINE:COLUMN before` / `+LINE:COLUMN after`, no tag headers (grouped runs still get the folded `# dir/` / `## file (N replacement)` headers).
+    - `Hashline`: a `[PATH#TAG]` header above a single-file preview, `-LINE:before` / `+LINE:after` changes (no column), and grouped headers with the tag appended (`# dir/`, `## file#TAG (N replacement)`).
+    - Grouped output is the upstream `formatGroupedFiles` tree: one `#` per nesting level, single-child directory chains folded into one header, files listed under their deepest directory header, and blank lines before directory headers and root-level files.
+    - `details.displayContent` carries the TUI code-frame view: `-LINE│text` / `+LINE│text` per change, gutter padded to the widest line number in the file. Grouped frames repeat the same grouped headers; a single-file frame has no header. This is display metadata, not model content.
+    - Tags shown in a hashline preview are minted from the pre-edit bytes and recorded in the session snapshot store, so a follow-up `edit` can anchor to them without a re-read. Successful apply re-records post-apply tags and appends fresh `[PATH#TAG]` headers only in `Hashline` mode.
   - Only the first line of each `before`/`after` snippet is shown, truncated to 120 characters.
   - `Limit reached; narrow paths.` and formatted parse issues are appended when applicable.
 - If no rewrites match, text is `No replacements made` plus formatted parse issues when present.
 - `details` includes aggregate preview metadata:
   - `totalReplacements`, `filesTouched`, `filesSearched`, `applied`, `limitReached`
-  - optional `parseErrors`, `parseErrorsTotal`, `scopePath`, `files`, `fileReplacements`, `searchPath`, `cwd`
+  - optional `parseErrors`, `parseErrorsTotal`, `scopePath`, `files`, `fileReplacements`, `displayContent`, `searchPath`, `cwd`
   - `changes`: per-match `path`, `before`, `after`, byte/line/column ranges, and metavariable `captures`
 - The tool always previews first (`applied: false` in the direct result). Actual file writes happen only later through a plain-text `write` to `xd://resolve`; the body is the reason.
 - When preview produced replacements, `ast_edit` also queues a pending resolve action. Successful apply returns a separate resolve dispatch result (on the `write` call), not another `ast_edit` result.
@@ -54,7 +60,7 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
    - duplicate `pat` values fail,
    - ops are converted to a `Record<pattern, replacement>`.
 2. The wrapper reads `PI_MAX_AST_FILES` via `$envpos(..., 1000)` and uses that as the native `maxFiles` cap for both preview and apply.
-3. Path normalization, internal URL handling, missing-path partitioning, and multi-path resolution follow the same `path-utils.ts` flow as `ast_grep`.
+3. Each `paths` entry is resolved independently through `plan_targets_single` (per-entry `parseSearchPath` semantics, not `ast_grep`'s multi-path union): a leading glob stays at its entry's root (`*.ts` is top-level, `**/*.ts` recurses), every entry keeps its own base, overlapping entries dedupe to one canonical file, and missing-path partitioning plus the `/` root guard still apply. The port has no internal-URL or remote resolver, so non-local schemes are rejected.
 4. The scope's `isDirectory` flag (set by a stat in `resolveToolSearchScope`) decides whether to render grouped directory output.
 5. `runAstEditOnce(...)` always runs native `astEdit(...)` with `dryRun: true` and `failOnParseError: false` on the first pass.
 6. Rust preview (`crates/pi-agent/src/tools/ast_edit.rs`):
@@ -64,13 +70,13 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
    - infers a language per candidate and compiles each rule for every discovered language, reporting per-language parse issues,
    - parses each file once, skips error trees, collects `replace_by(...)` edits, deduplicates byte-identical edits, and enforces the `maxFiles` cap,
    - stores the **exact original bytes** of every affected file plus the prepared rewritten bytes; no content hash stands in for the bytes,
-   - renders `-LINE:COLUMN before` / `+LINE:COLUMN after` pairs and exposes captures in `details.changes`.
+   - renders the preview in the tool's `PreviewDisplay` mode (plain `-LINE:COLUMN` pairs or hashline `[PATH#TAG]`/tag-header output), builds grouped runs as the folded `formatGroupedFiles` tree, emits code frames as `details.displayContent`, and exposes captures in `details.changes`.
 7. Parse errors are deduplicated and capped at 20; `details.parseErrors` carries the capped list and `parseErrorsTotal` the pre-cap count.
 8. A non-zero preview registers `AstEditPending` in the session `PendingStore`. Zero replacements register nothing. Apply/discard is a plain `write` to `xd://resolve` / `xd://reject`.
 9. Apply first re-reads **all** affected files and compares bytes to the preview's originals. Any changed or unreadable file is stale: zero files are written and the action is requeued. A same-count content change fails this gate; counts alone never validate a preview.
 10. After the all-files gate, each prepared output is written through `write_atomic` (mode and symlink preserved). A per-file recheck narrows the gate-to-write window; there is no filesystem lock, so a writer racing inside that window can still be overwritten.
 11. A failure or cancellation after some writes is reported as a partial apply: it lists written files and snapshot invalidations, does not rewrite the remainder, and requeues the action. Retrying then fails the byte gate because already-written files no longer match the preview.
-12. On success the result is `Applied N replacements in M files.` followed by fresh `[path#TAG]` headers for snapshots re-recorded from the post-apply bytes; on discard (`write xd://reject`) no file is mutated.
+12. On success the result is `Applied N replacements in M files.` followed, only in `Hashline` mode, by fresh `[path#TAG]` headers for snapshots re-recorded from the post-apply bytes (tags are always re-recorded so `edit` can anchor); on discard (`write xd://reject`) no file is mutated.
 
 ## Modes / Variants
 - Single file: preview or apply against one file.
@@ -79,7 +85,7 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
 - Internal URL inputs: only supported when the router resolves them to a backing file path.
 - Preview mode: always the direct `ast_edit` tool result.
 - Apply mode: only reachable through the queued resolve callback (a `write` to `xd://resolve` or `xd://reject`) after a preview.
-- Hashline output mode is not selected by the Rust port: previews are plain `LINE:COLUMN`; apply emits fresh snapshot headers.
+- Preview display mode: explicit `PreviewDisplay` constructor input. `Plain` renders `LINE:COLUMN`; `Hashline` renders `[PATH#TAG]` / tagged grouped headers and records the shown tags from pre-edit bytes. `builtin_tools()` selects `Hashline` (upstream's default `edit.mode` is `hashline`; `read` in this registry always shows hashline headers), while standalone `AstEditTool::new` keeps `Plain`. No runtime `edit.mode`/model-variant settings resolver exists in this port yet, so the mode is fixed at construction.
 
 ## Side Effects
 - Filesystem
@@ -129,4 +135,4 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
 - Rewrites are accumulated per file, then applied from the end of the file backward after an overlap check. Independent matches can coexist; overlapping matches abort the run.
 - Native rewrite rule order is by pattern-string sort, not by the original `ops` array order, because `normalize_rewrite_map(...)` sorts the `(pattern, rewrite)` pairs.
 - Preview/apply parity is validated by byte-exact comparison of every affected file before the write phase; the prepared outputs are then written without rerunning the rewrite. Replacement totals and per-file counts are reporting only.
-- Display parity gap: upstream can render hashline preview headers; the Rust port renders plain `LINE:COLUMN` previews and emits hashline headers only for post-apply snapshots.
+- Display parity: the Rust preview implements the `resolveFileDisplayMode(...).hashLines` branch — pre-edit snapshot recording, `[PATH#TAG]` (single file) and tagged folded grouped headers, `-LINE:text` / `+LINE:text`, upstream's `formatGroupedFiles` directory tree, and `details.displayContent` code frames. The remaining difference is selection input: an explicit constructor mode here versus session `edit.mode`/model-variant settings upstream (a CLI/config resolver task).

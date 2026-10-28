@@ -15,7 +15,7 @@ pub mod todo;
 pub mod yield_tool;
 
 pub use ask::AskTool;
-pub use ast_edit::AstEditTool;
+pub use ast_edit::{AstEditTool, PreviewDisplay};
 pub use ast_grep::AstGrepTool;
 pub use hub::HubTool;
 pub use pending::{PendingAction, PendingStore, REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH};
@@ -1935,7 +1935,13 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
 		Arc::new(GlobTool),
 		Arc::new(GrepTool),
 		Arc::new(AstGrepTool),
-		Arc::new(AstEditTool::new(snapshots, pending)),
+		// Upstream's default `edit.mode` is `hashline`, and `read` here always
+		// displays hashline headers, so the builtin preview matches it.
+		Arc::new(AstEditTool::with_display(
+			snapshots,
+			pending,
+			PreviewDisplay::Hashline,
+		)),
 		Arc::new(TodoTool::new()),
 	]
 }
