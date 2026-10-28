@@ -4,7 +4,8 @@
 //! [`PendingAction`] here and tells the model to `write` a reason to
 //! `xd://resolve` (apply) or `xd://reject` (discard). The store owns the
 //! lifecycle: one entry is handed to exactly one resolve/reject call, a failed
-//! apply requeues the same entry, and an empty resolve/reject drains itself.
+//! apply requeues the same entry, and a clear invalidates any resolve/reject
+//! already in flight so it cannot resurrect a discarded preview.
 //!
 //! The owner is the runner session, not a [`ToolRegistry`]: registries are
 //! rebuilt for every prompt, so a registry-local queue would forget a staged
@@ -91,16 +92,57 @@ pub trait PendingAction: Send + Sync {
 	}
 }
 
+/// Stable identity of the newest staged action, returned by
+/// [`PendingStore::peek_head`].
+///
+/// `generation` is the queue generation the head was observed in. Neither
+/// `id` nor `generation` is enforced by resolve/reject: those always act on
+/// the current head. A caller that wants to act on this specific entry (e.g. a
+/// reminder or force reset) must compare both `id` and `generation` against a
+/// fresh [`PendingStore::peek_head`]; a `clear` bumps the generation and a new
+/// [`PendingStore::register`] assigns a new id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingHead {
+	pub id:          u64,
+	pub source_tool: String,
+	pub label:       String,
+	pub generation:  u64,
+}
+
+/// One queued action with the id assigned when it was registered.
+struct Entry {
+	id:     u64,
+	action: Arc<dyn PendingAction>,
+}
+
+/// Queue contents and the generation used to invalidate in-flight
+/// resolve/reject futures; both live under a single lock so a peek and its
+/// generation are always a consistent snapshot.
+struct State {
+	entries:    VecDeque<Entry>,
+	generation: u64,
+	next_id:    u64,
+}
+
 /// Stack of staged actions, newest last (upstream `peekPendingHead`).
 ///
 /// The store is shared across prompts by the runner session; every mutating
 /// method locks, and [`PendingStore::resolve`]/[`PendingStore::reject`] remove
 /// the head *before* awaiting `apply`, so concurrent or repeated resolves can
-/// never run the same action twice. A dropped resolve future requeues its
-/// action through an RAII guard.
-#[derive(Default)]
+/// never run the same action twice. A dropped or failed resolve/reject future
+/// requeues its action through an RAII guard, but only while the generation it
+/// captured with the take is still current: a [`PendingStore::clear`] during
+/// the await discards the in-flight entry instead of resurrecting it.
 pub struct PendingStore {
-	queue: Mutex<VecDeque<Arc<dyn PendingAction>>>,
+	state: Mutex<State>,
+}
+
+impl Default for PendingStore {
+	fn default() -> Self {
+		Self {
+			state: Mutex::new(State { entries: VecDeque::new(), generation: 0, next_id: 1 }),
+		}
+	}
 }
 
 impl PendingStore {
@@ -108,64 +150,89 @@ impl PendingStore {
 		Self::default()
 	}
 
-	fn queue(&self) -> MutexGuard<'_, VecDeque<Arc<dyn PendingAction>>> {
-		self.queue.lock().unwrap_or_else(|poison| poison.into_inner())
+	fn state(&self) -> MutexGuard<'_, State> {
+		self.state.lock().unwrap_or_else(|poison| poison.into_inner())
 	}
 
-	/// Stage an action as the newest head.
-	pub fn register(&self, action: Arc<dyn PendingAction>) {
-		self.queue().push_back(action);
+	/// Stage an action as the newest head, returning its stable id. The id
+	/// identifies the entry for [`PendingStore::peek_head`] callers; it does
+	/// not order the queue.
+	pub fn register(&self, action: Arc<dyn PendingAction>) -> u64 {
+		let mut state = self.state();
+		let id = state.next_id;
+		state.next_id = state.next_id.wrapping_add(1);
+		state.entries.push_back(Entry { id, action });
+		id
 	}
 
 	/// Inspect the newest staged action without consuming it.
 	pub fn peek(&self) -> Option<Arc<dyn PendingAction>> {
-		self.queue().back().cloned()
+		self.state().entries.back().map(|entry| Arc::clone(&entry.action))
+	}
+
+	/// Snapshot the newest staged action's identity, atomically with the queue
+	/// generation, without consuming it.
+	pub fn peek_head(&self) -> Option<PendingHead> {
+		let state = self.state();
+		state.entries.back().map(|entry| PendingHead {
+			id:          entry.id,
+			source_tool: entry.action.source_tool().to_string(),
+			label:       entry.action.label().to_string(),
+			generation:  state.generation,
+		})
+	}
+
+	pub fn generation(&self) -> u64 {
+		self.state().generation
 	}
 
 	pub fn len(&self) -> usize {
-		self.queue().len()
+		self.state().entries.len()
 	}
 
 	pub fn is_empty(&self) -> bool {
-		self.queue().is_empty()
+		self.state().entries.is_empty()
 	}
 
-	/// Drop every staged action (session end, phantom drain).
+	/// Drop every staged action (session end, phantom drain) and invalidate any
+	/// resolve/reject already in flight, so they cannot requeue afterwards.
 	pub fn clear(&self) {
-		self.queue().clear();
+		let mut state = self.state();
+		state.entries.clear();
+		state.generation = state.generation.wrapping_add(1);
 	}
 
-	/// Pop the newest action, or drain the queue when it is already empty
-	/// (phantom drain, upstream `dispatchResolutionDevice`).
-	fn take_or_drain(&self) -> Option<Arc<dyn PendingAction>> {
-		let mut queue = self.queue();
-		match queue.pop_back() {
-			Some(action) => Some(action),
-			None => {
-				queue.clear();
-				None
-			},
-		}
+	/// Pop the newest action together with the generation it was taken in.
+	/// An empty queue is a plain miss; draining nothing must not invalidate
+	/// entries still held by concurrent resolve/reject futures.
+	fn take(&self) -> Option<(Entry, u64)> {
+		let mut state = self.state();
+		let generation = state.generation;
+		state.entries.pop_back().map(|entry| (entry, generation))
 	}
 
 	/// Restore a failed, cancelled, or dropped action to its head position
-	/// without reordering the previews staged before it.
-	fn requeue(&self, action: Arc<dyn PendingAction>) {
-		self.queue().push_back(action);
+	/// without reordering the previews staged before it. A `clear` since the
+	/// take bumped the generation, so the stale entry is dropped instead.
+	fn requeue(&self, entry: Entry, generation: u64) {
+		let mut state = self.state();
+		if state.generation == generation {
+			state.entries.push_back(entry);
+		}
 	}
 
-	/// Apply the newest action. With nothing pending this is an error and the
-	/// stale queue is drained.
+	/// Apply the newest action. With nothing pending this is an error.
 	///
 	/// A failed or cancelled `apply`, a dropped future, and an `is_error`
-	/// result all leave the same entry pending for a retry or a later reject.
+	/// result all leave the same entry pending for a retry or a later reject,
+	/// unless a `clear` happened meanwhile.
 	pub async fn resolve(&self, ctx: &AgentContext, reason: &str) -> Result<ToolResult, ToolError> {
-		let Some(action) = self.take_or_drain() else {
+		let Some((entry, generation)) = self.take() else {
 			return Err(ToolError::ExecutionFailed(format!(
 				"No pending action to apply — {RESOLVE_DEVICE_PATH} is only valid while a staged preview is pending."
 			)));
 		};
-		let mut guard = RequeueOnDrop::new(self, action);
+		let mut guard = RequeueOnDrop::new(self, entry, generation);
 		match guard.action().apply(ctx, reason).await {
 			Ok(result) if !result.is_error => {
 				let decorated = resolve_details(result, "apply", reason, guard.action());
@@ -181,12 +248,12 @@ impl PendingStore {
 	/// Discard the newest action. With nothing pending this succeeds: rejecting
 	/// asks to reach the "no staged change" end-state, which already holds.
 	pub async fn reject(&self, ctx: &AgentContext, reason: &str) -> Result<ToolResult, ToolError> {
-		let Some(action) = self.take_or_drain() else {
+		let Some((entry, generation)) = self.take() else {
 			let mut result = tool_result("Nothing to reject; no pending action remains.", false);
 			result.details = Some(serde_json::json!({"action": "discard", "reason": reason}));
 			return Ok(result);
 		};
-		let mut guard = RequeueOnDrop::new(self, action);
+		let mut guard = RequeueOnDrop::new(self, entry, generation);
 		match guard.action().reject(ctx, reason).await {
 			Ok(result) if !result.is_error => {
 				let decorated = resolve_details(result, "discard", reason, guard.action());
@@ -201,30 +268,32 @@ impl PendingStore {
 
 /// Requeue the entry unless the call proved it was consumed, so a dropped
 /// resolve/reject future (interrupt mid-apply) cannot lose the staged action.
+/// Entries staged before a `clear` are dropped rather than resurrected.
 struct RequeueOnDrop<'a> {
-	store:  &'a PendingStore,
-	action: Option<Arc<dyn PendingAction>>,
+	store:      &'a PendingStore,
+	entry:      Option<Entry>,
+	generation: u64,
 }
 
 impl<'a> RequeueOnDrop<'a> {
-	fn new(store: &'a PendingStore, action: Arc<dyn PendingAction>) -> Self {
-		Self { store, action: Some(action) }
+	fn new(store: &'a PendingStore, entry: Entry, generation: u64) -> Self {
+		Self { store, entry: Some(entry), generation }
 	}
 
 	fn action(&self) -> &dyn PendingAction {
-		self.action.as_deref().expect("pending action armed")
+		self.entry.as_ref().expect("pending action armed").action.as_ref()
 	}
 
 	/// Mark the action consumed so `Drop` leaves the queue alone.
 	fn consume(&mut self) {
-		self.action.take();
+		self.entry.take();
 	}
 }
 
 impl Drop for RequeueOnDrop<'_> {
 	fn drop(&mut self) {
-		if let Some(action) = self.action.take() {
-			self.store.requeue(action);
+		if let Some(entry) = self.entry.take() {
+			self.store.requeue(entry, self.generation);
 		}
 	}
 }
@@ -503,6 +572,29 @@ mod tests {
 		}
 	}
 
+	/// Holds `apply` until the test releases it, then fails.
+	struct SlowFailAction {
+		entered: Arc<Notify>,
+		gate:    Arc<Notify>,
+	}
+
+	#[async_trait]
+	impl PendingAction for SlowFailAction {
+		fn label(&self) -> &str {
+			"slow stale edit"
+		}
+
+		fn source_tool(&self) -> &str {
+			"ast_edit"
+		}
+
+		async fn apply(&self, _ctx: &AgentContext, _reason: &str) -> Result<ToolResult, ToolError> {
+			self.entered.notify_one();
+			self.gate.notified().await;
+			Err(ToolError::ExecutionFailed("preview is stale".to_string()))
+		}
+	}
+
 	#[tokio::test]
 	async fn dropping_resolve_future_requeues_the_entry() {
 		let dir = TempDir::new("dropped");
@@ -536,6 +628,131 @@ mod tests {
 		assert!(!retried.is_error);
 		assert_eq!(std::fs::read_to_string(&target).expect("read"), "applied: retry\n");
 		assert!(store.is_empty());
+	}
+
+	#[tokio::test]
+	async fn head_identity_is_stable_across_retry_and_fresh_per_register() {
+		let dir = TempDir::new("identity");
+		let store = PendingStore::new();
+		let file = Arc::new(FileAction::new(dir.0.join("out.txt")));
+		file.fail.store(true, Ordering::SeqCst);
+		let registered = store.register(file.clone());
+		let ctx = ctx(&dir);
+
+		let head = store.peek_head().expect("head");
+		assert_eq!(head.id, registered);
+		assert_eq!(head.source_tool, "ast_edit");
+		assert_eq!(head.label, "test edit");
+		assert_eq!(head.generation, store.generation());
+
+		store.resolve(&ctx, "stale").await.expect_err("stale apply");
+		let retried = store.peek_head().expect("requeued head");
+		assert_eq!(retried.id, registered, "a retry keeps the staged id");
+		assert_eq!(retried.generation, head.generation);
+
+		file.fail.store(false, Ordering::SeqCst);
+		store.resolve(&ctx, "ok").await.expect("apply");
+		assert!(store.peek_head().is_none());
+
+		let older = store.register(Arc::new(FileAction::new(dir.0.join("older.txt"))));
+		let newer = store.register(Arc::new(FileAction::new(dir.0.join("newer.txt"))));
+		assert!(newer > older, "every register gets a fresh monotonic id");
+		assert_eq!(store.peek_head().expect("newest").id, newer);
+		assert_eq!(store.peek().expect("peek agrees").label(), "test edit");
+
+		let generation = store.generation();
+		store.clear();
+		assert_eq!(store.generation(), generation + 1, "clear invalidates in-flight entries");
+		assert!(store.peek_head().is_none());
+
+		let fresh = store.register(Arc::new(FileAction::new(dir.0.join("fresh.txt"))));
+		assert!(fresh > newer, "ids stay unique across clear");
+		assert_eq!(store.peek_head().expect("fresh").id, fresh);
+		assert_eq!(store.peek_head().expect("fresh").generation, generation + 1);
+	}
+
+	#[tokio::test]
+	async fn clear_while_apply_in_flight_drops_the_failed_entry() {
+		let dir = TempDir::new("clear-fail");
+		let store = Arc::new(PendingStore::new());
+		let slow = Arc::new(SlowFailAction {
+			entered: Arc::new(Notify::new()),
+			gate:    Arc::new(Notify::new()),
+		});
+		store.register(slow.clone());
+		let ctx = ctx(&dir);
+
+		let handle = {
+			let store = store.clone();
+			let ctx = ctx.clone();
+			tokio::spawn(async move { store.resolve(&ctx, "stale").await })
+		};
+		slow.entered.notified().await;
+		store.clear();
+		assert!(store.peek_head().is_none());
+
+		slow.gate.notify_one();
+		let error = handle.await.expect("join").expect_err("stale apply");
+		assert!(error.to_string().contains("preview is stale"));
+		assert!(store.is_empty(), "a cleared entry must not resurrect on failure");
+		assert!(store.peek_head().is_none());
+	}
+
+	#[tokio::test]
+	async fn clear_while_resolve_in_flight_drops_the_requeued_entry() {
+		let dir = TempDir::new("clear-drop");
+		let target = dir.0.join("out.txt");
+		let store = Arc::new(PendingStore::new());
+		let slow = Arc::new(SlowAction {
+			path:    target.clone(),
+			entered: Arc::new(Notify::new()),
+			gate:    Arc::new(Notify::new()),
+		});
+		store.register(slow.clone());
+		let ctx = ctx(&dir);
+
+		let handle = {
+			let store = store.clone();
+			let ctx = ctx.clone();
+			tokio::spawn(async move { store.resolve(&ctx, "aborted").await })
+		};
+		slow.entered.notified().await;
+		store.clear();
+		handle.abort();
+		assert!(handle.await.expect_err("cancelled task").is_cancelled());
+
+		assert!(store.is_empty(), "a cleared entry must not resurrect on drop");
+		assert!(store.peek_head().is_none());
+		assert!(!target.exists());
+		slow.gate.notify_one();
+	}
+
+	#[tokio::test]
+	async fn empty_concurrent_resolve_does_not_invalidate_the_inflight_entry() {
+		let dir = TempDir::new("empty-race");
+		let store = Arc::new(PendingStore::new());
+		let slow = Arc::new(SlowFailAction {
+			entered: Arc::new(Notify::new()),
+			gate:    Arc::new(Notify::new()),
+		});
+		let registered = store.register(slow.clone());
+		let ctx = ctx(&dir);
+
+		let first = {
+			let store = store.clone();
+			let ctx = ctx.clone();
+			tokio::spawn(async move { store.resolve(&ctx, "first").await })
+		};
+		slow.entered.notified().await;
+		// Seeing the queue empty must not bump the generation: the first call
+		// still owns the entry and requeues it when its apply fails.
+		let second = store.resolve(&ctx, "second").await;
+		assert!(second.expect_err("nothing pending").to_string().contains("No pending action"));
+
+		slow.gate.notify_one();
+		first.await.expect("join").expect_err("stale apply");
+		let head = store.peek_head().expect("requeued head");
+		assert_eq!(head.id, registered);
 	}
 
 	/// Applies exactly once while a concurrent resolve sees an empty queue.
