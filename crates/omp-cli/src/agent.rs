@@ -128,6 +128,13 @@ pub struct RunRequest {
 	pub skills: Vec<Skill>,
 	/// Earlier turns of this session (`--continue`/`--session-id`), oldest first.
 	pub history: Vec<crate::session::TurnRecord>,
+	/// Todo phases restored from the session branch (TS
+	/// `getLatestTodoPhasesFromEntries`): the newest `user_todo_edit` custom
+	/// entry or successful `todo` tool result, whichever comes last in the log.
+	pub todo_phases: Vec<pi_agent::tools::todo::TodoPhase>,
+	/// Whether turns are written to a session log; tools report
+	/// `details.storage` as `session` instead of `memory`.
+	pub session_persisted: bool,
 	pub config: Config,
 	pub catalog: Arc<Catalog>,
 	pub approvals: Approvals,

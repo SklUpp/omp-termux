@@ -5,14 +5,15 @@ use std::{
 
 use pi_agent::{
 	AgentConfig, AgentContext, AgentLoop, AgentState,
-	ChildStatus, DelegationLimits, OpenAiCompatibleProvider,
+	ChildStatus, DelegationLimits, HubTool, OpenAiCompatibleProvider,
 	Role, Supervisor, TaskTool, Tool, ToolRegistry,
 };
+use pi_agent::tools::hub::HubToolDetails;
 use pi_agent::tools::task::TaskToolDetails;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 fn tool_call_response(tool_name: &str, tool_args: &Value) -> Value {
 	json!({
@@ -205,6 +206,22 @@ fn last_message_text(body: &str) -> String {
 /// stage first, because `child_finished` is a substring of `grandchild_finished`
 /// and tool results echo the child task text they ran.
 fn route_response(latest: &str) -> Value {
+	// T9: child runs a long shell command that the parent future abandons.
+	if latest.contains("BASH_DROP") {
+		return tool_call_response(
+			"bash",
+			&json!({
+				"command": "sh -c 'echo $$ > pid.txt; sleep 2; touch marker.txt'",
+				"timeout": 0,
+			}),
+		);
+	}
+
+	// T8: a yield error is a task failure, not a cancellation.
+	if latest.contains("YIELD_ERROR") {
+		return tool_call_response("yield", &json!({ "result": { "error": "boom" } }));
+	}
+
 	// T2 recovery stages
 	if latest.contains("Tool not found: task") {
 		return tool_call_response(
@@ -351,7 +368,8 @@ async fn test_t1_happy_delegation() {
 
 	let sub_result = &details.results[0];
 	assert_eq!(sub_result.index, 0);
-	assert_eq!(sub_result.id, "sub-1");
+	assert_eq!(sub_result.id, "task-1");
+	assert_eq!(sub_result.name, "sub-1");
 	assert_eq!(sub_result.agent, "task");
 	assert_eq!(sub_result.exit_code, 0);
 
@@ -383,7 +401,8 @@ async fn test_t1_happy_delegation() {
 	// 5. Supervisor child record marked Completed
 	let children = supervisor.children();
 	assert_eq!(children.len(), 1);
-	assert_eq!(children[0].id, "sub-1");
+	assert_eq!(children[0].id, "task-1");
+	assert_eq!(children[0].name, "sub-1");
 	assert_eq!(children[0].status, ChildStatus::Completed);
 	assert!(children[0].duration_ms.is_some());
 }
@@ -409,11 +428,11 @@ async fn test_t2_depth_limits() {
 	// depth 0 (root): has task
 	assert!(supervisor.root_registry().get("task").is_some());
 	// depth 1 (child): has task and yield
-	let reg1 = supervisor.child_registry(1);
+	let reg1 = supervisor.child_registry(1, Some("child"));
 	assert!(reg1.get("task").is_some());
 	assert!(reg1.get("yield").is_some());
 	// depth 2 (grandchild, depth == max_depth): has yield, but NO task
-	let reg2 = supervisor.child_registry(2);
+	let reg2 = supervisor.child_registry(2, Some("grandchild"));
 	assert!(reg2.get("task").is_none());
 	assert!(reg2.get("yield").is_some());
 
@@ -451,8 +470,16 @@ async fn test_t2_depth_limits() {
 	assert!(turn_results.last().unwrap().is_completed);
 
 	let children = supervisor.children();
-	assert!(children.iter().any(|c| c.id == "t2-child" && c.status == ChildStatus::Completed));
-	assert!(children.iter().any(|c| c.id == "t2-grandchild" && c.status == ChildStatus::Completed));
+	assert!(
+		children
+			.iter()
+			.any(|c| c.name == "t2-child" && c.status == ChildStatus::Completed)
+	);
+	assert!(
+		children
+			.iter()
+			.any(|c| c.name == "t2-grandchild" && c.status == ChildStatus::Completed)
+	);
 }
 
 #[tokio::test]
@@ -515,7 +542,7 @@ async fn test_t3_cancellation_cleans_up_and_records_aborted() {
 	let children = supervisor.children();
 	let child = children
 		.iter()
-		.find(|c| c.id == "hang-child")
+		.find(|c| c.name == "hang-child")
 		.expect("hang-child record in supervisor");
 	assert_eq!(child.status, ChildStatus::Aborted);
 	assert_eq!(child.aborted, Some(true));
@@ -563,7 +590,8 @@ async fn test_t4_batch_execution_order() {
 
 	let r0 = &details.results[0];
 	assert_eq!(r0.index, 0);
-	assert_eq!(r0.id, "task-A");
+	assert_eq!(r0.id, "task-1");
+	assert_eq!(r0.name, "task-A");
 	assert_eq!(r0.exit_code, 0);
 	assert_eq!(
 		r0.extracted_tool_data.as_ref().unwrap()["yield"][0]["data"],
@@ -572,7 +600,8 @@ async fn test_t4_batch_execution_order() {
 
 	let r1 = &details.results[1];
 	assert_eq!(r1.index, 1);
-	assert_eq!(r1.id, "task-B");
+	assert_eq!(r1.id, "task-2");
+	assert_eq!(r1.name, "task-B");
 	assert_eq!(r1.exit_code, 0);
 	assert_eq!(
 		r1.extracted_tool_data.as_ref().unwrap()["yield"][0]["data"],
@@ -582,4 +611,445 @@ async fn test_t4_batch_execution_order() {
 	let children = supervisor.children();
 	assert_eq!(children.len(), 2);
 	assert!(children.iter().all(|c| c.status == ChildStatus::Completed));
+}
+
+#[tokio::test]
+async fn test_t5_hub_jobs_snapshot_after_child_completion() {
+	let (server, _) = spawn_mock_server(None).await;
+	let provider = Arc::new(
+		OpenAiCompatibleProvider::new(&server.base_url, "fake-key", "test-model").unwrap(),
+	);
+
+	let supervisor = Supervisor::new(
+		ToolRegistry::new(),
+		provider.clone(),
+		None,
+		DelegationLimits::default(),
+	);
+
+	// Root has no yield; children do.
+	assert!(supervisor.root_registry().get("yield").is_none());
+	assert!(supervisor.child_registry(1, Some("child")).get("yield").is_some());
+	assert!(supervisor.root_registry().get("hub").is_some());
+
+	let root_registry = supervisor.root_registry();
+	let config = AgentConfig {
+		max_turns: 5,
+		context_limit: 100_000,
+		system_prompt: None,
+		cwd: std::env::temp_dir(),
+	};
+	let agent_loop = AgentLoop::new(config, provider, root_registry);
+	let mut state = AgentState::default();
+	let turn_results = agent_loop
+		.run_dialog("T1_START", &mut state, None)
+		.await
+		.expect("root dialog run");
+	assert!(turn_results.last().unwrap().is_completed);
+
+	let hub = HubTool::root(supervisor.clone());
+	let ctx = AgentContext::new(std::env::temp_dir());
+	let snapshot = hub.execute(&json!({ "op": "jobs" }), &ctx).await.expect("jobs");
+	assert!(!snapshot.is_error);
+	let details: HubToolDetails = serde_json::from_str(&snapshot.content).expect("details");
+	assert_eq!(details.op, "jobs");
+	assert_eq!(details.jobs.len(), 1);
+	assert_eq!(details.jobs[0].id, "task-1");
+	assert_eq!(details.jobs[0].name, "sub-1");
+	assert_eq!(details.jobs[0].kind, "task");
+	assert_eq!(details.jobs[0].status, "completed");
+	assert!(
+		details.jobs[0]
+			.result_text
+			.as_deref()
+			.is_some_and(|text| text.contains("result_val"))
+	);
+	assert!(details.jobs[0].label.contains("T1_CHILD_WORK"));
+
+	// Unknown ids are reported per id, not fabricated.
+	let unknown = hub
+		.execute(&json!({ "op": "cancel", "ids": ["missing", "task-1"] }), &ctx)
+		.await
+		.expect("cancel");
+	let cancel_details: HubToolDetails = serde_json::from_str(&unknown.content).expect("details");
+	let cancelled = cancel_details.cancelled.expect("outcomes");
+	assert_eq!(cancelled[0].id, "missing");
+	assert_eq!(cancelled[0].status, "not_found");
+	assert_eq!(cancelled[1].id, "task-1");
+	assert_eq!(cancelled[1].status, "already_completed");
+	assert_eq!(cancel_details.jobs.len(), 1);
+	assert_eq!(cancel_details.jobs[0].status, "completed");
+
+	// Unsupported hub ops are explicitly rejected, not silently ignored.
+	let unsupported = hub
+		.execute(&json!({ "op": "send", "to": "Main", "message": "hi" }), &ctx)
+		.await
+		.expect("unsupported op result");
+	assert!(unsupported.is_error);
+	assert!(unsupported.content.contains("not supported"));
+	assert!(unsupported.content.contains("jobs, cancel"));
+}
+
+#[tokio::test]
+async fn test_t6_hub_cancel_aborts_running_child_and_scopes_owner() {
+	let (server, hang_rx) = spawn_mock_server(Some("HUB_HANG")).await;
+	let mut hang_rx = hang_rx.expect("hang signal rx");
+	let provider = Arc::new(
+		OpenAiCompatibleProvider::new(&server.base_url, "fake-key", "test-model").unwrap(),
+	);
+
+	let supervisor = Supervisor::new(
+		ToolRegistry::new(),
+		provider.clone(),
+		None,
+		DelegationLimits::default(),
+	);
+
+	let task = TaskTool::new(supervisor.clone(), 0);
+	let ctx = AgentContext::new(std::env::temp_dir());
+	let handle = tokio::spawn(async move {
+		task
+			.execute(&json!({ "name": "hang-cancel", "task": "HUB_HANG" }), &ctx)
+			.await
+	});
+
+	tokio::time::timeout(Duration::from_secs(5), hang_rx.recv())
+		.await
+		.expect("child reached hang mock")
+		.expect("hang channel");
+
+	// A later turn rebinds the supervisor to its own registry/approval gate.
+	// The in-flight child must keep its abort handle and record.
+	supervisor.rebind(
+		ToolRegistry::new(),
+		provider,
+		None,
+		DelegationLimits::default(),
+		true,
+		true,
+	);
+
+	// A child-owned hub cannot cancel the root's child. Capture the generated
+	// identity (names are only labels and cannot address a child).
+	let child_id = supervisor
+		.children()
+		.into_iter()
+		.find(|record| record.name == "hang-cancel")
+		.expect("running child record")
+		.id;
+	let child_hub = HubTool::with_owner(supervisor.clone(), Some("not-the-parent".to_string()));
+	let ctx = AgentContext::new(std::env::temp_dir());
+	let foreign = child_hub
+		.execute(&json!({ "op": "cancel", "ids": [child_id.clone()] }), &ctx)
+		.await
+		.expect("foreign cancel");
+	let foreign_details: HubToolDetails = serde_json::from_str(&foreign.content).expect("details");
+	assert_eq!(foreign_details.cancelled.unwrap()[0].status, "not_found");
+
+	let hub = HubTool::root(supervisor.clone());
+	let result = hub
+		.execute(&json!({ "op": "cancel", "ids": [child_id] }), &ctx)
+		.await
+		.expect("cancel");
+	let details: HubToolDetails = serde_json::from_str(&result.content).expect("details");
+	assert_eq!(details.cancelled.as_ref().unwrap()[0].status, "cancelled");
+	assert_eq!(details.jobs[0].status, "cancelled");
+	assert_eq!(details.jobs[0].error_text.as_deref(), Some("cancelled by hub"));
+
+	let task_result = tokio::time::timeout(Duration::from_secs(5), handle)
+		.await
+		.expect("task returned after cancel")
+		.expect("task join")
+		.expect("task execution");
+	let task_details: TaskToolDetails =
+		serde_json::from_str(&task_result.content).expect("task details");
+	assert_eq!(task_details.results[0].exit_code, 1);
+	assert_eq!(task_details.results[0].aborted, Some(true));
+
+	let record = supervisor
+		.children()
+		.into_iter()
+		.find(|record| record.name == "hang-cancel")
+		.expect("child record");
+	assert_eq!(record.status, ChildStatus::Aborted);
+	assert_eq!(record.abort_reason.as_deref(), Some("cancelled by hub"));
+}
+
+#[tokio::test]
+async fn test_t7_hub_cancel_queued_child_never_starts() {
+	let (server, hang_rx) = spawn_mock_server(Some("HUB_QUEUE")).await;
+	let mut hang_rx = hang_rx.expect("hang signal rx");
+	let provider = Arc::new(
+		OpenAiCompatibleProvider::new(&server.base_url, "fake-key", "test-model").unwrap(),
+	);
+
+	let supervisor = Supervisor::new(
+		ToolRegistry::new(),
+		provider.clone(),
+		None,
+		DelegationLimits::default(),
+	);
+	// One permit: the second reservation waits in the semaphore queue.
+	let task = TaskTool::with_semaphore(supervisor.clone(), 0, Arc::new(Semaphore::new(1)));
+	let ctx = AgentContext::new(std::env::temp_dir());
+	let handle = tokio::spawn(async move {
+		task
+			.execute(
+				&json!({ "tasks": [
+					{ "name": "first", "task": "HUB_QUEUE" },
+					{ "name": "queued", "task": "HUB_QUEUE" }
+				] }),
+				&ctx,
+			)
+			.await
+	});
+
+	tokio::time::timeout(Duration::from_secs(5), hang_rx.recv())
+		.await
+		.expect("first child reached hang mock")
+		.expect("hang channel");
+
+	let queued = supervisor
+		.children()
+		.into_iter()
+		.find(|record| record.name == "queued")
+		.expect("queued reservation");
+	assert_eq!(queued.status, ChildStatus::Running);
+	let queued_id = queued.id;
+	let first_id = supervisor
+		.children()
+		.into_iter()
+		.find(|record| record.name == "first")
+		.expect("first child")
+		.id;
+
+	let hub = HubTool::root(supervisor.clone());
+	let nav_ctx = AgentContext::new(std::env::temp_dir());
+	let queued_cancel = hub
+		.execute(&json!({ "op": "cancel", "ids": [queued_id.clone()] }), &nav_ctx)
+		.await
+		.expect("cancel queued");
+	let queued_details: HubToolDetails =
+		serde_json::from_str(&queued_cancel.content).expect("details");
+	assert_eq!(queued_details.cancelled.as_ref().unwrap()[0].status, "cancelled");
+	let record = supervisor
+		.children()
+		.into_iter()
+		.find(|record| record.name == "queued")
+		.expect("queued record");
+	assert_eq!(record.status, ChildStatus::Aborted);
+	assert_eq!(record.abort_reason.as_deref(), Some("cancelled by hub"));
+
+	// Finishing the running child must not start the cancelled reservation.
+	let first_cancel = hub
+		.execute(&json!({ "op": "cancel", "ids": [first_id] }), &nav_ctx)
+		.await
+		.expect("cancel first");
+	assert!(!first_cancel.is_error);
+
+	let task_result = tokio::time::timeout(Duration::from_secs(10), handle)
+		.await
+		.expect("batch returned")
+		.expect("task join")
+		.expect("task execution");
+	let details: TaskToolDetails = serde_json::from_str(&task_result.content).expect("details");
+	let queued_result = details
+		.results
+		.iter()
+		.find(|result| result.id == queued_id)
+		.expect("queued result");
+	assert_eq!(queued_result.name, "queued");
+	assert_eq!(queued_result.aborted, Some(true));
+	assert_eq!(queued_result.abort_reason.as_deref(), Some("cancelled by hub"));
+	assert!(
+		hang_rx.try_recv().is_err(),
+		"cancelled reservation must never reach the model"
+	);
+}
+
+#[tokio::test]
+async fn test_t8_yield_error_reports_failed_not_cancelled() {
+	let (server, _hang_rx) = spawn_mock_server(None).await;
+	let provider = Arc::new(
+		OpenAiCompatibleProvider::new(&server.base_url, "fake-key", "test-model").unwrap(),
+	);
+	let supervisor = Supervisor::new(
+		ToolRegistry::new(),
+		provider.clone(),
+		None,
+		DelegationLimits::default(),
+	);
+	let task = TaskTool::new(supervisor.clone(), 0);
+	let ctx = AgentContext::new(std::env::temp_dir());
+	let result = task
+		.execute(&json!({ "name": "yield-fail", "task": "YIELD_ERROR" }), &ctx)
+		.await
+		.expect("task result");
+	let details: TaskToolDetails = serde_json::from_str(&result.content).expect("details");
+	assert_eq!(details.results[0].aborted, Some(true));
+	assert_eq!(details.results[0].abort_reason.as_deref(), Some("boom"));
+
+	let hub = HubTool::root(supervisor.clone());
+	let jobs = hub
+		.execute(&json!({ "op": "jobs" }), &ctx)
+		.await
+		.expect("jobs");
+	let jobs: HubToolDetails = serde_json::from_str(&jobs.content).expect("details");
+	assert_eq!(jobs.jobs[0].status, "failed");
+	assert_eq!(jobs.jobs[0].error_text.as_deref(), Some("boom"));
+}
+
+#[tokio::test]
+async fn test_t9_dropping_child_future_kills_its_shell_tree() {
+	let (server, _hang_rx) = spawn_mock_server(None).await;
+	let provider = Arc::new(
+		OpenAiCompatibleProvider::new(&server.base_url, "fake-key", "test-model").unwrap(),
+	);
+	let dir = std::env::temp_dir().join(format!(
+		"omp-delegation-drop-{}-{}",
+		std::process::id(),
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_nanos())
+			.unwrap_or_default()
+	));
+	std::fs::create_dir_all(&dir).expect("temp dir");
+	let pid_file = dir.join("pid.txt");
+	let marker = dir.join("marker.txt");
+
+	let supervisor = Supervisor::new(
+		ToolRegistry::with_builtins(),
+		provider,
+		None,
+		DelegationLimits::default(),
+	);
+	let task = TaskTool::new(supervisor.clone(), 0);
+	let ctx = AgentContext::new(dir.clone());
+	let handle = tokio::spawn(async move {
+		task
+			.execute(&json!({ "name": "bash-drop", "task": "BASH_DROP" }), &ctx)
+			.await
+	});
+
+	let mut pid = None;
+	for _ in 0..60 {
+		pid = std::fs::read_to_string(&pid_file)
+			.ok()
+			.and_then(|text| text.trim().parse::<u32>().ok());
+		if pid.is_some() {
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	let pid = pid.expect("child shell must start");
+
+	// Drop the parent tool future without hub/cooperative cancellation.
+	handle.abort();
+	let _ = handle.await;
+
+	let mut gone = false;
+	for _ in 0..60 {
+		let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+			.ok()
+			.map(|stat| {
+				let state = stat.rsplit(')').next().and_then(|rest| rest.split_whitespace().next());
+				state != Some("Z")
+			})
+			.unwrap_or_else(|| {
+				std::process::Command::new("kill")
+					.arg("-0")
+					.arg(pid.to_string())
+					.status()
+					.is_ok_and(|status| status.success())
+			});
+		if !alive {
+			gone = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	assert!(gone, "child shell {pid} survived parent drop");
+
+	tokio::time::sleep(Duration::from_millis(1200)).await;
+	assert!(!marker.exists(), "abandoned child shell executed its tail");
+	assert_eq!(
+		supervisor
+			.children()
+			.into_iter()
+			.find(|record| record.name == "bash-drop")
+			.expect("record")
+			.status,
+		ChildStatus::Aborted
+	);
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn test_t10_dropping_batch_settles_queued_reservations() {
+	let (server, hang_rx) = spawn_mock_server(Some("DROP_QUEUE")).await;
+	let mut hang_rx = hang_rx.expect("hang signal rx");
+	let provider = Arc::new(
+		OpenAiCompatibleProvider::new(&server.base_url, "fake-key", "test-model").unwrap(),
+	);
+	let supervisor = Supervisor::new(
+		ToolRegistry::new(),
+		provider,
+		None,
+		DelegationLimits::default(),
+	);
+	let task = TaskTool::with_semaphore(supervisor.clone(), 0, Arc::new(Semaphore::new(1)));
+	let ctx = AgentContext::new(std::env::temp_dir());
+	let handle = tokio::spawn(async move {
+		task
+			.execute(
+				&json!({ "tasks": [
+					{ "name": "first", "task": "DROP_QUEUE" },
+					{ "name": "queued", "task": "DROP_QUEUE" }
+				] }),
+				&ctx,
+			)
+			.await
+	});
+	tokio::time::timeout(Duration::from_secs(5), hang_rx.recv())
+		.await
+		.expect("first child reached hang mock")
+		.expect("hang channel");
+
+	let queued_id = supervisor
+		.children()
+		.into_iter()
+		.find(|record| record.name == "queued")
+		.expect("queued reservation")
+		.id;
+
+	// Drop the whole batch while the second child is still queued.
+	handle.abort();
+	let _ = handle.await;
+
+	let records = supervisor.children();
+	assert!(
+		records.iter().all(|record| record.status != ChildStatus::Running),
+		"dropped batch left running records: {records:?}"
+	);
+	assert_eq!(
+		records
+			.iter()
+			.find(|record| record.name == "queued")
+			.expect("queued record")
+			.status,
+		ChildStatus::Aborted
+	);
+
+	// The reservation must already be settled: no five-second cancel wait.
+	let hub = HubTool::root(supervisor);
+	let ctx = AgentContext::new(std::env::temp_dir());
+	let cancel = tokio::time::timeout(
+		Duration::from_millis(500),
+		hub.execute(&json!({ "op": "cancel", "ids": [queued_id] }), &ctx),
+	)
+	.await
+	.expect("queued cancel must not wait for the settle timeout")
+	.expect("cancel result");
+	let details: HubToolDetails = serde_json::from_str(&cancel.content).expect("details");
+	assert_eq!(details.cancelled.as_ref().unwrap()[0].status, "already_completed");
 }

@@ -35,6 +35,11 @@ impl ToolRegistry {
 		self.tools.insert(tool.name().to_string(), tool);
 	}
 
+	/// Unregister a tool by name, if present.
+	pub fn remove(&mut self, name: &str) {
+		self.tools.remove(name);
+	}
+
 	pub fn register_server_error(&mut self, server: impl Into<String>, error: impl Into<String>) {
 		self.server_errors.insert(server.into(), error.into());
 	}

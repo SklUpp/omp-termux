@@ -206,14 +206,9 @@ mod proc_snapshot {
 		}
 
 		pub fn age(&self) -> Option<Duration> {
-			let uptime = fs::read_to_string("/proc/uptime")
-				.ok()?
-				.split_whitespace()
-				.next()?
-				.parse::<f64>()
-				.ok()?;
+			let boot = boot_time_seconds()?;
 			let ticks = clock_ticks()? as f64;
-			Some(Duration::from_secs_f64((uptime - self.stat.start_time as f64 / ticks).max(0.0)))
+			Some(Duration::from_secs_f64((boot - self.stat.start_time as f64 / ticks).max(0.0)))
 		}
 
 		pub fn match_name(&self) -> String {
@@ -349,6 +344,21 @@ mod proc_snapshot {
 			.skip(1)
 			.filter_map(|value| value.parse().ok());
 		Some((ids.next()?, ids.next()?))
+	}
+
+	fn boot_time_seconds() -> Option<f64> {
+		if let Some(uptime) = fs::read_to_string("/proc/uptime")
+			.ok()
+			.and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok())
+		{
+			return Some(uptime);
+		}
+		// Android hides /proc/uptime from apps; CLOCK_BOOTTIME is the same
+		// clock that /proc/<pid>/stat field 22 counts against.
+		let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+		// SAFETY: clock_gettime writes the single timespec it is given.
+		(unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &raw mut now) } == 0)
+			.then(|| now.tv_sec as f64 + now.tv_nsec as f64 / 1_000_000_000.0)
 	}
 
 	fn clock_ticks() -> Option<u64> {

@@ -47,6 +47,45 @@ impl Drop for ShellSessionCore {
 #[derive(Clone, Default)]
 struct ShellAbortState(Arc<TokioMutex<Option<AbortToken>>>);
 
+/// Cancellation ownership for a one-shot/session run. If the caller's future is
+/// dropped, `Drop` still cancels the run token, aborts the spawned shell task,
+/// and hard-kills every process the run recorded — no polling of the outer
+/// future required.
+struct RunCancelGuard {
+	token:     CancellationToken,
+	registry:  Arc<process::SpawnRegistry>,
+	task:      Option<tokio::task::AbortHandle>,
+	armed:     bool,
+}
+
+impl RunCancelGuard {
+	fn new(token: CancellationToken, registry: Arc<process::SpawnRegistry>) -> Self {
+		Self { token, registry, task: None, armed: true }
+	}
+
+	fn attach(&mut self, task: tokio::task::AbortHandle) {
+		self.task = Some(task);
+	}
+
+	/// Normal completion owns its own cleanup; don't signal healthy children.
+	fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for RunCancelGuard {
+	fn drop(&mut self) {
+		if !self.armed {
+			return;
+		}
+		self.token.cancel();
+		if let Some(task) = &self.task {
+			task.abort();
+		}
+		self.registry.cancel_all();
+	}
+}
+
 impl ShellAbortState {
 	async fn set(&self, abort_token: AbortToken) {
 		*self.0.lock().await = Some(abort_token);
@@ -328,6 +367,9 @@ async fn run_shell_session(
 		}
 	});
 
+	let mut guard = RunCancelGuard::new(tokio_cancel.clone(), spawn_registry.clone());
+	guard.attach(run_task.abort_handle());
+
 	let res = tokio::select! {
 		res = &mut run_task => res,
 		reason = ct.wait() => {
@@ -341,10 +383,11 @@ async fn run_shell_session(
 			// Use try_lock to avoid deadlocking if another task holds the session.
 			// If we can't acquire the lock, the session will be cleaned up when the
 			// holding task finishes.
-			if let Ok(mut guard) = session.try_lock() {
-				*guard = None;
+			if let Ok(mut session_guard) = session.try_lock() {
+				*session_guard = None;
 			}
 			let _ = process_cancel_bridge.await;
+			guard.disarm();
 			return Ok(ShellRunResult {
 				exit_code:   None,
 				cancelled:   matches!(reason, AbortReason::Signal),
@@ -356,6 +399,7 @@ async fn run_shell_session(
 	};
 	let res =
 		res.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
+	guard.disarm();
 	process_cancel_bridge.abort();
 	let _ = process_cancel_bridge.await;
 	abort_state.clear().await;
@@ -405,6 +449,9 @@ async fn run_shell_oneshot(
 		}
 	});
 
+	let mut guard = RunCancelGuard::new(tokio_cancel.clone(), spawn_registry.clone());
+	guard.attach(task.abort_handle());
+
 	let run_result = tokio::select! {
 		result = &mut task => result,
 		reason = ct.wait() => {
@@ -415,6 +462,7 @@ async fn run_shell_oneshot(
 				let _ = task.await;
 			}
 			let _ = process_cancel_bridge.await;
+			guard.disarm();
 			return Ok(ShellExecuteResult {
 				exit_code:   None,
 				cancelled:   matches!(reason, AbortReason::Signal),
@@ -425,6 +473,7 @@ async fn run_shell_oneshot(
 		},
 	};
 
+	guard.disarm();
 	process_cancel_bridge.abort();
 	let _ = process_cancel_bridge.await;
 	let res = run_result
@@ -471,6 +520,9 @@ async fn run_shell_oneshot_streams(
 		}
 	});
 
+	let mut guard = RunCancelGuard::new(tokio_cancel.clone(), spawn_registry.clone());
+	guard.attach(task.abort_handle());
+
 	let run_result = tokio::select! {
 		result = &mut task => result,
 		reason = ct.wait() => {
@@ -481,6 +533,7 @@ async fn run_shell_oneshot_streams(
 				let _ = task.await;
 			}
 			let _ = process_cancel_bridge.await;
+			guard.disarm();
 			return Ok(ShellExecuteResult {
 				exit_code: None,
 				cancelled: matches!(reason, AbortReason::Signal),
@@ -491,6 +544,7 @@ async fn run_shell_oneshot_streams(
 		},
 	};
 
+	guard.disarm();
 	process_cancel_bridge.abort();
 	let _ = process_cancel_bridge.await;
 	let res = run_result
@@ -2084,12 +2138,28 @@ mod tests {
 
 	#[cfg(unix)]
 	fn process_test_command(prefix: &str) -> (tempfile::TempDir, std::path::PathBuf, String) {
+		use std::os::unix::fs::PermissionsExt as _;
+
 		let dir = tempfile::tempdir().expect("process test directory");
 		let name = format!("{prefix}{}", std::process::id());
 		let command = dir.path().join(&name);
-		let sleep = test_executable("sleep");
-		std::os::unix::fs::symlink(sleep, &command).expect("sleep symlink");
+		// Copy rather than symlink: multicall binaries such as Termux's
+		// coreutils dispatch on argv[0], so a renamed symlink exits with
+		// "unknown program" before it can be observed. A copied shell keeps
+		// the unique executable name while running a normal script.
+		fs::copy(test_executable("sh"), &command).expect("shell copy");
+		fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
+			.expect("shell executable mode");
 		(dir, command, name)
+	}
+
+	#[cfg(unix)]
+	fn test_sleep_command(command: &std::path::Path, seconds: &str) -> Command {
+		// The trailing builtin prevents shells from exec-ing sleep, which
+		// would replace the uniquely named fixture process.
+		let mut command = Command::new(command);
+		command.arg("-c").arg(format!("sleep {seconds}; :"));
+		command
 	}
 
 	#[cfg(unix)]
@@ -2114,8 +2184,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn pgrep_matches_name_and_pkills_signal_probe() {
 		let (_dir, command, name) = process_test_command("opg");
-		let mut child = Command::new(command)
-			.arg("30")
+		let mut child = test_sleep_command(&command, "30")
 			.spawn()
 			.expect("matching process");
 		let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
@@ -2171,8 +2240,8 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn pkill_queue_option_consumes_its_value() {
 		let (_dir, command, name) = process_test_command("opq");
-		let mut command = Command::new(command);
-		command.arg("30").kill_on_drop(true);
+		let mut command = test_sleep_command(&command, "30");
+		command.kill_on_drop(true);
 		let mut child = command.spawn().expect("queue test process");
 		let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
 		wait_for_process_name(pid, &name).await;
@@ -2190,8 +2259,8 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn pkill_interactive_prompt_honors_cancellation() {
 		let (_dir, command, name) = process_test_command("opi");
-		let mut command = Command::new(command);
-		command.arg("30").kill_on_drop(true);
+		let mut command = test_sleep_command(&command, "30");
+		command.kill_on_drop(true);
 		let mut child = command.spawn().expect("interactive target");
 		let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
 		wait_for_process_name(pid, &name).await;
@@ -2227,8 +2296,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn pgrep_reads_pidfile_from_standard_input() {
 		let (_dir, command, name) = process_test_command("opf");
-		let mut child = Command::new(command)
-			.arg("30")
+		let mut child = test_sleep_command(&command, "30")
 			.spawn()
 			.expect("pidfile process");
 		let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
@@ -2252,8 +2320,7 @@ mod tests {
 		}
 
 		let (_dir, command, name) = process_test_command("opl");
-		let mut child = Command::new(command)
-			.arg("30")
+		let mut child = test_sleep_command(&command, "30")
 			.spawn()
 			.expect("locked pidfile process");
 		let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
@@ -2308,12 +2375,10 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn pkill_signals_every_matching_process() {
 		let (_dir, command, name) = process_test_command("opk");
-		let mut first = Command::new(&command)
-			.arg("30")
+		let mut first = test_sleep_command(&command, "30")
 			.spawn()
 			.expect("first matching process");
-		let mut second = Command::new(command)
-			.arg("30")
+		let mut second = test_sleep_command(&command, "30")
 			.spawn()
 			.expect("second matching process");
 		let first_pid = i32::try_from(first.id().expect("first pid")).expect("pid fits i32");
@@ -2340,8 +2405,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn pidwait_returns_after_the_matching_process_exits() {
 		let (_dir, command, name) = process_test_command("opw");
-		let mut child = Command::new(command)
-			.arg("0.25")
+		let mut child = test_sleep_command(&command, "0.25")
 			.spawn()
 			.expect("waited process");
 		let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");

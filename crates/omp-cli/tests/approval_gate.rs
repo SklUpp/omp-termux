@@ -137,6 +137,8 @@ fn make_run_request(
 		context_files: Vec::new(),
 		skills: Vec::new(),
 		history: Vec::new(),
+		todo_phases: Vec::new(),
+		session_persisted: false,
 		config,
 		catalog: Arc::new(Catalog::default()),
 		approvals,

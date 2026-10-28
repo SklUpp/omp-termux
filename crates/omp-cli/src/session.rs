@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use pi_agent::tools::todo::{TodoPhase, USER_TODO_EDIT_CUSTOM_TYPE};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::Event;
@@ -624,6 +625,10 @@ pub struct ToolCallRecord {
 		skip_serializing_if = "Vec::is_empty"
 	)]
 	pub result_parts: Vec<ContentPart>,
+	/// Structured result payload (TS `details`), preserved across resume/fork so
+	/// tools with session state (e.g. `todo` phases) rehydrate losslessly.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub details: Option<serde_json::Value>,
 }
 
 fn deserialize_turn_parts<'de, D>(deserializer: D) -> Result<Vec<ContentPart>, D::Error>
@@ -777,8 +782,20 @@ impl TurnBuilder {
 					self.record.assistant = last_asst.content.clone();
 				}
 			},
-			Event::TurnEnd { stop_reason, .. } => {
+			Event::TurnEnd { stop_reason, tool_results, .. } => {
 				self.record.stop_reason = canonical_stop_reason(stop_reason).to_string();
+				// Structured tool details ride on TurnEnd, never on the provider
+				// wire; keep them on the recorded call for session persistence.
+				for result in tool_results {
+					if let Some(call) = self
+						.record
+						.tool_calls
+						.iter_mut()
+						.find(|call| call.id == result.tool_call_id)
+					{
+						call.details = result.details.clone();
+					}
+				}
 			},
 			Event::ToolStart { id, tool, args } => {
 				self
@@ -791,6 +808,7 @@ impl TurnBuilder {
 					result: String::new(),
 					is_error: false,
 					result_parts: Vec::new(),
+					details: None,
 				});
 			},
 			Event::ToolEnd { id, result, error, .. } => {
@@ -1085,6 +1103,62 @@ impl SessionStore {
 		self.title_slot.as_ref()
 	}
 
+	/// Latest todo phases recorded on this session branch, scanning newest
+	/// entry first (TS `getLatestTodoPhasesFromEntries`). A `user_todo_edit`
+	/// custom entry wins by log order — including `{phases: []}` clears — and a
+	/// successful `todo` tool result contributes its `details.phases`; error
+	/// results are skipped because their details echo the pre-call state.
+	#[must_use]
+	pub fn latest_todo_phases(&self) -> Vec<TodoPhase> {
+		for entry in self.entries.iter().rev() {
+			match entry.kind.as_str() {
+				"custom" => {
+					if entry.extra.get("customType").and_then(serde_json::Value::as_str)
+						!= Some(USER_TODO_EDIT_CUSTOM_TYPE)
+					{
+						continue;
+					}
+					let Some(phases) = entry.extra.get("data").and_then(|data| data.get("phases")) else {
+						continue;
+					};
+					if !phases.is_array() {
+						continue;
+					}
+					if let Ok(phases) = serde_json::from_value::<Vec<TodoPhase>>(phases.clone()) {
+						return phases;
+					}
+				},
+				"message" => {
+					let Some(message) = entry.extra.get("message") else {
+						continue;
+					};
+					if message.get("role").and_then(serde_json::Value::as_str) != Some("toolResult")
+						|| message.get("toolName").and_then(serde_json::Value::as_str) != Some("todo")
+						|| message
+							.get("isError")
+							.and_then(serde_json::Value::as_bool)
+							.unwrap_or(false)
+					{
+						continue;
+					}
+					let Some(phases) = message
+						.get("details")
+						.and_then(|details| details.get("phases"))
+					else {
+						continue;
+					};
+					if !phases.is_array() {
+						continue;
+					}
+					if let Ok(phases) = serde_json::from_value::<Vec<TodoPhase>>(phases.clone()) {
+						return phases;
+					}
+				},
+				_ => {},
+			}
+		}
+		Vec::new()
+	}
 
 	#[must_use]
 	pub fn history(&self) -> &[TurnRecord] {
@@ -1456,20 +1530,24 @@ impl SessionStore {
 				} else {
 					MessageContent::Text(tc.result.clone())
 				};
+				let mut message = SessionMessage {
+					timestamp_ms: Some(now_ms),
+					..SessionMessage::tool_result(
+						tc.id.clone(),
+						tc.name.clone(),
+						content,
+						tc.is_error,
+						now_ms,
+					)
+				};
+				if let Some(details) = &tc.details {
+					message.extra.insert("details".to_string(), details.clone());
+				}
 				entries.push(MessageEntry::new(
 					res_id.clone(),
 					parent_id.take(),
 					now_iso.clone(),
-					SessionMessage {
-						timestamp_ms: Some(now_ms),
-						..SessionMessage::tool_result(
-							tc.id.clone(),
-							tc.name.clone(),
-							content,
-							tc.is_error,
-							now_ms,
-						)
-					},
+					message,
 				));
 				parent_id = Some(res_id);
 			}
@@ -2088,6 +2166,7 @@ fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnRecord>, Str
 							result: String::new(),
 							is_error: false,
 							result_parts: Vec::new(),
+							details: None,
 						});
 					}
 				}
@@ -2148,6 +2227,7 @@ fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnRecord>, Str
 						call.result = result_text.clone();
 						call.result_parts = result_parts.clone();
 						call.is_error = is_error;
+						call.details = entry.message.extra.get("details").cloned();
 						break;
 					}
 				}
@@ -3146,20 +3226,24 @@ pub fn import_legacy_v1(
 				} else {
 					MessageContent::Text(tc.result.clone())
 				};
+				let mut message = SessionMessage {
+					timestamp_ms: import_ms,
+					..SessionMessage::tool_result(
+						tc.id.clone(),
+						tc.name.clone(),
+						content,
+						tc.is_error,
+						0,
+					)
+				};
+				if let Some(details) = &tc.details {
+					message.extra.insert("details".to_string(), details.clone());
+				}
 				let res_entry = MessageEntry::new(
 					res_id.clone(),
 					parent_id.take(),
 					v1_header.timestamp.clone(),
-					SessionMessage {
-						timestamp_ms: import_ms,
-						..SessionMessage::tool_result(
-							tc.id.clone(),
-							tc.name.clone(),
-							content,
-							tc.is_error,
-							0,
-						)
-					},
+					message,
 				);
 				lines.push(format!("{}\n", serde_json::to_string(&res_entry).map_err(|e| e.to_string())?));
 				parent_id = Some(res_id);
@@ -3284,6 +3368,7 @@ mod tests {
 				result: "contents".to_string(),
 				is_error: false,
 				result_parts: Vec::new(),
+				details: None,
 			}],
 			parts: Vec::new(),
 		}
@@ -4068,6 +4153,7 @@ mod tests {
 					ContentPart::text("snapshot"),
 					ContentPart::image("aW1nMQ==", "image/png"),
 				],
+				details: None,
 			}],
 			parts: vec![],
 		};
@@ -4145,6 +4231,7 @@ mod tests {
 						extra: serde_json::Map::new(),
 					},
 				],
+				details: None,
 			}],
 			parts: vec![],
 		};
@@ -4153,5 +4240,154 @@ mod tests {
 		assert_eq!(store.history().len(), 0);
 
 		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn tool_details_survive_turn_builder_append_and_resume() {
+		let details = json!({
+			"op": "init",
+			"phases": [{"name": "Plan", "tasks": [{"content": "write code", "status": "pending"}]}],
+			"storage": "session",
+		});
+		let mut builder = TurnBuilder::new("build");
+		builder.observe(&Event::ToolStart {
+			id: "call-todo".to_string(),
+			tool: "todo".to_string(),
+			args: json!({"op": "init"}),
+		});
+		let mut asst = pi_agent::Message::assistant("");
+		asst.tool_calls.push(pi_agent::ToolCall {
+			id: "call-todo".to_string(),
+			name: "todo".to_string(),
+			arguments: json!({"op": "init"}),
+		});
+		builder.observe(&Event::ToolEnd {
+			id: "call-todo".to_string(),
+			tool: "todo".to_string(),
+			result: "plan written".to_string(),
+			error: None,
+		});
+		builder.observe(&Event::turn_end(
+			asst,
+			vec![pi_agent::ToolResult {
+				tool_call_id: "call-todo".to_string(),
+				content: "plan written".to_string(),
+				is_error: false,
+				terminate: false,
+				details: Some(details.clone()),
+			}],
+			"toolUse",
+		));
+		let record = builder.finish();
+		assert_eq!(record.tool_calls[0].details.as_ref(), Some(&details));
+
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("todo-details")));
+		store.append_turn(&record).expect("append turn");
+		let file = store.file().expect("session file").to_path_buf();
+
+		let reopened = SessionStore::open(&options(dir.clone(), Some("todo-details")));
+		assert!(reopened.enabled());
+		assert_eq!(reopened.history().len(), 1);
+		assert_eq!(reopened.history()[0].tool_calls[0].details.as_ref(), Some(&details));
+
+		let raw = fs::read_to_string(&file).expect("read session log");
+		assert!(
+			raw.contains(r#""details":{"op":"init""#),
+			"tool details must be written into the toolResult session entry: {raw}"
+		);
+
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn latest_todo_phases_honors_custom_entries_in_log_order() {
+		fn todo_turn(prompt: &str, phases: serde_json::Value, is_error: bool) -> TurnRecord {
+			TurnRecord {
+				prompt: prompt.to_string(),
+				assistant: "updated todos".to_string(),
+				stop_reason: "toolUse".to_string(),
+				tool_calls: vec![ToolCallRecord {
+					id: "call-todo".to_string(),
+					name: "todo".to_string(),
+					arguments: json!({"op": "init"}),
+					result: "todos updated".to_string(),
+					is_error,
+					result_parts: Vec::new(),
+					details: Some(json!({"op": "init", "phases": phases, "storage": "session"})),
+				}],
+				parts: Vec::new(),
+			}
+		}
+		fn custom_entry(data: serde_json::Value) -> SessionEntry {
+			SessionEntry {
+				kind: "custom".to_string(),
+				id: format!("msg-{}", output::session_id()),
+				parent_id: None,
+				timestamp: output::iso8601(SystemTime::now()),
+				extra: json!({"customType": USER_TODO_EDIT_CUSTOM_TYPE, "data": data}),
+			}
+		}
+
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("todo-custom")));
+		store
+			.append_turn(&todo_turn(
+				"seed",
+				json!([{"name": "Plan", "tasks": [{"content": "from tool", "status": "in_progress"}]}]),
+				false,
+			))
+			.expect("append seed turn");
+		assert_eq!(store.latest_todo_phases()[0].tasks[0].content, "from tool");
+
+		// A later user edit wins by log order; an empty list is a real clear.
+		store
+			.append_entry(custom_entry(json!({"phases": []})))
+			.expect("append clear edit");
+		assert!(store.latest_todo_phases().is_empty());
+
+		// A malformed custom payload is skipped, not treated as a clear.
+		store.append_entry(custom_entry(json!({}))).expect("append malformed edit");
+		assert!(store.latest_todo_phases().is_empty());
+
+		// A tool result appended after the edit takes over again.
+		store
+			.append_turn(&todo_turn(
+				"later",
+				json!([{"name": "Plan", "tasks": [{"content": "from later tool", "status": "pending"}]}]),
+				false,
+			))
+			.expect("append later turn");
+		assert_eq!(store.latest_todo_phases()[0].tasks[0].content, "from later tool");
+
+		// A failed tool result echoes the pre-call state; it never rolls the
+		// list back or forward.
+		store
+			.append_turn(&todo_turn(
+				"failed",
+				json!([{"name": "Plan", "tasks": [{"content": "stale echo", "status": "pending"}]}]),
+				true,
+			))
+			.expect("append failed turn");
+		assert_eq!(store.latest_todo_phases()[0].tasks[0].content, "from later tool");
+
+		let file = store.file().expect("session file").to_path_buf();
+		let resumed = SessionStore::open(&options(dir.clone(), Some("todo-custom")));
+		assert_eq!(resumed.latest_todo_phases()[0].tasks[0].content, "from later tool");
+
+		// Fork copies the branch verbatim, so the restored todo state matches.
+		let fork_dir = temp_dir();
+		let fork_file = fork_session(&file, None, Some(&fork_dir)).expect("fork session");
+		let fork_stem = fork_file
+			.file_stem()
+			.and_then(std::ffi::OsStr::to_str)
+			.expect("fork stem")
+			.to_string();
+		let forked = SessionStore::open(&options(fork_dir.clone(), Some(&fork_stem)));
+		assert!(forked.enabled(), "forked session must open: {:?}", forked.corrupt_reason());
+		assert_eq!(forked.latest_todo_phases()[0].tasks[0].content, "from later tool");
+
+		fs::remove_dir_all(dir).ok();
+		fs::remove_dir_all(fork_dir).ok();
 	}
 }

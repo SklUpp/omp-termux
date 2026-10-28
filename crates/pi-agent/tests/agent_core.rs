@@ -79,7 +79,7 @@ impl ModelProvider for LoopingProvider {
 			vec![ToolCall {
 				id: format!("call_{call}"),
 				name: "todo".to_string(),
-				arguments: json!({"action": "list"}),
+				arguments: json!({"op": "view"}),
 			}],
 		))
 	}
@@ -1928,8 +1928,8 @@ async fn streaming_keeps_tool_calls_finalized_across_turns() {
 	let provider = Arc::new(StreamingProvider::new(vec![
 		vec![
 			text_chunk("Checking"),
-			tool_delta(0, Some("call_todo"), Some("todo"), Some("{\"action\":")),
-			tool_delta(0, None, None, Some("\"list\"}")),
+			tool_delta(0, Some("call_todo"), Some("todo"), Some("{\"op\":")),
+			tool_delta(0, None, None, Some("\"view\"}")),
 			done_chunk(),
 		],
 		vec![text_chunk("Done"), done_chunk()],
@@ -1951,7 +1951,7 @@ async fn streaming_keeps_tool_calls_finalized_across_turns() {
 	assert_eq!(turns[0].message.tool_calls.len(), 1);
 	assert_eq!(turns[0].message.tool_calls[0].id, "call_todo");
 	assert_eq!(turns[0].message.tool_calls[0].name, "todo");
-	assert_eq!(turns[0].message.tool_calls[0].arguments, json!({"action": "list"}));
+	assert_eq!(turns[0].message.tool_calls[0].arguments, json!({"op": "view"}));
 	assert_eq!(turns[0].tool_results.len(), 1);
 	assert_eq!(turns[0].tool_results[0].tool_call_id, "call_todo");
 	assert!(!turns[0].tool_results[0].is_error);

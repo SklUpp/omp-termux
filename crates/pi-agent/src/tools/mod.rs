@@ -1,12 +1,17 @@
+pub mod hub;
 pub mod registry;
 pub mod scheduler;
 pub mod task;
+pub mod todo;
 pub mod yield_tool;
 
+pub use hub::HubTool;
 pub use task::TaskTool;
+pub use todo::TodoTool;
 pub use yield_tool::YieldTool;
 
 use std::{
+	collections::HashMap,
 	io::Write,
 	path::{Path, PathBuf},
 	sync::{
@@ -25,9 +30,10 @@ use crate::state::{AgentContext, ToolResult};
 
 /// Captured stdout+stderr budget for one bash call.
 const MAX_BASH_OUTPUT_BYTES: usize = 64 * 1024;
-/// Default and ceiling for the bash timeout.
-const DEFAULT_BASH_TIMEOUT_MS: u64 = 300_000;
-const MAX_BASH_TIMEOUT_MS: u64 = 600_000;
+/// Bash `timeout` bounds in seconds, matching the TypeScript tool.
+const DEFAULT_BASH_TIMEOUT_SECS: f64 = 300.0;
+const MIN_BASH_TIMEOUT_SECS: f64 = 1.0;
+const MAX_BASH_TIMEOUT_SECS: f64 = 3600.0;
 /// Bytes returned by one `read` call.
 const MAX_READ_BYTES: usize = 256 * 1024;
 /// Bytes accepted by one `write` call.
@@ -130,7 +136,126 @@ fn skip_note(base: &str, skipped: usize) -> String {
 }
 
 fn tool_result(content: impl Into<String>, is_error: bool) -> ToolResult {
-	ToolResult { tool_call_id: String::new(), content: content.into(), is_error, terminate: false }
+	ToolResult {
+		tool_call_id: String::new(),
+		content: content.into(),
+		is_error,
+		terminate: false,
+		details: None,
+	}
+}
+
+/// Portable shell variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_valid_env_name(name: &str) -> bool {
+	let mut chars = name.chars();
+	match chars.next() {
+		Some(first) if first.is_ascii_alphabetic() || first == '_' => {},
+		_ => return false,
+	}
+	chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Resolve the per-call `cwd`: empty means the agent cwd, `~` means `$HOME`,
+/// absolute paths are taken as given, and relative paths are joined to the
+/// agent cwd.
+fn resolve_bash_cwd(raw: Option<&str>, ctx: &AgentContext) -> Result<PathBuf, String> {
+	let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
+		return Ok(ctx.cwd.clone());
+	};
+	if raw == "~" || raw.starts_with("~/") {
+		let Some(home) = ctx.env.get("HOME").map(PathBuf::from) else {
+			return Err("Cannot resolve '~': HOME is not set".to_string());
+		};
+		return Ok(if raw == "~" { home } else { home.join(&raw[2..]) });
+	}
+	let path = PathBuf::from(raw);
+	Ok(if path.is_absolute() { path } else { ctx.cwd.join(path) })
+}
+
+/// Report a `cwd` that cannot be entered, before any command runs.
+async fn invalid_bash_cwd(path: &Path) -> Option<ToolResult> {
+	match tokio::fs::metadata(path).await {
+		Ok(meta) if meta.is_dir() => None,
+		Ok(_) => {
+			Some(tool_result(format!("Working directory is not a directory: {}", path.display()), true))
+		},
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+			Some(tool_result(format!("Working directory does not exist: {}", path.display()), true))
+		},
+		Err(err) => Some(tool_result(
+			format!("Cannot access working directory {}: {err}", path.display()),
+			true,
+		)),
+	}
+}
+
+/// Overlay a per-call `env` object onto the agent environment.
+fn bash_env(
+	raw: Option<&Value>,
+	base: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, ToolError> {
+	let Some(value) = raw.filter(|value| !value.is_null()) else {
+		return Ok(base.clone());
+	};
+	let Some(object) = value.as_object() else {
+		return Err(ToolError::InvalidArguments("'env' must be an object of string values".to_string()));
+	};
+	let mut env = base.clone();
+	for (name, value) in object {
+		if !is_valid_env_name(name) {
+			return Err(ToolError::InvalidArguments(format!("Invalid bash env name: {name}")));
+		}
+		let Some(text) = value.as_str() else {
+			return Err(ToolError::InvalidArguments(format!("'env' value for {name} must be a string")));
+		};
+		env.insert(name.clone(), text.to_string());
+	}
+	Ok(env)
+}
+
+/// Resolve the per-call `timeout` in seconds: default 300, `0` disables the
+/// deadline, and nonzero values clamp to `1..=3600` seconds.
+fn bash_timeout_ms(raw: Option<&Value>) -> Result<Option<u32>, ToolError> {
+	let Some(value) = raw.filter(|value| !value.is_null()) else {
+		return Ok(Some((DEFAULT_BASH_TIMEOUT_SECS * 1000.0) as u32));
+	};
+	let Some(seconds) = value.as_f64() else {
+		return Err(ToolError::InvalidArguments("'timeout' must be a number of seconds".to_string()));
+	};
+	if !seconds.is_finite() {
+		return Err(ToolError::InvalidArguments("'timeout' must be a finite number".to_string()));
+	}
+	if seconds == 0.0 {
+		return Ok(None);
+	}
+	let clamped = seconds.clamp(MIN_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS);
+	Ok(Some((clamped * 1000.0).round() as u32))
+}
+
+/// Reject arguments whose TypeScript semantics this tool does not implement.
+///
+/// Background (`async`) and PTY execution are separate subsystems; accepting
+/// either would promise a run mode that never happens. `timeout_ms` is the
+/// removed legacy spelling of `timeout`. An explicit `false` is safe: it asks
+/// for exactly the foreground, non-PTY behavior this tool provides.
+fn reject_unsupported_bash_args(args: &Value) -> Result<(), ToolError> {
+	for name in ["async", "pty"] {
+		match args.get(name) {
+			None => {},
+			Some(value) if value.as_bool() == Some(false) => {},
+			Some(_) => {
+				return Err(ToolError::InvalidArguments(format!(
+					"Unsupported argument '{name}': this bash tool runs commands in the foreground only"
+				)));
+			},
+		}
+	}
+	if args.get("timeout_ms").is_some() {
+		return Err(ToolError::InvalidArguments(
+			"'timeout_ms' was removed; pass 'timeout' in seconds".to_string(),
+		));
+	}
+	Ok(())
 }
 
 /// Builtin bash execution tool.
@@ -154,9 +279,18 @@ impl Tool for BashTool {
 					"type": "string",
 					"description": "Shell command to run"
 				},
-				"timeout_ms": {
+				"env": {
+					"type": "object",
+					"additionalProperties": { "type": "string" },
+					"description": "Extra environment variables for this call"
+				},
+				"cwd": {
+					"type": "string",
+					"description": "Working directory: absolute, ~, or relative to the agent cwd"
+				},
+				"timeout": {
 					"type": "number",
-					"description": "Optional timeout in milliseconds"
+					"description": "Timeout in seconds; 0 disables the command deadline; nonzero values are clamped to 1-3600"
 				}
 			},
 			"required": ["command"]
@@ -173,24 +307,35 @@ impl Tool for BashTool {
 			.and_then(Value::as_str)
 			.ok_or_else(|| ToolError::InvalidArguments("missing 'command' parameter".to_string()))?;
 
-		let timeout_ms = args
-			.get("timeout_ms")
-			.and_then(Value::as_u64)
-			.unwrap_or(DEFAULT_BASH_TIMEOUT_MS)
-			.min(MAX_BASH_TIMEOUT_MS) as u32;
+		reject_unsupported_bash_args(args)?;
+		let timeout_ms = bash_timeout_ms(args.get("timeout"))?;
+		let env = bash_env(args.get("env"), &ctx.env)?;
+		let cwd_arg = match args.get("cwd") {
+			None | Some(Value::Null) => None,
+			Some(Value::String(cwd)) => Some(cwd.as_str()),
+			Some(_) => return Err(ToolError::InvalidArguments("'cwd' must be a string".to_string())),
+		};
+		let cwd = match resolve_bash_cwd(cwd_arg, ctx) {
+			Ok(cwd) => cwd,
+			Err(message) => return Ok(tool_result(message, true)),
+		};
+		if let Some(error) = invalid_bash_cwd(&cwd).await {
+			return Ok(error);
+		}
 
 		let options = pi_shell::ShellExecuteOptions {
 			command: command.to_string(),
-			cwd: Some(ctx.cwd.to_string_lossy().to_string()),
-			env: Some(ctx.env.clone()),
+			cwd: Some(cwd.to_string_lossy().to_string()),
+			env: Some(env),
 			session_env: None,
-			timeout_ms: Some(timeout_ms),
+			timeout_ms,
 			snapshot_path: None,
 			minimizer: None,
 		};
 
-		// Bridge the run's cancellation into the shell's own abort flag.
-		let mut cancel_token = pi_shell::cancel::CancelToken::new(Some(timeout_ms));
+		// Bridge the run's cancellation into the shell's own abort flag. A
+		// `None` deadline (timeout 0) still honours that cancellation.
+		let mut cancel_token = pi_shell::cancel::CancelToken::new(timeout_ms);
 		let abort_token = cancel_token.emplace_abort_token();
 		let hub_cancel = ctx.cancellation_token.clone();
 		let watcher = tokio::spawn(async move {
@@ -1633,107 +1778,6 @@ impl Tool for GrepTool {
 		}
 
 		Ok(tool_result(sink.finish(), false))
-	}
-}
-
-/// Builtin todo management tool.
-pub struct TodoTool {
-	todos: std::sync::RwLock<Vec<String>>,
-}
-
-impl Default for TodoTool {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-impl TodoTool {
-	pub fn new() -> Self {
-		Self { todos: std::sync::RwLock::new(Vec::new()) }
-	}
-}
-
-#[async_trait]
-impl Tool for TodoTool {
-	fn name(&self) -> &str {
-		"todo"
-	}
-
-	fn description(&self) -> &str {
-		"Manage task todo list: add, list, or clear items"
-	}
-
-	fn schema(&self) -> Value {
-		serde_json::json!({
-			"type": "object",
-			"properties": {
-				"action": {
-					"type": "string",
-					"enum": ["add", "list", "clear"],
-					"description": "Action to perform"
-				},
-				"item": {
-					"type": "string",
-					"description": "Todo item description (for 'add')"
-				}
-			},
-			"required": ["action"]
-		})
-	}
-
-	fn is_exclusive(&self) -> bool {
-		true
-	}
-
-	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
-		let action = args
-			.get("action")
-			.and_then(Value::as_str)
-			.ok_or_else(|| ToolError::InvalidArguments("missing 'action'".to_string()))?;
-		if ctx.cancellation_token.is_cancelled() {
-			return Ok(tool_result("Todo update cancelled", true));
-		}
-
-		match action {
-			"add" => {
-				let item = args
-					.get("item")
-					.and_then(Value::as_str)
-					.ok_or_else(|| ToolError::InvalidArguments("missing 'item'".to_string()))?;
-				let mut todos = self
-					.todos
-					.write()
-					.map_err(|_| ToolError::ExecutionFailed("todo lock poisoned".to_string()))?;
-				todos.push(item.to_string());
-				Ok(tool_result(format!("Added todo item: {item}"), false))
-			},
-			"clear" => {
-				let mut todos = self
-					.todos
-					.write()
-					.map_err(|_| ToolError::ExecutionFailed("todo lock poisoned".to_string()))?;
-				todos.clear();
-				Ok(tool_result("Todo list cleared", false))
-			},
-			"list" => {
-				let todos = self
-					.todos
-					.read()
-					.map_err(|_| ToolError::ExecutionFailed("todo lock poisoned".to_string()))?;
-				let content = if todos.is_empty() {
-					"Todo list is empty".to_string()
-				} else {
-					todos
-						.iter()
-						.enumerate()
-						.map(|(index, item)| format!("{}. {item}", index + 1))
-						.collect::<Vec<_>>()
-						.join("\n")
-				};
-				Ok(tool_result(content, false))
-			},
-			other => Err(ToolError::InvalidArguments(format!("unknown action '{other}'"))),
-		}
 	}
 }
 

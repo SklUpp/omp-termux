@@ -33,6 +33,10 @@ pub struct ToolResult {
 	pub is_error: bool,
 	#[serde(default)]
 	pub terminate: bool,
+	/// Structured result payload (TS `details`). Persisted with the session so
+	/// tools such as `todo` can restore their state; never sent to the model.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub details: Option<serde_json::Value>,
 }
 
 /// Completion status of an assistant turn.

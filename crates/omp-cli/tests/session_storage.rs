@@ -697,6 +697,7 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 				result: "contents".to_string(),
 				is_error: false,
 				result_parts: Vec::new(),
+				details: None,
 			}],
 			parts: Vec::new(),
 		})
@@ -769,6 +770,7 @@ fn session_storage_preserves_and_replays_tool_result_images() {
 					omp_cli::session::ContentPart::text("Captured screen"),
 					omp_cli::session::ContentPart::image("aW1nMQ==", "image/png"),
 				],
+				details: None,
 			}],
 			parts: Vec::new(),
 		})

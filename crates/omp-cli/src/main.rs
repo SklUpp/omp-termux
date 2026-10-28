@@ -677,6 +677,8 @@ impl Session<'_> {
 			context_files: self.prompts.files.clone(),
 			skills: self.skills.clone(),
 			history: self.history.clone(),
+			todo_phases: self.store.latest_todo_phases(),
+			session_persisted: self.store.enabled() && !self.store.is_v1(),
 			config: self.config.clone(),
 			catalog: Arc::clone(&self.catalog),
 			approvals: self.approvals.clone(),
@@ -933,13 +935,16 @@ impl Session<'_> {
 							.get(&tr.tool_call_id)
 							.cloned()
 							.unwrap_or_default();
-						let tool_msg = SessionMessage::tool_result(
+						let mut tool_msg = SessionMessage::tool_result(
 							tr.tool_call_id.clone(),
 							tool_name,
 							MessageContent::Text(tr.content.clone()),
 							tr.is_error,
 							evt_ms,
 						);
+						if let Some(details) = &tr.details {
+							tool_msg.extra.insert("details".to_string(), details.clone());
+						}
 						let tool_entry = MessageEntry::new(
 							res_id.clone(),
 							Some(prev_id.clone()),

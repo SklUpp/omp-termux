@@ -163,8 +163,6 @@ Artifacts and side channels:
 - If the child omits `yield`, `finalizeSubprocessOutput(...)` injects warnings such as `SYSTEM WARNING: Subagent exited without calling yield tool after 3 reminders.`
 - `agent://<id>` resolution errors are model-visible when another tool reads them: no session, no artifacts dir, missing id, conflicting extraction syntax, or invalid JSON for extraction.
 
-## Notes
-- Parallelism is parallel `task` calls in one assistant message — or, with `task.batch`, a `tasks[]` batch in one call; either way the session-scoped semaphore bounds the fan-out. With `async.enabled=true`, each spawn is an independent background job.
 - Shared background convention without batch mode: write it once to a `local://` file and reference that path in each spawn's `task` — subagents share the parent's `local://` root. With `task.batch`, the required `context` parameter carries the shared background directly into each spawn's system prompt.
 - Prefer messaging an existing agent (`hub`) over a fresh spawn for follow-up work: it already holds the relevant context. `hub` op:"list" shows idle/parked candidates; messaging a parked agent revives it. `history://<id>` shows what an agent has done.
 - Peer-messaging availability is derived, not configured (`isIrcEnabled` in `packages/coding-agent/src/tools/hub/messaging.ts`): it exists exactly when there is someone to message — the session can spawn subagents, or it is a subagent itself. Messaging is the only follow-up path to a finished subagent, so task without hub messaging would strand idle agents.
@@ -174,3 +172,24 @@ Artifacts and side channels:
 - Branch-mode merge temporarily stashes the parent repo before cherry-picking; a stash-pop conflict does not unmerge the cherry-picked commits — they stay on HEAD, the stash entry is preserved, and the conflict is surfaced separately as `stashConflict`. Patch mode only applies the combined root patch when `git.patch.canApplyText(...)` succeeds; failures leave the `.patch` artifact for manual handling.
 - Nested git repos are diffed independently inside isolated workspaces and merged separately with `applyNestedPatches(...)`.
 - `agent://` ids are name-based (`Task` first, `Task-2`/`Task-3` only when the name repeats, nested like `Parent.Child`) by `AgentOutputManager`; this is what prevents artifact collisions across repeated or nested invocations.
+
+## Rust headless parity
+`crates/pi-agent/src/tools/task.rs` runs each item synchronously inside the tool
+call through `pi_agent::Supervisor`; there is no background job manager.
+
+- The supervisor reserves an immutable `id` before spawning (`task-1`,
+  `task-2`, ...); the model-supplied `name` is a non-unique label. Results carry
+  both: `SingleResult{id, name, ...}`.
+- `outputSchema`, `schemaMode`, `effort`, and `isolated` are rejected as invalid
+  arguments rather than silently ignored.
+- Parent cancellation cancels the child's token, interrupts its loop, and waits
+  up to 5 s for tool cleanup before aborting. A dropped `ChildGuard` (the task
+  future itself aborted) does the same synchronously.
+- pi-shell also owns cleanup on future drop: the shell task is aborted and every
+  recorded external process is SIGKILLed, even when the parent future is
+  dropped without running a cancellation branch.
+- A child that yields `{result:{error}}` keeps `aborted: true` in the task
+  result (TS parity), but `hub jobs` projects it as `failed`; `cancelled` is
+  reserved for hub/parent cancellation.
+- Children inherit the parent's builtin/MCP registry and approval gate, minus
+  `todo`, which stays parent-owned.

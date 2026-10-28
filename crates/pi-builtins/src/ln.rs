@@ -658,7 +658,7 @@ mod tests {
 		assert!(!root.join("dir_a").join("dir_b").exists());
 	}
 
-	#[cfg(unix)]
+	#[cfg(all(unix, not(target_os = "android")))]
 	#[test]
 	fn hard_link_shares_inode() {
 		use std::os::unix::fs::MetadataExt;
@@ -673,6 +673,32 @@ mod tests {
 			fs::metadata(root.join("a")).unwrap().ino(),
 			fs::metadata(root.join("b")).unwrap().ino()
 		);
+	}
+
+	/// Android app-private storage denies `link(2)` with EACCES for `$HOME`
+	/// and `$TMPDIR`. The builtin must report that native refusal without
+	/// substituting a copy, which would fabricate a different inode.
+	#[cfg(target_os = "android")]
+	#[test]
+	fn hard_link_reports_android_denial_without_mutation() {
+		use std::os::unix::fs::MetadataExt;
+
+		let (_dir, root) = canonical_tempdir();
+		let source = root.join("a");
+		fs::write(&source, b"payload").unwrap();
+		let before = fs::metadata(&source).unwrap();
+		let (code, stdout, stderr) = run_in(root.clone(), &["a", "b"]);
+		assert_eq!(code, 1);
+		assert_eq!(stdout, "");
+		assert_eq!(
+			stderr,
+			"ln: failed to create hard link 'a' => 'b': Permission denied\n"
+		);
+		assert!(!root.join("b").exists(), "denied link must not create a destination");
+		assert_eq!(fs::read(&source).unwrap(), b"payload");
+		let after = fs::metadata(&source).unwrap();
+		assert_eq!(after.ino(), before.ino());
+		assert_eq!(after.nlink(), before.nlink());
 	}
 
 	#[cfg(unix)]

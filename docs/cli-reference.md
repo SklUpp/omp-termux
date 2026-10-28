@@ -120,8 +120,8 @@ See [providers](./providers.md) and [models](./models.md) for model resolution.
 
 | Flag | Description |
 | --- | --- |
-| `--tools <a,b,c>` | Comma-separated list of tools to enable (default: all). |
-| `--no-tools` | Disable all built-in tools. |
+| `--tools <a,b,c>` | Comma-separated list of tools to enable (default: all). Also accepts `task` and `hub`; naming one excludes the other delegation tool. |
+| `--no-tools` | Disable all built-in tools, including `task` and `hub`. |
 | `--no-lsp` | Disable LSP tools, formatting, and diagnostics. |
 | `--no-pty` | Disable PTY-based interactive bash execution. |
 | `--approval-mode <mode>` | Override `tools.approvalMode` for this session (`always-ask`, `write`, or `yolo`). See [approval mode](./approval-mode.md). |

@@ -119,8 +119,28 @@ Unchanged from the former `launch` tool: the first process op starts a detached 
 - A `wait` timeout is a normal result (`waited: null` or an all-running snapshot flagged `useless`), never an error.
 - Per-recipient delivery failures surface as `failed` receipts; `send` is `isError` only when nothing was delivered.
 
-## Notes
-- The IRC bus, agent registry, job manager, and launch broker are unchanged subsystems; only the tool surface merged.
 - A running recipient still gets messages injected as non-interrupting asides (`irc:incoming` custom messages, `prompts/system/irc-incoming.md`); replies are real turns.
 - Messaging a parked agent revives it — the only resume primitive; the task tool has no `resume` parameter.
 - TUI rendering is preserved per family: messaging cards (`IRC ➤ / ⟵` headers), job waiting frames (displaceable, shimmering rows), and launch frames render byte-identically to the pre-merge tools; the `hub` renderer only dispatches.
+
+## Rust headless parity
+`crates/pi-agent/src/tools/hub.rs` implements only `jobs` and `cancel`; every
+other op returns an explicit `not supported in this build` error. Records are
+in-memory and process-scoped, owned by `Supervisor`:
+
+- Child identity is supervisor-generated (`task-1`, `task-2`, ...). `task.name`
+  is kept only as a `name` label; duplicate names never overwrite records, and
+  `cancel` accepts generated `id`s only, not names.
+- `jobs` returns `{id, name, type, status, label, durationMs, resultText?, errorText?}`.
+- `cancel` first cancels the child's cancellation token and interrupts its loop,
+  waiting up to 5 s for in-flight tools to clean up; only then is the task
+  aborted. An unknown or foreign id is `not_found`; a settled child is
+  `already_completed`.
+- A child still queued for a concurrency permit is reserved with its own token:
+  `cancel` cancels that reservation so the child never starts, and the job
+  settles as `aborted`.
+- Dropping the caller's shell future (parent abort, runtime shutdown) cancels
+  the spawned shell task and SIGKILLs its recorded process tree synchronously;
+  it does not rely on the outer `select!` polling the cancellation branch.
+- Subagents get a hub scoped to their direct children and do not inherit `todo`
+  from the parent (TS parent-owned-tool rule).

@@ -161,8 +161,29 @@ impl AgentLoop {
 		&self,
 		user_message: Message,
 		state: &mut AgentState,
+		steering_rx: Option<mpsc::Receiver<SteeringEvent>>,
+		events: Option<mpsc::Sender<AgentEvent>>,
+	) -> Result<Vec<TurnResult>, AgentError> {
+		self
+			.run_dialog_message_with_cancel(
+				user_message,
+				state,
+				steering_rx,
+				events,
+				CancellationToken::new(),
+			)
+			.await
+	}
+
+	/// Like [`Self::run_dialog_message`], but with a caller-owned cancellation
+	/// token so a supervisor can stop the loop (and its in-flight tools) directly.
+	pub async fn run_dialog_message_with_cancel(
+		&self,
+		user_message: Message,
+		state: &mut AgentState,
 		mut steering_rx: Option<mpsc::Receiver<SteeringEvent>>,
 		events: Option<mpsc::Sender<AgentEvent>>,
+		cancellation_token: CancellationToken,
 	) -> Result<Vec<TurnResult>, AgentError> {
 		// The configured prompt belongs at the head of the history; resumed
 		// sessions may already carry messages, so test for the role, not emptiness.
@@ -175,8 +196,6 @@ impl AgentLoop {
 			state.messages.insert(0, Message::system(system.clone()));
 		}
 		state.messages.push(user_message);
-
-		let cancellation_token = CancellationToken::new();
 		let ctx = AgentContext::with_approver(
 			self.config.cwd.clone(),
 			cancellation_token.clone(),
@@ -400,6 +419,7 @@ impl AgentLoop {
 					content: INTERRUPTED_TOOL_RESULT.to_string(),
 					is_error: true,
 					terminate: false,
+					details: None,
 				}),
 			}
 		}

@@ -61,6 +61,7 @@ impl ToolScheduler {
 				content: self.registry.missing_tool_diagnostic(&call.name),
 				is_error: true,
 				terminate: false,
+				details: None,
 			};
 		};
 
@@ -72,6 +73,7 @@ impl ToolScheduler {
 					content: format!("Tool execution denied: {denial}"),
 					is_error: true,
 					terminate: false,
+					details: None,
 				};
 			}
 		}
@@ -94,5 +96,6 @@ fn tool_error_result(tool_call_id: &str, err: ToolError) -> ToolResult {
 		content: format!("Tool error: {err}"),
 		is_error: true,
 		terminate: false,
+		details: None,
 	}
 }

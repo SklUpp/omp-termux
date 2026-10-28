@@ -4,6 +4,7 @@
 
 ## Source
 - Entry: `packages/coding-agent/src/tools/todo.ts`
+- Rust entry (headless parity): `crates/pi-agent/src/tools/todo.rs`
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/todo.md`
 - Key collaborators:
   - `packages/coding-agent/src/tools/index.ts` — registers tool, exposes session hooks, gates availability.
@@ -82,6 +83,28 @@ The TUI renderer (`todoToolRenderer`) merges call and result into one transcript
 10. The agent runtime watches `todo` tool results in `packages/coding-agent/src/session/agent-session.ts`; successful results refresh cached todos, failed results inject a hidden next-turn reminder telling the model that todo progress is not visible until it retries.
 11. The event controller updates the visible todo UI from `result.details.phases` on success, or shows a warning on error (`packages/coding-agent/src/modes/controllers/event-controller.ts`).
 
+## Rust headless parity
+
+`crates/pi-agent/src/tools/todo.rs` implements the same op set, schema, exact
+content targeting, phase progression, blocked handling, text summary, and
+`details{op,phases,storage,completedTasks?}` payload. Differences are limited to
+the transport:
+
+- State lives on the tool instance (`RwLock<Vec<TodoPhase>>`) for the run and is
+  restored on resume/fork by `SessionStore::latest_todo_phases`, which mirrors TS
+  `getLatestTodoPhasesFromEntries` over the session branch: newest entry first,
+  `user_todo_edit` custom entries (`{customType, data:{phases}}`) and successful
+  `todo` tool results (`details.phases`) both count, whichever appears later in
+  the log wins, `phases: []` is a real clear, and error results are skipped.
+- `details` is written on the session `toolResult` message (`SessionMessage.extra`
+  → JSONL `details`), so Rust and TypeScript sessions round-trip the field without
+  conversion. `ToolCallRecord.details` carries it through `TurnBuilder`, resume,
+  fork, and legacy v1 import.
+- `storage` is `"session"` when the run writes a session log
+  (`RunRequest.session_persisted`), else `"memory"`.
+- TUI renderer, `/todo` slash command, markdown round-trip, HUD reminders, and the
+  collapsed preview are not part of the headless tool.
+
 ## Modes / Variants
 ### State transitions
 
@@ -101,6 +124,7 @@ Normalization then re-applies the single-active-task rule after the op runs.
   - else `phase` set: affect every task in that exact-name phase.
   - else: affect every task in every phase.
 - `block` and `unblock` use the same task-or-phase lookup but reject an omitted target.
+- A blocker note only describes a `blocked` task: `start`, `done`, and `drop` clear it when they leave the blocked state.
 - `append` is the only op that creates a missing phase.
 - `init` discards previous phases entirely.
 

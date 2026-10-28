@@ -7,16 +7,16 @@
 use std::{
 	path::Path,
 	sync::{
-		Arc,
+		Arc, Mutex,
 		atomic::{AtomicBool, Ordering},
 	},
 };
 
 use async_trait::async_trait;
 use pi_agent::{
-	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, BashTool, EditTool, GlobTool,
-	GrepTool, ModelProvider, OpenAiCompatibleProvider, ReadTool, SteeringEvent, TodoTool, Tool,
-	ToolRegistry, WriteTool,
+	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, BashTool, DelegationLimits,
+	EditTool, GlobTool, GrepTool, ModelProvider, OpenAiCompatibleProvider, ReadTool,
+	SteeringEvent, Supervisor, TodoTool, Tool, ToolApprover, ToolRegistry, WriteTool,
 	mcp::{
 		MCPContent, MCPServerConfig, MCPStdioServerConfig, McpConnection, McpError,
 		McpToolOriginSource, connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key,
@@ -49,10 +49,19 @@ pub const BUILTIN_TOOLS: [(&str, bool); 7] = [
 	("todo", false),
 ];
 
+/// Delegation tools assembled around a [`Supervisor`] rather than built from
+/// static registry entries. They are offered by default and can be selected or
+/// excluded with `--tools`/`config.tools`.
+pub const DELEGATION_TOOLS: [&str; 2] = ["task", "hub"];
+
 /// Synchronous `AgentRunner` that drives `pi-agent` on its own tokio runtime.
 pub struct PiAgentRunner {
 	runtime:    tokio::runtime::Runtime,
 	dispatcher: Arc<SignalDispatcher>,
+	/// In-memory supervisor reused across turns of this process. Child records
+	/// survive REPL turns so `hub jobs` can inspect earlier delegations; they
+	/// are never written to the session log.
+	supervisor: Mutex<Option<Arc<Supervisor>>>,
 }
 
 impl PiAgentRunner {
@@ -62,7 +71,7 @@ impl PiAgentRunner {
 			.build()
 			.map_err(|err| Error::with_source("cannot start tokio runtime for pi-agent", err))?;
 		let dispatcher = Arc::new(SignalDispatcher::start(&runtime));
-		Ok(Self { runtime, dispatcher })
+		Ok(Self { runtime, dispatcher, supervisor: Mutex::new(None) })
 	}
 }
 
@@ -195,12 +204,15 @@ impl AgentRunner for PiAgentRunner {
 
 
 		let plan = RunPlan::resolve_with_mcp(request, !mcp_spawn.tools.is_empty())?;
-		let registry = build_registry_with_mcp_and_diagnostics(
+		let base_registry = build_registry_full(
 			&plan.tools,
 			mcp_spawn.tools,
 			mcp_spawn.server_errors,
 			mcp_spawn.all_server_names,
+			request.todo_phases.clone(),
+			request.session_persisted,
 		)?;
+		let (allow_task, allow_hub) = delegation_selection(request);
 		let cwd = request.cwd.clone();
 		let prompt = request.prompt.clone();
 		let mut messages = history_messages(&request.history)?;
@@ -271,12 +283,41 @@ impl AgentRunner for PiAgentRunner {
 			cwd,
 		};
 		let provider: Arc<dyn ModelProvider> = Arc::new(provider);
-		let agent = AgentLoop::with_approver(
-			config,
-			provider,
-			registry,
-			Arc::new(approvals),
-		);
+		let approvals: Arc<dyn ToolApprover> = Arc::new(approvals);
+		let registry = if allow_task || allow_hub {
+			let mut slot = self.supervisor.lock().map_err(|_| {
+				Error::new("delegation supervisor lock poisoned")
+			})?;
+			let supervisor = match slot.as_ref() {
+				Some(supervisor) => {
+					supervisor.rebind(
+						base_registry,
+						provider.clone(),
+						Some(approvals.clone()),
+						DelegationLimits::default(),
+						allow_task,
+						allow_hub,
+					);
+					Arc::clone(supervisor)
+				},
+				None => {
+					let supervisor = Supervisor::with_selection(
+						base_registry,
+						provider.clone(),
+						Some(approvals.clone()),
+						DelegationLimits::default(),
+						allow_task,
+						allow_hub,
+					);
+					*slot = Some(Arc::clone(&supervisor));
+					supervisor
+				},
+			};
+			supervisor.root_registry()
+		} else {
+			base_registry
+		};
+		let agent = AgentLoop::with_approver(config, provider, registry, approvals);
 		let mut state = AgentState { messages, total_turns: 0 };
 
 		let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<Event>>(64);
@@ -732,6 +773,22 @@ pub fn split_effort(model: &str) -> (&str, Option<&str>) {
 	(id, Some(selector))
 }
 
+/// Which supervisor-backed tools this run may offer. `--tools` is a whitelist:
+/// without it both delegation tools are on, and naming one (but not the other)
+/// enables exactly that subset. `--no-tools` disables both.
+pub fn delegation_selection(request: &RunRequest) -> (bool, bool) {
+	if !request.tools_enabled {
+		return (false, false);
+	}
+	match &request.config.tools {
+		None => (true, true),
+		Some(allowed) => (
+			allowed.iter().any(|tool| tool == "task"),
+			allowed.iter().any(|tool| tool == "hub"),
+		),
+	}
+}
+
 /// Tools the model may call, preserving explicit configuration restrictions.
 fn allowed_tools(request: &RunRequest, _has_mcp_tools: bool) -> Result<Vec<&'static str>> {
 	if !request.tools_enabled {
@@ -765,6 +822,18 @@ pub fn build_registry_with_mcp_and_diagnostics(
 	server_errors: Vec<(String, String)>,
 	all_server_names: Vec<String>,
 ) -> Result<ToolRegistry> {
+	build_registry_full(tools, mcp_tools, server_errors, all_server_names, Vec::new(), false)
+}
+
+/// Build the registry with session-restored `todo` phases.
+fn build_registry_full(
+	tools: &[&'static str],
+	mcp_tools: Vec<McpTool>,
+	server_errors: Vec<(String, String)>,
+	all_server_names: Vec<String>,
+	todo_phases: Vec<pi_agent::tools::todo::TodoPhase>,
+	session_persisted: bool,
+) -> Result<ToolRegistry> {
 	let mut registry = ToolRegistry::new();
 	for name in tools {
 		let tool: Arc<dyn Tool> = match *name {
@@ -774,7 +843,7 @@ pub fn build_registry_with_mcp_and_diagnostics(
 			"write" => Arc::new(WriteTool),
 			"edit" => Arc::new(EditTool),
 			"bash" => Arc::new(BashTool),
-			"todo" => Arc::new(TodoTool::new()),
+			"todo" => Arc::new(TodoTool::restored(todo_phases.clone(), session_persisted)),
 			other => {
 				return Err(Error::new(format!(
 					"unknown builtin tool `{other}`: BUILTIN_TOOLS and build_registry drifted"
@@ -958,6 +1027,7 @@ impl Tool for McpTool {
 				content:      format!("MCP tool {} cancelled", self.name),
 				is_error:     true,
 				terminate:    false,
+				details:      None,
 			});
 		}
 
@@ -968,6 +1038,7 @@ impl Tool for McpTool {
 					content: format!("MCP tool {} cancelled", self.name),
 					is_error: true,
 					terminate: false,
+					details: None,
 				})
 			}
 			res = self.connection.call_tool(&self.tool_name, args.clone()) => {
@@ -1003,13 +1074,20 @@ impl Tool for McpTool {
 							}
 						}
 						let is_error = call_result.is_error.unwrap_or(false);
-						Ok(pi_agent::ToolResult { tool_call_id: String::new(), content, is_error, terminate: false })
+						Ok(pi_agent::ToolResult {
+							tool_call_id: String::new(),
+							content,
+							is_error,
+							terminate: false,
+							details: None,
+						})
 					},
 					Err(err) => Ok(pi_agent::ToolResult {
 						tool_call_id: String::new(),
 						content: format_mcp_infrastructure_error(&self.server_name, "call", &err),
 						is_error: true,
 						terminate: false,
+						details: None,
 					}),
 				}
 			}
@@ -1467,6 +1545,7 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 
 	if let Some(requested_tools) = &config.tools {
 		let mut known_tools: Vec<String> = BUILTIN_TOOLS.iter().map(|(n, _)| n.to_string()).collect();
+		known_tools.extend(DELEGATION_TOOLS.iter().map(|name| (*name).to_string()));
 		for tool in &unique_tools {
 			known_tools.push(tool.name().to_string());
 		}
@@ -1798,6 +1877,8 @@ mod tests {
 			tools_enabled: true,
 			max_turns: 5,
 			history: Vec::new(),
+			todo_phases: Vec::new(),
+			session_persisted: false,
 			cancellation_token: None,
 		}
 	}
@@ -1958,6 +2039,24 @@ mod tests {
 	}
 
 	#[test]
+	fn delegation_defaults_on_and_follows_the_tools_whitelist() {
+		let mut request = request(yolo());
+		assert_eq!(delegation_selection(&request), (true, true));
+
+		request.config.tools = Some(vec!["read".to_string()]);
+		assert_eq!(delegation_selection(&request), (false, false));
+
+		request.config.tools = Some(vec!["task".to_string()]);
+		assert_eq!(delegation_selection(&request), (true, false));
+
+		request.config.tools = Some(vec!["hub".to_string()]);
+		assert_eq!(delegation_selection(&request), (false, true));
+
+		request.tools_enabled = false;
+		assert_eq!(delegation_selection(&request), (false, false));
+	}
+
+	#[test]
 	fn history_turns_become_pi_agent_messages() {
 		let history = vec![crate::session::TurnRecord {
 			prompt:      "fix".to_string(),
@@ -1970,6 +2069,7 @@ mod tests {
 				result:    "contents".to_string(),
 				is_error:  false,
 				result_parts: vec![],
+				details: None,
 			}],
 			parts:       vec![],
 		}];
@@ -2013,6 +2113,7 @@ mod tests {
 				result:    "[Tool execution interrupted by user]".to_string(),
 				is_error:  true,
 				result_parts: vec![],
+				details: None,
 			}],
 			parts:       vec![],
 		}];
@@ -2039,6 +2140,7 @@ mod tests {
 				result:    "exit code 1".to_string(),
 				is_error:  true,
 				result_parts: vec![],
+				details: None,
 			}],
 			parts:       vec![],
 		}];
@@ -2064,6 +2166,7 @@ mod tests {
 				result:    "[Tool execution interrupted by user]".to_string(),
 				is_error:  true,
 				result_parts: vec![],
+				details: None,
 			}],
 			parts:       vec![],
 		}];
@@ -2161,6 +2264,7 @@ mod tests {
 					crate::session::ContentPart::text("snapshot ready"),
 					crate::session::ContentPart::image("aW1hZ2VkYXRh", "image/png"),
 				],
+				details:      None,
 			}],
 			parts:       vec![],
 		}];
@@ -2192,6 +2296,7 @@ mod tests {
 					mime_type: Some("image/png".to_string()),
 					extra:     serde_json::Map::new(),
 				}],
+				details:      None,
 			}],
 			parts:       vec![],
 		}];
@@ -2221,6 +2326,7 @@ mod tests {
 					mime_type: None,
 					extra:     serde_json::Map::new(),
 				}],
+				details:      None,
 			}],
 			parts:       vec![],
 		}];
@@ -2761,5 +2867,323 @@ mod tests {
 		assert_eq!(content[0]["text"], "describe this");
 		assert_eq!(content[1]["type"], "image_url");
 		assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,aW1hZ2VkYXRh");
+	}
+
+	#[tokio::test]
+	async fn restored_todo_tool_reads_phases_from_the_session_log() {
+		let dir = std::env::temp_dir().join(format!(
+			"omp-cli-runtime-todo-{}",
+			crate::output::session_id()
+		));
+		let options = crate::session::SessionOptions {
+			enabled: true,
+			cwd: dir.clone(),
+			model: None,
+			provider: None,
+			dir: Some(dir.clone()),
+			id: Some("todo-runtime".to_string()),
+			continue_latest: false,
+		};
+		let mut store = crate::session::SessionStore::open(&options);
+		assert!(store.enabled());
+
+		// Invoke the real tool, persist its details exactly as the live turn
+		// recorder does, then recover through a fresh store/registry.
+		let ctx = pi_agent::AgentContext::new(dir.clone());
+		let registry =
+			build_registry_full(&["todo"], Vec::new(), Vec::new(), Vec::new(), Vec::new(), true)
+				.expect("registry");
+		let todo = registry.get("todo").expect("todo tool");
+		let args = serde_json::json!({
+			"op": "init",
+			"list": [{"phase": "Plan", "items": ["resume me"]}],
+		});
+		let init = todo.execute(&args, &ctx).await.expect("todo init executes");
+		assert!(!init.is_error, "init failed: {}", init.content);
+		let details = init.details.clone().expect("details");
+		assert_eq!(details["phases"][0]["tasks"][0]["content"], "resume me");
+		assert_eq!(details["storage"], "session");
+
+		store
+			.append_turn(&crate::session::TurnRecord {
+				prompt: "seed".to_string(),
+				assistant: "planned".to_string(),
+				stop_reason: "toolUse".to_string(),
+				tool_calls: vec![crate::session::ToolCallRecord {
+					id: "call-todo".to_string(),
+					name: "todo".to_string(),
+					arguments: args,
+					result: init.content,
+					is_error: init.is_error,
+					result_parts: Vec::new(),
+					details: Some(details),
+				}],
+				parts: Vec::new(),
+			})
+			.expect("append seed turn");
+		drop(store);
+
+		let reopened = crate::session::SessionStore::open(&options);
+		let phases = reopened.latest_todo_phases();
+		assert_eq!(phases[0].tasks[0].content, "resume me");
+
+		let registry =
+			build_registry_full(&["todo"], Vec::new(), Vec::new(), Vec::new(), phases, true)
+				.expect("registry");
+		let todo = registry.get("todo").expect("todo tool");
+		let viewed = todo
+			.execute(&serde_json::json!({"op": "view"}), &ctx)
+			.await
+			.expect("todo executes");
+		assert!(!viewed.is_error);
+		let details = viewed.details.as_ref().expect("details");
+		assert_eq!(details["phases"][0]["tasks"][0]["content"], "resume me");
+		assert_eq!(details["storage"], "session");
+
+		std::fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn cli_task_and_hub_share_supervisor_across_turns() {
+		use std::io::{Read, Write};
+		use std::sync::atomic::{AtomicU64, Ordering};
+
+		fn last_message_text(body: &str) -> String {
+			let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
+				return String::new();
+			};
+			let Some(messages) = request.get("messages").and_then(|v| v.as_array()) else {
+				return String::new();
+			};
+			let Some(last) = messages.last() else {
+				return String::new();
+			};
+			match last.get("content") {
+				Some(serde_json::Value::String(text)) => text.clone(),
+				Some(serde_json::Value::Array(parts)) => parts
+					.iter()
+					.filter_map(|part| part.get("text").and_then(|v| v.as_str()))
+					.collect::<Vec<_>>()
+					.join(""),
+				_ => String::new(),
+			}
+		}
+
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+		let addr = listener.local_addr().expect("fixture addr");
+		let call_seq = AtomicU64::new(0);
+		let server = std::thread::spawn(move || {
+			for _ in 0..5 {
+				let (mut socket, _) = listener.accept().expect("accept fixture");
+				let mut buf = Vec::new();
+				let mut chunk = [0u8; 4096];
+				let mut header_end = None;
+				let mut content_len = 0usize;
+				loop {
+					let n = socket.read(&mut chunk).expect("read request");
+					if n == 0 {
+						break;
+					}
+					buf.extend_from_slice(&chunk[..n]);
+					if header_end.is_none() {
+						if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+							header_end = Some(pos + 4);
+							let headers = String::from_utf8_lossy(&buf[..pos]);
+							for line in headers.lines() {
+								if line.to_ascii_lowercase().starts_with("content-length:") {
+									content_len = line
+										.split(':')
+										.nth(1)
+										.and_then(|v| v.trim().parse().ok())
+										.unwrap_or(0);
+								}
+							}
+						}
+					}
+					if let Some(end) = header_end {
+						if buf.len() >= end + content_len {
+							break;
+						}
+					}
+				}
+				let end = header_end.expect("headers");
+				let body = String::from_utf8_lossy(&buf[end..end + content_len]);
+				let latest = last_message_text(&body);
+				let streaming = serde_json::from_str::<serde_json::Value>(&body)
+					.ok()
+					.and_then(|request| request.get("stream").and_then(|v| v.as_bool()))
+					.unwrap_or(false);
+
+				let (tool, text) = if latest == "CLI_TASK" {
+					(
+						Some((
+							"task",
+							serde_json::json!({ "name": "cli-child", "task": "CLI_CHILD_WORK" }),
+						)),
+						None,
+					)
+				} else if latest == "CLI_CHILD_WORK" {
+					(
+						Some(("yield", serde_json::json!({ "result": { "data": "child-ok" } }))),
+						None,
+					)
+				} else if latest == "CLI_JOBS" {
+					(Some(("hub", serde_json::json!({ "op": "jobs" }))), None)
+				} else if latest.contains("\"op\":\"jobs\"") {
+					(None, Some("jobs done"))
+				} else if latest.contains("\"name\":\"cli-child\"") {
+					(None, Some("root done"))
+				} else {
+					(None, Some("unexpected route"))
+				};
+
+				let id = call_seq.fetch_add(1, Ordering::SeqCst) + 1;
+				let payload = if streaming {
+					if let Some((name, args)) = tool {
+						let delta = serde_json::json!({
+							"choices": [{
+								"delta": {
+									"tool_calls": [{
+										"index": 0,
+										"id": format!("call_{id}"),
+										"type": "function",
+										"function": {
+											"name": name,
+											"arguments": serde_json::to_string(&args).unwrap()
+										}
+									}]
+								},
+								"finish_reason": null
+							}]
+						});
+						format!("data: {delta}\n\ndata: [DONE]\n\n")
+					} else {
+						let delta = serde_json::json!({
+							"choices": [{
+								"delta": { "content": text.unwrap_or("unexpected route") },
+								"finish_reason": null
+							}]
+						});
+						format!("data: {delta}\n\ndata: [DONE]\n\n")
+					}
+				} else if let Some((name, args)) = tool {
+					serde_json::json!({
+						"choices": [{
+							"message": {
+								"role": "assistant",
+								"content": null,
+								"tool_calls": [{
+									"id": format!("call_{id}"),
+									"type": "function",
+									"function": {
+										"name": name,
+										"arguments": serde_json::to_string(&args).unwrap()
+									}
+								}]
+							}
+						}]
+					})
+					.to_string()
+				} else {
+					serde_json::json!({
+						"choices": [{
+							"message": {
+								"role": "assistant",
+								"content": text.unwrap_or("unexpected route"),
+								"tool_calls": null
+							}
+						}]
+					})
+					.to_string()
+				};
+
+				let content_type = if streaming {
+					"text/event-stream"
+				} else {
+					"application/json"
+				};
+				write!(
+					socket,
+					"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+					payload.len(),
+					payload
+				)
+				.expect("write fixture");
+				socket.flush().expect("flush fixture");
+			}
+		});
+
+		let mut req = request(yolo());
+		req.cwd = std::env::temp_dir();
+		req.config.providers.insert("local".to_string(), ProviderConfig {
+			base_url: Some(format!("http://{addr}/v1")),
+			api_key: Some("sk-test".to_string()),
+			..ProviderConfig::default()
+		});
+		req.model = Some("local/llama3".to_string());
+		req.prompt = "CLI_TASK".to_string();
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let mut task_result = None;
+		let mut child_yield_at_root = false;
+		for event in runner.run(&req).expect("run task turn") {
+			if let Ok(Event::ToolEnd { tool, result, .. }) = event {
+				if tool == "yield" {
+					child_yield_at_root = true;
+				}
+				if tool == "task" {
+					task_result = Some(result);
+				}
+			}
+		}
+		let task_result = task_result.expect("task tool ran");
+		let task_details: serde_json::Value =
+			serde_json::from_str(&task_result).expect("task result json");
+		assert_eq!(task_details["results"][0]["name"], "cli-child");
+		let child_id = task_details["results"][0]["id"]
+			.as_str()
+			.expect("child id")
+			.to_string();
+		assert!(
+			child_id.starts_with("task-"),
+			"child id must be supervisor-generated, got {child_id}"
+		);
+		assert_eq!(task_details["results"][0]["exitCode"].as_i64(), Some(0));
+		assert_eq!(
+			task_details["results"][0]["extractedToolData"]["yield"][0]["data"],
+			"child-ok"
+		);
+		assert!(!child_yield_at_root, "yield must stay child-only");
+
+		// A later REPL turn must still see the completed child in the same
+		// in-memory supervisor.
+		let mut jobs_req = request(yolo());
+		jobs_req.cwd = std::env::temp_dir();
+		jobs_req.config.providers.insert("local".to_string(), ProviderConfig {
+			base_url: Some(format!("http://{addr}/v1")),
+			api_key: Some("sk-test".to_string()),
+			..ProviderConfig::default()
+		});
+		jobs_req.model = Some("local/llama3".to_string());
+		jobs_req.prompt = "CLI_JOBS".to_string();
+
+		let mut hub_result = None;
+		for event in runner.run(&jobs_req).expect("run hub turn") {
+			if let Ok(Event::ToolEnd { tool, result, .. }) = event {
+				if tool == "hub" {
+					hub_result = Some(result);
+				}
+			}
+		}
+		let hub_result = hub_result.expect("hub tool ran");
+		let hub_details: serde_json::Value =
+			serde_json::from_str(&hub_result).expect("hub result json");
+		assert_eq!(hub_details["op"], "jobs");
+		assert_eq!(hub_details["jobs"][0]["id"].as_str(), Some(child_id.as_str()));
+		assert_eq!(hub_details["jobs"][0]["name"], "cli-child");
+		assert_eq!(hub_details["jobs"][0]["status"], "completed");
+		assert_eq!(hub_details["jobs"][0]["type"], "task");
+
+		server.join().expect("fixture joined");
 	}
 }

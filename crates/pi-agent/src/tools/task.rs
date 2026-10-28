@@ -21,19 +21,31 @@ use crate::{
 pub struct TaskTool {
 	pub supervisor: Arc<Supervisor>,
 	pub depth: i32,
+	/// Agent id that owns the children this tool spawns (`None` at the root).
+	pub parent_id: Option<String>,
 	pub semaphore: Arc<Semaphore>,
 }
 
 impl TaskTool {
 	pub fn new(supervisor: Arc<Supervisor>, depth: i32) -> Self {
-		let permits = if supervisor.limits.max_concurrency == 0 {
+		Self::with_parent(supervisor, depth, None)
+	}
+
+	pub fn with_parent(
+		supervisor: Arc<Supervisor>,
+		depth: i32,
+		parent_id: Option<String>,
+	) -> Self {
+		let limits = supervisor.limits();
+		let permits = if limits.max_concurrency == 0 {
 			Semaphore::MAX_PERMITS
 		} else {
-			supervisor.limits.max_concurrency
+			limits.max_concurrency
 		};
 		Self {
 			supervisor,
 			depth,
+			parent_id,
 			semaphore: Arc::new(Semaphore::new(permits)),
 		}
 	}
@@ -42,6 +54,7 @@ impl TaskTool {
 		Self {
 			supervisor,
 			depth,
+			parent_id: None,
 			semaphore,
 		}
 	}
@@ -53,19 +66,34 @@ impl TaskTool {
 		ctx: &AgentContext,
 	) -> SingleResult {
 		let start = Instant::now();
-		let child_id = item.name.clone();
+		let child_name = item.name.clone();
+		let (child_id, child_cancel) = self.supervisor.reserve_child(
+			&child_name,
+			index,
+			&item.agent,
+			&item.task,
+			self.parent_id.as_deref(),
+		);
+		let mut reservation = ReservationGuard::new(
+			self.supervisor.clone(),
+			child_id.clone(),
+			child_cancel.clone(),
+		);
 
 		let _permit = match tokio::select! {
-			_ = ctx.cancellation_token.cancelled() => Err(()),
-			permit = self.semaphore.acquire() => permit.map_err(|_| ()),
+			biased;
+			_ = child_cancel.cancelled() => Err("cancelled by hub"),
+			_ = ctx.cancellation_token.cancelled() => Err("aborted by parent"),
+			permit = self.semaphore.acquire() => permit.map_err(|_| "aborted by parent"),
 		} {
 			Ok(permit) => permit,
-			Err(_) => {
-				self.supervisor.register_child(&child_id, index, &item.agent, &item.task);
-				self.supervisor.mark_aborted(&child_id, "aborted by parent");
+			Err(reason) => {
+				self.supervisor.mark_aborted(&child_id, reason);
+				self.supervisor.unregister_active_child(&child_id);
 				return SingleResult {
 					index,
 					id: child_id,
+					name: child_name,
 					agent: "task".to_string(),
 					agent_source: "bundled".to_string(),
 					task: item.task,
@@ -78,13 +106,36 @@ impl TaskTool {
 					requests: 0,
 					error: None,
 					aborted: Some(true),
-					abort_reason: Some("aborted by parent".to_string()),
+					abort_reason: Some(reason.to_string()),
 					extracted_tool_data: None,
 				};
 			}
 		};
 
-		self.supervisor.register_child(&child_id, index, &item.agent, &item.task);
+		// A permit can be granted at the same moment the reservation is cancelled.
+		if child_cancel.is_cancelled() {
+			self.supervisor.mark_aborted(&child_id, "cancelled by hub");
+			self.supervisor.unregister_active_child(&child_id);
+			return SingleResult {
+				index,
+				id: child_id,
+				name: child_name,
+				agent: "task".to_string(),
+				agent_source: "bundled".to_string(),
+				task: item.task,
+				exit_code: 1,
+				output: "(no output)".to_string(),
+				stderr: String::new(),
+				truncated: false,
+				duration_ms: start.elapsed().as_millis() as u64,
+				tokens: 0,
+				requests: 0,
+				error: None,
+				aborted: Some(true),
+				abort_reason: Some("cancelled by hub".to_string()),
+				extracted_tool_data: None,
+			};
+		}
 
 		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(16);
 
@@ -95,9 +146,9 @@ impl TaskTool {
 			cwd: ctx.cwd.clone(),
 		};
 
-		let child_provider = self.supervisor.provider.clone();
-		let child_approver = self.supervisor.child_approver.clone();
-		let child_registry = self.supervisor.child_registry(self.depth + 1);
+		let child_provider = self.supervisor.provider();
+		let child_approver = self.supervisor.child_approver();
+		let child_registry = self.supervisor.child_registry(self.depth + 1, Some(&child_id));
 
 		let full_prompt = if let Some(context) = &item.context {
 			format!("{context}\n\n{}", item.task)
@@ -105,7 +156,8 @@ impl TaskTool {
 			item.task.clone()
 		};
 
-		let task_handle = tokio::spawn(async move {
+		let child_cancel_for_loop = child_cancel.clone();
+		let mut task_handle = tokio::spawn(async move {
 			let mut child_loop = match child_approver {
 				Some(approver) => AgentLoop::with_approver(
 					child_config,
@@ -117,47 +169,80 @@ impl TaskTool {
 			};
 			let mut child_state = AgentState::default();
 			child_loop
-				.run_dialog_message(
+				.run_dialog_message_with_cancel(
 					Message::user(full_prompt),
 					&mut child_state,
 					Some(steering_rx),
 					None,
+					child_cancel_for_loop,
 				)
 				.await
 		});
 
-		self.supervisor.register_active_child(
+		if !self.supervisor.register_active_child(
 			&child_id,
 			steering_tx.clone(),
 			task_handle.abort_handle(),
-		);
+			child_cancel.clone(),
+		) {
+			// The reservation was cancelled between the permit check and this
+			// registration; never let the already-spawned loop run unowned.
+			child_cancel.cancel();
+			task_handle.abort();
+			let _ = task_handle.await;
+			self.supervisor.mark_aborted(&child_id, "cancelled by hub");
+			self.supervisor.unregister_active_child(&child_id);
+			return SingleResult {
+				index,
+				id: child_id,
+				name: child_name,
+				agent: "task".to_string(),
+				agent_source: "bundled".to_string(),
+				task: item.task,
+				exit_code: 1,
+				output: "(no output)".to_string(),
+				stderr: String::new(),
+				truncated: false,
+				duration_ms: start.elapsed().as_millis() as u64,
+				tokens: 0,
+				requests: 0,
+				error: None,
+				aborted: Some(true),
+				abort_reason: Some("cancelled by hub".to_string()),
+				extracted_tool_data: None,
+			};
+		}
 
 		let mut guard = ChildGuard::new(
 			task_handle.abort_handle(),
 			steering_tx.clone(),
 			self.supervisor.clone(),
 			child_id.clone(),
+			child_cancel.clone(),
 		);
+		// The running task is now owned by `ChildGuard`; no await occurred since
+		// `register_active_child`, so nothing can drop this future in the gap.
+		reservation.disarm();
 
 		let outcome = tokio::select! {
 			_ = ctx.cancellation_token.cancelled() => {
+				child_cancel.cancel();
 				let _ = steering_tx.try_send(SteeringEvent::Interrupt);
-				guard.handle.abort();
-				self.supervisor.mark_aborted(&child_id, "aborted by parent");
-				Err(AgentError::Interrupted)
+				None
 			}
-			res = task_handle => {
-				match res {
-					Ok(dialog_res) => dialog_res,
-					Err(join_err) => {
-						if join_err.is_cancelled() {
-							Err(AgentError::Interrupted)
-						} else {
-							Err(AgentError::Internal(join_err.to_string()))
-						}
-					}
-				}
-			}
+			res = &mut task_handle => Some(join_dialog_result(res)),
+		};
+		// Await outside the select so only one branch borrows the handle.
+		let outcome = match outcome {
+			Some(outcome) => outcome,
+			None => match tokio::time::timeout(CHILD_CANCEL_GRACE, &mut task_handle).await {
+				Ok(joined) => join_dialog_result(joined),
+				Err(_) => {
+					guard.handle.abort();
+					let _ = task_handle.await;
+					Err(AgentError::Interrupted)
+				},
+			},
 		};
 
 		guard.defuse();
@@ -227,12 +312,25 @@ impl TaskTool {
 						abort_reason.as_deref().unwrap_or("aborted by yield"),
 					);
 				} else {
-					self.supervisor.mark_completed(&child_id, duration_ms, &output);
+					// A child that yields carries its real result in the terminal
+					// tool payload, not in assistant text. Surface that data in the
+					// hub snapshot instead of "(no output)".
+					let record_output = extracted_tool_data
+						.as_ref()
+						.and_then(|map| map.get("yield"))
+						.and_then(|yields| yields.first())
+						.and_then(|yielded| yielded.get("data"))
+						.map(Value::to_string)
+						.unwrap_or_else(|| output.clone());
+					self
+						.supervisor
+						.mark_completed(&child_id, duration_ms, &record_output);
 				}
 
 				SingleResult {
 					index,
 					id: child_id,
+					name: child_name,
 					agent: "task".to_string(),
 					agent_source: "bundled".to_string(),
 					task: item.task,
@@ -254,6 +352,7 @@ impl TaskTool {
 				SingleResult {
 					index,
 					id: child_id,
+					name: child_name,
 					agent: "task".to_string(),
 					agent_source: "bundled".to_string(),
 					task: item.task,
@@ -276,6 +375,7 @@ impl TaskTool {
 				SingleResult {
 					index,
 					id: child_id,
+					name: child_name,
 					agent: "task".to_string(),
 					agent_source: "bundled".to_string(),
 					task: item.task,
@@ -297,6 +397,63 @@ impl TaskTool {
 }
 
 const UNSUPPORTED_FIELDS: &[&str] = &["outputSchema", "schemaMode", "effort", "isolated"];
+
+/// Owns a queued reservation until the spawned `ChildGuard` takes over. If the
+/// batch future is dropped while waiting for a semaphore permit, this drop still
+/// settles the record and releases the reservation instead of leaking a
+/// `Running` id forever.
+struct ReservationGuard {
+	supervisor: Arc<Supervisor>,
+	id:         String,
+	token:      tokio_util::sync::CancellationToken,
+	armed:      bool,
+}
+
+impl ReservationGuard {
+	fn new(
+		supervisor: Arc<Supervisor>,
+		id: String,
+		token: tokio_util::sync::CancellationToken,
+	) -> Self {
+		Self { supervisor, id, token, armed: true }
+	}
+
+	/// Called only after `ChildGuard` owns the running task; no await may sit
+	/// between registration and this handoff.
+	fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for ReservationGuard {
+	fn drop(&mut self) {
+		if !self.armed {
+			return;
+		}
+		self.token.cancel();
+		self.supervisor.mark_aborted(&self.id, "aborted by parent");
+		self.supervisor.unregister_active_child(&self.id);
+	}
+}
+
+/// How long a cancelled child may take to unwind cooperative tool cleanup
+/// (the shell's own graceful-kill window) before it is hard-aborted.
+const CHILD_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn join_dialog_result(
+	joined: Result<Result<Vec<crate::state::TurnResult>, AgentError>, tokio::task::JoinError>,
+) -> Result<Vec<crate::state::TurnResult>, AgentError> {
+	match joined {
+		Ok(dialog_res) => dialog_res,
+		Err(join_err) => {
+			if join_err.is_cancelled() {
+				Err(AgentError::Interrupted)
+			} else {
+				Err(AgentError::Internal(join_err.to_string()))
+			}
+		},
+	}
+}
 
 fn check_unsupported_fields(obj: &serde_json::Map<String, Value>) -> Result<(), ToolError> {
 	for &field in UNSUPPORTED_FIELDS {
@@ -346,7 +503,10 @@ struct TaskItemSpec {
 #[serde(rename_all = "camelCase")]
 pub struct SingleResult {
 	pub index: usize,
+	/// Supervisor-generated identity, used for `hub cancel`.
 	pub id: String,
+	/// Model-supplied display label (may repeat across children).
+	pub name: String,
 	pub agent: String,
 	pub agent_source: String,
 	pub task: String,
@@ -415,10 +575,11 @@ impl Tool for TaskTool {
 	}
 
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
-		if self.supervisor.limits.max_depth >= 0 && self.depth >= self.supervisor.limits.max_depth {
+		let limits = self.supervisor.limits();
+		if limits.max_depth >= 0 && self.depth >= limits.max_depth {
 			return Err(ToolError::ExecutionFailed(format!(
 				"Cannot spawn another agent at task depth {}; maximum depth is {}.",
-				self.depth, self.supervisor.limits.max_depth
+				self.depth, limits.max_depth
 			)));
 		}
 
@@ -520,6 +681,7 @@ impl Tool for TaskTool {
 			content,
 			is_error: false,
 			terminate: false,
+			details: None,
 		})
 	}
 }

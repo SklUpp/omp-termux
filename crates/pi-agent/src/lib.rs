@@ -21,8 +21,10 @@ pub use state::{
 	ToolCall, ToolResult, TurnResult, TurnStatus,
 };
 pub use tokenizer::Tokenizer;
-pub use supervisor::{ChildGuard, ChildRecord, ChildStatus, DelegationLimits, Supervisor};
+pub use supervisor::{
+	CancelAttempt, ChildGuard, ChildRecord, ChildStatus, DelegationLimits, Supervisor,
+};
 pub use tools::{
-	BashTool, EditTool, GlobTool, GrepTool, ReadTool, TaskTool, TodoTool, Tool, ToolError,
+	BashTool, EditTool, GlobTool, GrepTool, HubTool, ReadTool, TaskTool, TodoTool, Tool, ToolError,
 	WriteTool, YieldTool, registry::ToolRegistry, scheduler::ToolScheduler,
 };

@@ -199,6 +199,7 @@ fn test_cli_tool_result_image_replay_to_openai_chat_wire() {
 						ContentPart::text("Photo 1 captured successfully"),
 						ContentPart::image("aW1nMQ==", "image/png"),
 					],
+					details: None,
 				},
 				ToolCallRecord {
 					id: "call-cam-2".to_string(),
@@ -210,6 +211,7 @@ fn test_cli_tool_result_image_replay_to_openai_chat_wire() {
 						ContentPart::text("Photo 2 captured successfully"),
 						ContentPart::image("aW1nMg==", "image/jpeg"),
 					],
+					details: None,
 				},
 				ToolCallRecord {
 					id: "call-diag-3".to_string(),
@@ -218,6 +220,7 @@ fn test_cli_tool_result_image_replay_to_openai_chat_wire() {
 					result: "all systems green".to_string(),
 					is_error: false,
 					result_parts: vec![ContentPart::text("all systems green")],
+					details: None,
 				},
 			],
 			parts: Vec::new(),
@@ -331,6 +334,7 @@ fn test_cli_image_only_tool_result_uses_placeholder_on_wire() {
 				result: String::new(),
 				is_error: false,
 				result_parts: vec![ContentPart::image("aW1nMQ==", "image/png")],
+				details: None,
 			}],
 			parts: Vec::new(),
 		};
@@ -409,6 +413,7 @@ fn test_cli_aborted_tool_turn_with_image_replays_properly() {
 					ContentPart::text("partial preview"),
 					ContentPart::image("aW1nMQ==", "image/png"),
 				],
+				details: None,
 			}],
 			parts: Vec::new(),
 		};
@@ -527,6 +532,7 @@ fn test_cli_legacy_text_tool_session_replays_without_user_image_insertion() {
 				result: "port=8080".to_string(),
 				is_error: false,
 				result_parts: Vec::new(),
+				details: None,
 			}],
 			parts: Vec::new(),
 		};

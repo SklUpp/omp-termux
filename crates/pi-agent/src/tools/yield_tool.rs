@@ -123,6 +123,7 @@ impl Tool for YieldTool {
 			content,
 			is_error: false,
 			terminate,
+			details: None,
 		})
 	}
 }

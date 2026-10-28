@@ -530,6 +530,7 @@ mod tests {
 						content: "file data".to_string(),
 						is_error: false,
 						terminate: false,
+						details: None,
 					}],
 					stop_reason: "tool_use".to_string(),
 					api: None,

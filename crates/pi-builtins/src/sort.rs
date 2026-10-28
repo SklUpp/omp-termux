@@ -4591,7 +4591,7 @@ fn uu_sort(host: &mut Host, matches: &ArgMatches, legacy_warnings: &[LegacyKeyWa
 		.get_one::<String>(options::TMP_DIR)
 		.map(PathBuf::from)
 		.or_else(|| host.var("TMPDIR").map(PathBuf::from))
-		.unwrap_or_else(|| PathBuf::from("/tmp"));
+		.unwrap_or_else(std::env::temp_dir);
 	let mut tmp_dir = TmpDirWrapper::new(host.resolve(tmp_base));
 
 	settings.compress = matches
@@ -5699,6 +5699,7 @@ mod tests {
 			assert!(GlobalSettings::parse_byte_count(input).is_err());
 		}
 	}
+
 	#[test]
 	fn sorts_standard_input() {
 		let (code, capture) = run_util::<Sort>(&[], "beta\nalpha\n", "/");

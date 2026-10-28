@@ -2,6 +2,7 @@
 
 use std::{
 	collections::{HashMap, HashSet},
+	sync::atomic::{AtomicBool, Ordering},
 	time::Duration,
 };
 
@@ -1772,7 +1773,11 @@ struct RegistryState {
 
 #[derive(Default)]
 pub struct SpawnRegistry {
-	state: Mutex<RegistryState>,
+	state:     Mutex<RegistryState>,
+	/// Set once the owning run is abandoned. `record` observes this under the
+	/// same lock, so a child spawned concurrently with cancellation is either
+	/// in the target snapshot or killed immediately on record.
+	cancelled: AtomicBool,
 }
 
 impl SpawnRegistry {
@@ -1811,17 +1816,48 @@ impl SpawnRegistry {
 	/// external commands cannot exhaust the process' FD/handle limit by
 	/// retaining one owned handle per historical spawn.
 	pub fn record(&self, pgid: Option<i32>, process: Option<Process>) {
-		let mut state = self.state.lock();
-		state.spawned.push(SpawnedProcess { process, pgid });
-		if state.spawned.len() >= state.next_sweep_at.max(Self::PRUNE_THRESHOLD) {
-			prune_exited(&mut state.spawned);
-			// Schedule the next sweep `PRUNE_THRESHOLD` further records away.
-			// Comparing against the post-sweep live-set size (not the pre-sweep
-			// length) bounds the sweep frequency when many entries survive:
-			// each sweep costs O(N) but now runs at most once per
-			// `PRUNE_THRESHOLD` records, so amortized per-record cost is O(1)
-			// even if the live set stays large.
-			state.next_sweep_at = state.spawned.len() + Self::PRUNE_THRESHOLD;
+		let pinned = process.clone();
+		let cancelled = {
+			let mut state = self.state.lock();
+			let cancelled = self.cancelled.load(Ordering::SeqCst);
+			state.spawned.push(SpawnedProcess { process, pgid });
+			if state.spawned.len() >= state.next_sweep_at.max(Self::PRUNE_THRESHOLD) {
+				prune_exited(&mut state.spawned);
+				// Schedule the next sweep `PRUNE_THRESHOLD` further records away.
+				// Comparing against the post-sweep live-set size (not the pre-sweep
+				// length) bounds the sweep frequency when many entries survive:
+				// each sweep costs O(N) but now runs at most once per
+				// `PRUNE_THRESHOLD` records, so amortized per-record cost is O(1)
+				// even if the live set stays large.
+				state.next_sweep_at = state.spawned.len() + Self::PRUNE_THRESHOLD;
+			}
+			cancelled
+		};
+		// A spawn observed after the owning run was dropped must die immediately;
+		// otherwise an aborted shell future could leave this child unowned.
+		if cancelled {
+			if let Some(process) = pinned {
+				let _ = process.signal_tree(KILL_SIGNAL);
+			}
+			if let Some(pgid) = pgid
+				&& pgid > 0
+			{
+				let _ = kill_process_group(pgid, KILL_SIGNAL);
+			}
+		}
+	}
+
+	/// Stop accepting new ownership and kill everything recorded so far plus any
+	/// child recorded after this call. Synchronous so it is safe from `Drop`,
+	/// where no future can be polled.
+	pub fn cancel_all(&self) {
+		{
+			let _state = self.state.lock();
+			self.cancelled.store(true, Ordering::SeqCst);
+		}
+		let targets = self.build_targets();
+		if !targets.is_empty() {
+			targets.signal(KILL_SIGNAL);
 		}
 	}
 
