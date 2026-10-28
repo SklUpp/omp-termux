@@ -3671,7 +3671,10 @@ mod tests {
 			"look at this",
 			vec![pi_agent::ImagePart::new("image/png", "aGVsbG8=")],
 		);
-		let err = provider.complete(&[msg], &[]).await.unwrap_err();
+		let err = provider
+			.complete(&[msg], &[], &pi_agent::ToolChoice::Auto)
+			.await
+			.unwrap_err();
 		assert!(
 			matches!(err, pi_agent::ProviderError::UnsupportedImage(_)),
 			"provider must reject image message when model is text-only, got: {:?}",

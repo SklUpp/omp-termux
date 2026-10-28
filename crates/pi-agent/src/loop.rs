@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	compaction::Compactor,
 	mailbox::{Mailbox, format_incoming},
-	provider::{ModelProvider, ProviderError, StreamAssembler},
+	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
 	state::{
 		AgentConfig, AgentContext, AgentState, Message, Role, ToolApprover, ToolCall, ToolResult,
 		TurnResult, TurnStatus,
@@ -530,8 +530,11 @@ impl AgentLoop {
 		if cancellation_token.is_cancelled() {
 			return Err(AgentError::Interrupted);
 		}
+		// Tool forcing is not wired into the loop yet; every turn keeps the
+		// upstream auto default and the wire stays unchanged.
+		let tool_choice = ToolChoice::Auto;
 		let Some(events) = events else {
-			let complete_fut = self.provider.complete(messages, schemas);
+			let complete_fut = self.provider.complete(messages, schemas, &tool_choice);
 			tokio::pin!(complete_fut);
 			loop {
 				match steering_rx.as_deref_mut() {
@@ -566,7 +569,7 @@ impl AgentLoop {
 			}
 		};
 
-		let stream_fut = self.provider.stream(messages, schemas);
+		let stream_fut = self.provider.stream(messages, schemas, &tool_choice);
 		tokio::pin!(stream_fut);
 		let mut stream = loop {
 			match steering_rx.as_deref_mut() {

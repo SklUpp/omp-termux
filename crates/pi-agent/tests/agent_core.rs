@@ -13,8 +13,8 @@ use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
 	CancellationToken, ChunkStream, DelegationLimits, EditTool, GlobTool, GrepTool, ImagePart,
 	Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, ReadTool, Role, SteeringEvent,
-	StreamAssembler, StreamChunk, Supervisor, Tool, ToolCall, ToolCallDelta, ToolRegistry,
-	TurnStatus, WriteTool, parse_sse_line, sse_stream,
+	StreamAssembler, StreamChunk, Supervisor, Tool, ToolCall, ToolCallDelta, ToolChoice,
+	ToolRegistry, TurnStatus, WriteTool, parse_sse_line, sse_stream,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde_json::json;
@@ -55,6 +55,7 @@ impl ModelProvider for ScriptedProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<Message, ProviderError> {
 		self.check_support(_messages)?;
 		self
@@ -69,6 +70,7 @@ impl ModelProvider for ScriptedProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
 		self.check_support(_messages)?;
 		Err(ProviderError::Protocol("scripted provider has no stream".to_string()))
@@ -86,6 +88,7 @@ impl ModelProvider for LoopingProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<Message, ProviderError> {
 		let call = self.calls.fetch_add(1, Ordering::SeqCst);
 		Ok(Message::assistant_with_tools(
@@ -102,6 +105,7 @@ impl ModelProvider for LoopingProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
 		Err(ProviderError::Protocol("looping provider has no stream".to_string()))
 	}
@@ -1866,6 +1870,7 @@ impl ModelProvider for StreamingProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<Message, ProviderError> {
 		self.complete_calls.fetch_add(1, Ordering::SeqCst);
 		Err(ProviderError::Protocol(
@@ -1877,6 +1882,7 @@ impl ModelProvider for StreamingProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
 		self.stream_calls.fetch_add(1, Ordering::SeqCst);
 		let chunks = self
@@ -2186,6 +2192,7 @@ fn reasoning_effort_is_serialized_only_when_set() {
 		model: "model-x".to_string(),
 		messages: Vec::new(),
 		tools: Vec::new(),
+		tool_choice: None,
 		stream: false,
 		reasoning_effort: None,
 		prompt_cache_key: None,
@@ -2241,6 +2248,7 @@ impl ModelProvider for ChannelProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<Message, ProviderError> {
 		Err(ProviderError::Protocol("streaming only".to_string()))
 	}
@@ -2249,6 +2257,7 @@ impl ModelProvider for ChannelProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
 		self
 			.stream
@@ -2267,6 +2276,7 @@ impl ModelProvider for StalledStreamProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<Message, ProviderError> {
 		futures::future::pending().await
 	}
@@ -2275,6 +2285,7 @@ impl ModelProvider for StalledStreamProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
 		futures::future::pending().await
 	}
@@ -2707,6 +2718,62 @@ async fn batch_abort_paired_results_in_provider_context() {
 	assert_eq!(tool_msgs[1].tool_call_id.as_deref(), Some("c2"));
 }
 
+async fn read_http_json_request(
+	stream: &mut tokio::net::TcpStream,
+) -> Option<serde_json::Value> {
+	let mut buf = vec![0u8; 16384];
+	let mut read_bytes = 0;
+	while read_bytes < buf.len() {
+		let n = stream.read(&mut buf[read_bytes..]).await.unwrap_or(0);
+		if n == 0 {
+			return None;
+		}
+		read_bytes += n;
+		if let Some(pos) = buf[..read_bytes].windows(4).position(|w| w == b"\r\n\r\n") {
+			let header_str = String::from_utf8_lossy(&buf[..pos]);
+			let content_length: usize = header_str
+				.lines()
+				.find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+				.and_then(|l| l.split(':').nth(1))
+				.and_then(|v| v.trim().parse().ok())
+				.unwrap_or(0);
+			if read_bytes >= pos + 4 + content_length {
+				let body_bytes = &buf[pos + 4..pos + 4 + content_length];
+				return serde_json::from_slice(body_bytes).ok();
+			}
+		}
+	}
+	None
+}
+
+async fn write_chat_completion_response(
+	stream: &mut tokio::net::TcpStream,
+	content: &str,
+) {
+	let resp_body = serde_json::json!({
+		"id": "chatcmpl-test",
+		"object": "chat.completion",
+		"created": 12345,
+		"model": "gpt-4o",
+		"choices": [{
+			"index": 0,
+			"message": {
+				"role": "assistant",
+				"content": content
+			},
+			"finish_reason": "stop"
+		}]
+	});
+	let resp_str = resp_body.to_string();
+	let http_response = format!(
+		"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+		resp_str.len(),
+		resp_str
+	);
+	let _ = stream.write_all(http_response.as_bytes()).await;
+	let _ = stream.flush().await;
+}
+
 async fn spawn_mock_openai_server() -> (String, tokio::sync::oneshot::Receiver<serde_json::Value>) {
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
 	let port = listener.local_addr().expect("local addr").port();
@@ -2715,53 +2782,35 @@ async fn spawn_mock_openai_server() -> (String, tokio::sync::oneshot::Receiver<s
 
 	tokio::spawn(async move {
 		if let Ok((mut stream, _)) = listener.accept().await {
-			let mut buf = vec![0u8; 16384];
-			let mut read_bytes = 0;
-			while read_bytes < buf.len() {
-				let n = stream.read(&mut buf[read_bytes..]).await.unwrap_or(0);
-				if n == 0 {
-					break;
-				}
-				read_bytes += n;
-				if let Some(pos) = buf[..read_bytes].windows(4).position(|w| w == b"\r\n\r\n") {
-					let header_str = String::from_utf8_lossy(&buf[..pos]);
-					let content_length: usize = header_str
-						.lines()
-						.find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-						.and_then(|l| l.split(':').nth(1))
-						.and_then(|v| v.trim().parse().ok())
-						.unwrap_or(0);
-					if read_bytes >= pos + 4 + content_length {
-						let body_bytes = &buf[pos + 4..pos + 4 + content_length];
-						if let Ok(json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
-							let _ = tx.send(json_body);
-						}
-						break;
-					}
-				}
+			if let Some(json_body) = read_http_json_request(&mut stream).await {
+				let _ = tx.send(json_body);
 			}
-			let resp_body = serde_json::json!({
-				"id": "chatcmpl-test",
-				"object": "chat.completion",
-				"created": 12345,
-				"model": "gpt-4o",
-				"choices": [{
-					"index": 0,
-					"message": {
-						"role": "assistant",
-						"content": "Saw the image clearly"
-					},
-					"finish_reason": "stop"
-				}]
-			});
-			let resp_str = resp_body.to_string();
-			let http_response = format!(
-				"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-				resp_str.len(),
-				resp_str
-			);
-			let _ = stream.write_all(http_response.as_bytes()).await;
-			let _ = stream.flush().await;
+			write_chat_completion_response(&mut stream, "Saw the image clearly").await;
+		}
+	});
+
+	(url, rx)
+}
+
+/// Accepts `requests` sequential chat-completions calls and forwards each
+/// parsed body, so a test can observe wire state across calls on one provider.
+async fn spawn_recording_openai_server(
+	requests: usize,
+) -> (String, tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>) {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+	let port = listener.local_addr().expect("local addr").port();
+	let url = format!("http://127.0.0.1:{port}");
+	let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+	tokio::spawn(async move {
+		for _ in 0..requests {
+			let Ok((mut stream, _)) = listener.accept().await else {
+				return;
+			};
+			if let Some(body) = read_http_json_request(&mut stream).await {
+				let _ = tx.send(body);
+			}
+			write_chat_completion_response(&mut stream, "ok").await;
 		}
 	});
 
@@ -2783,7 +2832,7 @@ async fn openai_request_with_image_serializes_multipart_data_uri() {
 	assert_eq!(msg.content, "describe this image");
 	assert!(msg.has_image());
 
-	let reply = provider.complete(&[msg], &[]).await.expect("complete ok");
+	let reply = provider.complete(&[msg], &[], &ToolChoice::Auto).await.expect("complete ok");
 	assert_eq!(reply.content, "Saw the image clearly");
 
 	let wire = rx.await.expect("server received request payload");
@@ -2814,7 +2863,7 @@ async fn openai_request_with_existing_data_uri_preserves_url() {
 	assert_eq!(msg.content, "");
 	assert!(msg.has_image());
 
-	let _ = provider.complete(&[msg], &[]).await.expect("complete ok");
+	let _ = provider.complete(&[msg], &[], &ToolChoice::Auto).await.expect("complete ok");
 
 	let wire = rx.await.expect("server received request payload");
 	let messages = wire["messages"].as_array().expect("messages array");
@@ -2836,14 +2885,14 @@ async fn unsupported_image_provider_rejects_clearly() {
 		.expect("provider build")
 		.with_images(false);
 
-	let err = provider.complete(&[msg.clone()], &[]).await.unwrap_err();
+	let err = provider.complete(&[msg.clone()], &[], &ToolChoice::Auto).await.unwrap_err();
 	assert!(
 		matches!(err, ProviderError::UnsupportedImage(_)),
 		"expected UnsupportedImage error, got: {:?}",
 		err
 	);
 
-	let stream_err = match provider.stream(&[msg.clone()], &[]).await {
+	let stream_err = match provider.stream(&[msg.clone()], &[], &ToolChoice::Auto).await {
 		Err(err) => err,
 		Ok(_) => panic!("expected UnsupportedImage error on stream"),
 	};
@@ -2855,12 +2904,124 @@ async fn unsupported_image_provider_rejects_clearly() {
 
 	// 2. ScriptedProvider (mock double without multimodal support)
 	let scripted = ScriptedProvider::new(vec![Ok(Message::assistant("never called"))]);
-	let script_err = scripted.complete(&[msg], &[]).await.unwrap_err();
+	let script_err = scripted.complete(&[msg], &[], &ToolChoice::Auto).await.unwrap_err();
 	assert!(
 		matches!(script_err, ProviderError::UnsupportedImage(_)),
 		"unsupported provider must reject clearly, got: {:?}",
 		script_err
 	);
+}
+
+#[tokio::test]
+async fn openai_auto_tool_choice_omits_the_wire_field() {
+	let (server_url, mut requests) = spawn_recording_openai_server(1).await;
+	let provider = OpenAiCompatibleProvider::new(server_url, "fake-key", "gpt-4o")
+		.expect("provider build");
+	let tools = vec![json!({
+		"type": "function",
+		"function": { "name": "write", "parameters": { "type": "object" } }
+	})];
+
+	let _ = provider
+		.complete(&[Message::user("hi")], &tools, &ToolChoice::Auto)
+		.await
+		.expect("complete ok");
+	let wire = requests.recv().await.expect("request captured");
+	assert!(
+		wire.get("tool_choice").is_none(),
+		"auto must leave the wire field absent: {wire}"
+	);
+}
+
+#[tokio::test]
+async fn openai_forced_tool_choice_uses_the_named_function_wire() {
+	let (server_url, mut requests) = spawn_recording_openai_server(2).await;
+	let provider = OpenAiCompatibleProvider::new(server_url, "fake-key", "gpt-4o")
+		.expect("provider build");
+	let tools = vec![json!({
+		"type": "function",
+		"function": { "name": "write", "parameters": { "type": "object" } }
+	})];
+	let choice = ToolChoice::Tool { name: "write".to_string() };
+
+	let _ = provider
+		.complete(&[Message::user("hi")], &tools, &choice)
+		.await
+		.expect("complete ok");
+	let _ = provider
+		.stream(&[Message::user("hi")], &tools, &choice)
+		.await
+		.expect("stream setup ok");
+
+	for _ in 0..2 {
+		let wire = requests.recv().await.expect("request captured");
+		assert_eq!(
+			wire["tool_choice"],
+			json!({ "type": "function", "function": { "name": "write" } })
+		);
+	}
+}
+
+#[tokio::test]
+async fn openai_forced_tool_choice_does_not_stick_to_the_next_request() {
+	let (server_url, mut requests) = spawn_recording_openai_server(2).await;
+	let provider = OpenAiCompatibleProvider::new(server_url, "fake-key", "gpt-4o")
+		.expect("provider build");
+	let tools = vec![json!({
+		"type": "function",
+		"function": { "name": "write", "parameters": { "type": "object" } }
+	})];
+
+	let _ = provider
+		.complete(
+			&[Message::user("first")],
+			&tools,
+			&ToolChoice::Tool { name: "write".to_string() },
+		)
+		.await
+		.expect("forced complete ok");
+	let _ = provider
+		.complete(&[Message::user("second")], &tools, &ToolChoice::Auto)
+		.await
+		.expect("auto complete ok");
+
+	let forced = requests.recv().await.expect("forced request captured");
+	assert_eq!(forced["tool_choice"]["function"]["name"], "write");
+	let auto = requests.recv().await.expect("auto request captured");
+	assert!(
+		auto.get("tool_choice").is_none(),
+		"forced choice must not leak into a later request: {auto}"
+	);
+}
+
+#[tokio::test]
+async fn openai_tool_choice_rejects_blank_or_absent_tools_before_sending() {
+	let provider = OpenAiCompatibleProvider::new("http://127.0.0.1:9", "fake-key", "gpt-4o")
+		.expect("provider build");
+	let tools = vec![json!({
+		"type": "function",
+		"function": { "name": "write", "parameters": { "type": "object" } }
+	})];
+
+	for name in ["   ", "missing"] {
+		let choice = ToolChoice::Tool { name: name.to_string() };
+		let err = provider
+			.complete(&[Message::user("hi")], &tools, &choice)
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(err, ProviderError::InvalidToolChoice(_)),
+			"complete must reject `{name}` explicitly, got: {err:?}"
+		);
+		let stream_err = match provider.stream(&[Message::user("hi")], &tools, &choice).await {
+			Err(err) => err,
+			Ok(_) => panic!("stream must reject `{name}` explicitly"),
+		};
+		assert!(
+			matches!(stream_err, ProviderError::InvalidToolChoice(_)),
+			"stream must reject `{name}` explicitly, got: {stream_err:?}"
+		);
+	}
 }
 
 #[test]
@@ -3024,7 +3185,7 @@ async fn provider_rejects_external_image_url_payload() {
 		"steal data",
 		vec![ImagePart::new("image/png", "https://attacker.com/leak.png")],
 	);
-	let err = provider.complete(&[msg], &[]).await.unwrap_err();
+	let err = provider.complete(&[msg], &[], &ToolChoice::Auto).await.unwrap_err();
 	assert!(
 		matches!(err, ProviderError::UnsupportedImage(_)),
 		"provider must reject external image URLs via UnsupportedImage, got: {:?}",

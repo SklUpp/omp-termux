@@ -14,7 +14,7 @@ use pi_agent::{
 	BackgroundResultSink,
 	loop_module::{AgentLoop, AgentError},
 	mailbox::{IrcMessage, MAIN_AGENT_ID, Mailbox},
-	provider::{ChunkStream, ModelProvider, ProviderError},
+	provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
 	state::{AgentConfig, AgentContext, Message},
 	supervisor::{
 		ChildStatus, DelegationLimits, MAX_OUTSTANDING_RESULTS, Supervisor,
@@ -42,6 +42,7 @@ impl ModelProvider for TestProvider {
 		&self,
 		messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<Message, ProviderError> {
 		if let Some(captured) = &self.captured {
 			captured.lock().unwrap().extend_from_slice(messages);
@@ -61,6 +62,7 @@ impl ModelProvider for TestProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
 		Err(ProviderError::Protocol("stream unused in test".to_string()))
 	}
@@ -399,6 +401,7 @@ impl ModelProvider for ScriptedProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<Message, ProviderError> {
 		if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
 			self.entered.notify_one();
@@ -416,6 +419,7 @@ impl ModelProvider for ScriptedProvider {
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
 		Err(ProviderError::Protocol("stream unused in test".to_string()))
 	}

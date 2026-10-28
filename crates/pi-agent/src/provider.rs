@@ -34,6 +34,24 @@ pub enum ProviderError {
 	InvalidBaseUrl(String),
 	#[error("Unsupported image: {0}")]
 	UnsupportedImage(String),
+	#[error("Invalid tool choice: {0}")]
+	InvalidToolChoice(String),
+}
+
+/// Request-scoped tool selection.
+///
+/// Mirrors the upstream one-shot `toolChoice` contract: the value belongs to a
+/// single [`ModelProvider::complete`]/[`ModelProvider::stream`] call and is
+/// never stored on the provider, so it cannot stick between requests or leak to
+/// sibling agents.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ToolChoice {
+	/// Let the model decide (the default; the wire field is omitted entirely).
+	#[default]
+	Auto,
+	/// Force exactly this tool. Only adapters that support forced selection may
+	/// accept it; the name must be non-empty and offered in the same request.
+	Tool { name: String },
 }
 
 /// Delta chunk emitted by streaming completions.
@@ -69,10 +87,14 @@ pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, ProviderErr
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
 	/// Complete a dialog turn with a single (non-streaming) request.
+	///
+	/// `tool_choice` is request-scoped; adapters that cannot honour a forced
+	/// selection must reject it rather than silently ignoring it.
 	async fn complete(
 		&self,
 		messages: &[Message],
 		tools: &[serde_json::Value],
+		tool_choice: &ToolChoice,
 	) -> Result<Message, ProviderError>;
 
 	/// Stream a dialog turn as OpenAI-style server-sent events.
@@ -80,6 +102,7 @@ pub trait ModelProvider: Send + Sync {
 		&self,
 		messages: &[Message],
 		tools: &[serde_json::Value],
+		tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError>;
 
 	/// Whether this provider supports multimodal image inputs.
@@ -246,12 +269,39 @@ impl OpenAiCompatibleProvider {
 		&self,
 		messages: &[Message],
 		tools: &[serde_json::Value],
+		tool_choice: &ToolChoice,
 		stream: bool,
 	) -> Result<OpenAiChatRequest, ProviderError> {
+		let tool_choice = match tool_choice {
+			ToolChoice::Auto => None,
+			ToolChoice::Tool { name } => {
+				if name.trim().is_empty() {
+					return Err(ProviderError::InvalidToolChoice(
+						"forced tool name must not be empty".to_string(),
+					));
+				}
+				if !tools.iter().any(|tool| {
+					tool.get("type").and_then(serde_json::Value::as_str) == Some("function")
+						&& tool
+							.get("function")
+							.and_then(|function| function.get("name"))
+							.and_then(serde_json::Value::as_str)
+							== Some(name.as_str())
+				}) {
+					return Err(ProviderError::InvalidToolChoice(format!(
+						"forced tool `{name}` is not offered in this request"
+					)));
+				}
+				Some(OpenAiToolChoice::Function {
+					function: OpenAiToolChoiceFunction { name: name.clone() },
+				})
+			},
+		};
 		Ok(OpenAiChatRequest {
 			model: self.model.clone(),
 			messages: to_openai_messages(messages)?,
 			tools: tools.to_vec(),
+			tool_choice,
 			stream,
 			reasoning_effort: self.effort.clone(),
 			prompt_cache_key: self.prompt_cache_enabled.then(|| self.prompt_cache_key()).flatten(),
@@ -269,9 +319,10 @@ impl ModelProvider for OpenAiCompatibleProvider {
 		&self,
 		messages: &[Message],
 		tools: &[serde_json::Value],
+		tool_choice: &ToolChoice,
 	) -> Result<Message, ProviderError> {
 		self.check_support(messages)?;
-		let body = self.request(messages, tools, false)?;
+		let body = self.request(messages, tools, tool_choice, false)?;
 		let response = self
 			.http
 			.post(self.endpoint())
@@ -303,9 +354,10 @@ impl ModelProvider for OpenAiCompatibleProvider {
 		&self,
 		messages: &[Message],
 		tools: &[serde_json::Value],
+		tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
 		self.check_support(messages)?;
-		let body = self.request(messages, tools, true)?;
+		let body = self.request(messages, tools, tool_choice, true)?;
 		let response = self
 			.http
 			.post(self.endpoint())
@@ -415,6 +467,9 @@ pub struct OpenAiChatRequest {
 	pub messages: Vec<OpenAiMessage>,
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	pub tools: Vec<serde_json::Value>,
+	/// OpenAI-compatible `tool_choice`; omitted for auto.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tool_choice: Option<OpenAiToolChoice>,
 	#[serde(default)]
 	pub stream: bool,
 	/// OpenAI-compatible `reasoning_effort`; omitted when unset.
@@ -423,6 +478,18 @@ pub struct OpenAiChatRequest {
 	/// OpenAI-compatible `prompt_cache_key`; omitted when unset.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub prompt_cache_key: Option<String>,
+}
+
+/// OpenAI chat-completions `tool_choice` for a forced function.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpenAiToolChoice {
+	Function { function: OpenAiToolChoiceFunction },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiToolChoiceFunction {
+	pub name: String,
 }
 
 /// Normalize a cache identity to the OpenAI wire limit (TS `normalizeOpenAIPromptCacheKey`).
@@ -960,7 +1027,7 @@ mod tests {
 			.with_session_id(Some("provider-session-1".to_string()))
 			.with_prompt_cache_key(Some("explicit-cache-1".to_string()));
 		assert_eq!(provider.prompt_cache_key().as_deref(), Some("explicit-cache-1"));
-		let request = provider.request(&[], &[], true).expect("request");
+		let request = provider.request(&[], &[], &ToolChoice::Auto, true).expect("request");
 		assert_eq!(request.prompt_cache_key.as_deref(), Some("explicit-cache-1"));
 
 		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "key", "model-x")
@@ -975,7 +1042,7 @@ mod tests {
 			.with_session_id(Some(String::new()))
 			.with_prompt_cache_key(Some(String::new()));
 		assert_eq!(provider.prompt_cache_key(), None);
-		let payload = serde_json::to_value(provider.request(&[], &[], true).expect("request"))
+		let payload = serde_json::to_value(provider.request(&[], &[], &ToolChoice::Auto, true).expect("request"))
 			.expect("serialize");
 		assert!(payload.get("prompt_cache_key").is_none(), "got: {payload}");
 	}
@@ -987,7 +1054,7 @@ mod tests {
 			.with_session_id(Some("provider-session-1".to_string()))
 			.with_prompt_cache_key(Some("explicit-cache-1".to_string()));
 		assert_eq!(provider.prompt_cache_key().as_deref(), Some("explicit-cache-1"));
-		let payload = serde_json::to_value(provider.request(&[], &[], true).expect("request"))
+		let payload = serde_json::to_value(provider.request(&[], &[], &ToolChoice::Auto, true).expect("request"))
 			.expect("serialize");
 		assert!(
 			payload.get("prompt_cache_key").is_none(),

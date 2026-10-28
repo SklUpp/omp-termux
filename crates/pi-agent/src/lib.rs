@@ -15,8 +15,9 @@ pub use loop_module::{AgentError, AgentEvent, AgentLoop, SteeringEvent, INTERRUP
 pub use tokio_util::sync::CancellationToken;
 pub use provider::{
 	ChunkStream, ModelProvider, OpenAiChatRequest, OpenAiCompatibleProvider, OpenAiContent,
-	OpenAiContentPart, OpenAiImageUrl, OpenAiMessage, ProviderError, StreamAssembler,
-	StreamChunk, ToolCallDelta, parse_sse_line, sse_stream, to_openai_messages,
+	OpenAiContentPart, OpenAiImageUrl, OpenAiMessage, OpenAiToolChoice, OpenAiToolChoiceFunction,
+	ProviderError, StreamAssembler, StreamChunk, ToolCallDelta, ToolChoice, parse_sse_line,
+	sse_stream, to_openai_messages,
 };
 pub use state::{
 	AgentConfig, AgentContext, AgentState, ContentPart, ImagePart, Message, Role, ToolApprover,

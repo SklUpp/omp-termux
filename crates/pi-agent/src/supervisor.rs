@@ -1101,7 +1101,7 @@ mod process_wiring_tests {
 
 	use super::*;
 	use crate::{
-		provider::{ChunkStream, ModelProvider, ProviderError},
+		provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
 		state::Message,
 		tools::{process::ProcessManager, registry::ToolRegistry, Tool},
 	};
@@ -1114,6 +1114,7 @@ mod process_wiring_tests {
 			&self,
 			_messages: &[Message],
 			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
 		) -> Result<Message, ProviderError> {
 			Err(ProviderError::Protocol("unused".to_string()))
 		}
@@ -1122,6 +1123,7 @@ mod process_wiring_tests {
 			&self,
 			_messages: &[Message],
 			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
 		) -> Result<ChunkStream, ProviderError> {
 			Err(ProviderError::Protocol("unused".to_string()))
 		}

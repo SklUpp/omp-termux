@@ -2080,7 +2080,7 @@ mod tests {
 	use super::*;
 	use async_trait::async_trait;
 	use crate::{
-		provider::{ChunkStream, ModelProvider, ProviderError},
+		provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
 		supervisor::DelegationLimits,
 	};
 
@@ -2092,6 +2092,7 @@ mod tests {
 			&self,
 			_messages: &[Message],
 			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
 		) -> std::result::Result<Message, ProviderError> {
 			Err(ProviderError::Network("unused in catalog tests".to_string()))
 		}
@@ -2100,6 +2101,7 @@ mod tests {
 			&self,
 			_messages: &[Message],
 			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
 		) -> std::result::Result<ChunkStream, ProviderError> {
 			Err(ProviderError::Network("unused in catalog tests".to_string()))
 		}

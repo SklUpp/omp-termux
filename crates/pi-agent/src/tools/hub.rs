@@ -1951,7 +1951,7 @@ mod backend_snapshot_tests {
 
 	use super::*;
 	use crate::{
-		provider::{ChunkStream, ModelProvider, ProviderError},
+		provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
 		state::Message,
 		supervisor::DelegationLimits,
 		tools::{process::ProcessManager, registry::ToolRegistry},
@@ -1965,6 +1965,7 @@ mod backend_snapshot_tests {
 			&self,
 			_messages: &[Message],
 			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
 		) -> Result<Message, ProviderError> {
 			Err(ProviderError::Protocol("unused".to_string()))
 		}
@@ -1973,6 +1974,7 @@ mod backend_snapshot_tests {
 			&self,
 			_messages: &[Message],
 			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
 		) -> Result<ChunkStream, ProviderError> {
 			Err(ProviderError::Protocol("unused".to_string()))
 		}
