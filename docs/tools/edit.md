@@ -23,6 +23,24 @@
 
 Supported modes are `hashline`, `apply_patch`, `patch`, and `replace`. Unless `PI_STRICT_EDIT_MODE` is set, a short model exclusion list can replace the default hashline contract with `replace`. This page documents the default hashline contract; the tool's schema, prompt, examples, renderer, and optional custom Lark format all switch with the selected mode. In `apply_patch` custom-tool mode the wire name is `apply_patch`; dispatch still reaches the same internal tool.
 
+### Native Rust CLI
+
+The Rust CLI ships only the default `hashline` wire contract (`input: string`); it has no mode selector, custom Lark grammar, or streaming preview.
+
+- Parser, clipboard registers, block anchors, bounded snapshot store, tag validation, and seen-line rejection are native (`crates/pi-agent/src/tools/hashline/`).
+- Snapshot state is per agent object, not process-global and not persisted: one injected `Arc<SnapshotStore>` is shared with the `read` sink, and named `CUT` registers live on that object's `EditTool`. The CLI's `PiAgentRunner` keeps that pair for the whole process, so REPL turns — including `/new`, resume, and fork — reuse it, matching the TypeScript `AgentSession` lifetime; a fresh process starts empty. Nothing is keyed by a session id or written to the session log. Tags are content-derived, so the store scopes read provenance (which lines were displayed) and register contents; a child agent gets its own store and tool instances instead of a clone of the parent's.
+- Accepted input normalization matches upstream: bare `+`-less body rows (warned; one uniform read-prefix strip), ignored read-output elision rows, byte-identical duplicate hunks (last wins, warned), and the upstream `-` row policy (Markdown bullets kept, unified-diff `-old` rows paired with `+new` dropped, anything else rejected). `@@` headers and apply-patch sentinels are rejected with a pointer to the canonical form.
+- A stale tag first tries snapshot-chain recovery: anchors are mapped through unchanged lines, must all move by one offset, and the edit is replayed on live content with a recovery warning. Only when no safe remap exists is the edit rejected, with the current `#TAG` and numbered context around the anchored lines. Patches that only insert at head (`<1:`) or tail (`>$:`) apply on live content with a drift warning instead.
+- Seen-line enforcement is opt-in: `EditToolOptions::enforce_seen_lines` defaults to `false`, matching the upstream `edit.enforceSeenLines` schema default. When enabled, edits anchored on lines the read never displayed are rejected with the reveal/retry diagnostic; when disabled (default), they apply.
+- A byte-identical no-op is a tool failure; three consecutive identical payloads on one path escalate to a hard-stop diagnostic. State is per `edit` tool instance (one runner process).
+- An edit that stops the file parsing while the pre-edit text parsed is still applied, and the result carries a syntax warning (upstream behavior; the probe reuses `pi-ast`'s tree-sitter cache).
+- Expansion is bounded before anything is materialized: a section may declare at most 100,000 expanded lines/body rows, a clipboard paste at most 100,000 lines, and one call at most 200,000 resolved edits / 24 MiB of prepared text across its sections. Register reads, register captures, paste expansions, splice payloads, prepared text, and each per-section batch snapshot are charged against that budget *before* they are cloned or allocated, so a large register pasted many times fails early instead of materializing gigabytes. Line accounting counts `String` slots and names as well as content, so captures full of blank lines and many tiny named registers are not free. Named registers persisted for the session are capped at 16 MiB (a file update still lands; the register store then reports the refusal). Cancel is polled between sections, inside splices, and before each commit.
+- `MV` destinations participate in batch conflict preflight: a destination may not alias any source or another destination in the same call (symlink aliases included), so a later section cannot overwrite moved content.
+- Each commit re-verifies the target's canonical path, the exact bytes read during validation (never the 16-bit tag, which only labels diagnostics), and the file identity (`dev`/`ino` where the platform exposes it); bytes replaced, a file deleted or swapped, or a symlink retargeted after preparation abort with a "changed after the batch was prepared" error instead of being overwritten. `REM` re-checks before unlinking; moves re-check source bytes/identity before unlinking the source after the destination write. The re-check and the rename are separate syscalls, so an adversarial swap inside that window is mitigated, not atomically excluded.
+- Commits land one section at a time. A later failure or cancellation returns the sections already written and states that the remaining ones did not complete (a move may still have partially mutated disk, which the message names); a move whose destination write succeeded but whose source unlink or permission step failed is reported as a partial move. Named registers reflect landed sections only.
+- Moves preserve the source file's permissions (e.g. `0600` stays `0600`, `0755` stays `0755`): the mode is applied to the unpublished temp file before the atomic rename, so the destination is never briefly world-readable; a move no longer chmods after publishing.
+- `apply_patch`, `patch`, and `replace` wire modes are not available.
+
 ## Input
 
 | Field | Type | Required | Description |
@@ -133,8 +151,8 @@ For multi-section calls, every section is parsed and prepared before writes begi
 - Ranges are inclusive, must be ordered, and are bounded by a parser amplification limit of 100,000 expanded lines before the target file's actual bounds are checked.
 - Overlapping edits or multiple operations targeting the same original anchor are rejected.
 - Same-path sections are merged so their original line anchors apply together. Clipboard operations are rejected if interleaved same-path sections would make authored register order ambiguous.
-- Stale tags attempt snapshot-based recovery. Recovery applies only when the recorded snapshot chain proves a unique safe result; otherwise a mismatch with current context is returned.
-- A byte-identical edit is an error. Repeating the same no-op payload three times escalates through the no-op loop guard.
+- Stale tags first attempt snapshot-chain recovery (unchanged-line remap replayed on live content, or head/tail-only insert drift); only an unrecoverable audit falls back to a mismatch that reports the current `#TAG` and numbered context around the anchored lines.
+- A byte-identical edit is an error. Repeating the same no-op payload three times escalates through the no-op loop guard (per session, keyed by canonical path and a hash of the raw patch input).
 
 ## Common failures
 

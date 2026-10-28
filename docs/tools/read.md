@@ -327,3 +327,70 @@ Notes: ...
 - URL line-range reads request `ensureArtifact: true, preferCached: true` so a later paginated read can reopen the same rendered body from artifact storage.
 - Raw SQLite `q=` execution is not keyword-restricted beyond “no bound parameters”; the read tool relies on the surrounding contract to keep it read-only.
 - The file snapshot store is not a read acceleration cache. It exists to verify and recover hashline edits when the file changed after the read.
+
+## Rust headless parity
+
+`crates/pi-agent/src/tools/read.rs` (wired from `tools/mod.rs`) implements the
+local filesystem contract:
+
+- Selector grammar mirrors `read-selector.ts` / `path-utils.ts`: `:raw`,
+  `:N`, `:N-`, `:N..`, `:A-B`, `:A+C`, `:R1,R2,...` (sorted + merged), and
+  `:range:raw` / `:raw:range`. Invalid shapes return the TS selector error;
+  `:0`, `+0`, and `end < start` are rejected. Literal paths that exist (or whose
+  `lstat` is inconclusive) win over peeling, so `test:1-2` reads the file.
+- Bounded reads add `RANGE_LEADING_CONTEXT_LINES = 1` /
+  `RANGE_TRAILING_CONTEXT_LINES = 3`; raw and multi-range reads are exact.
+  Open-ended reads stop at `read.defaultLimit = 300`, all reads at
+  `DEFAULT_MAX_LINES = 3000` / `DEFAULT_MAX_BYTES = 50 KiB` scaled by
+  `max(lines, 1) * 512`, and per-line display at 768 columns.
+- Files ≤ 4 MiB are read once through a validated regular handle and scanned
+  from that buffer: non-raw display uses the same BOM-stripped, LF-normalized
+  text the snapshot hashes (raw display stays byte-exact), and multi-range
+  reads take the full requested lines with no per-range byte budget. Only the
+  > 4 MiB streaming fallback keeps the byte budget, and each range it stops
+  early now emits an explicit `[Range A-B stopped at the read byte budget …]`
+  notice instead of silently dropping lines.
+- Off-end ranges return the explanatory `Line N is beyond end of file ...`
+  text, not an error. Files over 4 MiB stop scanning after the selected window
+  is collected, so a late range stays memory-bounded.
+- Line-number mode (no sink) prints `N|TEXT`. With a `ReadSnapshotSink`
+  (`ReadTool::with_snapshot_sink`) it prints `[path#TAG]` + `N:TEXT`, records
+  the whole LF-normalized/BOM-stripped file (≤ 4 MiB) and the displayed source
+  line numbers. The concrete store and xxh32 tag live in the hashline module;
+  `read.rs` never fabricates a header when no sink is installed.
+- Directory listings render the bounded tree (depth 2, 12 children per nested
+  directory) with sizes/ages and support `:N` / `:N-M` line slicing; multi-range
+  selectors on a directory are rejected. The no-selector listing goes through
+  the same 50 KiB head truncation as TS (`truncateHead` with an unbounded line
+  allowance), so `details.truncation` plus `details.meta.truncation` report the
+  byte cut; sliced listings are user-bounded.
+- Safety: paths outside the cwd are allowed (same as TS), non-regular files are
+  rejected, FIFOs are opened `O_NONBLOCK` and re-checked as regular after open,
+  a binary prefix returns a notice unless `:raw` was requested, and the
+  cancellation token aborts scans between chunks (intentional Rust interrupt
+  safety; TS keeps deterministic local reads non-abortable).
+- Snapshot provenance lives as long as its owning object: the CLI's `PiAgentRunner` holds one store for the whole process, so tags and seen ranges survive REPL turns, `/new`, resume, and fork in that process; it is never persisted to the session log or keyed by a session id, and a new process starts empty. Child agents get fresh stores.
+- Snapshot recording never reopens the path: the tag and the displayed lines
+  both come from the same ≤ 4 MiB bounded regular-handle read, so a concurrent
+  append or FIFO swap cannot tag content the read never showed.
+
+- `~` and `~/...` expand through `$HOME` before selector peeling, and a missing
+  relative path gets one `findUniqueWorkspaceSuffix` pass: a `**/<path>` walk of
+  the cwd (hidden included, 5 s budget) resolves only when exactly one entry
+  matches, then the output is prefixed with the TS notice and
+  `details.suffixResolution = { from, to }`. Ambiguity/timeout/cancellation
+  fall back to the normal not-found error.
+- No-selector reads of non-prose files go through `pi_ast::summary::summarize_code`
+  with the shipped defaults (`minTotalLines 100`, `minBodyLines 4`,
+  `minCommentLines 6`, `unfoldUntil 50`, `unfoldLimit 100`, 2 MiB / 20k-line
+  ceilings). The rendered summary mirrors TS: numbered kept lines, `…` elisions,
+  collapsed `S-E` brace pairs, the `[…Nln elided; re-read needed ranges …]`
+  footer, and `details.summary = { lines, elidedSpans, elidedLines }` plus
+  `displayContent`. Markdown/plain-text stay verbatim (`read.summarize.prose`
+  defaults off); explicit selectors always bypass summaries.
+
+Remaining read slices (planned, not silent fallbacks):
+archives, SQLite, markit documents, images/`:img`, internal-URL routing.
+`:conflicts` is blocked on the conflict-history session store that
+`write({path:"conflict://<N>"})` resolves against.
+Behavior tests: `crates/pi-agent/tests/read_contract.rs`.

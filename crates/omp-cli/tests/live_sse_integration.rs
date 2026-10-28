@@ -306,6 +306,11 @@ fn test_live_sse_two_turn_read_early_delta_and_resume() {
 
 	let secret_file = project_dir.join("secret_data.txt");
 	let secret_content = "AUTHENTIC_SECRET_PAYLOAD_48291\n";
+	// Hashline-eligible reads prefix the snapshot header and number lines with
+	// `N:TEXT`. The tag is content-derived, so compute it independently here from
+	// the expected bytes instead of copying it out of the tool's own output.
+	let tag = pi_agent::tools::hashline::hash::compute_file_hash(secret_content);
+	let read_output = format!("[secret_data.txt#{tag}]\n1:{}", secret_content.trim_end());
 	fs::write(&secret_file, secret_content).expect("write secret file");
 
 	let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
@@ -484,7 +489,7 @@ fn test_live_sse_two_turn_read_early_delta_and_resume() {
 		.find(|e| e["type"] == "tool_execution_end")
 		.expect("tool_execution_end event");
 	assert_eq!(tool_end["toolName"], "read");
-	assert_eq!(tool_end["result"], secret_content);
+	assert_eq!(tool_end["result"], read_output);
 	assert_eq!(tool_end["isError"], false);
 
 	// Verify session JSONL file on disk
@@ -517,7 +522,7 @@ fn test_live_sse_two_turn_read_early_delta_and_resume() {
 	assert_eq!(tool_results[0]["message"]["toolCallId"], "call_read_1");
 	assert_eq!(
 		tool_results[0]["message"]["content"],
-		secret_content
+		read_output
 	);
 	assert_eq!(tool_results[0]["message"]["isError"], false);
 
@@ -560,7 +565,7 @@ fn test_live_sse_two_turn_read_early_delta_and_resume() {
 	let has_tool_res = turn3_msgs.iter().any(|m| {
 		m["role"] == "tool"
 			&& m["tool_call_id"] == "call_read_1"
-			&& m["content"] == secret_content
+			&& m["content"] == read_output
 	});
 	assert!(has_tool_res, "resume request must include tool result in history");
 

@@ -65,7 +65,12 @@ fn isolate(command: &mut ProcCommand, sandbox: &Sandbox) {
 		.env("PI_CODING_AGENT_DIR", sandbox.agent())
 		.env("OMP_SHARE_DIR", sandbox.path().join("share"))
 		.env_remove("PREFIX")
+		.env_remove("OMP_PROFILE")
 		.env_remove("PI_PROFILE")
+		.env_remove("PI_CONFIG_FILES")
+		.env_remove("XDG_DATA_HOME")
+		.env_remove("XDG_STATE_HOME")
+		.env_remove("XDG_CACHE_HOME")
 		.current_dir(sandbox.work());
 }
 

@@ -22,6 +22,7 @@ use pi_agent::{
 		McpToolOriginSource, connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key,
 		mcp_tool_match_score, sanitize_mcp_tool_name_part,
 	},
+	tools::hashline::{NativeSnapshotSink, SnapshotStore, edit::EditToolOptions},
 };
 
 use crate::{
@@ -62,6 +63,24 @@ pub struct PiAgentRunner {
 	/// survive REPL turns so `hub jobs` can inspect earlier delegations; they
 	/// are never written to the session log.
 	supervisor: Mutex<Option<Arc<Supervisor>>>,
+	/// Root `read`/`edit` provenance shared by every turn this runner serves.
+	session:    Mutex<Option<Arc<RunnerSession>>>,
+}
+
+/// One snapshot store plus one `EditTool` per runner: tags, seen-line ranges,
+/// named `CUT` registers, and the no-op guard must survive REPL turns, while
+/// child agents still get fresh instances through `Supervisor::child_registry`.
+struct RunnerSession {
+	snapshots: Arc<SnapshotStore>,
+	edit:      Arc<EditTool>,
+}
+
+impl RunnerSession {
+	fn new(options: EditToolOptions) -> Self {
+		let snapshots = Arc::new(SnapshotStore::new());
+		let edit = Arc::new(EditTool::with_options(snapshots.clone(), options));
+		Self { snapshots, edit }
+	}
 }
 
 impl PiAgentRunner {
@@ -71,7 +90,15 @@ impl PiAgentRunner {
 			.build()
 			.map_err(|err| Error::with_source("cannot start tokio runtime for pi-agent", err))?;
 		let dispatcher = Arc::new(SignalDispatcher::start(&runtime));
-		Ok(Self { runtime, dispatcher, supervisor: Mutex::new(None) })
+		Ok(Self { runtime, dispatcher, supervisor: Mutex::new(None), session: Mutex::new(None) })
+	}
+
+	/// Reuse this runner's root store/`EditTool`, refreshing only the knobs.
+	fn session_tools(&self, options: EditToolOptions) -> Arc<RunnerSession> {
+		let mut slot = self.session.lock().unwrap_or_else(|poison| poison.into_inner());
+		let session = Arc::clone(slot.get_or_insert_with(|| Arc::new(RunnerSession::new(options))));
+		session.edit.set_options(options);
+		session
 	}
 }
 
@@ -204,6 +231,10 @@ impl AgentRunner for PiAgentRunner {
 
 
 		let plan = RunPlan::resolve_with_mcp(request, !mcp_spawn.tools.is_empty())?;
+		let edit_options = EditToolOptions {
+			enforce_seen_lines: request.config.edit.enforce_seen_lines(),
+		};
+		let session = self.session_tools(edit_options);
 		let base_registry = build_registry_full(
 			&plan.tools,
 			mcp_spawn.tools,
@@ -211,6 +242,8 @@ impl AgentRunner for PiAgentRunner {
 			mcp_spawn.all_server_names,
 			request.todo_phases.clone(),
 			request.session_persisted,
+			edit_options,
+			Some(&session),
 		)?;
 		let (allow_task, allow_hub) = delegation_selection(request);
 		let cwd = request.cwd.clone();
@@ -313,6 +346,7 @@ impl AgentRunner for PiAgentRunner {
 					supervisor
 				},
 			};
+			supervisor.set_edit_options(edit_options);
 			supervisor.root_registry()
 		} else {
 			base_registry
@@ -822,7 +856,16 @@ pub fn build_registry_with_mcp_and_diagnostics(
 	server_errors: Vec<(String, String)>,
 	all_server_names: Vec<String>,
 ) -> Result<ToolRegistry> {
-	build_registry_full(tools, mcp_tools, server_errors, all_server_names, Vec::new(), false)
+	build_registry_full(
+		tools,
+		mcp_tools,
+		server_errors,
+		all_server_names,
+		Vec::new(),
+		false,
+		EditToolOptions::default(),
+		None,
+	)
 }
 
 /// Build the registry with session-restored `todo` phases.
@@ -833,15 +876,26 @@ fn build_registry_full(
 	all_server_names: Vec<String>,
 	todo_phases: Vec<pi_agent::tools::todo::TodoPhase>,
 	session_persisted: bool,
+	edit_options: EditToolOptions,
+	session: Option<&Arc<RunnerSession>>,
 ) -> Result<ToolRegistry> {
 	let mut registry = ToolRegistry::new();
+	// Root turns share one store/`EditTool` (see `RunnerSession`); a standalone
+	// registry (tests, MCP-less helpers) gets a fresh pair. Child agents always
+	// get their own instances through `Supervisor::child_registry`.
+	let snapshots = session
+		.map_or_else(|| Arc::new(SnapshotStore::new()), |session| Arc::clone(&session.snapshots));
+	let read_sink = Arc::new(NativeSnapshotSink::new(snapshots.clone()));
 	for name in tools {
 		let tool: Arc<dyn Tool> = match *name {
-			"read" => Arc::new(ReadTool),
+			"read" => Arc::new(ReadTool::with_snapshot_sink(read_sink.clone())),
 			"glob" => Arc::new(GlobTool),
 			"grep" => Arc::new(GrepTool),
 			"write" => Arc::new(WriteTool),
-			"edit" => Arc::new(EditTool),
+			"edit" => match session {
+				Some(session) => session.edit.clone(),
+				None => Arc::new(EditTool::with_options(snapshots.clone(), edit_options)),
+			},
 			"bash" => Arc::new(BashTool),
 			"todo" => Arc::new(TodoTool::restored(todo_phases.clone(), session_persisted)),
 			other => {
@@ -2869,6 +2923,143 @@ mod tests {
 		assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,aW1hZ2VkYXRh");
 	}
 
+	#[test]
+	fn repl_turns_share_read_edit_provenance_but_keep_children_fresh() {
+		let dir = std::env::temp_dir().join(format!(
+			"omp-cli-runtime-session-tools-{}",
+			crate::output::session_id()
+		));
+		std::fs::create_dir_all(&dir).expect("mkdir");
+		let ctx = pi_agent::AgentContext::new(dir.clone());
+		let runner = PiAgentRunner::new().expect("runner");
+		let plain = EditToolOptions { enforce_seen_lines: false };
+		let build = |session: &Arc<RunnerSession>, options: EditToolOptions| {
+			build_registry_full(
+				&["read", "edit"],
+				Vec::new(),
+				Vec::new(),
+				Vec::new(),
+				Vec::new(),
+				false,
+				options,
+				Some(session),
+			)
+			.expect("registry")
+		};
+		async fn execute(
+			registry: &ToolRegistry,
+			tool: &str,
+			args: serde_json::Value,
+			ctx: &pi_agent::AgentContext,
+		) -> pi_agent::ToolResult {
+			let tool = registry.get(tool).expect("tool");
+			tool.execute(&args, ctx).await.expect("tool executes")
+		}
+
+		// Drive real tool calls on the runner's runtime; the runner (and its
+		// tokio runtime) must drop outside async context.
+		runner.runtime.block_on(async {
+		// Turn 1: read mints the tag, `CUT` parks line 2 in a named register.
+		std::fs::write(dir.join("note.txt"), "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n").expect("write");
+		let session = runner.session_tools(plain);
+		let turn1 = build(&session, plain);
+		let read = execute(&turn1, "read", serde_json::json!({ "path": "note.txt" }), &ctx).await;
+		assert!(!read.is_error, "{}", read.content);
+		let header = read.content.lines().next().expect("header").to_string();
+		let cut = execute(&turn1, "edit", serde_json::json!({
+			"input": format!("{header}\nCUT 2.=2 @saved\n"),
+		}), &ctx)
+		.await;
+		assert!(!cut.is_error, "{}", cut.content);
+		assert_eq!(
+			std::fs::read_to_string(dir.join("note.txt")).expect("read"),
+			"a\nc\nd\ne\nf\ng\nh\ni\nj\n"
+		);
+
+		// Turn 2: the register from turn 1 still pastes without a new `CUT`.
+		let turn2 = build(&session, plain);
+		let read = execute(&turn2, "read", serde_json::json!({ "path": "note.txt" }), &ctx).await;
+		let header = read.content.lines().next().expect("header").to_string();
+		let paste = execute(&turn2, "edit", serde_json::json!({
+			"input": format!("{header}\nPUT >$ @saved\n"),
+		}), &ctx)
+		.await;
+		assert!(!paste.is_error, "{}", paste.content);
+		assert_eq!(
+			std::fs::read_to_string(dir.join("note.txt")).expect("read"),
+			"a\nc\nd\ne\nf\ng\nh\ni\nj\nb\n"
+		);
+
+		// Turn 3: the tag minted before an external prepend still recovers.
+		let turn3 = build(&session, plain);
+		let read = execute(&turn3, "read", serde_json::json!({ "path": "note.txt" }), &ctx).await;
+		let drift_header = read.content.lines().next().expect("header").to_string();
+		let before_drift = std::fs::read_to_string(dir.join("note.txt")).expect("read");
+		std::fs::write(dir.join("note.txt"), format!("zero\n{before_drift}")).expect("drift");
+		let recovered = execute(&turn3, "edit", serde_json::json!({
+			"input": format!("{drift_header}\nPUT 2.=2:\n+A\n"),
+		}), &ctx)
+		.await;
+		assert!(!recovered.is_error, "{}", recovered.content);
+		assert_eq!(
+			std::fs::read_to_string(dir.join("note.txt")).expect("read"),
+			"zero\na\nA\nd\ne\nf\ng\nh\ni\nj\nb\n"
+		);
+
+		// Turn 4: opt-in seen lines reject an anchor this turn never displayed.
+		std::fs::write(dir.join("other.txt"), "o1\no2\no3\no4\no5\no6\no7\no8\no9\no10\n")
+			.expect("write");
+		let guarded = EditToolOptions { enforce_seen_lines: true };
+		let session = runner.session_tools(guarded);
+		let turn4 = build(&session, guarded);
+		let read = execute(&turn4, "read", serde_json::json!({ "path": "other.txt:1-4" }), &ctx).await;
+		let header = read.content.lines().next().expect("header").to_string();
+		let rejected = execute(&turn4, "edit", serde_json::json!({
+			"input": format!("{header}\nPUT 9.=9:\n+X\n"),
+		}), &ctx)
+		.await;
+		assert!(rejected.is_error, "{}", rejected.content);
+		assert_eq!(
+			std::fs::read_to_string(dir.join("other.txt")).expect("read"),
+			"o1\no2\no3\no4\no5\no6\no7\no8\no9\no10\n"
+		);
+		let read = execute(&turn4, "read", serde_json::json!({ "path": "other.txt:9" }), &ctx).await;
+		let header = read.content.lines().next().expect("header").to_string();
+		let landed = execute(&turn4, "edit", serde_json::json!({
+			"input": format!("{header}\nPUT 9.=9:\n+X\n"),
+		}), &ctx)
+		.await;
+		assert!(!landed.is_error, "{}", landed.content);
+		assert_eq!(
+			std::fs::read_to_string(dir.join("other.txt")).expect("read"),
+			"o1\no2\no3\no4\no5\no6\no7\no8\nX\no10\n"
+		);
+
+		// A child registry never inherits this provenance.
+		let provider = OpenAiCompatibleProvider::new(
+			"http://127.0.0.1:9/v1",
+			"sk-test",
+			"test-model",
+		)
+		.expect("provider");
+		let supervisor =
+			Supervisor::new(turn4, Arc::new(provider), None, DelegationLimits::default());
+		let child = supervisor.child_registry(1, Some("peer"));
+		let child_edit = child.get("edit").expect("child edit");
+		let stolen = child_edit
+			.execute(&serde_json::json!({
+				"input": format!("{header}\nPUT 9.=9:\n+Y\n"),
+			}), &ctx)
+			.await
+			.expect("child edit executes");
+		assert!(stolen.is_error, "{}", stolen.content);
+		assert_eq!(
+			std::fs::read_to_string(dir.join("other.txt")).expect("read"),
+			"o1\no2\no3\no4\no5\no6\no7\no8\nX\no10\n"
+		);
+		});
+	}
+
 	#[tokio::test]
 	async fn restored_todo_tool_reads_phases_from_the_session_log() {
 		let dir = std::env::temp_dir().join(format!(
@@ -2890,9 +3081,17 @@ mod tests {
 		// Invoke the real tool, persist its details exactly as the live turn
 		// recorder does, then recover through a fresh store/registry.
 		let ctx = pi_agent::AgentContext::new(dir.clone());
-		let registry =
-			build_registry_full(&["todo"], Vec::new(), Vec::new(), Vec::new(), Vec::new(), true)
-				.expect("registry");
+		let registry = build_registry_full(
+			&["todo"],
+			Vec::new(),
+			Vec::new(),
+			Vec::new(),
+			Vec::new(),
+			true,
+			EditToolOptions::default(),
+			None,
+		)
+		.expect("registry");
 		let todo = registry.get("todo").expect("todo tool");
 		let args = serde_json::json!({
 			"op": "init",
@@ -2927,9 +3126,17 @@ mod tests {
 		let phases = reopened.latest_todo_phases();
 		assert_eq!(phases[0].tasks[0].content, "resume me");
 
-		let registry =
-			build_registry_full(&["todo"], Vec::new(), Vec::new(), Vec::new(), phases, true)
-				.expect("registry");
+		let registry = build_registry_full(
+			&["todo"],
+			Vec::new(),
+			Vec::new(),
+			Vec::new(),
+			phases,
+			true,
+			EditToolOptions::default(),
+			None,
+		)
+		.expect("registry");
 		let todo = registry.get("todo").expect("todo tool");
 		let viewed = todo
 			.execute(&serde_json::json!({"op": "view"}), &ctx)

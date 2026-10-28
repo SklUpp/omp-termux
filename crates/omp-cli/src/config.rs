@@ -61,6 +61,31 @@ impl ProviderConfig {
 	}
 }
 
+/// `edit` settings group consumed by the headless runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EditConfig {
+	/// `edit.enforceSeenLines`; absent means [`Self::DEFAULT_ENFORCE_SEEN_LINES`]
+	/// (the upstream settings-schema default).
+	pub enforce_seen_lines: Option<bool>,
+}
+
+impl EditConfig {
+	/// Seen-line guard default, matching the upstream settings schema. The
+	/// runtime maps this onto `EditToolOptions { enforce_seen_lines, .. }`.
+	pub const DEFAULT_ENFORCE_SEEN_LINES: bool = false;
+
+	#[must_use]
+	pub fn enforce_seen_lines(&self) -> bool {
+		self.enforce_seen_lines.unwrap_or(Self::DEFAULT_ENFORCE_SEEN_LINES)
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enforce_seen_lines.is_some() {
+			self.enforce_seen_lines = overlay.enforce_seen_lines;
+		}
+	}
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
 	pub default_model:        Option<String>,
@@ -71,6 +96,7 @@ pub struct Config {
 	pub allow:                Vec<String>,
 	pub cwd:                  Option<PathBuf>,
 	pub tools:                Option<Vec<String>>,
+	pub edit:                 EditConfig,
 	/// Paths that contributed, base first.
 	pub sources:              Vec<PathBuf>,
 }
@@ -95,6 +121,7 @@ impl Config {
 		if overlay.tools.is_some() {
 			self.tools = overlay.tools;
 		}
+		self.edit.merge(overlay.edit);
 		if !overlay.allow.is_empty() {
 			self.allow = overlay.allow;
 		}
@@ -104,19 +131,119 @@ impl Config {
 		self.sources.extend(overlay.sources);
 	}
 
-	/// Base config (agent dir `config.yml`, then `config.yaml`) followed by each
-	/// `--config` overlay in order; later files win.
+	/// Base config (agent dir `config.yml`, then `config.yaml`), project config
+	/// under `cwd`, `PI_CONFIG_FILES`, then each `--config` overlay in order;
+	/// later files win. Mirrors `Settings` precedence: global <- project <-
+	/// environment overlays <- CLI overlays <- runtime overrides (applied by the
+	/// caller).
 	pub fn load(overlays: &[PathBuf]) -> Result<Self> {
+		Self::load_with_cwd(overlays, None, &env_config_files())
+	}
+
+	/// Load with the run's effective working directory (already resolved from
+	/// `--cwd` by the caller) so project discovery and relative overlays use it.
+	pub fn load_run(overlays: &[PathBuf], explicit_cwd: Option<&Path>) -> Result<Self> {
+		Self::load_with_cwd(overlays, explicit_cwd, &env_config_files())
+	}
+
+	pub fn load_with_cwd(
+		overlays: &[PathBuf],
+		explicit_cwd: Option<&Path>,
+		env_overlays: &[PathBuf],
+	) -> Result<Self> {
+		Self::load_layers(base_path().as_deref(), explicit_cwd, env_overlays, overlays)
+	}
+
+	fn load_layers(
+		base: Option<&Path>,
+		explicit_cwd: Option<&Path>,
+		env_overlays: &[PathBuf],
+		overlays: &[PathBuf],
+	) -> Result<Self> {
 		let mut config = Self::default();
-		if let Some(base) = base_path() {
-			let overlay = Self::load_file(&base)?;
-			config.merge(overlay);
+		let mut has_base = false;
+		if let Some(base) = base {
+			config.merge(Self::load_file(base)?);
+			has_base = true;
 		}
-		for path in overlays {
-			let overlay = Self::load_file(path)?;
-			config.merge(overlay);
+		if !has_base {
+			// `docs/settings.md`: `agent/settings.json` is the legacy global
+			// settings file, superseded once any main YAML exists. Reading it
+			// here mirrors the migration result without writing.
+			let legacy = dirs::agent_dir().join("settings.json");
+			if legacy.is_file() {
+				match Self::load_settings_json(&legacy) {
+					Ok(Some(overlay)) => config.merge(overlay),
+					Ok(None) => {
+						eprintln!("warning: skipping malformed global settings {}", legacy.display());
+					},
+					Err(_) => {
+						eprintln!("warning: skipping invalid global settings {}", legacy.display());
+					},
+				}
+			}
+		}
+		let process_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+		let cwd = explicit_cwd
+			.map(|path| dirs::absolute(&process_cwd, path))
+			.or_else(|| {
+				config
+					.cwd
+					.as_ref()
+					.map(|path| dirs::absolute(&process_cwd, path))
+			})
+			.unwrap_or(process_cwd);
+		Self::apply_project_layers(&mut config, &cwd)?;
+		for path in env_overlays.iter().chain(overlays) {
+			let resolved = resolve_layer_path(&cwd, path);
+			config.merge(Self::load_file(&resolved)?);
 		}
 		Ok(config)
+	}
+
+	fn apply_project_layers(config: &mut Self, cwd: &Path) -> Result<()> {
+		let project_dir = dirs::project_config_dir(cwd);
+		let settings_path = project_dir.join("settings.json");
+		if settings_path.is_file() {
+			match Self::load_settings_json(&settings_path) {
+				Ok(Some(overlay)) => config.merge(overlay),
+				Ok(None) => {
+					eprintln!(
+						"warning: skipping malformed project settings {}",
+						settings_path.display()
+					);
+				},
+				Err(_) => {
+					eprintln!(
+						"warning: skipping invalid project settings {}",
+						settings_path.display()
+					);
+				},
+			}
+		}
+		// TS contract: an invalid project `config.yml` is fatal after the file is
+		// quarantined (`Settings.#loadYamlIfPresentForStartup` throws). This binary
+		// must not move or delete user files without authorization, so read-only
+		// startup fails in place: bytes stay untouched, the path is reported, and
+		// the YAML reason is sanitized by `load_file`. Explicit `--config` and
+		// `PI_CONFIG_FILES` overlays are fatal for the same contract reason.
+		let project_config = project_dir.join("config.yml");
+		if project_config.is_file() {
+			config.merge(Self::load_file(&project_config)?);
+		}
+		Ok(())
+	}
+
+	/// Project `settings.json` is a settings-schema document, not the legacy
+	/// root-key dialect; map only the fields this binary consumes.
+	fn load_settings_json(path: &Path) -> Result<Option<Self>> {
+		let text = fs::read_to_string(path)
+			.map_err(|err| Error::with_source(format!("cannot read {}", path.display()), err))?;
+		let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+			return Ok(None);
+		};
+		let value = json_to_value(&json);
+		Self::from_settings_value(&value, path).map(Some)
 	}
 
 	fn load_file(path: &Path) -> Result<Self> {
@@ -125,8 +252,8 @@ impl Config {
 		}
 		let text = fs::read_to_string(path)
 			.map_err(|err| Error::with_source(format!("cannot read {}", path.display()), err))?;
-		let value =
-			yaml::parse(&text).map_err(|err| Error::new(format!("{}: {err}", path.display())))?;
+		let value = yaml::parse(&text)
+			.map_err(|err| Error::new(format!("{}: {}", path.display(), sanitize_yaml_error(&err.to_string()))))?;
 		Self::from_value(&value, path)
 	}
 
@@ -149,20 +276,37 @@ impl Config {
 				"cwd" => {
 					config.cwd = expect_text(item, key, path)?.map(PathBuf::from);
 				},
-				"approvalMode" => {
-					let raw = expect_text(item, key, path)?
-						.ok_or_else(|| invalid(path, key, "expected one of always-ask, write, yolo"))?;
-					let mode = ApprovalMode::parse(&raw)
-						.ok_or_else(|| invalid(path, key, "expected one of always-ask, write, yolo"))?;
-					config.approval_mode = Some(mode);
-				},
+				"approvalMode" => config.approval_mode = parse_approval(item, key, path)?,
 				"allow" => config.allow = expect_list_of_text(item, key, path)?,
+				"tools" => config.tools = expect_tools(item, key, path)?,
 				"providers" => config.providers = parse_providers(item, path)?,
 				// Unknown keys are ignored: the config file is shared with the
 				// full TS app, which carries extra keys (setupVersion etc.).
 				_ => {},
 			}
 		}
+		apply_nested_settings(&mut config, value, path)?;
+		config.sources.push(path.to_path_buf());
+		Ok(config)
+	}
+
+	/// Project `settings.json` is a `SETTINGS_SCHEMA` document, not the legacy
+	/// root-key dialect. Only fields this binary consumes are mapped:
+	/// `modelRoles.default` and `tools.approvalMode`. Root-level legacy keys and
+	/// other schema groups are intentionally ignored (they are either owned by
+	/// the full TS app or unsupported by the headless runtime).
+	fn from_settings_value(value: &Value, path: &Path) -> Result<Self> {
+		let mut config = Self::default();
+		let Value::Map(_) = value else {
+			if matches!(value, Value::Null) {
+				return Ok(config);
+			}
+			return Err(Error::new(format!(
+				"{}: expected a JSON object at the document root",
+				path.display()
+			)));
+		};
+		apply_nested_settings(&mut config, value, path)?;
 		config.sources.push(path.to_path_buf());
 		Ok(config)
 	}
@@ -171,6 +315,147 @@ impl Config {
 	#[must_use]
 	pub fn resolve_api_key(&self, provider: &str) -> Option<String> {
 		self.providers.get(provider)?.resolve_api_key()
+	}
+
+	/// Apply dedicated CLI flags after the layered load. Runtime overrides are
+	/// the highest settings layer (`docs/settings.md` order 1) and are never
+	/// persisted: flags replace the file value even when the file set one.
+	pub fn apply_runtime(&mut self, cli: &crate::args::Cli) {
+		if let Some(tools) = &cli.tools {
+			self.tools = Some(
+				tools
+					.iter()
+					.flat_map(|value| value.split(','))
+					.map(str::trim)
+					.filter(|value| !value.is_empty())
+					.map(str::to_string)
+					.collect(),
+			);
+		}
+		if let Some(mode) = cli.approval_mode {
+			self.approval_mode = Some(mode);
+		} else if cli.yolo {
+			self.approval_mode = Some(ApprovalMode::Yolo);
+		}
+		if !cli.allow.is_empty() {
+			let mut allow = cli.allow.clone();
+			allow.append(&mut self.allow);
+			self.allow = allow;
+		}
+		if let Some(input) = &cli.system_prompt {
+			self.system_prompt = Some(input.clone());
+		}
+		if let Some(input) = &cli.append_system_prompt {
+			self.append_system_prompt = Some(input.clone());
+		}
+	}
+}
+
+fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Result<()> {
+	if let Some(default) = value.get("modelRoles").and_then(|roles| roles.get("default")) {
+		config.default_model = expect_text(default, "modelRoles.default", path)?;
+	}
+	if let Some(mode) = value
+		.get("tools")
+		.and_then(|tools| tools.get("approvalMode"))
+	{
+		config.approval_mode = parse_approval(mode, "tools.approvalMode", path)?;
+	}
+	if let Some(enforce) = value
+		.get("edit")
+		.and_then(|edit| edit.get("enforceSeenLines"))
+	{
+		config.edit.enforce_seen_lines = expect_bool(enforce, "edit.enforceSeenLines", path)?;
+	}
+	Ok(())
+}
+
+fn parse_approval(value: &Value, key: &str, path: &Path) -> Result<Option<ApprovalMode>> {
+	let raw = expect_text(value, key, path)?
+		.ok_or_else(|| invalid(path, key, "expected one of always-ask, write, yolo"))?;
+	ApprovalMode::parse(&raw)
+		.map(Some)
+		.ok_or_else(|| invalid(path, key, "expected one of always-ask, write, yolo"))
+}
+
+fn expect_tools(value: &Value, key: &str, path: &Path) -> Result<Option<Vec<String>>> {
+	match value {
+		// `tools` is a list in the legacy dialect and a settings group in the
+		// TS schema; accept the object form so a shared project file loads.
+		Value::Map(_) => Ok(None),
+		Value::Null => Ok(Some(Vec::new())),
+		other => other
+			.as_list()
+			.map(|_| expect_list_of_text(other, key, path).map(Some))
+			.unwrap_or_else(|| Err(invalid(path, key, "expected a sequence of strings"))),
+	}
+}
+
+/// `PI_CONFIG_FILES` entries in declared order (`:` on Unix, `;` on Windows).
+#[must_use]
+pub fn env_config_files() -> Vec<PathBuf> {
+	env::var_os("PI_CONFIG_FILES")
+		.map(|value| {
+			env::split_paths(&value)
+				.filter(|path| !path.as_os_str().is_empty())
+				.collect()
+		})
+		.unwrap_or_default()
+}
+
+/// Overlay paths resolve relative to the effective project cwd after `~`
+/// expansion, matching the TS `Settings` constructor.
+fn resolve_layer_path(cwd: &Path, raw: &Path) -> PathBuf {
+	let text = raw.to_string_lossy();
+	let expanded = if let Some(home) = dirs::home_dir() {
+		if text == "~" {
+			home
+		} else if let Some(rest) = text.strip_prefix("~/") {
+			home.join(rest)
+		} else {
+			raw.to_path_buf()
+		}
+	} else {
+		raw.to_path_buf()
+	};
+	dirs::absolute(cwd, &expanded)
+}
+
+/// Keep YAML diagnostics useful without echoing file contents (which may hold
+/// credentials). The in-tree parser only quotes payloads in `unterminated flow
+/// sequence`, but strip every backticked span defensively.
+fn sanitize_yaml_error(message: &str) -> String {
+	let mut out = String::with_capacity(message.len());
+	let mut in_span = false;
+	for ch in message.chars() {
+		if ch == '`' {
+			in_span = !in_span;
+			continue;
+		}
+		if !in_span {
+			out.push(ch);
+		}
+	}
+	let trimmed = out.trim().trim_end_matches(':').trim().to_string();
+	if trimmed.is_empty() { "invalid YAML".to_string() } else { trimmed }
+}
+
+fn json_to_value(json: &serde_json::Value) -> Value {
+	match json {
+		serde_json::Value::Null => Value::Null,
+		serde_json::Value::Bool(value) => Value::Bool(*value),
+		serde_json::Value::Number(number) => number
+			.as_i64()
+			.map_or_else(|| Value::Float(number.as_f64().unwrap_or_default()), Value::Int),
+		serde_json::Value::String(value) => Value::Str(value.clone()),
+		serde_json::Value::Array(items) => {
+			Value::List(items.iter().map(json_to_value).collect())
+		},
+		serde_json::Value::Object(map) => Value::Map(
+			map.iter()
+				.map(|(key, value)| (key.clone(), json_to_value(value)))
+				.collect(),
+		),
 	}
 }
 
@@ -259,6 +544,14 @@ fn expect_text(value: &Value, key: &str, path: &Path) -> Result<Option<String>> 
 			.to_text()
 			.map(Some)
 			.ok_or_else(|| invalid(path, key, "expected a string")),
+	}
+}
+
+fn expect_bool(value: &Value, key: &str, path: &Path) -> Result<Option<bool>> {
+	match value {
+		Value::Null => Ok(None),
+		Value::Bool(value) => Ok(Some(*value)),
+		_ => Err(invalid(path, key, "expected a boolean")),
 	}
 }
 
@@ -824,6 +1117,85 @@ mod tests {
 	fn invalid_approval_mode_and_auth_are_rejected() {
 		assert!(parse_config("approvalMode: sometimes\n").is_err());
 		assert!(parse_config("providers:\n  p:\n    auth: magic\n").is_err());
+	}
+
+	#[test]
+	fn settings_json_maps_only_schema_paths() {
+		let json = serde_json::json!({
+			"modelRoles": { "default": "openai/gpt-5", "smol": "x" },
+			"tools": { "approvalMode": "write", "approval": { "bash": "allow" } },
+			"edit": { "enforceSeenLines": false },
+			// Legacy root keys are not settings-schema paths; the full TS app
+			// ignores them here and the headless binary must not invent support.
+			"defaultModel": "legacy/ignored",
+			"cwd": "/ignored",
+			"allow": ["bash"],
+		});
+		let config = Config::from_settings_value(&json_to_value(&json), Path::new("settings.json"))
+			.expect("settings");
+		assert_eq!(config.default_model.as_deref(), Some("openai/gpt-5"));
+		assert_eq!(config.approval_mode, Some(ApprovalMode::Write));
+		assert_eq!(config.edit.enforce_seen_lines, Some(false));
+		assert_eq!(config.cwd, None);
+		assert!(config.allow.is_empty());
+		assert!(config.tools.is_none());
+	}
+
+	#[test]
+	fn edit_enforce_seen_lines_defaults_false_and_overrides() {
+		let default = parse_config("").expect("default");
+		assert_eq!(default.edit.enforce_seen_lines, None);
+		assert!(!default.edit.enforce_seen_lines());
+
+		let explicit_false =
+			parse_config("edit:\n  enforceSeenLines: false\n").expect("explicit false");
+		assert_eq!(explicit_false.edit.enforce_seen_lines, Some(false));
+		assert!(!explicit_false.edit.enforce_seen_lines());
+
+		let explicit_true = parse_config("edit:\n  enforceSeenLines: true\n").expect("explicit true");
+		assert_eq!(explicit_true.edit.enforce_seen_lines, Some(true));
+		assert!(explicit_true.edit.enforce_seen_lines());
+
+		let mut layered = parse_config("edit:\n  enforceSeenLines: true\n").expect("base");
+		layered.merge(parse_config("edit:\n  enforceSeenLines: false\n").expect("overlay"));
+		assert!(!layered.edit.enforce_seen_lines());
+
+		let mut layered_on = parse_config("edit:\n  enforceSeenLines: false\n").expect("base");
+		layered_on.merge(parse_config("edit:\n  enforceSeenLines: true\n").expect("overlay"));
+		assert!(layered_on.edit.enforce_seen_lines());
+		assert!(parse_config("edit:\n  enforceSeenLines: nope\n").is_err());
+	}
+
+	#[test]
+	fn cli_flags_override_every_file_layer() {
+		use clap::Parser;
+		let mut config = parse_config(
+			"defaultModel: file/model\nsystemPrompt: file-system\nappendSystemPrompt: \
+			 file-append\napprovalMode: always-ask\nallow: [config-allow]\ntools: [read]\n",
+		)
+		.expect("config");
+		let cli = crate::args::Cli::try_parse_from([
+			"omp",
+			"--tools",
+			"bash,edit",
+			"--approval-mode",
+			"yolo",
+			"--allow",
+			"cli-allow",
+			"--system-prompt",
+			"cli-system",
+			"--append-system-prompt",
+			"cli-append",
+		])
+		.expect("cli");
+		config.apply_runtime(&cli);
+		assert_eq!(config.approval_mode, Some(ApprovalMode::Yolo));
+		assert_eq!(config.tools.as_deref(), Some(["bash".to_string(), "edit".to_string()].as_slice()));
+		assert_eq!(config.allow, ["cli-allow", "config-allow"]);
+		assert_eq!(config.system_prompt.as_deref(), Some("cli-system"));
+		assert_eq!(config.append_system_prompt.as_deref(), Some("cli-append"));
+		// A flag does not overwrite unrelated file fields.
+		assert_eq!(config.default_model.as_deref(), Some("file/model"));
 	}
 
 	#[test]

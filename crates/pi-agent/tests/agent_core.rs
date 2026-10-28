@@ -11,13 +11,27 @@ use futures::StreamExt;
 use pi_agent::provider::OpenAiChatRequest;
 use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
-	CancellationToken, ChunkStream, EditTool, GlobTool, GrepTool, ImagePart, Message, ModelProvider,
-	OpenAiCompatibleProvider, ProviderError, ReadTool, Role, SteeringEvent,
-	StreamAssembler, StreamChunk, Tool, ToolCall, ToolCallDelta, ToolRegistry, TurnStatus,
-	WriteTool, parse_sse_line, sse_stream,
+	CancellationToken, ChunkStream, DelegationLimits, EditTool, GlobTool, GrepTool, ImagePart,
+	Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, ReadTool, Role, SteeringEvent,
+	StreamAssembler, StreamChunk, Supervisor, Tool, ToolCall, ToolCallDelta, ToolRegistry,
+	TurnStatus, WriteTool, parse_sse_line, sse_stream,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde_json::json;
+
+/// Record a file the way `read` does — normalized text plus the displayed
+/// source lines — into the session store the `edit` tool validates against.
+fn record_edit_snapshot(store: &pi_agent::tools::hashline::SnapshotStore, path: &std::path::Path) -> String {
+	use pi_agent::tools::hashline::{canonical_key, hash};
+	let raw = std::fs::read_to_string(path).expect("read fixture for snapshot");
+	let (_, text) = hash::strip_bom(&raw);
+	let text = hash::normalize_to_lf(text);
+	let key = canonical_key(path);
+	let tag = store.record(&key, &text, None).expect("record snapshot");
+	let lines: Vec<u32> = (1..=text.lines().count().max(1) as u32).collect();
+	store.record_seen_lines(&key, &tag, &lines);
+	tag
+}
 
 /// Scripted transport: a queue of canned provider turns. This is a test double
 /// for the network, not a production code path.
@@ -148,6 +162,7 @@ fn assert_no_orphan_tool_calls(state: &AgentState) {
 #[tokio::test]
 async fn tool_call_round_trip_feeds_result_back_to_the_model() {
 	let dir = TempDir::new("roundtrip");
+	let edit_tag = pi_agent::tools::hashline::hash::compute_file_hash("hello");
 	let provider = ScriptedProvider::with_turns(vec![
 		Message::assistant_with_tools(
 			"writing",
@@ -162,7 +177,9 @@ async fn tool_call_round_trip_feeds_result_back_to_the_model() {
 			vec![ToolCall {
 				id: "call_edit".to_string(),
 				name: "edit".to_string(),
-				arguments: json!({"path": "note.txt", "old_string": "hello", "new_string": "world"}),
+				arguments: json!({
+					"input": format!("[note.txt#{edit_tag}]\nPUT 1.=1:\n+world")
+				}),
 			}],
 		),
 		Message::assistant("done"),
@@ -185,6 +202,10 @@ async fn tool_call_round_trip_feeds_result_back_to_the_model() {
 	assert!(turns[2].is_completed);
 	assert_eq!(turns[0].tool_results.len(), 1);
 	assert_eq!(turns[1].tool_results.len(), 1);
+	assert_eq!(
+		std::fs::read_to_string(dir.path.join("note.txt")).expect("read"),
+		"world"
+	);
 
 	let roles: Vec<Role> = state.messages.iter().map(|message| message.role).collect();
 	assert_eq!(
@@ -201,7 +222,10 @@ async fn tool_call_round_trip_feeds_result_back_to_the_model() {
 	);
 	let tools = tool_messages(&state);
 	assert!(tools[0].content.contains("Successfully wrote"));
-	assert!(tools[1].content.contains("Replaced 1 occurrence(s)"));
+	// The edit result carries the updated path plus the new snapshot header the
+	// model needs for its next anchored edit.
+	assert!(tools[1].content.starts_with("Updated note.txt"), "{}", tools[1].content);
+	assert!(tools[1].content.contains("[note.txt#"), "{}", tools[1].content);
 	assert_eq!(std::fs::read_to_string(dir.path.join("note.txt")).expect("file"), "world");
 	assert_no_orphan_tool_calls(&state);
 
@@ -369,33 +393,45 @@ async fn bash_output_is_bounded() {
 }
 
 #[tokio::test]
-async fn read_only_returns_regular_files_within_the_byte_cap() {
+async fn read_selectors_sort_ranges_stop_at_caps_and_list_directories() {
 	let dir = TempDir::new("read-limits");
 	let big = dir.path.join("big.txt");
 	std::fs::write(&big, "a".repeat(300_000)).expect("write big");
+	std::fs::write(dir.path.join("lines.txt"), "one\ntwo\nthree\nfour\n").expect("write lines");
 	std::fs::create_dir_all(dir.path.join("sub")).expect("mkdir");
+	std::fs::write(dir.path.join("sub/child.txt"), "child").expect("write child");
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+	let read = ReadTool::new();
 
-	let truncated = ReadTool
+	let capped = read
 		.execute(&json!({"path": "big.txt"}), &ctx)
 		.await
 		.expect("read");
-	assert!(!truncated.is_error);
-	assert!(
-		truncated
-			.content
-			.contains("[truncated at 262144 bytes of 300000]")
+	assert!(!capped.is_error);
+	// A single 300 KB line exceeds the byte budget: the tool shows a numbered
+	// preview capped at the budget instead of dumping the line.
+	assert!(capped.content.starts_with("1|aaa"), "got: {}", &capped.content[..capped.content.len().min(120)]);
+	assert!(capped.content.len() < 300_000);
+	assert_eq!(
+		capped.details.expect("details")["truncation"]["firstLineExceedsLimit"],
+		json!(true)
 	);
-	assert!(truncated.content.len() < 300_000);
 
-	let directory = ReadTool
+	let ranged = read
+		.execute(&json!({"path": "lines.txt:2-2"}), &ctx)
+		.await
+		.expect("read range");
+	assert!(!ranged.is_error);
+	assert_eq!(ranged.content, "1|one\n2|two\n3|three\n4|four");
+
+	let directory = read
 		.execute(&json!({"path": "sub"}), &ctx)
 		.await
 		.expect("read dir");
-	assert!(directory.is_error);
-	assert!(directory.content.contains("not a regular file"));
+	assert!(!directory.is_error, "{}", directory.content);
+	assert!(directory.content.contains("- child.txt"), "{}", directory.content);
 
-	let missing = ReadTool
+	let missing = read
 		.execute(&json!({"path": "nope.txt"}), &ctx)
 		.await
 		.expect("read miss");
@@ -416,91 +452,109 @@ async fn write_rejects_oversized_content() {
 }
 
 #[tokio::test]
-async fn edit_replaces_a_unique_match_and_reports_the_count() {
+async fn edit_replaces_an_anchored_line_and_deletes_a_bodyless_span() {
 	let dir = TempDir::new("edit-unique");
-	std::fs::write(dir.path.join("note.txt"), "one needle two\n").expect("write");
+	let path = dir.path.join("note.txt");
+	std::fs::write(&path, "one needle two\n").expect("write");
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
 
-	let result = EditTool
-		.execute(&json!({"path": "note.txt", "old_string": "needle", "new_string": "thread"}), &ctx)
-		.await
-		.expect("edit");
-
-	assert!(!result.is_error);
-	assert!(result.content.contains("Replaced 1 occurrence(s)"));
-	assert_eq!(
-		std::fs::read_to_string(dir.path.join("note.txt")).expect("read"),
-		"one thread two\n"
-	);
-
-	let empty = EditTool
-		.execute(&json!({"path": "note.txt", "old_string": "", "new_string": "x"}), &ctx)
-		.await
-		.expect_err("empty search must be rejected");
-	assert!(empty.to_string().contains("must not be empty"));
-}
-
-#[tokio::test]
-async fn edit_rejects_an_ambiguous_match_without_touching_the_file() {
-	let dir = TempDir::new("edit-ambiguous");
-	std::fs::write(dir.path.join("note.txt"), "dup dup\n").expect("write");
-	let ctx = pi_agent::AgentContext::new(dir.path.clone());
-
-	let result = EditTool
-		.execute(&json!({"path": "note.txt", "old_string": "dup", "new_string": "one"}), &ctx)
-		.await
-		.expect("edit");
-
-	assert!(result.is_error);
-	assert!(result.content.contains("2 occurrences"));
-	assert!(result.content.contains("set replace_all"));
-	assert_eq!(std::fs::read_to_string(dir.path.join("note.txt")).expect("read"), "dup dup\n");
-}
-
-#[tokio::test]
-async fn edit_replace_all_rewrites_every_occurrence() {
-	let dir = TempDir::new("edit-all");
-	std::fs::write(dir.path.join("note.txt"), "dup dup dup\n").expect("write");
-	let ctx = pi_agent::AgentContext::new(dir.path.clone());
-
-	let result = EditTool
+	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
+	let tag = record_edit_snapshot(&store, &path);
+	let result = EditTool::new(store)
 		.execute(
-			&json!({
-				"path": "note.txt",
-				"old_string": "dup",
-				"new_string": "one",
-				"replace_all": true
-			}),
+			&json!({ "input": format!("[note.txt#{tag}]\nPUT 1.=1:\n+one thread two") }),
 			&ctx,
 		)
 		.await
 		.expect("edit");
 
-	assert!(!result.is_error);
-	assert!(result.content.contains("Replaced 3 occurrence(s)"));
-	assert_eq!(std::fs::read_to_string(dir.path.join("note.txt")).expect("read"), "one one one\n");
+	assert!(!result.is_error, "{}", result.content);
+	assert_eq!(std::fs::read_to_string(&path).expect("read"), "one thread two\n");
+
+	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
+	let tag = record_edit_snapshot(&store, &path);
+	// Upstream hashline reads a body-less `PUT A.=B:` as a ranged delete.
+	let delete = EditTool::new(store)
+		.execute(&json!({ "input": format!("[note.txt#{tag}]\nPUT 1.=1:\n") }), &ctx)
+		.await
+		.expect("edit");
+	assert!(!delete.is_error, "{}", delete.content);
+	assert_eq!(std::fs::read_to_string(&path).expect("read"), "");
 }
 
 #[tokio::test]
-async fn edit_reports_missing_files_and_absent_matches() {
+async fn edit_rejects_a_foreign_tag_without_touching_the_file() {
+	let dir = TempDir::new("edit-stale");
+	let path = dir.path.join("note.txt");
+	std::fs::write(&path, "dup dup\n").expect("write");
+	let other = dir.path.join("other.txt");
+	std::fs::write(&other, "unrelated content\n").expect("write other");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
+	let foreign_tag = record_edit_snapshot(&store, &other);
+	let result = EditTool::new(store)
+		.execute(
+			&json!({ "input": format!("[note.txt#{foreign_tag}]\nPUT 1.=1:\n+one") }),
+			&ctx,
+		)
+		.await
+		.expect("edit");
+
+	assert!(result.is_error, "{}", result.content);
+	assert_eq!(std::fs::read_to_string(&path).expect("read"), "dup dup\n");
+}
+
+#[tokio::test]
+async fn edit_replaces_a_multi_line_span() {
+	let dir = TempDir::new("edit-span");
+	let path = dir.path.join("note.txt");
+	std::fs::write(&path, "dup dup dup\none\ntwo\n").expect("write");
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
+	let tag = record_edit_snapshot(&store, &path);
+	let result = EditTool::new(store)
+		.execute(
+			&json!({ "input": format!("[note.txt#{tag}]\nPUT 2.=3:\n+X\n+Y") }),
+			&ctx,
+		)
+		.await
+		.expect("edit");
+
+	assert!(!result.is_error, "{}", result.content);
+	assert_eq!(std::fs::read_to_string(&path).expect("read"), "dup dup dup\nX\nY\n");
+}
+
+#[tokio::test]
+async fn edit_reports_missing_files_and_mismatched_tags() {
 	let dir = TempDir::new("edit-missing");
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
 
-	let missing = EditTool
-		.execute(&json!({"path": "nope.txt", "old_string": "a", "new_string": "b"}), &ctx)
+	let missing_path = dir.path.join("nope.txt");
+	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
+	let missing = EditTool::new(store)
+		.execute(&json!({ "input": "[nope.txt#0000]\nPUT 1.=1:\n+x" }), &ctx)
 		.await
 		.expect("edit");
-	assert!(missing.is_error);
-	assert!(missing.content.contains("Failed to edit"));
+	assert!(missing.is_error, "{}", missing.content);
+	assert!(!missing_path.exists());
 
-	std::fs::write(dir.path.join("note.txt"), "present\n").expect("write");
-	let absent = EditTool
-		.execute(&json!({"path": "note.txt", "old_string": "absent", "new_string": "b"}), &ctx)
+	let path = dir.path.join("note.txt");
+	std::fs::write(&path, "present\n").expect("write");
+	let other = dir.path.join("other.txt");
+	std::fs::write(&other, "different text\n").expect("write other");
+	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
+	let foreign_tag = record_edit_snapshot(&store, &other);
+	let absent = EditTool::new(store)
+		.execute(
+			&json!({ "input": format!("[note.txt#{foreign_tag}]\nPUT 1.=1:\n+b") }),
+			&ctx,
+		)
 		.await
 		.expect("edit");
-	assert!(absent.is_error);
-	assert!(absent.content.contains("Not found in"));
-	assert_eq!(std::fs::read_to_string(dir.path.join("note.txt")).expect("read"), "present\n");
+	assert!(absent.is_error, "{}", absent.content);
+	assert_eq!(std::fs::read_to_string(&path).expect("read"), "present\n");
 }
 
 #[tokio::test]
@@ -514,21 +568,17 @@ async fn edit_preserves_original_bytes_and_cleans_temp_on_cancellation() {
 	token.cancel();
 	let ctx = pi_agent::AgentContext::with_cancellation(dir.path.clone(), token);
 
-	let result = EditTool
+	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
+	let tag = record_edit_snapshot(&store, &target);
+	let result = EditTool::new(store)
 		.execute(
-			&json!({
-				"path": "file.txt",
-				"old_string": "sensitive",
-				"new_string": "corrupted"
-			}),
+			&json!({ "input": format!("[file.txt#{tag}]\nPUT 1.=1:\n+corrupted") }),
 			&ctx,
 		)
 		.await
 		.expect("edit");
 
-	assert!(result.is_error);
-	assert!(result.content.contains("Edit of"));
-	assert!(result.content.contains("cancelled"));
+	assert!(result.is_error, "{}", result.content);
 
 	let content = std::fs::read_to_string(&target).expect("read");
 	assert_eq!(content, original);
@@ -780,19 +830,17 @@ async fn edit_preserves_symlink_structure_and_permissions() {
 	std::os::unix::fs::symlink(&real_file, &link_file).expect("symlink");
 
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
-	let result = EditTool
+	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
+	let tag = record_edit_snapshot(&store, &link_file);
+	let result = EditTool::new(store)
 		.execute(
-			&json!({
-				"path": "link_script.sh",
-				"old_string": "original",
-				"new_string": "updated"
-			}),
+			&json!({ "input": format!("[link_script.sh#{tag}]\nPUT 2.=2:\n+echo updated") }),
 			&ctx,
 		)
 		.await
 		.expect("edit");
 
-	assert!(!result.is_error);
+	assert!(!result.is_error, "{}", result.content);
 	assert_eq!(
 		std::fs::read_to_string(&real_file).expect("read real"),
 		"#!/bin/sh\necho updated\n"
@@ -2025,16 +2073,111 @@ async fn edit_refuses_files_above_the_cap_without_touching_them() {
 	std::fs::write(&path, "a".repeat(EDIT_CAP + 1)).expect("write");
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
 
-	let result = EditTool
-		.execute(&json!({"path": "big.txt", "old_string": "a", "new_string": "b"}), &ctx)
+	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
+	let result = EditTool::new(store)
+		.execute(&json!({ "input": "[big.txt#0000]\nPUT 1.=1:\n+b" }), &ctx)
 		.await
 		.expect("edit");
 
-	assert!(result.is_error);
-	assert!(result.content.contains("edit limit"), "got: {}", result.content);
+	assert!(result.is_error, "{}", result.content);
 	let bytes = std::fs::read(&path).expect("read");
 	assert_eq!(bytes.len(), EDIT_CAP + 1);
 	assert!(bytes.iter().all(|byte| *byte == b'a'), "file content must be untouched");
+}
+
+#[tokio::test]
+async fn child_registry_gets_fresh_store_registers_and_seen_lines() {
+	let dir = TempDir::new("child-isolation");
+	let path = dir.path.join("note.txt");
+	std::fs::write(&path, "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n").expect("write");
+	let provider = Arc::new(ScriptedProvider::with_turns(Vec::new()));
+	let supervisor = Supervisor::new(
+		ToolRegistry::with_builtins(),
+		provider,
+		None,
+		DelegationLimits::default(),
+	);
+	supervisor.set_edit_options(pi_agent::tools::hashline::edit::EditToolOptions {
+		enforce_seen_lines: true,
+	});
+	let parent = supervisor.root_registry();
+	let child = supervisor.child_registry(1, Some("peer"));
+	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+
+	// Parent reads line 2 and parks it in a named register.
+	let parent_read = parent
+		.get("read")
+		.expect("parent read")
+		.execute(&json!({ "path": "note.txt:2" }), &ctx)
+		.await
+		.expect("read");
+	let parent_header = parent_read.content.lines().next().expect("header").to_string();
+	let cut = parent
+		.get("edit")
+		.expect("parent edit")
+		.execute(&json!({ "input": format!("{parent_header}\nCUT 2.=2 @saved\n") }), &ctx)
+		.await
+		.expect("cut");
+	assert!(!cut.is_error, "{}", cut.content);
+	let cut_content = "l1\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
+	assert_eq!(std::fs::read_to_string(&path).expect("read"), cut_content);
+
+	// A child sharing the same file cannot paste the parent's register.
+	let child_read = child
+		.get("read")
+		.expect("child read")
+		.execute(&json!({ "path": "note.txt" }), &ctx)
+		.await
+		.expect("read");
+	let child_header = child_read.content.lines().next().expect("header").to_string();
+	let paste = child
+		.get("edit")
+		.expect("child edit")
+		.execute(&json!({ "input": format!("{child_header}\nPUT >$ @saved\n") }), &ctx)
+		.await
+		.expect("paste");
+	assert!(paste.is_error, "{}", paste.content);
+	assert_eq!(std::fs::read_to_string(&path).expect("read"), cut_content);
+
+	// Seen lines are per store: a fresh child that displayed only lines 1-7
+	// (bounded `:1-4` plus trailing context) cannot edit line 8, even though
+	// the parent displayed more.
+	let fresh = supervisor.child_registry(1, Some("peer2"));
+	let fresh_read = fresh
+		.get("read")
+		.expect("fresh read")
+		.execute(&json!({ "path": "note.txt:1-4" }), &ctx)
+		.await
+		.expect("read");
+	let fresh_header = fresh_read.content.lines().next().expect("header").to_string();
+	let unseen = fresh
+		.get("edit")
+		.expect("fresh edit")
+		.execute(&json!({ "input": format!("{fresh_header}\nPUT 8.=8:\n+delta") }), &ctx)
+		.await
+		.expect("edit");
+	assert!(unseen.is_error, "{}", unseen.content);
+	assert_eq!(std::fs::read_to_string(&path).expect("read"), cut_content);
+
+	// Re-reading the target line makes the same anchored edit legal.
+	let target_read = fresh
+		.get("read")
+		.expect("fresh read")
+		.execute(&json!({ "path": "note.txt:8" }), &ctx)
+		.await
+		.expect("read");
+	let target_header = target_read.content.lines().next().expect("header").to_string();
+	let landed = fresh
+		.get("edit")
+		.expect("fresh edit")
+		.execute(&json!({ "input": format!("{target_header}\nPUT 8.=8:\n+delta") }), &ctx)
+		.await
+		.expect("edit");
+	assert!(!landed.is_error, "{}", landed.content);
+	assert_eq!(
+		std::fs::read_to_string(&path).expect("read"),
+		"l1\nl3\nl4\nl5\nl6\nl7\nl8\ndelta\nl10\n"
+	);
 }
 
 #[test]

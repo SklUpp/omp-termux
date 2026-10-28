@@ -6205,15 +6205,18 @@ dependencies = [
  "async-trait",
  "flume",
  "futures",
+ "pi-ast",
  "pi-shell",
  "pi-walker",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "similar 3.2.0",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
+ "xxhash-rust",
 ]
 
 [[package]]

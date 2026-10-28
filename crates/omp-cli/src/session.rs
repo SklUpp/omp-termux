@@ -858,7 +858,7 @@ impl SessionOptions {
 
 	#[must_use]
 	pub fn default_sessions_root() -> PathBuf {
-		dirs::agent_dir().join(SESSIONS_SUBDIR)
+		dirs::agent_subdir(SESSIONS_SUBDIR, dirs::AgentDirCategory::Data)
 	}
 }
 
@@ -2602,7 +2602,7 @@ pub fn write_terminal_breadcrumb(
 			let Some(term_id) = get_terminal_id() else {
 				return Ok(());
 			};
-			let dir = dirs::agent_dir().join("terminal-sessions");
+			let dir = dirs::agent_subdir("terminal-sessions", dirs::AgentDirCategory::State);
 			let _ = fs::create_dir_all(&dir);
 			dir.join(term_id)
 		},
@@ -2626,7 +2626,7 @@ pub fn read_terminal_breadcrumb(override_path: Option<&Path>) -> Option<Terminal
 		Some(p) => p.to_path_buf(),
 		None => {
 			let term_id = get_terminal_id()?;
-			dirs::agent_dir().join("terminal-sessions").join(term_id)
+			dirs::agent_subdir("terminal-sessions", dirs::AgentDirCategory::State).join(term_id)
 		},
 	};
 

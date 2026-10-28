@@ -53,6 +53,12 @@ Argument handling:
 - `--` ends flag parsing; everything after it is literal message text, even if it
   looks like a flag.
 
+`--profile` and `--alias` are extracted before the main parser and must be
+followed by a value that does not start with `-`; they are ignored after `--`
+and after a subcommand such as `completions`. Known string flags still consume a
+flag-looking value, so `--system-prompt --profile` sets the system prompt to the
+literal text `--profile` instead of selecting a profile.
+
 ### Launch flags
 
 #### Session and workspace

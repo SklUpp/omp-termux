@@ -1,4 +1,6 @@
+pub mod hashline;
 pub mod hub;
+pub mod read;
 pub mod registry;
 pub mod scheduler;
 pub mod task;
@@ -6,12 +8,13 @@ pub mod todo;
 pub mod yield_tool;
 
 pub use hub::HubTool;
+pub use read::{ReadSnapshotSink, ReadTool};
 pub use task::TaskTool;
 pub use todo::TodoTool;
 pub use yield_tool::YieldTool;
 
 use std::{
-	collections::HashMap,
+	collections::{BTreeMap, HashMap},
 	io::Write,
 	path::{Path, PathBuf},
 	sync::{
@@ -34,14 +37,10 @@ const MAX_BASH_OUTPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_BASH_TIMEOUT_SECS: f64 = 300.0;
 const MIN_BASH_TIMEOUT_SECS: f64 = 1.0;
 const MAX_BASH_TIMEOUT_SECS: f64 = 3600.0;
-/// Bytes returned by one `read` call.
-const MAX_READ_BYTES: usize = 256 * 1024;
 /// Bytes accepted by one `write` call.
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
 /// Bytes accepted by one `edit` call: the whole file is read and rewritten.
-const MAX_EDIT_BYTES: usize = 4 * 1024 * 1024;
-/// Characters of the search string echoed back in an `edit` error.
-const MAX_EDIT_PREVIEW_CHARS: usize = 120;
+pub(crate) const MAX_EDIT_BYTES: usize = 4 * 1024 * 1024;
 /// Default and maximum entries returned by `glob`.
 const DEFAULT_GLOB_LIMIT: usize = 200;
 const MAX_GLOB_LIMIT: usize = 200;
@@ -118,7 +117,7 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
 }
 
 /// Read at most `cap` bytes from a regular file.
-async fn read_capped(path: &Path, cap: usize) -> std::io::Result<(Vec<u8>, u64)> {
+pub(crate) async fn read_capped(path: &Path, cap: usize) -> std::io::Result<(Vec<u8>, u64)> {
 	let file = tokio::fs::File::open(path).await?;
 	let mut bytes = Vec::new();
 	file.take(cap as u64).read_to_end(&mut bytes).await?;
@@ -387,60 +386,6 @@ impl Tool for BashTool {
 	}
 }
 
-/// Builtin file reading tool.
-pub struct ReadTool;
-
-#[async_trait]
-impl Tool for ReadTool {
-	fn name(&self) -> &str {
-		"read"
-	}
-
-	fn description(&self) -> &str {
-		"Read the contents of a regular file"
-	}
-
-	fn schema(&self) -> Value {
-		serde_json::json!({
-			"type": "object",
-			"properties": {
-				"path": {
-					"type": "string",
-					"description": "Path to file to read"
-				}
-			},
-			"required": ["path"]
-		})
-	}
-
-	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
-		let path = args
-			.get("path")
-			.and_then(Value::as_str)
-			.ok_or_else(|| ToolError::InvalidArguments("missing 'path' parameter".to_string()))?;
-		let target = ctx.cwd.join(path);
-
-		let meta = match tokio::fs::metadata(&target).await {
-			Ok(meta) => meta,
-			Err(err) => {
-				return Ok(tool_result(format!("Failed to read {}: {err}", target.display()), true));
-			},
-		};
-		if !meta.is_file() {
-			return Ok(tool_result(format!("{} is not a regular file", target.display()), true));
-		}
-
-		let (bytes, size) = read_capped(&target, MAX_READ_BYTES)
-			.await
-			.map_err(|err| ToolError::ExecutionFailed(format!("{}: {err}", target.display())))?;
-		let mut content = String::from_utf8_lossy(&bytes).into_owned();
-		if size > bytes.len() as u64 {
-			content.push_str(&format!("\n[truncated at {} bytes of {size}]", bytes.len()));
-		}
-		Ok(tool_result(content, false))
-	}
-}
-
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Guard that removes a temporary file on drop unless disarmed.
@@ -584,18 +529,31 @@ fn create_exclusive_temp(
 	))
 }
 
+fn mode_permissions(mode: Option<u32>) -> Option<std::fs::Permissions> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		mode.map(std::fs::Permissions::from_mode)
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = mode;
+		None
+	}
+}
+
 fn write_atomic_sync(
 	real_target: &Path,
 	bytes: &[u8],
 	token: &CancellationToken,
 	commit_state: &Arc<Mutex<CommitState>>,
-	existing_permissions: Option<std::fs::Permissions>,
+	permissions: Option<std::fs::Permissions>,
 ) -> std::io::Result<()> {
 	if token.is_cancelled() {
 		return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
 	}
 
-	let (temp_path, mut temp_file) = create_exclusive_temp(real_target, &existing_permissions)?;
+	let (temp_path, mut temp_file) = create_exclusive_temp(real_target, &permissions)?;
 	let mut guard = TempFileGuard::new(temp_path.clone());
 
 	for chunk in bytes.chunks(64 * 1024) {
@@ -610,7 +568,7 @@ fn write_atomic_sync(
 		return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
 	}
 
-	if let Some(perms) = existing_permissions {
+	if let Some(perms) = permissions {
 		std::fs::set_permissions(&temp_path, perms)?;
 	}
 
@@ -627,7 +585,23 @@ fn write_atomic_sync(
 	Ok(())
 }
 
-async fn write_atomic(target: &Path, bytes: &[u8], token: &CancellationToken) -> std::io::Result<()> {
+pub(crate) async fn write_atomic(
+	target: &Path,
+	bytes: &[u8],
+	token: &CancellationToken,
+) -> std::io::Result<()> {
+	write_atomic_with_mode(target, bytes, token, None).await
+}
+
+/// Atomic write with an explicit file mode applied to the unpublished temp file
+/// before rename, so a mode-restricted result is never briefly world-readable.
+/// `None` keeps the destination's existing mode, or the platform default.
+pub(crate) async fn write_atomic_with_mode(
+	target: &Path,
+	bytes: &[u8],
+	token: &CancellationToken,
+	mode: Option<u32>,
+) -> std::io::Result<()> {
 	if token.is_cancelled() {
 		return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
 	}
@@ -647,7 +621,10 @@ async fn write_atomic(target: &Path, bytes: &[u8], token: &CancellationToken) ->
 		tokio::fs::create_dir_all(parent).await?;
 	}
 
-	let existing_permissions = tokio::fs::metadata(&real_target).await.ok().map(|m| m.permissions());
+	let effective_permissions = match mode_permissions(mode) {
+		Some(permissions) => Some(permissions),
+		None => tokio::fs::metadata(&real_target).await.ok().map(|m| m.permissions()),
+	};
 
 	let write_token = token.child_token();
 	let commit_state = Arc::new(Mutex::new(CommitState::default()));
@@ -661,7 +638,7 @@ async fn write_atomic(target: &Path, bytes: &[u8], token: &CancellationToken) ->
 			&bytes_vec,
 			&write_token,
 			&commit_state,
-			existing_permissions,
+			effective_permissions,
 		)
 	})
 	.await
@@ -746,8 +723,40 @@ impl Tool for WriteTool {
 	}
 }
 
-/// Builtin exact-match search/replace tool.
-pub struct EditTool;
+/// Builtin hashline `edit` tool: one line-anchored patch over one or more
+/// `[PATH#TAG]` sections.
+///
+/// `store` MUST be the same `Arc<SnapshotStore>` handed to the session's read
+/// sink: tags and seen-line provenance are per agent, never process-global.
+/// Named `CUT` registers persist for this tool instance only.
+pub struct EditTool {
+	store: Arc<hashline::SnapshotStore>,
+	registers: Mutex<BTreeMap<String, Vec<String>>>,
+	noop_guard: hashline::edit::NoopGuard,
+	options: Mutex<hashline::edit::EditToolOptions>,
+}
+
+impl EditTool {
+	pub fn new(store: Arc<hashline::SnapshotStore>) -> Self {
+		Self::with_options(store, hashline::edit::EditToolOptions::default())
+	}
+
+	/// Construct with explicit knobs (e.g. `enforce_seen_lines = false`).
+	pub fn with_options(store: Arc<hashline::SnapshotStore>, options: hashline::edit::EditToolOptions) -> Self {
+		Self {
+			store,
+			registers: Mutex::new(BTreeMap::new()),
+			noop_guard: Mutex::new(BTreeMap::new()),
+			options: Mutex::new(options),
+		}
+	}
+
+	/// Replace the behavioural knobs for later calls without dropping the
+	/// registers or the no-op guard this instance carries.
+	pub fn set_options(&self, options: hashline::edit::EditToolOptions) {
+		*self.options.lock().unwrap_or_else(|poison| poison.into_inner()) = options;
+	}
+}
 
 #[async_trait]
 impl Tool for EditTool {
@@ -756,31 +765,19 @@ impl Tool for EditTool {
 	}
 
 	fn description(&self) -> &str {
-		"Replace exact text in a file; the match must be unique unless replace_all is set"
+		"Apply hashline sections to existing files; anchors must carry the 4-hex snapshot tag from the latest read"
 	}
 
 	fn schema(&self) -> Value {
 		serde_json::json!({
 			"type": "object",
 			"properties": {
-				"path": {
+				"input": {
 					"type": "string",
-					"description": "Path to file to edit"
-				},
-				"old_string": {
-					"type": "string",
-					"description": "Exact text to replace"
-				},
-				"new_string": {
-					"type": "string",
-					"description": "Replacement text (empty string deletes the match)"
-				},
-				"replace_all": {
-					"type": "boolean",
-					"description": "Replace every occurrence instead of requiring a unique match"
+					"description": "One or more hashline sections: `[PATH#TAG]` headers followed by PUT/CUT/REM/MV ops. TAG is the 4-hex content-hash tag printed by the latest read/search/edit of that file. Line numbers index that tagged snapshot."
 				}
 			},
-			"required": ["path", "old_string", "new_string"]
+			"required": ["input"]
 		})
 	}
 
@@ -789,105 +786,9 @@ impl Tool for EditTool {
 	}
 
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
-		let path = args
-			.get("path")
-			.and_then(Value::as_str)
-			.ok_or_else(|| ToolError::InvalidArguments("missing 'path' parameter".to_string()))?;
-		let search = args
-			.get("old_string")
-			.and_then(Value::as_str)
-			.ok_or_else(|| {
-				ToolError::InvalidArguments("missing 'old_string' parameter".to_string())
-			})?;
-		if search.is_empty() {
-			return Err(ToolError::InvalidArguments("'old_string' must not be empty".to_string()));
-		}
-		let replacement = args
-			.get("new_string")
-			.and_then(Value::as_str)
-			.ok_or_else(|| {
-				ToolError::InvalidArguments("missing 'new_string' parameter".to_string())
-			})?;
-		let replace_all = args
-			.get("replace_all")
-			.and_then(Value::as_bool)
-			.unwrap_or(false);
-
-		let target = ctx.cwd.join(path);
-		let meta = match tokio::fs::metadata(&target).await {
-			Ok(meta) => meta,
-			Err(err) => {
-				return Ok(tool_result(format!("Failed to edit {}: {err}", target.display()), true));
-			},
-		};
-		if !meta.is_file() {
-			return Ok(tool_result(format!("{} is not a regular file", target.display()), true));
-		}
-		// The size decision is taken on the read result, never on an earlier
-		// `metadata` call: the file can grow in between, and rewriting a capped
-		// buffer would silently drop the tail. One limit, one code path.
-		let (bytes, size) = read_capped(&target, MAX_EDIT_BYTES)
-			.await
-			.map_err(|err| ToolError::ExecutionFailed(format!("{}: {err}", target.display())))?;
-		if size > bytes.len() as u64 {
-			return Ok(tool_result(
-				format!("{} is {size} bytes, the edit limit is {MAX_EDIT_BYTES}", target.display()),
-				true,
-			));
-		}
-		let content = String::from_utf8(bytes).map_err(|_| {
-			ToolError::ExecutionFailed(format!("{} is not valid UTF-8", target.display()))
-		})?;
-
-		let occurrences = content.matches(search).count();
-		if occurrences == 0 {
-			return Ok(tool_result(
-				format!("Not found in {}: \"{}\"", target.display(), preview(search)),
-				true,
-			));
-		}
-		if occurrences > 1 && !replace_all {
-			return Ok(tool_result(
-				format!(
-					"{} occurrences in {}; make the match unique or set replace_all",
-					occurrences,
-					target.display()
-				),
-				true,
-			));
-		}
-		if ctx.cancellation_token.is_cancelled() {
-			return Ok(tool_result(format!("Edit of {} cancelled", target.display()), true));
-		}
-
-		let (updated, replacements) = if replace_all {
-			(content.replace(search, replacement), occurrences)
-		} else {
-			(content.replacen(search, replacement, 1), 1)
-		};
-		match write_atomic(&target, updated.as_bytes(), &ctx.cancellation_token).await {
-			Ok(()) => Ok(tool_result(
-				format!("Replaced {replacements} occurrence(s) in {}", target.display()),
-				false,
-			)),
-			Err(err)
-				if err.kind() == std::io::ErrorKind::Interrupted
-					|| ctx.cancellation_token.is_cancelled() =>
-			{
-				Ok(tool_result(format!("Edit of {} cancelled", target.display()), true))
-			},
-			Err(err) => Ok(tool_result(format!("Failed to write {}: {err}", target.display()), true)),
-		}
+		let options = *self.options.lock().unwrap_or_else(|poison| poison.into_inner());
+		hashline::execute(self.store.as_ref(), &self.registers, &self.noop_guard, &options, args, ctx).await
 	}
-}
-
-/// Short, single-line echo of a search string for error messages.
-fn preview(text: &str) -> String {
-	text
-		.chars()
-		.take(MAX_EDIT_PREVIEW_CHARS)
-		.collect::<String>()
-		.replace('\n', "\\n")
 }
 
 fn normalize_path_like_input(input: &str) -> String {
@@ -1781,13 +1682,32 @@ impl Tool for GrepTool {
 	}
 }
 
+/// The hashline sink seam: one concrete store satisfies the read-side trait.
+impl ReadSnapshotSink for hashline::NativeSnapshotSink {
+	fn record_file(&self, absolute_path: &Path, full_text: &str) -> Option<String> {
+		hashline::NativeSnapshotSink::record_file(self, absolute_path, full_text)
+	}
+
+	fn record_seen_lines(&self, absolute_path: &Path, tag: &str, lines: &[u32]) {
+		hashline::NativeSnapshotSink::record_seen_lines(self, absolute_path, tag, lines);
+	}
+
+	fn header(&self, absolute_path: &Path, tag: &str, cwd: &Path) -> String {
+		hashline::NativeSnapshotSink::header(self, absolute_path, tag, cwd)
+	}
+}
+
 /// Tools registered by default.
 pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
+	// One snapshot store per registry; `read` mint tags here and `edit`
+	// validates against them.
+	let snapshots = Arc::new(hashline::SnapshotStore::new());
+	let sink = Arc::new(hashline::NativeSnapshotSink::new(snapshots.clone()));
 	vec![
 		Arc::new(BashTool),
-		Arc::new(ReadTool),
+		Arc::new(ReadTool::with_snapshot_sink(sink)),
 		Arc::new(WriteTool),
-		Arc::new(EditTool),
+		Arc::new(EditTool::new(snapshots)),
 		Arc::new(GlobTool),
 		Arc::new(GrepTool),
 		Arc::new(TodoTool::new()),

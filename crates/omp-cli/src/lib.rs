@@ -16,6 +16,7 @@ pub mod dirs;
 pub mod file_mentions;
 pub mod foreign_session;
 pub mod output;
+pub mod profile;
 pub mod prompts;
 pub mod repl;
 pub mod runtime;

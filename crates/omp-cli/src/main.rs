@@ -9,7 +9,7 @@ use clap::Parser;
 use omp_cli::{
 	Error, Result,
 	agent::{self, AgentRunner, RunRequest},
-	approve::{ApprovalMode, Approvals},
+	approve::Approvals,
 	args::{Cli, Command},
 	catalog::Catalog,
 	completions,
@@ -19,6 +19,7 @@ use omp_cli::{
 	file_mentions,
 	foreign_session::{self, ForeignSessionSource, ForeignSessionStore},
 	output::{self, OutputMode, Reporter, session_id},
+	profile,
 	prompts::{self, Prompts},
 	repl,
 	runtime::{self, PiAgentRunner},
@@ -80,7 +81,28 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> std::result::Result<(), CliError> {
-	let cli = Cli::parse();
+	// Bootstrap before clap (as `runCli` does before `parseArgs`): profile flags
+	// are cracked out of raw argv with the shared value-consumption contract so
+	// `--system-prompt --profile` stays literal and invalid OMP_PROFILE errors
+	// even for `--help`.
+	let bootstrap = profile::extract_cli_flags(std::env::args_os().collect())?;
+	let profile = profile::resolve_cli(bootstrap.profile.as_deref())?;
+	profile::activate(profile.as_deref());
+	let cli = Cli::parse_from(bootstrap.argv.iter().cloned());
+	if let Some(alias_name) = &bootstrap.alias {
+		let result = profile::install_alias(alias_name, profile.as_deref())?;
+		print!(
+			"Created {} for profile {} in {}\nRestart your shell or run: {}\nThen use: {} update, {} --version, or {}\n",
+			result.alias_name,
+			result.profile,
+			result.config_path.display(),
+			result.reloaded_with,
+			result.alias_name,
+			result.alias_name,
+			result.alias_name,
+		);
+		return Ok(());
+	}
 	// Completion commands run before the agent runtime, config, and sessions are
 	// loaded: generating a script or resolving candidates must never boot a
 	// session, read config, or touch the network.
@@ -101,16 +123,11 @@ fn run() -> std::result::Result<(), CliError> {
 		return Err(CliError::fail(agent::MISSING_RUNTIME));
 	};
 
-	let mut config = Config::load(&cli.config)?;
-	if let Some(tools) = &cli.tools {
-		let normalized: Vec<String> = tools
-			.iter()
-			.flat_map(|s| s.split(','))
-			.map(|s| s.trim().to_string())
-			.filter(|s| !s.is_empty())
-			.collect();
-		config.tools = Some(normalized);
-	}
+	// Project discovery (and relative overlays) use the effective run directory:
+	// an explicit `--cwd` first, else the base config `cwd`, else the process cwd.
+	let mut config = Config::load_run(&cli.config, cli.cwd.as_deref())?;
+	// Dedicated flags are the runtime override layer: they win over every file.
+	config.apply_runtime(&cli);
 	let cwd = resolve_cwd(cli.cwd.clone(), config.cwd.clone())?;
 	let processed_cli_files = if !cli.file_args.is_empty() {
 		process_cli_file_args(&cli.file_args, &cwd)?
@@ -160,21 +177,15 @@ fn run() -> std::result::Result<(), CliError> {
 		return Err(CliError::usage("--fork requires session persistence"));
 	}
 
-	let prompt_inputs = (cli.system_prompt.clone(), cli.append_system_prompt.clone());
+	let prompt_inputs = (config.system_prompt.clone(), config.append_system_prompt.clone());
 	let loaded_prompts =
 		prompts::resolve(prompt_inputs.0.as_deref(), prompt_inputs.1.as_deref(), &cwd)?;
 	let skills_filter = (cli.no_skills, cli.skills.clone());
 	let loaded_skills = skills::load(&cwd, skills_filter.0, &skills_filter.1)?;
 	let catalog = Arc::new(Catalog::load(&cwd)?);
 	let approvals = Approvals::new(
-		cli.approval_mode
-			.or_else(|| cli.yolo.then_some(ApprovalMode::Yolo))
-			.or(config.approval_mode)
-			.unwrap_or_default(),
-		cli.allow
-			.iter()
-			.cloned()
-			.chain(config.allow.iter().cloned()),
+		config.approval_mode.unwrap_or_default(),
+		config.allow.iter().cloned(),
 	);
 	let default_model = config.default_model.clone();
 	let requested_model = cli.model.clone();
@@ -409,8 +420,8 @@ fn run() -> std::result::Result<(), CliError> {
 	// provider route and prompt/tool shape are unchanged.
 	let explicit_cache_key = cli.prompt_cache_key.clone().filter(|key| !key.is_empty());
 	let cache_shape_changed = cli.model.is_some()
-		|| cli.system_prompt.is_some()
-		|| cli.append_system_prompt.is_some()
+		|| session.config.system_prompt.is_some()
+		|| session.config.append_system_prompt.is_some()
 		|| cli.tools.is_some()
 		|| cli.no_tools;
 	if let Some(key) = explicit_cache_key {

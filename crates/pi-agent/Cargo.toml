@@ -22,6 +22,9 @@ regex = { workspace = true }
 reqwest = { workspace = true }
 pi-shell = { workspace = true }
 pi-walker = { workspace = true }
+pi-ast = { workspace = true }
+xxhash-rust = { workspace = true }
+similar = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

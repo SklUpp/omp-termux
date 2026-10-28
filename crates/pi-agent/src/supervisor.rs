@@ -16,7 +16,9 @@ use crate::{
 	provider::ModelProvider,
 	state::ToolApprover,
 	tools::{
-		HubTool, TaskTool, YieldTool,
+		EditTool, HubTool, TaskTool, YieldTool,
+		hashline::{self, NativeSnapshotSink, SnapshotStore},
+		read::ReadTool,
 		registry::ToolRegistry,
 	},
 };
@@ -102,6 +104,9 @@ pub struct Supervisor {
 	limits: Mutex<DelegationLimits>,
 	allow_task: AtomicBool,
 	allow_hub: AtomicBool,
+	/// Options copied into each child's fresh `EditTool` (same knobs as the
+	/// parent run, but a fresh store/registers/guard).
+	edit_options: Mutex<hashline::edit::EditToolOptions>,
 	state: Mutex<SupervisorState>,
 	seq: AtomicU64,
 	/// Wakes `cancel_child` waiters whenever a child reaches a terminal status.
@@ -141,6 +146,7 @@ impl Supervisor {
 			limits: Mutex::new(limits),
 			allow_task: AtomicBool::new(allow_task),
 			allow_hub: AtomicBool::new(allow_hub),
+			edit_options: Mutex::new(hashline::edit::EditToolOptions::default()),
 			state: Mutex::new(SupervisorState {
 				records: HashMap::new(),
 				order: Vec::new(),
@@ -188,6 +194,11 @@ impl Supervisor {
 		self.child_approver.lock().unwrap().clone()
 	}
 
+	/// Mirror the parent run's `edit` options onto child `EditTool`s.
+	pub fn set_edit_options(&self, options: hashline::edit::EditToolOptions) {
+		*self.edit_options.lock().unwrap() = options;
+	}
+
 	pub fn task_enabled(&self) -> bool {
 		self.allow_task.load(Ordering::SeqCst)
 	}
@@ -210,6 +221,20 @@ impl Supervisor {
 
 	pub fn child_registry(self: &Arc<Self>, depth: i32, owner: Option<&str>) -> ToolRegistry {
 		let mut reg = self.template.lock().unwrap().clone();
+		// `read`/`edit` are session-scoped: a child gets its own snapshot store,
+		// `CUT` registers, and no-op guard. Rebinding keeps the parent's tool
+		// whitelist and edit options, but never its read provenance.
+		let snapshots = Arc::new(SnapshotStore::new());
+		if reg.get("read").is_some() {
+			let sink = Arc::new(NativeSnapshotSink::new(snapshots.clone()));
+			reg.remove("read");
+			reg.register(Arc::new(ReadTool::with_snapshot_sink(sink)));
+		}
+		if reg.get("edit").is_some() {
+			let options = *self.edit_options.lock().unwrap();
+			reg.remove("edit");
+			reg.register(Arc::new(EditTool::with_options(snapshots, options)));
+		}
 		// `todo` is parent-owned: the template shares one live `Arc<TodoTool>`
 		// instance, and child events/session details are not persisted. Dropping
 		// it here prevents descendants from mutating the parent list.

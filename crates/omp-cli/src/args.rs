@@ -43,6 +43,14 @@ struct RawCli {
 	#[arg(long, value_name = "DIR")]
 	cwd: Option<PathBuf>,
 
+	/// Isolated profile for auth, sessions, settings, and caches.
+	#[arg(long, value_name = "NAME")]
+	profile: Option<String>,
+
+	/// Create a shell shortcut for the selected profile and exit.
+	#[arg(long, value_name = "NAME")]
+	alias: Option<String>,
+
 	/// Model id (`provider/model` or bare id).
 	#[arg(long)]
 	model: Option<String>,
@@ -150,6 +158,10 @@ struct RawCli {
 	#[arg(long, value_delimiter = ',', value_name = "GLOB")]
 	skills: Vec<String>,
 
+	/// Internal marker inserted by the profile bootstrap; never user-facing.
+	#[arg(long = "omp-profile-boundary", hide = true)]
+	profile_boundary: bool,
+
 	#[command(subcommand)]
 	command: Option<Command>,
 }
@@ -170,6 +182,12 @@ pub struct Cli {
 
 	/// Working directory for the session.
 	pub cwd: Option<PathBuf>,
+
+	/// Isolated profile for auth, sessions, settings, and caches.
+	pub profile: Option<String>,
+
+	/// Create a shell shortcut for the selected profile and exit.
+	pub alias: Option<String>,
 
 	/// Model id (`provider/model` or bare id).
 	pub model: Option<String>,
@@ -266,6 +284,7 @@ pub fn parse_file_arg(token: &str) -> String {
 
 impl Cli {
 	fn from_raw(raw: RawCli) -> Self {
+		let _ = raw.profile_boundary;
 		let mut prompt = Vec::new();
 		let mut file_args = Vec::new();
 
@@ -287,6 +306,8 @@ impl Cli {
 			print: raw.print,
 			mode: raw.mode,
 			cwd: raw.cwd,
+			profile: raw.profile,
+			alias: raw.alias,
 			model: raw.model,
 			provider: raw.provider,
 			api_key: raw.api_key,
@@ -565,6 +586,23 @@ mod tests {
 		assert_eq!(cli.config, [PathBuf::from("a.yml"), PathBuf::from("b.yml")]);
 		assert!(cli.no_skills);
 		assert_eq!(cli.prompt, ["hello"]);
+	}
+
+	#[test]
+	fn profile_and_alias_flags_parse() {
+		let cli = parse(&["omp", "--profile", "work", "--alias", "wk", "hello"]);
+		assert_eq!(cli.profile.as_deref(), Some("work"));
+		assert_eq!(cli.alias.as_deref(), Some("wk"));
+		assert_eq!(cli.prompt, ["hello"]);
+		assert!(Cli::try_parse_from(["omp", "--profile"]).is_err());
+		assert!(Cli::try_parse_from(["omp", "--alias"]).is_err());
+	}
+
+	#[test]
+	fn bootstrap_boundary_keeps_the_next_token_positional() {
+		let cli = parse(&["omp", "--resume", "--omp-profile-boundary", "work"]);
+		assert_eq!(cli.resume.as_deref(), Some(""));
+		assert_eq!(cli.prompt, ["work"]);
 	}
 
 	#[test]
