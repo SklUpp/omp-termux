@@ -682,7 +682,7 @@ async fn test_t5_hub_jobs_snapshot_after_child_completion() {
 
 	// Unsupported hub ops are explicitly rejected, not silently ignored.
 	let unsupported = hub
-		.execute(&json!({ "op": "send", "to": "Main", "message": "hi" }), &ctx)
+		.execute(&json!({ "op": "ps" }), &ctx)
 		.await
 		.expect("unsupported op result");
 	assert!(unsupported.is_error);

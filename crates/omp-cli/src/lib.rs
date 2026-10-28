@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod approve;
 pub mod args;
+pub mod ask;
 pub mod catalog;
 pub mod completions;
 pub mod config;

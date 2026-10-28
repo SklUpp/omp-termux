@@ -86,6 +86,67 @@ impl EditConfig {
 	}
 }
 
+/// `async` settings group consumed by the headless runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AsyncConfig {
+	/// `async.enabled`; absent means [`Self::DEFAULT_ENABLED`] (upstream
+	/// settings-schema default `true`).
+	pub enabled: Option<bool>,
+}
+
+impl AsyncConfig {
+	/// Upstream `async.enabled` default. A explicit `false` disables background
+	/// task execution; the headless runtime still runs `task` synchronously.
+	pub const DEFAULT_ENABLED: bool = true;
+
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(Self::DEFAULT_ENABLED)
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+	}
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AskConfig {
+	/// `ask.enabled`; absent means the upstream default (`true`).
+	pub enabled: Option<bool>,
+	/// `ask.timeout` in milliseconds; absent or `0` disables the timeout.
+	/// Legacy settings values above 1000 were milliseconds and are converted to
+	/// seconds before mapping here, matching the TypeScript migration.
+	pub timeout_ms: Option<u64>,
+}
+
+impl AskConfig {
+	pub const DEFAULT_ENABLED: bool = true;
+
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(Self::DEFAULT_ENABLED)
+	}
+
+	#[must_use]
+	pub fn timeout(&self) -> Option<std::time::Duration> {
+		self
+			.timeout_ms
+			.filter(|millis| *millis > 0)
+			.map(std::time::Duration::from_millis)
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+		if overlay.timeout_ms.is_some() {
+			self.timeout_ms = overlay.timeout_ms;
+		}
+	}
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
 	pub default_model:        Option<String>,
@@ -97,6 +158,8 @@ pub struct Config {
 	pub cwd:                  Option<PathBuf>,
 	pub tools:                Option<Vec<String>>,
 	pub edit:                 EditConfig,
+	pub async_config:         AsyncConfig,
+	pub ask:                  AskConfig,
 	/// Paths that contributed, base first.
 	pub sources:              Vec<PathBuf>,
 }
@@ -122,6 +185,8 @@ impl Config {
 			self.tools = overlay.tools;
 		}
 		self.edit.merge(overlay.edit);
+		self.async_config.merge(overlay.async_config);
+		self.ask.merge(overlay.ask);
 		if !overlay.allow.is_empty() {
 			self.allow = overlay.allow;
 		}
@@ -367,7 +432,46 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	{
 		config.edit.enforce_seen_lines = expect_bool(enforce, "edit.enforceSeenLines", path)?;
 	}
+	if let Some(enabled) = value.get("async").and_then(|async_settings| async_settings.get("enabled"))
+	{
+		config.async_config.enabled = expect_bool(enabled, "async.enabled", path)?;
+	}
+	if let Some(ask) = value.get("ask") {
+		if let Some(enabled) = ask.get("enabled") {
+			config.ask.enabled = expect_bool(enabled, "ask.enabled", path)?;
+		}
+		if let Some(timeout) = ask.get("timeout") {
+			config.ask.timeout_ms = parse_ask_timeout(timeout, "ask.timeout", path)?;
+		}
+	}
 	Ok(())
+}
+
+/// `ask.timeout` is seconds; legacy values above 1000 are migrated from
+/// milliseconds. `0` disables the timeout.
+fn parse_ask_timeout(value: &Value, key: &str, path: &Path) -> Result<Option<u64>> {
+	let seconds = match value {
+		Value::Null => return Ok(None),
+		Value::Int(value) => {
+			if *value < 0 {
+				return Err(invalid(path, key, "expected a non-negative number of seconds"));
+			}
+			if *value > 1000 {
+				(*value as f64 / 1000.0).round()
+			} else {
+				*value as f64
+			}
+		},
+		Value::Float(value) => {
+			if !value.is_finite() || *value < 0.0 {
+				return Err(invalid(path, key, "expected a non-negative number of seconds"));
+			}
+			if *value > 1000.0 { *value / 1000.0 } else { *value }
+		},
+		_ => return Err(invalid(path, key, "expected a number of seconds")),
+	};
+	let millis = (seconds * 1000.0).round() as u64;
+	Ok(Some(millis))
 }
 
 fn parse_approval(value: &Value, key: &str, path: &Path) -> Result<Option<ApprovalMode>> {
@@ -1057,6 +1161,33 @@ mod tests {
 	}
 
 	#[test]
+	fn ask_settings_parse_seconds_and_migrate_legacy_milliseconds() {
+		let config = parse_config("ask:\n  enabled: false\n  timeout: 15\n").expect("ask");
+		assert!(!config.ask.enabled());
+		assert_eq!(config.ask.timeout(), Some(std::time::Duration::from_secs(15)));
+
+		let legacy = parse_config("ask:\n  timeout: 1500\n").expect("legacy timeout");
+		assert_eq!(legacy.ask.timeout(), Some(std::time::Duration::from_secs(2)));
+
+		let disabled = parse_config("ask:\n  timeout: 0\n").expect("disabled");
+		assert_eq!(disabled.ask.timeout_ms, Some(0));
+		assert_eq!(disabled.ask.timeout(), None);
+		assert!(disabled.ask.enabled());
+
+		let boundary = parse_config("ask:\n  timeout: 1000\n").expect("boundary");
+		assert_eq!(boundary.ask.timeout(), Some(std::time::Duration::from_secs(1000)));
+
+		assert!(parse_config("ask:\n  timeout: -1\n").is_err());
+		assert!(parse_config("ask:\n  timeout: soon\n").is_err());
+		assert!(parse_config("ask:\n  enabled: maybe\n").is_err());
+
+		let mut base = parse_config("ask:\n  timeout: 30\n").expect("base");
+		let overlay = parse_config("ask:\n  timeout: 0\n").expect("overlay");
+		base.merge(overlay);
+		assert_eq!(base.ask.timeout(), None, "explicit 0 must disable a lower layer");
+	}
+
+	#[test]
 	fn later_overlay_wins_per_scalar_and_per_provider_field() {
 		let mut base = parse_config(
 			"defaultModel: a\nproviders:\n  openai:\n    baseUrl: https://one\n    apiKey: \
@@ -1164,6 +1295,26 @@ mod tests {
 		layered_on.merge(parse_config("edit:\n  enforceSeenLines: true\n").expect("overlay"));
 		assert!(layered_on.edit.enforce_seen_lines());
 		assert!(parse_config("edit:\n  enforceSeenLines: nope\n").is_err());
+	}
+
+	#[test]
+	fn async_enabled_defaults_true_and_explicit_false_wins() {
+		let default = parse_config("").expect("default");
+		assert_eq!(default.async_config.enabled, None);
+		assert!(default.async_config.enabled());
+
+		let explicit_false =
+			parse_config("async:\n  enabled: false\n").expect("explicit false");
+		assert_eq!(explicit_false.async_config.enabled, Some(false));
+		assert!(!explicit_false.async_config.enabled());
+
+		let explicit_true = parse_config("async:\n  enabled: true\n").expect("explicit true");
+		assert!(explicit_true.async_config.enabled());
+
+		let mut layered = parse_config("async:\n  enabled: true\n").expect("base");
+		layered.merge(parse_config("async:\n  enabled: false\n").expect("overlay"));
+		assert!(!layered.async_config.enabled());
+		assert!(parse_config("async:\n  enabled: nope\n").is_err());
 	}
 
 	#[test]

@@ -552,15 +552,26 @@ fn run_repl<W: Write, E: Write>(
 	mode: OutputMode,
 	reporter: &mut Reporter<W, E>,
 ) -> Result<()> {
-	let stdin = io::stdin();
-	let mut input = stdin.lock();
+	// The turn needs stdin for approvals and `ask`; the REPL locks only while
+	// reading its own prompt line.
+	if io::stdin().is_terminal() && io::stderr().is_terminal() {
+		session
+			.approvals
+			.set_ask(Some(omp_cli::ask::terminal_channel(session.config.ask.timeout())));
+	} else {
+		session.approvals.set_ask(None);
+	}
 	let mut line = String::new();
 	loop {
 		eprint!("> ");
 		io::stderr().flush()?;
 		line.clear();
-		if input.read_line(&mut line)? == 0 {
-			break;
+		{
+			let stdin = io::stdin();
+			let mut input = stdin.lock();
+			if input.read_line(&mut line)? == 0 {
+				break;
+			}
 		}
 		let Some(command) = repl::parse(&line) else {
 			continue;
@@ -585,6 +596,10 @@ fn run_repl<W: Write, E: Write>(
 					eprintln!("{error}");
 					continue;
 				}
+				// Text mode buffers the final assistant message until `finish`:
+				// flush it per turn so REPL output is visible immediately instead
+				// of only when `/exit` ends the session.
+				reporter.finish()?;
 			},
 		}
 	}

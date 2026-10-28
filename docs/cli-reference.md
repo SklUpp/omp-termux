@@ -135,6 +135,8 @@ See [providers](./providers.md) and [models](./models.md) for model resolution.
 | `--advisor` | Enable the advisor runtime (passively reviews each turn and injects notes). See [advisor / watchdog](./advisor-watchdog.md). |
 | `--max-time <duration>` | Stop the session after this duration (e.g. `600`, `10m`, `1h`). |
 
+> **Native Rust CLI:** `ask` is offered only in an interactive REPL with terminal stdin and `ask.enabled` (default `true`); `task`/`hub` are offered when delegation is allowed. Ordinary `task` spawns run in the background by default (`async.enabled: true`); set it to `false` for blocking batches. `hub` supports messaging plus `jobs`/`wait`/`cancel` only — process launch ops are not implemented.
+
 #### Extensions, hooks, skills, and rules
 
 | Flag | Description |

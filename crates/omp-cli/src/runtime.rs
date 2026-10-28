@@ -14,7 +14,7 @@ use std::{
 
 use async_trait::async_trait;
 use pi_agent::{
-	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, BashTool, DelegationLimits,
+	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, AskTool, BashTool, DelegationLimits,
 	EditTool, GlobTool, GrepTool, ModelProvider, OpenAiCompatibleProvider, ReadTool,
 	SteeringEvent, Supervisor, TodoTool, Tool, ToolApprover, ToolRegistry, WriteTool,
 	mcp::{
@@ -40,7 +40,7 @@ pub const DEFAULT_CONTEXT_LIMIT: usize = 32_768;
 /// `pi-agent` has no approval hook, so the registry *is* the approval gate:
 /// a tool is offered to the model only when the approval matrix would
 /// auto-approve it.
-pub const BUILTIN_TOOLS: [(&str, bool); 7] = [
+pub const BUILTIN_TOOLS: [(&str, bool); 8] = [
 	("read", true),
 	("glob", true),
 	("grep", true),
@@ -48,6 +48,7 @@ pub const BUILTIN_TOOLS: [(&str, bool); 7] = [
 	("edit", false),
 	("bash", false),
 	("todo", false),
+	("ask", true),
 ];
 
 /// Delegation tools assembled around a [`Supervisor`] rather than built from
@@ -99,6 +100,22 @@ impl PiAgentRunner {
 		let session = Arc::clone(slot.get_or_insert_with(|| Arc::new(RunnerSession::new(options))));
 		session.edit.set_options(options);
 		session
+	}
+}
+
+impl Drop for PiAgentRunner {
+	fn drop(&mut self) {
+		// Background jobs hold `Arc<Supervisor>`, so the supervisor's own Drop
+		// cannot fire while they run. Shut it down here, before the `runtime`
+		// field is dropped, so queued reservations are cancelled and live child
+		// tasks get their cancellation token plus abort handle.
+		let slot = match self.supervisor.get_mut() {
+			Ok(slot) => slot,
+			Err(poisoned) => poisoned.into_inner(),
+		};
+		if let Some(supervisor) = slot.take() {
+			supervisor.shutdown();
+		}
 	}
 }
 
@@ -235,8 +252,16 @@ impl AgentRunner for PiAgentRunner {
 			enforce_seen_lines: request.config.edit.enforce_seen_lines(),
 		};
 		let session = self.session_tools(edit_options);
+		// `ask` needs the root context's UI: register it after the supervisor has
+		// cloned its child template, so children never receive the tool.
+		let build_tools: Vec<&'static str> = plan
+			.tools
+			.iter()
+			.copied()
+			.filter(|tool| *tool != "ask")
+			.collect();
 		let base_registry = build_registry_full(
-			&plan.tools,
+			&build_tools,
 			mcp_spawn.tools,
 			mcp_spawn.server_errors,
 			mcp_spawn.all_server_names,
@@ -316,8 +341,13 @@ impl AgentRunner for PiAgentRunner {
 			cwd,
 		};
 		let provider: Arc<dyn ModelProvider> = Arc::new(provider);
+		// Children never prompt: keep the interactive `ask` surface on the root
+		// approver only.
+		let child_approvals: Arc<dyn ToolApprover> = Arc::new(approvals.without_ask());
 		let approvals: Arc<dyn ToolApprover> = Arc::new(approvals);
-		let registry = if allow_task || allow_hub {
+		let mut root_supervisor: Option<Arc<Supervisor>> = None;
+		let mut root_sink = None;
+		let mut registry = if allow_task || allow_hub {
 			let mut slot = self.supervisor.lock().map_err(|_| {
 				Error::new("delegation supervisor lock poisoned")
 			})?;
@@ -326,7 +356,7 @@ impl AgentRunner for PiAgentRunner {
 					supervisor.rebind(
 						base_registry,
 						provider.clone(),
-						Some(approvals.clone()),
+						Some(child_approvals.clone()),
 						DelegationLimits::default(),
 						allow_task,
 						allow_hub,
@@ -337,7 +367,7 @@ impl AgentRunner for PiAgentRunner {
 					let supervisor = Supervisor::with_selection(
 						base_registry,
 						provider.clone(),
-						Some(approvals.clone()),
+						Some(child_approvals.clone()),
 						DelegationLimits::default(),
 						allow_task,
 						allow_hub,
@@ -347,11 +377,23 @@ impl AgentRunner for PiAgentRunner {
 				},
 			};
 			supervisor.set_edit_options(edit_options);
+			supervisor.set_async_enabled(request.config.async_config.enabled());
+			root_sink = Some(supervisor.owner_results_sink(None));
+			root_supervisor = Some(Arc::clone(&supervisor));
 			supervisor.root_registry()
 		} else {
 			base_registry
 		};
+		if plan.tools.contains(&"ask") {
+			registry.register(Arc::new(AskTool::new()));
+		}
 		let agent = AgentLoop::with_approver(config, provider, registry, approvals);
+		let agent = match (root_supervisor, root_sink) {
+			(Some(supervisor), Some(sink)) => agent
+				.with_background_results(sink)
+				.with_peer_inbox(supervisor.mailbox(), pi_agent::mailbox::MAIN_AGENT_ID),
+			_ => agent,
+		};
 		let mut state = AgentState { messages, total_turns: 0 };
 
 		let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<Event>>(64);
@@ -828,12 +870,21 @@ fn allowed_tools(request: &RunRequest, _has_mcp_tools: bool) -> Result<Vec<&'sta
 	if !request.tools_enabled {
 		return Ok(Vec::new());
 	}
+	let ask_available = request.config.ask.enabled() && request.approvals.ask_channel().is_some();
 	let mut tools: Vec<&'static str> = BUILTIN_TOOLS
 		.iter()
 		.map(|(name, _)| *name)
 		.collect();
 	if let Some(allowed) = &request.config.tools {
 		tools.retain(|name| allowed.iter().any(|a| a == *name));
+		if allowed.iter().any(|tool| tool == "ask") && !ask_available {
+			return Err(Error::new(
+				"tool `ask` requires interactive stdin/stdout and ask.enabled",
+			));
+		}
+	}
+	if !ask_available {
+		tools.retain(|name| *name != "ask");
 	}
 	tools.sort_unstable();
 	Ok(tools)
@@ -898,6 +949,7 @@ fn build_registry_full(
 			},
 			"bash" => Arc::new(BashTool),
 			"todo" => Arc::new(TodoTool::restored(todo_phases.clone(), session_persisted)),
+			"ask" => Arc::new(AskTool::new()),
 			other => {
 				return Err(Error::new(format!(
 					"unknown builtin tool `{other}`: BUILTIN_TOOLS and build_registry drifted"
@@ -1361,7 +1413,7 @@ pub fn is_stdio_mcp_launch_allowed_with_servers(
 }
 
 #[cfg(unix)]
-fn poll_stdin_readable(timeout_ms: i32) -> bool {
+pub(crate) fn poll_stdin_readable(timeout_ms: i32) -> bool {
 	#[repr(C)]
 	struct PollFd {
 		fd: std::os::raw::c_int,
@@ -1382,13 +1434,34 @@ fn poll_stdin_readable(timeout_ms: i32) -> bool {
 }
 
 #[cfg(unix)]
-fn read_stdin_byte() -> Option<u8> {
+pub(crate) fn read_stdin_byte() -> Option<u8> {
 	unsafe extern "C" {
 		fn read(fd: std::os::raw::c_int, buf: *mut std::os::raw::c_void, count: usize) -> isize;
 	}
 	let mut b = 0u8;
 	let ret = unsafe { read(0, &mut b as *mut u8 as *mut std::os::raw::c_void, 1) };
 	if ret == 1 { Some(b) } else { None }
+}
+
+/// Discard unread terminal input, including a partial canonical line that the
+/// user typed but never submitted. Only a TTY is flushed: headless/piped stdin
+/// may belong to the next consumer and must never be drained here.
+#[cfg(unix)]
+pub(crate) fn flush_tty_stdin() {
+	use std::io::IsTerminal;
+	if !std::io::stdin().is_terminal() {
+		return;
+	}
+	const TCIFLUSH: std::os::raw::c_int = 0;
+	unsafe extern "C" {
+		fn tcflush(
+			fd: std::os::raw::c_int,
+			queue_selector: std::os::raw::c_int,
+		) -> std::os::raw::c_int;
+	}
+	unsafe {
+		tcflush(0, TCIFLUSH);
+	}
 }
 
 async fn check_or_prompt_stdio_mcp_launch(
@@ -2082,6 +2155,29 @@ mod tests {
 		req.config.tools = Some(vec!["bash".to_string()]);
 		let plan = RunPlan::resolve(&req).expect("plan");
 		assert_eq!(plan.tools, ["bash"]);
+	}
+
+	#[test]
+	fn ask_tool_is_offered_only_with_an_interactive_channel() {
+		let mut request = request(yolo());
+		assert!(!RunPlan::resolve(&request).expect("headless").tools.contains(&"ask"));
+
+		request
+			.approvals
+			.set_ask(Some(crate::ask::terminal_channel(None)));
+		let plan = RunPlan::resolve(&request).expect("interactive");
+		assert!(plan.tools.contains(&"ask"), "{:?}", plan.tools);
+
+		request.config.ask.enabled = Some(false);
+		let plan = RunPlan::resolve(&request).expect("disabled");
+		assert!(!plan.tools.contains(&"ask"));
+
+		request.config.tools = Some(vec!["ask".to_string()]);
+		let err = match RunPlan::resolve(&request) {
+			Ok(_) => panic!("explicit headless ask must fail"),
+			Err(err) => err,
+		};
+		assert!(err.to_string().contains("requires interactive"));
 	}
 
 	#[test]
@@ -3322,6 +3418,10 @@ mod tests {
 
 		let mut req = request(yolo());
 		req.cwd = std::env::temp_dir();
+		// This test pins the synchronous delegation contract (inline `task`
+		// results); background delivery is covered by pi-agent's
+		// `async_coordination` suite.
+		req.config.async_config.enabled = Some(false);
 		req.config.providers.insert("local".to_string(), ProviderConfig {
 			base_url: Some(format!("http://{addr}/v1")),
 			api_key: Some("sk-test".to_string()),

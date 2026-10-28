@@ -24,6 +24,16 @@
   - `packages/coding-agent/src/sdk.ts` — child-session router/tool wiring and per-subagent `AgentOutputManager`.
   - `docs/task-agent-discovery.md` — deeper discovery and precedence notes.
 
+### Native Rust CLI
+
+`crates/pi-agent/src/tools/task.rs` implements one-item and `tasks[]` batches over a fixed `task` child session:
+
+- Wire fields: `task`, `name` (`[A-Za-z0-9_-]+`), `agent` (only `"task"`), `context`, and `tasks[]`. `outputSchema`, `schemaMode`, `effort`, and `isolated` are rejected as unsupported. There is no agent discovery or catalog: an `agent` value other than `task` fails with a clear error instead of loading a file.
+- With `async.enabled` (default `true`) and a root result sink, ordinary calls reserve real supervisor ids and return a receipt (`details.async = { state: "running", jobId }`). Results auto-deliver exactly once at the next agent-loop turn boundary, or are consumed by a settled `hub jobs`/`hub wait` snapshot. Delivery cannot interrupt a provider request that is still streaming; it waits for the boundary. With `async.enabled=false`, the call runs inline and returns the full `details.results` batch.
+- Concurrency is one semaphore per `TaskTool` instance: the root session reuses one across REPL turns and each child registry creates its own, so a parent holding a permit while descendants spawn cannot deadlock. The built-in limits are depth 2 and 32 concurrent spawns per session; they are not configurable in this build.
+- Admission is explicitly bounded: at most 64 outstanding results (running + undelivered) are admitted, and a batch larger than the remaining capacity is rejected before any record is allocated or child spawned. Result bodies are capped at 64 KiB with an honest `[truncated: N bytes total]` marker; queued undelivered text additionally has an aggregate byte cap and is never silently evicted or reserialized.
+- Caller or `hub cancel` cancellation cascades into child loops; reserved jobs settle as aborted and release their slot when no body is queued. A background child that panics is settled as aborted by an RAII guard and releases its slot, so a crash cannot strand a `Running` record. There is no isolation/worktree mode, parked-agent revival, or custom-agent runtime.
+
 ## Inputs
 
 The wire schema is shape-swapped by `task.batch` (default on). One unit of work is the task item `{ name?, agent?, task, effort?, outputSchema?, schemaMode?, isolated? }`. `isolated` exists only when `task.isolation.mode` is not `none` **and plan mode is disabled**; `effort` exists only when `task.enableEffort=true` (default off).

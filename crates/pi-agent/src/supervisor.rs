@@ -1,5 +1,5 @@
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet, VecDeque},
 	sync::{
 		Arc, Mutex,
 		atomic::{AtomicBool, AtomicU64, Ordering},
@@ -8,20 +8,104 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
 	loop_module::SteeringEvent,
+	mailbox::Mailbox,
 	provider::ModelProvider,
 	state::ToolApprover,
 	tools::{
-		EditTool, HubTool, TaskTool, YieldTool,
+		EditTool, HubTool, TaskTool, ThinkTool, YieldTool,
 		hashline::{self, NativeSnapshotSink, SnapshotStore},
 		read::ReadTool,
 		registry::ToolRegistry,
 	},
 };
+
+/// Settled job records stay inspectable for five minutes (TypeScript
+/// `DEFAULT_RETENTION_MS`), with a hard count cap so a long-lived REPL session
+/// cannot grow memory without bound.
+const RECORD_RETENTION_MS: u64 = 5 * 60 * 1000;
+const MAX_SETTLED_RECORDS: usize = 100;
+
+/// Outstanding results (running + undelivered) admitted by `reserve_child`.
+/// Admission fails explicitly at the cap instead of growing an unbounded
+/// backlog of promised bodies while the root provider call is blocked.
+pub const MAX_OUTSTANDING_RESULTS: usize = 64;
+/// Per-result body cap; mirrors the existing bash output budget.
+pub const MAX_RESULT_BYTES: usize = 64 * 1024;
+/// Aggregate cap for queued (undelivered) result text. Slot and per-body caps
+/// keep the realistic maximum below this; the check is a defensive bound.
+pub const MAX_PENDING_RESULT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Cap a result body on a UTF-8 boundary and mark it honestly.
+pub fn cap_result_text(text: &str) -> (String, bool) {
+	if text.len() <= MAX_RESULT_BYTES {
+		return (text.to_string(), false);
+	}
+	let marker = format!("\n[truncated: {} bytes total]", text.len());
+	let mut end = MAX_RESULT_BYTES.saturating_sub(marker.len());
+	while end > 0 && !text.is_char_boundary(end) {
+		end -= 1;
+	}
+	(format!("{}{}", &text[..end], marker), true)
+}
+
+fn truncate_to_bytes(text: &str, max_bytes: usize) -> String {
+	if text.len() <= max_bytes {
+		return text.to_string();
+	}
+	let marker = format!("\n[truncated: {} bytes total]", text.len());
+	// Never grow past the caller's budget: if even the marker cannot fit, the
+	// only honest representation is an empty body (the aggregate bound is
+	// defensive; slot and per-body caps keep it unreachable in practice).
+	if marker.len() >= max_bytes {
+		// Signal truncation without exceeding the remaining budget.
+		return marker[..max_bytes].to_string();
+	}
+	let mut end = max_bytes - marker.len();
+	while end > 0 && !text.is_char_boundary(end) {
+		end -= 1;
+	}
+	format!("{}{}", &text[..end], marker)
+}
+
+fn now_ms() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|duration| duration.as_millis() as u64)
+		.unwrap_or(0)
+}
+
+/// Pull-based delivery of finished background results into an agent loop.
+///
+/// The loop calls [`take_background_results`] at a turn boundary; removal and
+/// return happen under the supervisor lock, so a result is delivered exactly
+/// once even when several callers race.
+pub trait BackgroundResultSink: Send + Sync {
+	fn take_background_results(&self) -> Vec<String>;
+}
+
+/// One undelivered background result, scoped to the agent that spawned it.
+#[derive(Clone)]
+struct PendingDelivery {
+	id: String,
+	owner: Option<String>,
+	text: String,
+}
+
+struct OwnerResultSink {
+	supervisor: Arc<Supervisor>,
+	owner: Option<String>,
+}
+
+impl BackgroundResultSink for OwnerResultSink {
+	fn take_background_results(&self) -> Vec<String> {
+		self.supervisor.take_results_for(self.owner.as_deref())
+	}
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegationLimits {
@@ -93,6 +177,16 @@ struct SupervisorState {
 	/// Cancellation tokens for children that are reserved but still waiting for
 	/// a concurrency permit. Cancelling one prevents the child from starting.
 	reservations: HashMap<String, CancellationToken>,
+	/// Background results not yet handed to their owner or a hub snapshot.
+	pending: VecDeque<PendingDelivery>,
+	/// Jobs whose result was already delivered or recovered by a snapshot.
+	consumed: HashSet<String>,
+	/// Wall-clock settlement time, used by bounded record retention.
+	settled_at: HashMap<String, u64>,
+	/// Results admitted but not yet consumed (running or pending delivery).
+	outstanding: HashSet<String>,
+	/// Bytes held by queued undelivered result text.
+	pending_bytes: usize,
 }
 
 pub struct Supervisor {
@@ -104,12 +198,27 @@ pub struct Supervisor {
 	limits: Mutex<DelegationLimits>,
 	allow_task: AtomicBool,
 	allow_hub: AtomicBool,
+	/// `async.enabled` equivalent: background spawns are allowed by default.
+	async_enabled: AtomicBool,
+	/// Set once a result sink is registered. Without a sink a background
+	/// result has nowhere to go, so the task tool falls back to synchronous
+	/// execution (same fallback the TypeScript manager logs when it is absent).
+	result_sink_attached: AtomicBool,
+	/// Root session spawn permits, shared by every root `TaskTool` instance so
+	/// the `task.maxConcurrency` bound survives REPL turns. Each child registry
+	/// creates its own semaphore, matching the TypeScript one-per-session
+	/// `TaskTool`; a supervisor-wide semaphore would deadlock nested spawns
+	/// while a parent holds a permit across its descendants.
+	root_permits: Arc<Semaphore>,
+	/// Peer mailboxes; supervisor-owned so they survive REPL turns.
+	mailbox: Arc<Mailbox>,
 	/// Options copied into each child's fresh `EditTool` (same knobs as the
 	/// parent run, but a fresh store/registers/guard).
 	edit_options: Mutex<hashline::edit::EditToolOptions>,
 	state: Mutex<SupervisorState>,
 	seq: AtomicU64,
-	/// Wakes `cancel_child` waiters whenever a child reaches a terminal status.
+	/// Wakes `cancel_child`, `hub jobs`, and `hub wait` waiters whenever a child
+	/// reaches a terminal status or a delivery is consumed.
 	settle: Notify,
 }
 
@@ -139,6 +248,11 @@ impl Supervisor {
 		allow_task: bool,
 		allow_hub: bool,
 	) -> Arc<Self> {
+		let permits = if limits.max_concurrency == 0 {
+			Semaphore::MAX_PERMITS
+		} else {
+			limits.max_concurrency
+		};
 		Arc::new(Self {
 			template: Mutex::new(template),
 			provider: Mutex::new(provider),
@@ -146,12 +260,21 @@ impl Supervisor {
 			limits: Mutex::new(limits),
 			allow_task: AtomicBool::new(allow_task),
 			allow_hub: AtomicBool::new(allow_hub),
+			async_enabled: AtomicBool::new(true),
+			result_sink_attached: AtomicBool::new(false),
+			root_permits: Arc::new(Semaphore::new(permits)),
+			mailbox: Arc::new(Mailbox::default()),
 			edit_options: Mutex::new(hashline::edit::EditToolOptions::default()),
 			state: Mutex::new(SupervisorState {
 				records: HashMap::new(),
 				order: Vec::new(),
 				active: HashMap::new(),
 				reservations: HashMap::new(),
+				pending: VecDeque::new(),
+				consumed: HashSet::new(),
+				settled_at: HashMap::new(),
+				outstanding: HashSet::new(),
+				pending_bytes: 0,
 			}),
 			seq: AtomicU64::new(0),
 			settle: Notify::new(),
@@ -182,6 +305,53 @@ impl Supervisor {
 		// unregister their own handle, so this map cannot grow stale.
 	}
 
+	/// Evict settled records that are older than [`RECORD_RETENTION_MS`] or
+	/// beyond [`MAX_SETTLED_RECORDS`], keeping running work, queued
+	/// reservations, and undelivered results. Mirrors the TypeScript job
+	/// manager's five-minute retention while bounding the long-lived runner.
+	fn prune_state(state: &mut SupervisorState) {
+		let now = now_ms();
+		let pending: HashSet<&str> =
+			state.pending.iter().map(|delivery| delivery.id.as_str()).collect();
+		let mut candidates: Vec<(u64, String)> = Vec::new();
+		for id in &state.order {
+			if state.active.contains_key(id) || state.reservations.contains_key(id) {
+				continue;
+			}
+			let Some(record) = state.records.get(id) else { continue };
+			if record.status == ChildStatus::Running || pending.contains(id.as_str()) {
+				continue;
+			}
+			candidates.push((state.settled_at.get(id).copied().unwrap_or(now), id.clone()));
+		}
+		let mut evict: HashSet<String> = candidates
+			.iter()
+			.filter(|(settled, _)| now.saturating_sub(*settled) > RECORD_RETENTION_MS)
+			.map(|(_, id)| id.clone())
+			.collect();
+		let retained: Vec<&(u64, String)> = candidates
+			.iter()
+			.filter(|(_, id)| !evict.contains(id))
+			.collect();
+		if retained.len() > MAX_SETTLED_RECORDS {
+			let mut fresh = retained;
+			fresh.sort_by_key(|pair| pair.0);
+			let excess = fresh.len() - MAX_SETTLED_RECORDS;
+			for (_, id) in fresh.into_iter().take(excess) {
+				evict.insert(id.clone());
+			}
+		}
+		if evict.is_empty() {
+			return;
+		}
+		state.order.retain(|id| !evict.contains(id));
+		for id in &evict {
+			state.records.remove(id);
+			state.settled_at.remove(id);
+			state.consumed.remove(id);
+		}
+	}
+
 	pub fn limits(&self) -> DelegationLimits {
 		*self.limits.lock().unwrap()
 	}
@@ -207,11 +377,202 @@ impl Supervisor {
 		self.allow_hub.load(Ordering::SeqCst)
 	}
 
+	/// `async.enabled`: default `true`, matching the upstream setting.
+	pub fn async_enabled(&self) -> bool {
+		self.async_enabled.load(Ordering::SeqCst)
+	}
+
+	pub fn set_async_enabled(&self, enabled: bool) {
+		self.async_enabled.store(enabled, Ordering::SeqCst);
+	}
+
+	/// True only when background execution has both a policy and a delivery
+	/// target. A caller that never registers a sink keeps the synchronous
+	/// behavior, which is the upstream "no AsyncJobManager" fallback.
+	pub fn background_ready(&self) -> bool {
+		self.async_enabled() && self.result_sink_attached.load(Ordering::SeqCst)
+	}
+
+	pub fn mailbox(&self) -> Arc<Mailbox> {
+		self.mailbox.clone()
+	}
+
+	fn mark_result_sink_attached(&self) {
+		self.result_sink_attached.store(true, Ordering::SeqCst);
+	}
+
+	/// Build a pull-based sink scoped to one owner. Root is `None`; a child
+	/// passes its supervisor id so it never consumes a sibling's results.
+	pub fn owner_results_sink(self: &Arc<Self>, owner: Option<&str>) -> Arc<dyn BackgroundResultSink> {
+		self.mark_result_sink_attached();
+		Arc::new(OwnerResultSink {
+			supervisor: Arc::clone(self),
+			owner: owner.map(str::to_string),
+		})
+	}
+
+	/// Remove and return every undelivered background result owned by `owner`.
+	/// A result is enqueued only after the child settles, so this never yields
+	/// a still-running job.
+	pub fn take_results_for(&self, owner: Option<&str>) -> Vec<String> {
+		let mut state = self.state.lock().unwrap();
+		let mut taken = Vec::new();
+		let mut index = 0;
+		while index < state.pending.len() {
+			if state.pending[index].owner.as_deref() == owner {
+				if let Some(delivery) = state.pending.remove(index) {
+					state.consumed.insert(delivery.id.clone());
+					state.outstanding.remove(&delivery.id);
+					state.pending_bytes = state.pending_bytes.saturating_sub(delivery.text.len());
+					taken.push(delivery.text);
+				}
+			} else {
+				index += 1;
+			}
+		}
+		taken
+	}
+
+	/// Enqueue a settled background result for exactly-once delivery. If the
+	/// spawning agent already settled before its nested job finished, route to
+	/// the nearest live ancestor (root = `None`) instead of orphaning the result.
+	pub fn enqueue_delivery(&self, id: &str, text: String) {
+		let mut state = self.state.lock().unwrap();
+		// Every queued body is backed by an admission slot; a settled job whose
+		// slot was already released (aborted or consumed) must not add mail.
+		if state.consumed.contains(id) || !state.outstanding.contains(id) {
+			return;
+		}
+		let mut owner = state.records.get(id).and_then(|record| record.parent_id.clone());
+		while let Some(current) = owner.clone() {
+			let live = state
+				.records
+				.get(&current)
+				.is_some_and(|record| record.status == ChildStatus::Running);
+			if live {
+				break;
+			}
+			owner = state
+				.records
+				.get(&current)
+				.and_then(|record| record.parent_id.clone());
+		}
+		let (mut text, _) = cap_result_text(&text);
+		let remaining = MAX_PENDING_RESULT_BYTES.saturating_sub(state.pending_bytes);
+		if text.len() > remaining {
+			text = truncate_to_bytes(&text, remaining);
+		}
+		state.pending_bytes += text.len();
+		state.pending.push_back(PendingDelivery { id: id.to_string(), owner, text });
+	}
+
+	/// Atomically consume a set of settled results for a snapshot. Returns the
+	/// ids that were *already* delivered before this call, so the snapshot can
+	/// hide their bodies; every id is marked consumed and its queued copy is
+	/// removed under one lock. This closes the race where the loop drains a
+	/// result between a hub status check and a per-id consume.
+	pub fn consume_results(&self, ids: &[String]) -> HashSet<String> {
+		let mut state = self.state.lock().unwrap();
+		let mut already = HashSet::new();
+		let mut removed_any = false;
+		for id in ids {
+			if state.consumed.contains(id) {
+				already.insert(id.clone());
+			}
+			let removed_bytes: usize = state
+				.pending
+				.iter()
+				.filter(|delivery| &delivery.id == id)
+				.map(|delivery| delivery.text.len())
+				.sum();
+			let before = state.pending.len();
+			state.pending.retain(|delivery| &delivery.id != id);
+			removed_any |= state.pending.len() != before;
+			state.pending_bytes = state.pending_bytes.saturating_sub(removed_bytes);
+			state.outstanding.remove(id);
+			state.consumed.insert(id.clone());
+		}
+		if removed_any {
+			drop(state);
+			self.settle.notify_waiters();
+		}
+		already
+	}
+
+	/// Cancel queued reservations and abort every live child. Runtime owners
+	/// call this when the runner is dropped: background tasks hold their own
+	/// `Arc<Supervisor>`, so relying on `Drop` alone would let them outlive the
+	/// runner. Safe to call more than once.
+	pub fn shutdown(&self) {
+		let (reservations, active) = {
+			let mut state = match self.state.lock() {
+				Ok(state) => state,
+				Err(poisoned) => poisoned.into_inner(),
+			};
+			state.pending.clear();
+			(state.reservations.drain().map(|(_, token)| token).collect::<Vec<_>>(),
+			 state.active.drain().map(|(_, child)| child).collect::<Vec<_>>())
+		};
+		for reservation in reservations {
+			reservation.cancel();
+		}
+		for active in active {
+			// Cancel first so shell tools can unwind their process trees, then
+			// abort the task as the bounded fallback.
+			active.cancellation_token.cancel();
+			let _ = active.steering_tx.try_send(SteeringEvent::Interrupt);
+			active.abort_handle.abort();
+		}
+		self.settle.notify_waiters();
+	}
+
+	pub fn settle_signal(&self) -> tokio::sync::futures::Notified<'_> {
+		self.settle.notified()
+	}
+
+	/// True when `id` names a supervisor child or the root agent id.
+	pub fn is_known_agent(&self, id: &str) -> bool {
+		id == crate::mailbox::MAIN_AGENT_ID || self.state.lock().unwrap().records.contains_key(id)
+	}
+
+	pub fn running_agent_ids(&self) -> Vec<String> {
+		self.state.lock().unwrap().active.keys().cloned().collect()
+	}
+
+	/// Hand a peer message to a live child. Only an actual `try_send` success
+	/// is reported as injected; anything else is an error the caller turns into
+	/// a failed receipt plus a buffered mailbox copy.
+	pub fn inject_peer_message(&self, id: &str, text: String) -> Result<(), String> {
+		let state = self.state.lock().unwrap();
+		let Some(record) = state.records.get(id) else {
+			return Err(format!(
+				"Unknown agent \"{id}\" — check `hub` list for live peers."
+			));
+		};
+		if record.status == ChildStatus::Aborted {
+			return Err(format!(
+				"Agent \"{id}\" was hard-aborted and cannot be messaged or revived."
+			));
+		}
+		match state.active.get(id) {
+			Some(active) => active
+				.steering_tx
+				.try_send(SteeringEvent::InjectMessage(text))
+				.map_err(|_| format!("Agent \"{id}\" has no live session.")),
+			None => Err(format!("Agent \"{id}\" has no live session.")),
+		}
+	}
+
 	pub fn root_registry(self: &Arc<Self>) -> ToolRegistry {
 		let mut reg = self.template.lock().unwrap().clone();
+		reg.register(Arc::new(ThinkTool::new()));
 		let limits = self.limits();
 		if self.task_enabled() && (limits.max_depth < 0 || 0 < limits.max_depth) {
-			reg.register(Arc::new(TaskTool::new(Arc::clone(self), 0)));
+			reg.register(Arc::new(TaskTool::with_semaphore(
+				Arc::clone(self),
+				0,
+				Arc::clone(&self.root_permits),
+			)));
 		}
 		if self.hub_enabled() {
 			reg.register(Arc::new(HubTool::root(Arc::clone(self))));
@@ -239,7 +600,10 @@ impl Supervisor {
 		// instance, and child events/session details are not persisted. Dropping
 		// it here prevents descendants from mutating the parent list.
 		reg.remove("todo");
+		// Children are headless: interactive ask has no channel.
+		reg.remove("ask");
 		reg.register(Arc::new(YieldTool::new()));
+		reg.register(Arc::new(ThinkTool::new()));
 		let limits = self.limits();
 		if self.task_enabled() && (limits.max_depth < 0 || depth < limits.max_depth) {
 			reg.register(Arc::new(TaskTool::with_parent(
@@ -262,7 +626,8 @@ impl Supervisor {
 	}
 
 	pub fn children(&self) -> Vec<ChildRecord> {
-		let state = self.state.lock().unwrap();
+		let mut state = self.state.lock().unwrap();
+		Self::prune_state(&mut state);
 		state
 			.order
 			.iter()
@@ -381,10 +746,14 @@ impl Supervisor {
 		agent: &str,
 		task: &str,
 		parent_id: Option<&str>,
-	) -> (String, CancellationToken) {
+	) -> Option<(String, CancellationToken)> {
+		let mut state = self.state.lock().unwrap();
+		Self::prune_state(&mut state);
+		if state.outstanding.len() >= MAX_OUTSTANDING_RESULTS {
+			return None;
+		}
 		let id = format!("task-{}", self.next_seq());
 		let cancellation_token = CancellationToken::new();
-		let mut state = self.state.lock().unwrap();
 		let started_at = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
 			.map(|d| d.as_millis() as u64)
@@ -409,7 +778,31 @@ impl Supervisor {
 		state
 			.reservations
 			.insert(id.clone(), cancellation_token.clone());
-		(id, cancellation_token)
+		state.outstanding.insert(id.clone());
+		Some((id, cancellation_token))
+	}
+
+	/// Free result slots for jobs whose inline/sync result was returned or
+	/// whose aborted run never queued a body. Idempotent.
+	pub fn release_outstanding(&self, id: &str) {
+		let mut state = self.state.lock().unwrap();
+		state.outstanding.remove(id);
+	}
+
+	/// Release a slot only when the settled job has no queued, undelivered
+	/// body. Used by the background lifecycle guard when a panic unwinds
+	/// between settlement and enqueue.
+	pub fn release_outstanding_if_undelivered(&self, id: &str) {
+		let mut state = self.state.lock().unwrap();
+		if !state.pending.iter().any(|delivery| delivery.id == id) {
+			state.outstanding.remove(id);
+		}
+	}
+
+	/// Remaining admission capacity for new results.
+	pub fn outstanding_capacity(&self) -> usize {
+		let state = self.state.lock().unwrap();
+		MAX_OUTSTANDING_RESULTS.saturating_sub(state.outstanding.len())
 	}
 
 	pub fn register_active_child(
@@ -438,51 +831,31 @@ impl Supervisor {
 	}
 
 	pub fn unregister_active_child(&self, id: &str) {
-		let mut state = self.state.lock().unwrap();
-		state.active.remove(id);
-		state.reservations.remove(id);
+		let changed = {
+			let mut state = self.state.lock().unwrap();
+			let active = state.active.remove(id).is_some();
+			let reserved = state.reservations.remove(id).is_some();
+			active || reserved
+		};
+		// Peer waits treat the active map as liveness; missing this wake leaves
+		// an unbounded `hub wait` asleep after the last peer disappeared.
+		if changed {
+			self.settle.notify_waiters();
+		}
 	}
 
 	pub fn mark_completed(&self, id: &str, duration_ms: u64, output: &str) {
-		let changed = {
-			let mut state = self.state.lock().unwrap();
-			match state.records.get_mut(id) {
-				Some(record) if record.status == ChildStatus::Running => {
-					record.status = ChildStatus::Completed;
-					record.duration_ms = Some(duration_ms);
-					record.output = Some(output.to_string());
-					true
-				},
-				_ => false,
-			}
-		};
-		if changed {
-			self.settle.notify_waiters();
-		}
+		self.settle_child(id, duration_ms, Some(output), None);
 	}
 
 	pub fn mark_failed(&self, id: &str, duration_ms: u64, error: &str) {
-		let changed = {
-			let mut state = self.state.lock().unwrap();
-			match state.records.get_mut(id) {
-				Some(record) if record.status == ChildStatus::Running => {
-					record.status = ChildStatus::Failed;
-					record.duration_ms = Some(duration_ms);
-					record.error = Some(error.to_string());
-					true
-				},
-				_ => false,
-			}
-		};
-		if changed {
-			self.settle.notify_waiters();
-		}
+		self.settle_child(id, duration_ms, None, Some(error));
 	}
 
-	pub fn mark_aborted(&self, id: &str, reason: &str) {
+	pub fn mark_aborted(&self, id: &str, reason: &str) -> bool {
 		let changed = {
 			let mut state = self.state.lock().unwrap();
-			match state.records.get_mut(id) {
+			let changed = match state.records.get_mut(id) {
 				Some(record) if record.status == ChildStatus::Running => {
 					record.status = ChildStatus::Aborted;
 					record.aborted = Some(true);
@@ -490,10 +863,65 @@ impl Supervisor {
 					true
 				},
 				_ => false,
+			};
+			if changed {
+				state.settled_at.insert(id.to_string(), now_ms());
+				state.outstanding.remove(id);
 			}
+			changed
 		};
 		if changed {
+			self.sweep_owner_deliveries(id);
 			self.settle.notify_waiters();
+		}
+		changed
+	}
+
+	fn settle_child(&self, id: &str, duration_ms: u64, output: Option<&str>, error: Option<&str>) {
+		let changed = {
+			let mut state = self.state.lock().unwrap();
+			let changed = match state.records.get_mut(id) {
+				Some(record) if record.status == ChildStatus::Running => {
+					record.duration_ms = Some(duration_ms);
+					match (output, error) {
+						(Some(output), None) => {
+							record.status = ChildStatus::Completed;
+							record.output = Some(cap_result_text(output).0);
+						},
+						(None, Some(error)) => {
+							record.status = ChildStatus::Failed;
+							record.error = Some(cap_result_text(error).0);
+						},
+						_ => return,
+					}
+					true
+				},
+				_ => false,
+			};
+			if changed {
+				state.settled_at.insert(id.to_string(), now_ms());
+			}
+			changed
+		};
+		if changed {
+			self.sweep_owner_deliveries(id);
+			self.settle.notify_waiters();
+		}
+	}
+
+	/// A child that settles before draining its own nested background results
+	/// hands them to its parent so no finished work disappears. Exactly-once is
+	/// preserved: entries are moved, not copied.
+	fn sweep_owner_deliveries(&self, owner: &str) {
+		let mut state = self.state.lock().unwrap();
+		let parent = state
+			.records
+			.get(owner)
+			.and_then(|record| record.parent_id.clone());
+		for delivery in &mut state.pending {
+			if delivery.owner.as_deref() == Some(owner) {
+				delivery.owner = parent.clone();
+			}
 		}
 	}
 }
@@ -501,6 +929,12 @@ impl Supervisor {
 /// Cancellation may take up to the shell's own graceful-kill window; after this
 /// bound the task is aborted as a last resort.
 const CANCEL_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl Drop for Supervisor {
+	fn drop(&mut self) {
+		self.shutdown();
+	}
+}
 
 pub struct ChildGuard {
 	pub handle: tokio::task::AbortHandle,

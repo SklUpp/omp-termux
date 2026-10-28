@@ -10,6 +10,16 @@
   - `packages/coding-agent/src/modes/theme/theme.ts` — checkbox and radio glyphs for TUI rendering
   - `packages/coding-agent/src/tui/index.ts` — status-line rendering
 
+### Native Rust CLI
+
+`crates/pi-agent/src/tools/ask.rs` keeps validation, exclusive execution, and answer formatting native; `crates/omp-cli/src/ask.rs` is the only interactive channel.
+
+- The channel is installed only for an interactive REPL with terminal stdin and `ask.enabled` (default `true`). Printed runs and child agents get no channel, so the tool aborts without reading stdin rather than fabricating an answer.
+- Questions support `id`, `question`, `header`, `options[{label, description, preview}]`, `multi`, and `recommended`. The reserved labels `Other (type your own)`, `Chat about this`, and `Next →` cannot be supplied as options. Keys: numbers select/toggle, `o` custom input, `n` note, `c` chat redirect, `b` back within a batch, `q` cancel.
+- Answers carry selected labels, optional custom input, note, and `timedOut`; an unanswered prompt auto-selects the recommended (else first) option on timeout. Preview text is printed as plain lines.
+- Timeout and cancellation flush unread terminal input (`tcflush` on a TTY only), so an abandoned partial line cannot become the next ask, approval, or REPL input. Once the first byte of a submitted line arrives, the deadline no longer applies and the complete line — including multibyte UTF-8 — is preserved. Ctrl-C or external cancellation aborts the prompt and flushes.
+- There are no image previews, theme glyphs, or TUI widgets: output is plain lines on stderr.
+
 ## Inputs
 
 | Field | Type | Required | Description |

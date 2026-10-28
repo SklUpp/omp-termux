@@ -1,4 +1,5 @@
 pub mod compaction;
+pub mod mailbox;
 pub mod mcp;
 #[path = "loop.rs"]
 pub mod loop_module;
@@ -22,9 +23,14 @@ pub use state::{
 };
 pub use tokenizer::Tokenizer;
 pub use supervisor::{
-	CancelAttempt, ChildGuard, ChildRecord, ChildStatus, DelegationLimits, Supervisor,
+	BackgroundResultSink, CancelAttempt, ChildGuard, ChildRecord, ChildStatus, DelegationLimits,
+	Supervisor,
+};
+pub use mailbox::{
+	DEFAULT_IRC_TIMEOUT_MS, IrcMessage, MAIN_AGENT_ID, MAILBOX_CAP, Mailbox, MailboxWaiter,
+	format_incoming,
 };
 pub use tools::{
-	BashTool, EditTool, GlobTool, GrepTool, HubTool, ReadTool, TaskTool, TodoTool, Tool, ToolError,
-	WriteTool, YieldTool, registry::ToolRegistry, scheduler::ToolScheduler,
+	AskTool, BashTool, EditTool, GlobTool, GrepTool, HubTool, ReadTool, TaskTool, ThinkTool,
+	TodoTool, Tool, ToolError, WriteTool, YieldTool, registry::ToolRegistry, scheduler::ToolScheduler,
 };

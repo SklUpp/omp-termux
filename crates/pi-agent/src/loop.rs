@@ -6,11 +6,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
 	compaction::Compactor,
+	mailbox::{Mailbox, format_incoming},
 	provider::{ModelProvider, ProviderError, StreamAssembler},
 	state::{
 		AgentConfig, AgentContext, AgentState, Message, Role, ToolApprover, ToolCall, ToolResult,
 		TurnResult, TurnStatus,
 	},
+	supervisor::BackgroundResultSink,
 	tools::{registry::ToolRegistry, scheduler::ToolScheduler},
 };
 
@@ -93,12 +95,38 @@ struct BatchOutcome {
 	interrupted: bool,
 }
 
+/// Marks a loop's agent present in the shared mailbox while the dialog runs.
+/// Root (`Main`) turns and detached child loops both register here, so a peer
+/// `hub wait` can tell whether its counterpart still exists.
+struct PresenceGuard {
+	mailbox: Arc<Mailbox>,
+	agent:   String,
+}
+
+impl PresenceGuard {
+	fn install(peer_inbox: &Option<(Arc<Mailbox>, String)>) -> Option<Self> {
+		let (mailbox, agent) = peer_inbox.as_ref()?;
+		mailbox.set_agent_active(agent, true);
+		Some(Self { mailbox: Arc::clone(mailbox), agent: agent.clone() })
+	}
+}
+
+impl Drop for PresenceGuard {
+	fn drop(&mut self) {
+		self.mailbox.set_agent_active(&self.agent, false);
+	}
+}
+
 /// Agent execution engine: provider turn, tool batch, repeat.
 pub struct AgentLoop {
 	config: AgentConfig,
 	provider: Arc<dyn ModelProvider>,
 	scheduler: ToolScheduler,
 	registry: ToolRegistry,
+	/// Finished background results injected as user messages at turn boundaries.
+	background_results: Option<Arc<dyn BackgroundResultSink>>,
+	/// Peer mailbox drained into the same boundary messages.
+	peer_inbox: Option<(Arc<Mailbox>, String)>,
 }
 
 impl AgentLoop {
@@ -108,7 +136,14 @@ impl AgentLoop {
 		registry: ToolRegistry,
 	) -> Self {
 		let scheduler = ToolScheduler::new(registry.clone());
-		Self { config, provider, scheduler, registry }
+		Self {
+			config,
+			provider,
+			scheduler,
+			registry,
+			background_results: None,
+			peer_inbox: None,
+		}
 	}
 
 	pub fn with_approver(
@@ -118,7 +153,46 @@ impl AgentLoop {
 		approver: Arc<dyn ToolApprover>,
 	) -> Self {
 		let scheduler = ToolScheduler::with_approver(registry.clone(), approver);
-		Self { config, provider, scheduler, registry }
+		Self {
+			config,
+			provider,
+			scheduler,
+			registry,
+			background_results: None,
+			peer_inbox: None,
+		}
+	}
+
+	/// Register the supervisor's exactly-once background result sink. Without
+	/// this the task tool remains synchronous, because a detached job would have
+	/// no one to deliver its result to.
+	#[must_use]
+	pub fn with_background_results(mut self, sink: Arc<dyn BackgroundResultSink>) -> Self {
+		self.background_results = Some(sink);
+		self
+	}
+
+	/// Drain peer mail addressed to `agent_id` into turn-boundary messages.
+	#[must_use]
+	pub fn with_peer_inbox(mut self, mailbox: Arc<Mailbox>, agent_id: impl Into<String>) -> Self {
+		self.peer_inbox = Some((mailbox, agent_id.into()));
+		self
+	}
+
+	/// Push undelivered background results and buffered peer mail as user
+	/// messages. Called only between turns, so history never has an unanswered
+	/// tool call.
+	fn inject_boundary_messages(&self, state: &mut AgentState) {
+		if let Some(sink) = &self.background_results {
+			for text in sink.take_background_results() {
+				state.messages.push(Message::user(text));
+			}
+		}
+		if let Some((mailbox, agent_id)) = &self.peer_inbox {
+			for message in mailbox.inbox(agent_id, false) {
+				state.messages.push(Message::user(format_incoming(&message)));
+			}
+		}
 	}
 	/// Run turns without emitting live events.
 	pub async fn run_dialog(
@@ -196,6 +270,8 @@ impl AgentLoop {
 			state.messages.insert(0, Message::system(system.clone()));
 		}
 		state.messages.push(user_message);
+		let _presence = PresenceGuard::install(&self.peer_inbox);
+		self.inject_boundary_messages(state);
 		let ctx = AgentContext::with_approver(
 			self.config.cwd.clone(),
 			cancellation_token.clone(),
@@ -214,10 +290,16 @@ impl AgentLoop {
 					state.messages.push(Message::user(message));
 				}
 			}
+			// Results that settled while the previous assistant turn ran land
+			// before this one, exactly once.
+			self.inject_boundary_messages(state);
 
 			state.messages =
 				Compactor::compact(&state.messages, self.config.context_limit, MIN_RECENT_MESSAGES);
 
+			if cancellation_token.is_cancelled() {
+				return Err(AgentError::Interrupted);
+			}
 			let schemas = self.registry.schemas();
 			let mut pending_injections = Vec::new();
 			let assistant = self
@@ -318,7 +400,11 @@ impl AgentLoop {
 				state.messages.push(Message::user(message));
 			}
 
-			let status = if outcome.interrupted {
+			// A tool may cancel the turn itself (interactive `ask` cancel/abort).
+			// TS ToolAbortError interrupts the whole turn; never issue another
+			// provider request merely because the tool returned an Aborted result.
+			let cancelled = outcome.interrupted || cancellation_token.is_cancelled();
+			let status = if cancelled {
 				TurnStatus::Aborted
 			} else {
 				TurnStatus::ToolUse
@@ -342,7 +428,7 @@ impl AgentLoop {
 				is_completed: should_terminate,
 			});
 
-			if outcome.interrupted {
+			if cancelled {
 				cancellation_token.cancel();
 				return Err(AgentError::Interrupted);
 			}
@@ -441,6 +527,9 @@ impl AgentLoop {
 		mut steering_rx: Option<&mut mpsc::Receiver<SteeringEvent>>,
 		injections: &mut Vec<String>,
 	) -> Result<Message, AgentError> {
+		if cancellation_token.is_cancelled() {
+			return Err(AgentError::Interrupted);
+		}
 		let Some(events) = events else {
 			let complete_fut = self.provider.complete(messages, schemas);
 			tokio::pin!(complete_fut);

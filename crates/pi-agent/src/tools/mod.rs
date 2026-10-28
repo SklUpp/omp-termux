@@ -1,15 +1,19 @@
+pub mod ask;
 pub mod hashline;
 pub mod hub;
 pub mod read;
 pub mod registry;
 pub mod scheduler;
 pub mod task;
+pub mod think;
 pub mod todo;
 pub mod yield_tool;
 
+pub use ask::AskTool;
 pub use hub::HubTool;
 pub use read::{ReadSnapshotSink, ReadTool};
 pub use task::TaskTool;
+pub use think::ThinkTool;
 pub use todo::TodoTool;
 pub use yield_tool::YieldTool;
 
@@ -60,6 +64,8 @@ pub enum ToolError {
 	InvalidArguments(String),
 	#[error("Execution failed: {0}")]
 	ExecutionFailed(String),
+	#[error("Operation aborted: {0}")]
+	Aborted(String),
 }
 
 /// Dynamic trait implemented by all agent tools.

@@ -47,6 +47,16 @@ Merged from the former `irc`, `job`, and `launch` tools; each op family keeps it
 
 `send` with both `to` and `name` is rejected as ambiguous. `wait` routes by target: `name` → process wait; otherwise the unified coordination wait.
 
+### Native Rust CLI
+
+`crates/pi-agent/src/tools/hub.rs` exposes only the messaging and job subsets over an in-process mailbox and supervisor; there is no launch broker.
+
+- Supported ops: `send`, `inbox`, `wait`, `jobs`, `list`, `cancel`. Process ops (`start`, `ps`, `logs`, `stop`, `restart`, `describe`, `send` with `name`) return a clear "not supported in this build" error.
+- Mailboxes buffer per recipient. Direct sends to `Main` buffer across REPL turns, while targeting an unknown or finished agent fails instead of reviving it — there is no parked-agent revival and no fabricated live peer. Broadcasts reach currently live agents plus a running root turn.
+- Liveness combines supervisor children with mailbox presence. A `wait` without `from` excludes the caller and returns a "No running peers" result when the last eligible peer exits instead of blocking until its timeout; `wait from: "Main"` works while a root turn with a delegation sink is running. Waits take buffered mail or register a waiter atomically, so a concurrent sender cannot hand a message to a waiter that the same call drops.
+- `wait` with `ids` (or bare) watches background jobs; a settled snapshot consumes the pending auto-delivery so the loop never shows it twice. Settled job records are retained for five minutes or the newest 100 entries; running jobs, queued spawns, and undelivered results are never evicted.
+- `list` reports supervisor children only (root `Main` is not a child record); the schema omits the process `name` target entirely.
+
 ## The unified `wait`
 One blocking primitive. It resolves job legs (explicit `ids`, owner-scoped and silently filtered, or every running job the caller owns) and — when the session can message peers — parks a bus waiter, then races:
 - every watched running job's `job.promise`,

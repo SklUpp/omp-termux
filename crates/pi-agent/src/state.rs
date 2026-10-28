@@ -522,11 +522,17 @@ pub struct AgentConfig {
 	pub cwd: PathBuf,
 }
 
-/// Shared context accessible to tools and execution loop.
 /// Tool approval gate checked prior to executing side-effecting operations.
 #[async_trait]
 pub trait ToolApprover: Send + Sync {
 	async fn approve(&self, name: &str, args: &serde_json::Value) -> Result<(), String>;
+
+	/// Interactive frontend exposed to the `ask` tool, when this approver is
+	/// backed by one. Children receive a stripped approver, so delegated runs
+	/// stay headless.
+	fn ask_channel(&self) -> Option<Arc<dyn crate::tools::ask::AskChannel>> {
+		None
+	}
 }
 
 /// Shared context accessible to tools and execution loop.
@@ -536,6 +542,8 @@ pub struct AgentContext {
 	pub env: HashMap<String, String>,
 	pub cancellation_token: CancellationToken,
 	pub approver: Option<Arc<dyn ToolApprover>>,
+	/// Interactive `ask` surface; `None` in headless runs and child agents.
+	pub ask: Option<Arc<dyn crate::tools::ask::AskChannel>>,
 }
 
 impl std::fmt::Debug for AgentContext {
@@ -545,6 +553,7 @@ impl std::fmt::Debug for AgentContext {
 			.field("env", &self.env)
 			.field("cancellation_token", &self.cancellation_token)
 			.field("has_approver", &self.approver.is_some())
+			.field("has_ask", &self.ask.is_some())
 			.finish()
 	}
 }
@@ -556,6 +565,7 @@ impl AgentContext {
 			env: std::env::vars().collect(),
 			cancellation_token: CancellationToken::new(),
 			approver: None,
+			ask: None,
 		}
 	}
 
@@ -565,6 +575,7 @@ impl AgentContext {
 			env: std::env::vars().collect(),
 			cancellation_token,
 			approver: None,
+			ask: None,
 		}
 	}
 
@@ -573,12 +584,21 @@ impl AgentContext {
 		cancellation_token: CancellationToken,
 		approver: Option<Arc<dyn ToolApprover>>,
 	) -> Self {
+		let ask = approver.as_ref().and_then(|approver| approver.ask_channel());
 		Self {
 			cwd,
 			env: std::env::vars().collect(),
 			cancellation_token,
 			approver,
+			ask,
 		}
+	}
+
+	/// Attach an interactive `ask` surface (tests and embedders).
+	#[must_use]
+	pub fn with_ask(mut self, ask: Option<Arc<dyn crate::tools::ask::AskChannel>>) -> Self {
+		self.ask = ask;
+		self
 	}
 }
 

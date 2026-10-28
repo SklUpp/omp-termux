@@ -93,7 +93,7 @@ pub fn has_ssh_target(args: &serde_json::Value) -> bool {
 /// Classify tool invocation into a capability tier.
 pub fn classify_tool(name: &str, args: &serde_json::Value) -> ToolTier {
 	match name {
-		"todo" | "glob" => ToolTier::Read,
+		"todo" | "glob" | "ask" => ToolTier::Read,
 		"read" => {
 			if has_ssh_target(args) {
 				ToolTier::Exec
@@ -140,16 +140,46 @@ pub fn extract_tool_detail(name: &str, args: &serde_json::Value) -> Option<Strin
 	}
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Approvals {
 	pub mode: ApprovalMode,
 	pub allow: BTreeSet<String>,
+	/// Interactive `ask` surface; absent in headless runs and child agents.
+	pub ask: Option<std::sync::Arc<dyn pi_agent::tools::ask::AskChannel>>,
+}
+
+impl std::fmt::Debug for Approvals {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Approvals")
+			.field("mode", &self.mode)
+			.field("allow", &self.allow)
+			.field("has_ask", &self.ask.is_some())
+			.finish()
+	}
 }
 
 impl Approvals {
 	#[must_use]
 	pub fn new(mode: ApprovalMode, allow: impl IntoIterator<Item = String>) -> Self {
-		Self { mode, allow: allow.into_iter().collect() }
+		Self { mode, allow: allow.into_iter().collect(), ask: None }
+	}
+
+	/// Install or clear the interactive `ask` surface.
+	pub fn set_ask(&mut self, ask: Option<std::sync::Arc<dyn pi_agent::tools::ask::AskChannel>>) {
+		self.ask = ask;
+	}
+
+	/// Copy without the interactive surface, for delegated children.
+	#[must_use]
+	pub fn without_ask(&self) -> Self {
+		let mut clone = self.clone();
+		clone.ask = None;
+		clone
+	}
+
+	#[must_use]
+	pub fn ask_channel(&self) -> Option<std::sync::Arc<dyn pi_agent::tools::ask::AskChannel>> {
+		self.ask.clone()
 	}
 
 	/// Authorize a registered MCP tool name if the exact colon tool allow
@@ -208,6 +238,10 @@ impl Approvals {
 
 #[async_trait]
 impl pi_agent::ToolApprover for Approvals {
+	fn ask_channel(&self) -> Option<std::sync::Arc<dyn pi_agent::tools::ask::AskChannel>> {
+		Approvals::ask_channel(self)
+	}
+
 	async fn approve(&self, name: &str, args: &serde_json::Value) -> std::result::Result<(), String> {
 		let tier = classify_tool(name, args);
 		let decision = self.decide_tier(name, tier);
@@ -264,6 +298,16 @@ mod tests {
 	}
 
 	#[test]
+	fn child_approvals_strip_the_ask_channel() {
+		let mut approvals = approvals(ApprovalMode::AlwaysAsk, &[]);
+		assert!(approvals.ask_channel().is_none());
+		approvals.set_ask(Some(crate::ask::terminal_channel(None)));
+		assert!(approvals.ask_channel().is_some());
+		assert!(approvals.without_ask().ask_channel().is_none());
+		assert_eq!(approvals.without_ask().mode, approvals.mode);
+	}
+
+	#[test]
 	fn confirm_reads_yes_from_stdin() {
 		let approvals = approvals(ApprovalMode::AlwaysAsk, &[]);
 		let mut input = Cursor::new(b"y\n");
@@ -307,6 +351,7 @@ mod tests {
 		// Local vs SSH paths
 		assert_eq!(classify_tool("todo", &json!({})), ToolTier::Read);
 		assert_eq!(classify_tool("glob", &json!({})), ToolTier::Read);
+		assert_eq!(classify_tool("ask", &json!({})), ToolTier::Read);
 		assert_eq!(
 			classify_tool("read", &json!({"path": "/local/file.txt"})),
 			ToolTier::Read

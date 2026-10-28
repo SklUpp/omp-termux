@@ -9,12 +9,13 @@ use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use super::{Tool, ToolError};
 use crate::{
 	loop_module::{AgentError, AgentLoop, SteeringEvent},
-	state::{AgentConfig, AgentContext, AgentState, Message, ToolResult},
-	supervisor::{ChildGuard, Supervisor},
+	state::{AgentConfig, AgentContext, AgentState, Message, ToolResult, TurnResult},
+	supervisor::{ChildGuard, Supervisor, cap_result_text},
 };
 
 #[derive(Clone)]
@@ -67,13 +68,36 @@ impl TaskTool {
 	) -> SingleResult {
 		let start = Instant::now();
 		let child_name = item.name.clone();
-		let (child_id, child_cancel) = self.supervisor.reserve_child(
+		let Some((child_id, child_cancel)) = self.supervisor.reserve_child(
 			&child_name,
 			index,
 			&item.agent,
 			&item.task,
 			self.parent_id.as_deref(),
-		);
+		) else {
+			return SingleResult {
+				index,
+				id: child_name.clone(),
+				name: child_name,
+				agent: "task".to_string(),
+				agent_source: "bundled".to_string(),
+				task: item.task,
+				exit_code: 1,
+				output: "(no output)".to_string(),
+				stderr: String::new(),
+				truncated: false,
+				duration_ms: 0,
+				tokens: 0,
+				requests: 0,
+				error: Some(format!(
+					"result capacity exhausted ({} outstanding); wait for or consume finished jobs first",
+					crate::supervisor::MAX_OUTSTANDING_RESULTS
+				)),
+				aborted: None,
+				abort_reason: None,
+				extracted_tool_data: None,
+			};
+		};
 		let mut reservation = ReservationGuard::new(
 			self.supervisor.clone(),
 			child_id.clone(),
@@ -158,7 +182,7 @@ impl TaskTool {
 
 		let child_cancel_for_loop = child_cancel.clone();
 		let mut task_handle = tokio::spawn(async move {
-			let mut child_loop = match child_approver {
+			let child_loop = match child_approver {
 				Some(approver) => AgentLoop::with_approver(
 					child_config,
 					child_provider,
@@ -249,23 +273,26 @@ impl TaskTool {
 		self.supervisor.unregister_active_child(&child_id);
 
 		let duration_ms = start.elapsed().as_millis() as u64;
+		let outstanding_id = child_id.clone();
 
-		match outcome {
+		let result = match outcome {
 			Ok(turn_results) => {
 				let requests = turn_results.len();
 
-				let output = turn_results
-					.iter()
-					.rev()
-					.find_map(|turn| {
-						let trimmed = turn.message.content.trim();
-						if !trimmed.is_empty() {
-							Some(trimmed.to_string())
-						} else {
-							None
-						}
-					})
-					.unwrap_or_else(|| "(no output)".to_string());
+				let (output, output_truncated) = cap_result_text(
+					&turn_results
+						.iter()
+						.rev()
+						.find_map(|turn| {
+							let trimmed = turn.message.content.trim();
+							if !trimmed.is_empty() {
+								Some(trimmed.to_string())
+							} else {
+								None
+							}
+						})
+						.unwrap_or_else(|| "(no output)".to_string()),
+				);
 
 				let mut extracted_tool_data = None;
 				for turn in &turn_results {
@@ -337,7 +364,7 @@ impl TaskTool {
 					exit_code,
 					output,
 					stderr: String::new(),
-					truncated: false,
+					truncated: output_truncated,
 					duration_ms,
 					tokens: 0,
 					requests,
@@ -392,11 +419,265 @@ impl TaskTool {
 					extracted_tool_data: None,
 				}
 			},
+		};
+		self.supervisor.release_outstanding(&outstanding_id);
+		result
+	}
+
+	/// Reserve and detach one background child. The returned id is the real
+	/// supervisor identity and doubles as the job id, so `hub jobs/cancel/wait`
+	/// address it immediately, before the child acquires a permit or runs.
+	fn spawn_background_task(
+		&self,
+		index: usize,
+		item: TaskItemSpec,
+		ctx: &AgentContext,
+	) -> Result<String, String> {
+		let child_name = item.name.clone();
+		let Some((child_id, child_cancel)) = self.supervisor.reserve_child(
+			&child_name,
+			index,
+			&item.agent,
+			&item.task,
+			self.parent_id.as_deref(),
+		) else {
+			return Err(format!(
+				"{child_name}: result capacity exhausted ({} outstanding); wait for or consume finished jobs first",
+				crate::supervisor::MAX_OUTSTANDING_RESULTS
+			));
+		};
+		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(16);
+		let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+		let supervisor = self.supervisor.clone();
+		// Per-`TaskTool` (per-session) permits: nested spawns use their own
+		// semaphore, so a parent holding a permit while waiting for descendants
+		// cannot deadlock when every parent permit is occupied.
+		let semaphore = self.semaphore.clone();
+		let depth = self.depth;
+		let cwd = ctx.cwd.clone();
+		let task_id = child_id.clone();
+		let cancel = child_cancel.clone();
+		let mut lifecycle = SettlementGuard::new(supervisor.clone(), task_id.clone());
+
+		let handle = tokio::spawn(async move {
+			// Wait until the reservation is registered as active, so an early
+			// cancel can abort this task before it ever reaches the model.
+			if start_rx.await.is_err() {
+				supervisor.mark_aborted(&task_id, "cancelled before start");
+				supervisor.unregister_active_child(&task_id);
+				return;
+			}
+			let start = Instant::now();
+			let permit = tokio::select! {
+				biased;
+				_ = cancel.cancelled() => None,
+				permit = semaphore.clone().acquire_owned() => permit.ok(),
+			};
+			let Some(_permit) = permit else {
+				supervisor.mark_aborted(&task_id, "cancelled by hub");
+				supervisor.unregister_active_child(&task_id);
+				return;
+			};
+			if cancel.is_cancelled() {
+				supervisor.mark_aborted(&task_id, "cancelled by hub");
+				supervisor.unregister_active_child(&task_id);
+				return;
+			}
+			let outcome = run_background_child(
+				supervisor.clone(),
+				depth,
+				task_id.clone(),
+				item,
+				cwd,
+				steering_rx,
+				cancel.clone(),
+			)
+			.await;
+			supervisor.unregister_active_child(&task_id);
+			settle_background_result(supervisor, task_id, start, outcome);
+			lifecycle.disarm();
+		});
+
+		if !self.supervisor.register_active_child(
+			&child_id,
+			steering_tx,
+			handle.abort_handle(),
+			child_cancel.clone(),
+		) {
+			child_cancel.cancel();
+			handle.abort();
+			self.supervisor.mark_aborted(&child_id, "cancelled by hub");
+			self.supervisor.unregister_active_child(&child_id);
+			return Err(format!("{child_name}: cancelled before start"));
 		}
+		let _ = start_tx.send(());
+		Ok(child_id)
 	}
 }
 
-const UNSUPPORTED_FIELDS: &[&str] = &["outputSchema", "schemaMode", "effort", "isolated"];
+/// Build a child loop with fresh read/edit state, its own result sink, and its
+/// own peer inbox. Runs detached from the parent turn so REPL turns do not kill
+/// a background job.
+async fn run_background_child(
+	supervisor: Arc<Supervisor>,
+	depth: i32,
+	child_id: String,
+	item: TaskItemSpec,
+	cwd: std::path::PathBuf,
+	steering_rx: tokio::sync::mpsc::Receiver<SteeringEvent>,
+	cancel: CancellationToken,
+) -> Result<Vec<TurnResult>, AgentError> {
+	let child_config = AgentConfig {
+		max_turns: 20,
+		context_limit: 100_000,
+		system_prompt: None,
+		cwd,
+	};
+	let child_provider = supervisor.provider();
+	let child_approver = supervisor.child_approver();
+	let child_registry = supervisor.child_registry(depth + 1, Some(&child_id));
+	let full_prompt = if let Some(context) = &item.context {
+		format!("{context}\n\n{}", item.task)
+	} else {
+		item.task.clone()
+	};
+	let child_loop = match child_approver {
+		Some(approver) => {
+			AgentLoop::with_approver(child_config, child_provider, child_registry, approver)
+		},
+		None => AgentLoop::new(child_config, child_provider, child_registry),
+	};
+	let child_loop = child_loop
+		.with_background_results(supervisor.owner_results_sink(Some(&child_id)))
+		.with_peer_inbox(supervisor.mailbox(), child_id.clone());
+	let mut child_state = AgentState::default();
+	child_loop
+		.run_dialog_message_with_cancel(
+			Message::user(full_prompt),
+			&mut child_state,
+			Some(steering_rx),
+			None,
+			cancel,
+		)
+		.await
+}
+
+/// Summarize a finished child: final assistant text, abort flag/reason, and a
+/// terminal `yield` payload when one exists.
+fn summarize_turns(turns: &[TurnResult]) -> (String, bool, Option<String>) {
+	let output = turns
+		.iter()
+		.rev()
+		.find_map(|turn| {
+			let trimmed = turn.message.content.trim();
+			if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+		})
+		.unwrap_or_else(|| "(no output)".to_string());
+	let mut aborted = false;
+	let mut reason = None;
+	for turn in turns {
+		for result in &turn.tool_results {
+			if result.terminate {
+				if let Ok(value) = serde_json::from_str::<Value>(&result.content)
+					&& value.get("status").and_then(Value::as_str) == Some("aborted")
+				{
+					aborted = true;
+					reason = value
+						.get("error")
+						.and_then(Value::as_str)
+						.map(str::to_string);
+				}
+			}
+		}
+	}
+	(output, aborted, reason)
+}
+
+fn settle_background_result(
+	supervisor: Arc<Supervisor>,
+	id: String,
+	start: Instant,
+	outcome: Result<Vec<TurnResult>, AgentError>,
+) {
+	let duration_ms = start.elapsed().as_millis() as u64;
+	match outcome {
+		Ok(turns) => {
+			let (output, aborted, reason) = summarize_turns(&turns);
+			let (output, _) = cap_result_text(&output);
+			if aborted {
+				supervisor.mark_aborted(
+					&id,
+					reason.as_deref().unwrap_or("aborted by yield"),
+				);
+				return;
+			}
+			let envelope =
+				task_result_envelope(&id, "task", "completed", duration_ms, &output);
+			supervisor.mark_completed(&id, duration_ms, &envelope);
+			supervisor.enqueue_delivery(&id, envelope);
+		},
+		Err(AgentError::Interrupted) => {
+			supervisor.mark_aborted(&id, "aborted");
+		},
+		Err(error) => {
+			let message = error.to_string();
+			let envelope =
+				task_result_envelope(&id, "task", "failed (exit 1)", duration_ms, &message);
+			supervisor.mark_failed(&id, duration_ms, &envelope);
+			supervisor.enqueue_delivery(&id, envelope);
+		},
+	}
+}
+
+/// `<task-result>` envelope from `prompts/tools/task-summary.md`. No
+/// `agent://`/`history://` pointer is emitted: this build has no transcript
+/// resolver, so a link would be fake.
+fn task_result_envelope(
+	id: &str,
+	agent: &str,
+	status: &str,
+	duration_ms: u64,
+	output: &str,
+) -> String {
+	format!(
+		"<task-result id=\"{id}\" agent=\"{agent}\" status=\"{status}\" duration=\"{}\">\n<output>\n{output}\n</output>\n</task-result>",
+		format_duration_ms(duration_ms)
+	)
+}
+
+fn format_duration_ms(milliseconds: u64) -> String {
+	if milliseconds < 1_000 {
+		return format!("{milliseconds}ms");
+	}
+	let seconds = milliseconds as f64 / 1_000.0;
+	if seconds < 60.0 {
+		let rounded = (seconds * 10.0).round() / 10.0;
+		if rounded.fract() == 0.0 {
+			format!("{}s", rounded as u64)
+		} else {
+			format!("{rounded:.1}s")
+		}
+	} else {
+		let minutes = (seconds / 60.0).floor() as u64;
+		let rest = (seconds - minutes as f64 * 60.0).round() as u64;
+		format!("{minutes}m {rest}s")
+	}
+}
+
+fn coordination_hint(ids: &[String]) -> String {
+	let dm = if ids.len() == 1 {
+		format!(
+			"DM `{}` via `hub` send to coordinate while it runs; use `hub` only to inspect (`jobs`), wait, or cancel a stuck task.",
+			ids[0]
+		)
+	} else {
+		"DM these ids via `hub` send to coordinate while they run; use `hub` only to inspect (`jobs`), wait, or cancel a stuck task by id.".to_string()
+	};
+	format!("{dm}\n{}", TASK_ASYNC_CONTRACT)
+}
+
+/// Upstream `prompts/tools/task-async-contract.md`, verbatim.
+const TASK_ASYNC_CONTRACT: &str = "No polling needed.\n\nSettled-job inspection: `hub jobs` | `hub wait` delivers its snapshot → no duplicate `async-result`.\n\n`completed`: subagent yielded successfully; claimed artifacts unverified.";
 
 /// Owns a queued reservation until the spawned `ChildGuard` takes over. If the
 /// batch future is dropped while waiting for a semaphore permit, this drop still
@@ -436,6 +717,38 @@ impl Drop for ReservationGuard {
 	}
 }
 
+/// Lifecycle guard for a detached background child. A panic inside the child
+/// future unwinds past the normal unregister/settle path; this guard then
+/// settles the record as aborted and frees the admission slot (unless a body
+/// was already queued). Disarmed only after normal settlement.
+struct SettlementGuard {
+	supervisor: Arc<Supervisor>,
+	id:         String,
+	armed:      bool,
+}
+
+impl SettlementGuard {
+	fn new(supervisor: Arc<Supervisor>, id: String) -> Self {
+		Self { supervisor, id, armed: true }
+	}
+
+	fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for SettlementGuard {
+	fn drop(&mut self) {
+		if !self.armed {
+			return;
+		}
+		if !self.supervisor.mark_aborted(&self.id, "panicked before settlement") {
+			self.supervisor.release_outstanding_if_undelivered(&self.id);
+		}
+		self.supervisor.unregister_active_child(&self.id);
+	}
+}
+
 /// How long a cancelled child may take to unwind cooperative tool cleanup
 /// (the shell's own graceful-kill window) before it is hard-aborted.
 const CHILD_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -454,6 +767,8 @@ fn join_dialog_result(
 		},
 	}
 }
+
+const UNSUPPORTED_FIELDS: &[&str] = &["outputSchema", "schemaMode", "effort", "isolated"];
 
 fn check_unsupported_fields(obj: &serde_json::Map<String, Value>) -> Result<(), ToolError> {
 	for &field in UNSUPPORTED_FIELDS {
@@ -529,10 +844,25 @@ pub struct SingleResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AsyncTaskState {
+	pub state: String,
+	pub job_id: String,
+	#[serde(rename = "type")]
+	pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskToolDetails {
 	pub project_agents_dir: Option<String>,
 	pub results: Vec<SingleResult>,
 	pub total_duration_ms: u64,
+	/// Model-facing spawn summary for a background call.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub message: Option<String>,
+	/// Present only for a background call that returned before the jobs ran.
+	#[serde(rename = "async", skip_serializing_if = "Option::is_none")]
+	pub async_state: Option<AsyncTaskState>,
 }
 
 #[async_trait]
@@ -657,6 +987,98 @@ impl Tool for TaskTool {
 			}]
 		};
 
+		// Bound the batch before allocating records or spawning any child: an
+		// oversized batch is rejected as a whole with an explicit capacity error
+		// instead of silently queueing an unbounded backlog of result bodies.
+		let capacity = self.supervisor.outstanding_capacity();
+		if items.len() > capacity {
+			return Err(ToolError::ExecutionFailed(format!(
+				"task result capacity exhausted: {} item(s) requested, {} slot(s) available; wait for or consume finished jobs first",
+				items.len(),
+				capacity
+			)));
+		}
+
+		if self.supervisor.background_ready() {
+			let mut started = Vec::new();
+			let mut failures = Vec::new();
+			for (index, item) in items.into_iter().enumerate() {
+				match self.spawn_background_task(index, item, ctx) {
+					Ok(id) => started.push(id),
+					Err(error) => failures.push(error),
+				}
+			}
+
+			if started.is_empty() {
+				let message = if failures.is_empty() {
+					"Failed to start background task job".to_string()
+				} else {
+					format!(
+						"Failed to start background task job{}: {}",
+						if failures.len() == 1 { "" } else { "s" },
+						failures.join("; ")
+					)
+				};
+				return Ok(ToolResult {
+					tool_call_id: String::new(),
+					content: message,
+					is_error: false,
+					terminate: false,
+					details: None,
+				});
+			}
+
+			let schedule_failure_summary = if failures.is_empty() {
+				String::new()
+			} else {
+				format!(
+					" Failed to schedule {} spawn{}: {}.",
+					failures.len(),
+					if failures.len() == 1 { "" } else { "s" },
+					failures.join("; ")
+				)
+			};
+			let coordination_hint = coordination_hint(&started);
+			let content = if started.len() == 1 {
+				format!(
+					"Spawned agent `{}` (job `{}`). Its result auto-delivers on yield unless a settled `hub jobs`/`wait` snapshot consumes it first. {coordination_hint}",
+					started[0], started[0]
+				)
+			} else {
+				let listing = started
+					.iter()
+					.map(|id| format!("- `{id}` (job `{id}`)"))
+					.collect::<Vec<_>>()
+					.join("\n");
+				format!(
+					"Spawned {} background agents.{} Each result auto-delivers on yield unless a settled `hub jobs`/`wait` snapshot consumes it first.\n{listing}\n{coordination_hint}",
+					started.len(),
+					schedule_failure_summary
+				)
+			};
+			let details = TaskToolDetails {
+				project_agents_dir: None,
+				results: Vec::new(),
+				total_duration_ms: 0,
+				async_state: Some(AsyncTaskState {
+					state: "running".to_string(),
+					job_id: started[0].clone(),
+					kind: "task".to_string(),
+				}),
+				message: Some(content),
+			};
+			let serialized = serde_json::to_string(&details).map_err(|e| {
+				ToolError::ExecutionFailed(format!("Failed to serialize TaskToolDetails: {e}"))
+			})?;
+			return Ok(ToolResult {
+				tool_call_id: String::new(),
+				content: serialized,
+				is_error: false,
+				terminate: false,
+				details: None,
+			});
+		}
+
 		let start_total = Instant::now();
 		let futures = items
 			.into_iter()
@@ -670,6 +1092,8 @@ impl Tool for TaskTool {
 			project_agents_dir: None,
 			results,
 			total_duration_ms,
+			message: None,
+			async_state: None,
 		};
 
 		let content = serde_json::to_string(&details).map_err(|e| {
