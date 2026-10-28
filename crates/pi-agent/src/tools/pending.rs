@@ -842,23 +842,23 @@ mod tests {
 		let ctx = ctx(&dir);
 
 		// Nothing staged: resolve errors, reject succeeds, no file is created.
-		let error = dispatch(&tool, "xd://resolve", "go").await.expect_err("empty resolve");
+		let error = dispatch(&tool, "xd://resolve", "go", &ctx).await.expect_err("empty resolve");
 		assert!(error.to_string().contains("No pending action to apply"));
-		let rejected = dispatch(&tool, "xd://reject", "nothing").await.expect("empty reject");
+		let rejected = dispatch(&tool, "xd://reject", "nothing", &ctx).await.expect("empty reject");
 		assert!(!rejected.is_error);
 		assert!(rejected.content.contains("Nothing to reject"));
 
 		// A staged action is applied through the device, once.
 		let target = dir.0.join("out.txt");
 		store.register(Arc::new(FileAction::new(target.clone())));
-		let applied = dispatch(&tool, "xd://resolve", "looks right").await.expect("apply");
+		let applied = dispatch(&tool, "xd://resolve", "looks right", &ctx).await.expect("apply");
 		assert!(!applied.is_error);
 		assert_eq!(std::fs::read_to_string(&target).expect("read"), "applied: looks right\n");
 		let details = applied.details.as_ref().expect("dispatch details");
 		assert_eq!(details["xdev"]["tool"], "resolve");
 		assert_eq!(details["xdev"]["inner"]["action"], "apply");
 		assert_eq!(details["xdev"]["inner"]["sourceToolName"], "ast_edit");
-		let again = dispatch(&tool, "xd://resolve", "again").await.expect_err("consumed");
+		let again = dispatch(&tool, "xd://resolve", "again", &ctx).await.expect_err("consumed");
 		assert!(again.to_string().contains("No pending action to apply"));
 
 		let entries: Vec<_> = std::fs::read_dir(&dir.0)
@@ -875,7 +875,7 @@ mod tests {
 		let ctx = ctx(&dir);
 
 		for path in ["xd://propose", "xd://", "xd://a/b"] {
-			let error = dispatch(&tool, path, "body").await.expect_err(path);
+			let error = dispatch(&tool, path, "body", &ctx).await.expect_err(path);
 			assert!(error.to_string().contains("xd://"), "{path}: {error}");
 		}
 		assert!(std::fs::read_dir(&dir.0).expect("read dir").next().is_none());
