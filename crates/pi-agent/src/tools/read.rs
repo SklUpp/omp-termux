@@ -157,6 +157,24 @@ impl Tool for ReadTool {
 		if raw_path.is_empty() {
 			return Ok(tool_result("Path must not be empty", true));
 		}
+		// Resolution devices are virtual: `read xd://resolve` returns their
+		// one-line usage instead of probing a filesystem path.
+		match super::pending::parse_xd_target(raw_path) {
+			Some(super::pending::XdTarget::Device(device)) => {
+				return match super::pending::resolution_device_usage(device) {
+					Some(usage) => Ok(tool_result(usage, false)),
+					None => Err(ToolError::InvalidArguments(format!(
+						"Unknown xd:// device '{device}'. Mounted devices: xd://resolve, xd://reject."
+					))),
+				};
+			},
+			Some(super::pending::XdTarget::Invalid) => {
+				return Err(ToolError::InvalidArguments(format!(
+					"Invalid xd:// URL: '{raw_path}'. Use xd://resolve or xd://reject."
+				)));
+			},
+			None => {},
+		}
 		if is_cancelled(ctx) {
 			return Ok(tool_result("Read cancelled", true));
 		}

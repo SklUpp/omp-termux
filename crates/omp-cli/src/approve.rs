@@ -108,7 +108,22 @@ pub fn classify_tool(name: &str, args: &serde_json::Value) -> ToolTier {
 				ToolTier::Read
 			}
 		},
-		"write" | "edit" => {
+		"write" => {
+			let path = args.get("path").and_then(|v| v.as_str());
+			if has_ssh_target(args) {
+				ToolTier::Exec
+			} else if path.is_some_and(pi_agent::tools::pending::is_resolution_device_path) {
+				// `xd://resolve|reject` only finalizes an already-approved
+				// staged preview: the queued action carries the approval that
+				// staged it, so the dispatch itself is read tier (upstream
+				// `write.ts` parity). Unknown xd:// targets stay write tier and
+				// fail closed in the tool.
+				ToolTier::Read
+			} else {
+				ToolTier::Write
+			}
+		},
+		"edit" => {
 			if has_ssh_target(args) {
 				ToolTier::Exec
 			} else {

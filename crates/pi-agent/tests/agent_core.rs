@@ -447,7 +447,7 @@ async fn write_rejects_oversized_content() {
 	let dir = TempDir::new("write-limits");
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
 
-	let error = WriteTool
+	let error = WriteTool::default()
 		.execute(&json!({"path": "big.txt", "content": "x".repeat(1024 * 1024 + 1)}), &ctx)
 		.await
 		.expect_err("must reject");
@@ -605,7 +605,7 @@ async fn write_preserves_original_bytes_and_cleans_temp_on_cancellation() {
 	token.cancel();
 	let ctx = pi_agent::AgentContext::with_cancellation(dir.path.clone(), token);
 
-	let result = WriteTool
+	let result = WriteTool::default()
 		.execute(
 			&json!({
 				"path": "file.txt",
@@ -647,7 +647,7 @@ async fn write_aborted_during_actual_write_cleans_temp_and_preserves_target() {
 	});
 
 	let task = tokio::spawn(async move {
-		WriteTool.execute(&args, &ctx).await
+		WriteTool::default().execute(&args, &ctx).await
 	});
 
 	for _ in 0..1000 {
@@ -696,7 +696,7 @@ async fn write_aborted_by_task_abort_cleans_temp_and_prevents_rename() {
 	});
 
 	let task = tokio::spawn(async move {
-		WriteTool.execute(&args, &ctx).await
+		WriteTool::default().execute(&args, &ctx).await
 	});
 
 	for _ in 0..1000 {
@@ -764,7 +764,7 @@ async fn write_follows_dangling_symlink_preserving_symlink() {
 	assert!(!target_file.exists());
 
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
-	let result = WriteTool
+	let result = WriteTool::default()
 		.execute(
 			&json!({
 				"path": "dangling_link.txt",
@@ -797,7 +797,7 @@ async fn write_fails_when_target_is_directory() {
 	std::fs::create_dir_all(&subdir).expect("mkdir");
 
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
-	let result = WriteTool
+	let result = WriteTool::default()
 		.execute(
 			&json!({
 				"path": "subfolder",
@@ -868,7 +868,7 @@ async fn write_preserves_restrictive_mode_on_existing_file() {
 	std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
 
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
-	let result = WriteTool
+	let result = WriteTool::default()
 		.execute(
 			&json!({
 				"path": "secret.key",

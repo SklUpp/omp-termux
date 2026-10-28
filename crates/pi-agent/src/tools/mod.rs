@@ -2,6 +2,7 @@ pub mod ask;
 pub mod ast_grep;
 pub mod hashline;
 pub mod hub;
+pub mod pending;
 pub mod process;
 pub mod read;
 pub mod registry;
@@ -15,6 +16,7 @@ pub mod yield_tool;
 pub use ask::AskTool;
 pub use ast_grep::AstGrepTool;
 pub use hub::HubTool;
+pub use pending::{PendingAction, PendingStore, REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH};
 pub use read::{ReadSnapshotSink, ReadTool};
 pub use task::TaskTool;
 pub use think::ThinkTool;
@@ -794,7 +796,78 @@ pub(crate) async fn write_atomic_with_mode(
 }
 
 /// Builtin file writing tool.
-pub struct WriteTool;
+///
+/// A write to `xd://resolve` or `xd://reject` is not a filesystem write: it
+/// settles the newest staged action from the session's [`pending::PendingStore`]
+/// before any path is resolved. The store is injected by the owner of the
+/// agent session (the runner for roots, a fresh one per child), never created
+/// per registry — registries are rebuilt every prompt.
+pub struct WriteTool {
+	pending: Option<Arc<pending::PendingStore>>,
+}
+
+impl Default for WriteTool {
+	fn default() -> Self {
+		Self { pending: None }
+	}
+}
+
+impl WriteTool {
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Mount the session's staging queue on this tool.
+	pub fn with_pending(pending: Arc<pending::PendingStore>) -> Self {
+		Self { pending: Some(pending) }
+	}
+
+	/// Dispatch an `xd://resolve|reject` write. Never touches the filesystem.
+	async fn dispatch_pending(
+		&self,
+		path: &str,
+		target: pending::XdTarget<'_>,
+		content: &str,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, ToolError> {
+		let device = match target {
+			pending::XdTarget::Device(device) => device,
+			pending::XdTarget::Invalid => {
+				return Err(ToolError::InvalidArguments(format!(
+					"Invalid xd:// URL: '{path}'. Use xd://resolve or xd://reject."
+				)));
+			},
+		};
+		if pending::resolution_device_usage(device).is_none() {
+			return Err(ToolError::InvalidArguments(format!(
+				"Unknown xd:// device '{device}'. Mounted devices: xd://resolve, xd://reject."
+			)));
+		}
+		// An interrupt outside `apply` must not consume the staged action.
+		if ctx.cancellation_token.is_cancelled() {
+			return Ok(tool_result(format!("Write to {path} cancelled"), true));
+		}
+		let Some(store) = &self.pending else {
+			return Err(ToolError::ExecutionFailed("xd:// is not mounted in this session.".to_string()));
+		};
+		let reason = content.trim();
+		let mut result = if device == pending::RESOLVE_DEVICE {
+			store.resolve(ctx, reason).await?
+		} else {
+			store.reject(ctx, reason).await?
+		};
+		let inner = result.details.take();
+		result.details = Some(serde_json::json!({
+			"xdev": {
+				"tool": device,
+				"mode": "execute",
+				"args": { "reason": reason },
+				"inner": inner,
+			}
+		}));
+		Ok(result)
+	}
+}
 
 #[async_trait]
 impl Tool for WriteTool {
@@ -836,6 +909,9 @@ impl Tool for WriteTool {
 			.get("content")
 			.and_then(Value::as_str)
 			.ok_or_else(|| ToolError::InvalidArguments("missing 'content' parameter".to_string()))?;
+		if let Some(target) = pending::parse_xd_target(path) {
+			return self.dispatch_pending(path, target, content, ctx).await;
+		}
 		if content.len() > MAX_WRITE_BYTES {
 			return Err(ToolError::InvalidArguments(format!(
 				"content is {} bytes, the limit is {MAX_WRITE_BYTES}",
@@ -1848,10 +1924,11 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
 	// validates against them.
 	let snapshots = Arc::new(hashline::SnapshotStore::new());
 	let sink = Arc::new(hashline::NativeSnapshotSink::new(snapshots.clone()));
+	let pending = Arc::new(pending::PendingStore::new());
 	vec![
 		Arc::new(BashTool::new()),
 		Arc::new(ReadTool::with_snapshot_sink(sink)),
-		Arc::new(WriteTool),
+		Arc::new(WriteTool::with_pending(pending)),
 		Arc::new(EditTool::new(snapshots)),
 		Arc::new(GlobTool),
 		Arc::new(GrepTool),

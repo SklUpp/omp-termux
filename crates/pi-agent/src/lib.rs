@@ -33,6 +33,7 @@ pub use mailbox::{
 	format_incoming,
 };
 pub use tools::{
-	AskTool, AstGrepTool, BashTool, EditTool, GlobTool, GrepTool, HubTool, ReadTool, TaskTool, ThinkTool,
-	TodoTool, Tool, ToolError, WriteTool, YieldTool, registry::ToolRegistry, scheduler::ToolScheduler,
+	AskTool, AstGrepTool, BashTool, EditTool, GlobTool, GrepTool, HubTool, PendingAction, PendingStore,
+	REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH, ReadTool, TaskTool, ThinkTool, TodoTool, Tool, ToolError,
+	WriteTool, YieldTool, registry::ToolRegistry, scheduler::ToolScheduler,
 };

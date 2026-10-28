@@ -18,7 +18,7 @@ use crate::{
 	provider::ModelProvider,
 	state::ToolApprover,
 	tools::{
-		BashTool, EditTool, HubTool, TaskTool, ThinkTool, YieldTool,
+		BashTool, EditTool, HubTool, PendingStore, TaskTool, ThinkTool, WriteTool, YieldTool,
 		hashline::{self, NativeSnapshotSink, SnapshotStore},
 		process::{ProcessBackend, ProcessManager},
 		read::ReadTool,
@@ -697,6 +697,13 @@ impl Supervisor {
 			reg.remove("edit");
 			reg.register(Arc::new(EditTool::with_options(snapshots, options)));
 		}
+		// Staged previews are session-scoped like snapshots: a child gets its
+		// own queue for the life of its registry, never the parent's pending
+		// action (which only the root may resolve).
+		if reg.get("write").is_some() {
+			reg.remove("write");
+			reg.register(Arc::new(WriteTool::with_pending(Arc::new(PendingStore::new()))));
+		}
 		// `todo` is parent-owned: the template shares one live `Arc<TodoTool>`
 		// instance, and child events/session details are not persisted. Dropping
 		// it here prevents descendants from mutating the parent list.
@@ -1102,9 +1109,33 @@ mod process_wiring_tests {
 	use super::*;
 	use crate::{
 		provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
-		state::Message,
-		tools::{process::ProcessManager, registry::ToolRegistry, Tool},
+		state::{AgentContext, Message, ToolResult},
+		tools::{PendingAction, ToolError, process::ProcessManager, registry::ToolRegistry, Tool},
 	};
+
+	struct Stage(std::path::PathBuf);
+
+	#[async_trait]
+	impl PendingAction for Stage {
+		fn label(&self) -> &str {
+			"staged file"
+		}
+
+		fn source_tool(&self) -> &str {
+			"ast_edit"
+		}
+
+		async fn apply(&self, _ctx: &AgentContext, reason: &str) -> Result<ToolResult, ToolError> {
+			std::fs::write(&self.0, reason).map_err(|err| ToolError::ExecutionFailed(err.to_string()))?;
+			Ok(ToolResult {
+				tool_call_id: String::new(),
+				content:       "applied".to_string(),
+				is_error:      false,
+				terminate:     false,
+				details:       None,
+			})
+		}
+	}
 
 	struct QuietProvider;
 
@@ -1218,5 +1249,54 @@ mod process_wiring_tests {
 			Err(_) => true,
 		};
 		assert!(missing, "swapped backend must not resolve the old job");
+	}
+
+	#[tokio::test]
+	async fn child_registry_gets_a_fresh_pending_store() {
+		let dir = std::env::temp_dir().join(format!("omp-sup-pending-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).expect("mkdir");
+		let target = dir.join("out.txt");
+		let root_store = Arc::new(PendingStore::new());
+		let mut registry = ToolRegistry::new();
+		registry.register(Arc::new(WriteTool::with_pending(root_store.clone())));
+		let supervisor = Supervisor::with_selection(
+			registry,
+			Arc::new(QuietProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			true,
+		);
+		root_store.register(Arc::new(Stage(target.clone())));
+
+		let ctx = AgentContext::new(dir.clone());
+		let write = |registry: ToolRegistry, dir: std::path::PathBuf| {
+			let tool = registry.get("write").expect("write");
+			let ctx = AgentContext::new(dir);
+			async move {
+				tool.execute(&serde_json::json!({"path": "xd://resolve", "content": "go"}), &ctx)
+					.await
+			}
+		};
+
+		// The child's fresh queue cannot resolve the root's staged action.
+		let child = write(supervisor.child_registry(1, Some("child")), dir.clone()).await;
+		let error = child.expect_err("child queue is empty");
+		assert!(error.to_string().contains("No pending action to apply"));
+		assert!(!target.exists());
+
+		// The root queue still holds it and applies exactly once.
+		let applied = write(supervisor.root_registry(), dir.clone())
+			.await
+			.expect("root apply");
+		assert!(!applied.is_error);
+		assert_eq!(std::fs::read_to_string(&target).expect("read"), "go");
+		assert!(root_store.is_empty());
+		let again = write(supervisor.root_registry(), dir.clone())
+			.await
+			.expect_err("consumed");
+		assert!(again.to_string().contains("No pending action to apply"));
+
+		std::fs::remove_dir_all(dir).ok();
 	}
 }

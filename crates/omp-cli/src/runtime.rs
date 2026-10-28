@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use pi_agent::{
 	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, AskTool, AstGrepTool, BashTool,
 	DelegationLimits,
-	EditTool, GlobTool, GrepTool, ModelProvider, OpenAiCompatibleProvider, ReadTool,
+	EditTool, GlobTool, GrepTool, ModelProvider, OpenAiCompatibleProvider, PendingStore, ReadTool,
 	SteeringEvent, Supervisor, TodoTool, Tool, ToolApprover, ToolRegistry, WriteTool,
 	process_broker::BrokerProcessBackend,
 	tools::process::{ProcessBackend, ProcessManager},
@@ -87,16 +87,20 @@ pub struct PiAgentRunner {
 /// One snapshot store plus one `EditTool` per runner: tags, seen-line ranges,
 /// named `CUT` registers, and the no-op guard must survive REPL turns, while
 /// child agents still get fresh instances through `Supervisor::child_registry`.
+/// `pending` sits beside them for the same reason: a staged preview registered
+/// in one prompt must stay resolvable in the next, even though the tool
+/// registry is rebuilt for every prompt.
 struct RunnerSession {
 	snapshots: Arc<SnapshotStore>,
 	edit:      Arc<EditTool>,
+	pending:   Arc<PendingStore>,
 }
 
 impl RunnerSession {
 	fn new(options: EditToolOptions) -> Self {
 		let snapshots = Arc::new(SnapshotStore::new());
 		let edit = Arc::new(EditTool::with_options(snapshots.clone(), options));
-		Self { snapshots, edit }
+		Self { snapshots, edit, pending: Arc::new(PendingStore::new()) }
 	}
 }
 
@@ -1468,11 +1472,14 @@ fn build_registry_full(
 	session: Option<&Arc<RunnerSession>>,
 ) -> Result<ToolRegistry> {
 	let mut registry = ToolRegistry::new();
-	// Root turns share one store/`EditTool` (see `RunnerSession`); a standalone
-	// registry (tests, MCP-less helpers) gets a fresh pair. Child agents always
-	// get their own instances through `Supervisor::child_registry`.
+	// Root turns share one snapshot/`EditTool` pair and one pending queue (see
+	// `RunnerSession`); a standalone registry (tests, MCP-less helpers) gets
+	// fresh instances. Child agents always get their own through
+	// `Supervisor::child_registry`.
 	let snapshots = session
 		.map_or_else(|| Arc::new(SnapshotStore::new()), |session| Arc::clone(&session.snapshots));
+	let pending = session
+		.map_or_else(|| Arc::new(PendingStore::new()), |session| Arc::clone(&session.pending));
 	let read_sink = Arc::new(NativeSnapshotSink::new(snapshots.clone()));
 	for name in tools {
 		let tool: Arc<dyn Tool> = match *name {
@@ -1480,7 +1487,7 @@ fn build_registry_full(
 			"glob" => Arc::new(GlobTool),
 			"grep" => Arc::new(GrepTool),
 			"ast_grep" => Arc::new(AstGrepTool),
-			"write" => Arc::new(WriteTool),
+			"write" => Arc::new(WriteTool::with_pending(Arc::clone(&pending))),
 			"edit" => match session {
 				Some(session) => session.edit.clone(),
 				None => Arc::new(EditTool::with_options(snapshots.clone(), edit_options)),
@@ -2654,7 +2661,11 @@ fn process_scope_root(project: &Path, runner_ns: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-	use std::{collections::BTreeMap, path::PathBuf};
+	use std::{
+		collections::BTreeMap,
+		path::PathBuf,
+		sync::atomic::{AtomicUsize, Ordering},
+	};
 
 	use super::*;
 	use crate::{
@@ -3996,6 +4007,102 @@ mod tests {
 			"o1\no2\no3\no4\no5\no6\no7\no8\nX\no10\n"
 		);
 		});
+	}
+
+	struct Stage {
+		path:  PathBuf,
+		calls: Arc<AtomicUsize>,
+	}
+
+	#[async_trait::async_trait]
+	impl pi_agent::PendingAction for Stage {
+		fn label(&self) -> &str {
+			"repl pending edit"
+		}
+
+		fn source_tool(&self) -> &str {
+			"ast_edit"
+		}
+
+		async fn apply(
+			&self,
+			_ctx: &pi_agent::AgentContext,
+			reason: &str,
+		) -> Result<pi_agent::ToolResult, pi_agent::ToolError> {
+			self.calls.fetch_add(1, Ordering::SeqCst);
+			std::fs::write(&self.path, reason)
+				.map_err(|err| pi_agent::ToolError::ExecutionFailed(err.to_string()))?;
+			Ok(pi_agent::ToolResult {
+				tool_call_id: String::new(),
+				content:      "applied".to_string(),
+				is_error:     false,
+				terminate:    false,
+				details:      None,
+			})
+		}
+	}
+
+	#[test]
+	fn repl_turns_share_the_pending_store_across_registry_rebuilds() {
+		let dir = std::env::temp_dir().join(format!(
+			"omp-cli-runtime-pending-{}",
+			crate::output::session_id()
+		));
+		std::fs::create_dir_all(&dir).expect("mkdir");
+		let target = dir.join("out.txt");
+		let calls = Arc::new(AtomicUsize::new(0));
+		let runner = PiAgentRunner::new().expect("runner");
+		let options = EditToolOptions::default();
+		let build = |session: Option<&Arc<RunnerSession>>| {
+			build_registry_full(
+				&["write"],
+				Vec::new(),
+				Vec::new(),
+				Vec::new(),
+				Vec::new(),
+				false,
+				options,
+				session,
+			)
+			.expect("registry")
+		};
+		let ctx = pi_agent::AgentContext::new(dir.clone());
+
+		runner.runtime.block_on(async {
+			// Prompt 1 stages the action under the session store; prompt 2 runs
+			// against a rebuilt registry and must still see it.
+			let session = runner.session_tools(options);
+			let _turn1 = build(Some(&session));
+			session.pending.register(Arc::new(Stage { path: target.clone(), calls: calls.clone() }));
+			let turn2 = build(Some(&session));
+
+			let applied = turn2
+				.get("write")
+				.expect("write")
+				.execute(
+					&serde_json::json!({"path": "xd://resolve", "content": "apply it"}),
+					&ctx,
+				)
+				.await
+				.expect("apply");
+			assert!(!applied.is_error, "{}", applied.content);
+			assert_eq!(std::fs::read_to_string(&target).expect("read"), "apply it");
+			assert_eq!(calls.load(Ordering::SeqCst), 1);
+			assert!(session.pending.is_empty());
+
+			// A registry built without the session owns a separate queue.
+			let standalone = build(None);
+			let rejected = standalone
+				.get("write")
+				.expect("write")
+				.execute(&serde_json::json!({"path": "xd://reject", "content": "none"}), &ctx)
+				.await
+				.expect("reject");
+			assert!(!rejected.is_error);
+			assert!(rejected.content.contains("Nothing to reject"));
+		});
+
+		std::fs::remove_dir_all(&dir).ok();
 	}
 
 	#[tokio::test]
