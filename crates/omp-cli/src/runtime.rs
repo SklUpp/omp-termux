@@ -39,7 +39,7 @@ pub const DEFAULT_CONTEXT_LIMIT: usize = 32_768;
 /// `pi-agent` has no approval hook, so the registry *is* the approval gate:
 /// a tool is offered to the model only when the approval matrix would
 /// auto-approve it.
-const BUILTIN_TOOLS: [(&str, bool); 7] = [
+pub const BUILTIN_TOOLS: [(&str, bool); 7] = [
 	("read", true),
 	("glob", true),
 	("grep", true),
@@ -260,7 +260,10 @@ impl AgentRunner for PiAgentRunner {
 		let provider = OpenAiCompatibleProvider::new(plan.base_url, plan.api_key, plan.model)
 			.map_err(|err| Error::with_source("pi-agent provider setup failed", err))?
 			.with_effort(plan.effort)
-			.with_images(plan.supports_images);
+			.with_images(plan.supports_images)
+			.with_prompt_cache_enabled(plan.provider == "kimi-code")
+			.with_session_id(request.provider_session_id.clone())
+			.with_prompt_cache_key(request.prompt_cache_key.clone());
 		let config = AgentConfig {
 			max_turns: plan.max_turns,
 			context_limit: plan.context_limit,
@@ -1774,6 +1777,8 @@ mod tests {
 			model: Some("local/llama3".to_string()),
 			provider: None,
 			api_key: None,
+			provider_session_id: None,
+			prompt_cache_key: None,
 			system_prompt: Some("base prompt".to_string()),
 			append_system_prompt: Some("appended".to_string()),
 			context_files: vec![ContextFile {

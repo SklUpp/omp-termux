@@ -23,6 +23,10 @@ use omp_cli::{
 };
 use serde_json::json;
 
+/// Mock listeners must outlive the runner's own `max_time` (10s) and full-suite
+/// scheduling delay; a 5s wall clock let `tools/list` race a dead listener.
+const FIXTURE_DEADLINE: Duration = Duration::from_secs(30);
+
 struct TempDir {
 	path: PathBuf,
 }
@@ -57,7 +61,7 @@ fn spawn_mock_model_server(
 		let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
 		let _ = listener.set_nonblocking(true);
 		addr_tx.send(listener.local_addr().unwrap()).unwrap();
-		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		let deadline = std::time::Instant::now() + FIXTURE_DEADLINE;
 		let mut socket = loop {
 			if std::time::Instant::now() >= deadline {
 				return;
@@ -126,6 +130,8 @@ fn make_run_request(
 		model: Some("local/mock-model".to_string()),
 		provider: Some("local".to_string()),
 		api_key: Some("sk-test".to_string()),
+		provider_session_id: None,
+		prompt_cache_key: None,
 		system_prompt: None,
 		append_system_prompt: None,
 		context_files: Vec::new(),
@@ -690,7 +696,7 @@ fn test_mcp_tool_error_redacts_http_body_secrets() {
 	let srv_addr = listener.local_addr().unwrap();
 	let srv_handle = std::thread::spawn(move || {
 		let _ = listener.set_nonblocking(true);
-		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		let deadline = std::time::Instant::now() + FIXTURE_DEADLINE;
 		while std::time::Instant::now() < deadline {
 			let (mut socket, _) = match listener.accept() {
 				Ok(conn) => conn,
@@ -787,7 +793,7 @@ fn test_mcp_tool_call_error_redacts_http_body_secrets() {
 	let srv_addr = listener.local_addr().unwrap();
 	let srv_handle = std::thread::spawn(move || {
 		let _ = listener.set_nonblocking(true);
-		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		let deadline = std::time::Instant::now() + FIXTURE_DEADLINE;
 		let mut done = false;
 		while !done && std::time::Instant::now() < deadline {
 			let (mut socket, _) = match listener.accept() {
@@ -962,7 +968,7 @@ fn test_mcp_tool_call_json_rpc_error_redacts_message_secrets() {
 	let srv_addr = listener.local_addr().unwrap();
 	let srv_handle = std::thread::spawn(move || {
 		let _ = listener.set_nonblocking(true);
-		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		let deadline = std::time::Instant::now() + FIXTURE_DEADLINE;
 		let mut done = false;
 		while !done && std::time::Instant::now() < deadline {
 			let (mut socket, _) = match listener.accept() {

@@ -2045,6 +2045,7 @@ fn reasoning_effort_is_serialized_only_when_set() {
 		tools: Vec::new(),
 		stream: false,
 		reasoning_effort: None,
+		prompt_cache_key: None,
 	};
 	let payload = serde_json::to_value(&without).expect("serialize");
 	assert!(payload.get("reasoning_effort").is_none(), "got: {payload}");

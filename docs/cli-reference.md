@@ -75,8 +75,8 @@ Argument handling:
 | `--continue`, `-c` | Continue the previous session. |
 | `--resume [id]`, `-r`, `--session [id]` | Resume a session by ID prefix or path, or open the picker when no value is given. |
 | `--fork <session>` | Fork a saved session (by ID prefix or path) into a new session. See [session operations](./session-operations-export-share-fork-resume.md). |
-| `--from-claude` | Import a Claude Code session into OMP. |
-| `--from-codex` | Import a Codex session into OMP. |
+| `--from-claude` | Import a Claude Code session into OMP. Requires an interactive picker; non-TTY exits 2. |
+| `--from-codex` | Import a Codex session into OMP. Requires an interactive picker; non-TTY exits 2. |
 | `--export <session>` | Export a session file to HTML and exit. |
 | `--no-title` | Disable title auto-generation (equivalent to the `PI_NO_TITLE` [environment variable](./environment-variables.md)). |
 
@@ -91,8 +91,8 @@ Argument handling:
 | `--models <a,b,c>` | Comma-separated model patterns for `Ctrl+P` cycling. |
 | `--provider <name>` | Provider to use (legacy; prefer `--model`). |
 | `--api-key <key>` | API key (defaults to env vars). |
-| `--provider-session-id <id>` | Reuse a specific provider-side session id for continuity and cache scoping. |
-| `--prompt-cache-key <key>` | Override the provider prompt-cache key for this session. |
+| `--provider-session-id <id>` | Reuse a specific provider-side session id for continuity and cache scoping; the fallback prompt-cache identity when no key is pinned. Like the TypeScript CLI, `prompt_cache_key` is sent only to dialects that accept it (`kimi-code` today). |
+| `--prompt-cache-key <key>` | Override the provider prompt-cache key for this run; wins over `--provider-session-id` and a key inherited from a resumed/forked session. Explicit keys survive a model switch, inherited keys do not; only the `kimi-code` dialect receives `prompt_cache_key` on the chat-completions wire. |
 | `--service-tier <tier>` | OpenAI service tier for this session (`none` omits `service_tier`). |
 
 See [providers](./providers.md) and [models](./models.md) for model resolution.
@@ -217,7 +217,7 @@ Run `omp <command> --help` for each command's own flags and examples.
 | `browser-relay` | Run the local CDP relay that lets the browser tool drive your own Chrome tabs. | [computer use](./computer-use.md) |
 | `cleanse` | Detect and fix project diagnostics with weighted parallel subagents. | |
 | `commit` | Generate a commit message and update changelogs. | |
-| `completions` | Print a shell completion script (bash, zsh, or fish). | |
+| `completions` | Print a shell completion script (bash, zsh, or fish). | [shell completions](#shell-completions) |
 | `compress` | Rewrite a text file into the dense prompt register, reporting what it drops. | |
 | `config` | Manage configuration settings. | [config usage](./config-usage.md), [settings](./settings.md) |
 | `dry-balance` | Dry-run OAuth account balancing across random session ids. | |
@@ -250,3 +250,37 @@ Run `omp <command> --help` for each command's own flags and examples.
 > reachable through related mechanisms (the `plugin` command, the `/join` slash
 > command, and so on). The table lists each as it is registered in
 > `packages/coding-agent/src/cli-commands.ts`.
+
+### Shell completions
+
+`omp completions <bash|zsh|fish>` prints a completion script derived from the
+same command/flag registry that renders `--help`. Generation loads no config,
+opens no session, and starts no network request. A missing or unknown shell
+prints `Usage: omp completions <bash|zsh|fish>` to stderr and exits 1.
+
+```sh
+# zsh — eval at startup, or write the output to a file in $fpath
+eval "$(omp completions zsh)"
+
+# bash
+eval "$(omp completions bash)"
+
+# fish
+omp completions fish > ~/.config/fish/completions/omp.fish
+```
+
+Flag values with a fixed domain (`--mode`, `--approval-mode`, the `completions`
+shell) are baked into the script. `--tools` values are suggested per item
+(comma-aware in bash and zsh). File and directory flags complete paths. Model
+and session selectors are resolved at TAB time by the hidden
+`omp __complete <kind> [-- <prefix>]` helper, which prints one
+`value<TAB>description` line per candidate:
+
+- `models` — ids from the CLI's model catalog, offered both as `provider/id`
+  and bare `id`; filtered by a case-insensitive substring match.
+- `sessions` — session ids from the current project's session directory,
+  newest first, with the session title (or the first user message when the
+  session has no title yet) as the description.
+
+Unknown kinds, a missing catalog, or a missing session directory print nothing
+and exit 0, so a TAB never fails the shell.

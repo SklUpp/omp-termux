@@ -12,6 +12,7 @@ use omp_cli::{
 	approve::{ApprovalMode, Approvals},
 	args::{Cli, Command},
 	catalog::Catalog,
+	completions,
 	config::Config,
 	deadline::{self, Deadline},
 	dirs,
@@ -80,6 +81,19 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> std::result::Result<(), CliError> {
 	let cli = Cli::parse();
+	// Completion commands run before the agent runtime, config, and sessions are
+	// loaded: generating a script or resolving candidates must never boot a
+	// session, read config, or touch the network.
+	match &cli.command {
+		Some(Command::Completions { shell }) => {
+			return completions::run(shell.as_deref()).map_err(|message| CliError::fail(message));
+		},
+		Some(Command::Complete { args }) => {
+			completions::complete(args);
+			return Ok(());
+		},
+		_ => {},
+	}
 	if agent::install(Box::new(PiAgentRunner::new()?)).is_err() {
 		return Err(CliError::fail("agent runtime already registered"));
 	}
@@ -88,7 +102,7 @@ fn run() -> std::result::Result<(), CliError> {
 	};
 
 	let mut config = Config::load(&cli.config)?;
-	if let Some(tools) = cli.tools {
+	if let Some(tools) = &cli.tools {
 		let normalized: Vec<String> = tools
 			.iter()
 			.flat_map(|s| s.split(','))
@@ -134,6 +148,11 @@ fn run() -> std::result::Result<(), CliError> {
 		if cli.continue_session || cli.resume.is_some() || cli.fork.is_some() {
 			return Err(CliError::usage(format!(
 				"--from-{src_name} cannot be combined with --continue, --resume, or --fork"
+			)));
+		}
+		if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+			return Err(CliError::usage(format!(
+				"Non-interactive environment cannot display session picker. --from-{src_name} requires an interactive session picker."
 			)));
 		}
 	}
@@ -323,6 +342,9 @@ fn run() -> std::result::Result<(), CliError> {
 		model: None,
 		provider: None,
 		api_key: None,
+		provider_session_id: None,
+		prompt_cache_key: None,
+		prompt_cache_key_source: None,
 		max_time: cli.max_time,
 		deadline: Deadline::new(cli.max_time),
 		max_turns: runtime::DEFAULT_MAX_TURNS,
@@ -382,6 +404,28 @@ fn run() -> std::result::Result<(), CliError> {
 	for warning in store.take_warnings() {
 		eprintln!("warning: {warning}");
 	}
+	// TS `main.ts:buildSessionOptions`: an explicit `--prompt-cache-key` always
+	// wins; otherwise a resumed/forked header key is inherited only when the
+	// provider route and prompt/tool shape are unchanged.
+	let explicit_cache_key = cli.prompt_cache_key.clone().filter(|key| !key.is_empty());
+	let cache_shape_changed = cli.model.is_some()
+		|| cli.system_prompt.is_some()
+		|| cli.append_system_prompt.is_some()
+		|| cli.tools.is_some()
+		|| cli.no_tools;
+	if let Some(key) = explicit_cache_key {
+		session.prompt_cache_key = Some(key);
+		session.prompt_cache_key_source = Some(PromptCacheKeySource::Explicit);
+	} else if !cache_shape_changed {
+		if let Some(key) = store
+			.header()
+			.and_then(|header| header.provider_prompt_cache_key.clone())
+		{
+			session.prompt_cache_key = Some(key);
+			session.prompt_cache_key_source = Some(PromptCacheKeySource::Inherited);
+		}
+	}
+	session.provider_session_id = cli.provider_session_id.clone().filter(|id| !id.is_empty());
 	if !cli.no_session && explicitly_existing && !store.enabled() {
 		return Err(CliError::usage(
 			"cannot open session log: persistence disabled due to format error",
@@ -536,6 +580,24 @@ fn run_repl<W: Write, E: Write>(
 	reporter.finish()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptCacheKeySource {
+	Explicit,
+	Inherited,
+}
+
+/// TS `#clearInheritedProviderPromptCacheKey`: a model switch clears only the
+/// inherited header key, never an explicit `--prompt-cache-key`.
+fn invalidate_inherited_cache_key(
+	key: &mut Option<String>,
+	source: &mut Option<PromptCacheKeySource>,
+) {
+	if *source == Some(PromptCacheKeySource::Inherited) {
+		*key = None;
+		*source = None;
+	}
+}
+
 struct Session<'a> {
 	runner: &'a dyn AgentRunner,
 	config: Config,
@@ -547,6 +609,13 @@ struct Session<'a> {
 	model: Option<String>,
 	provider: Option<String>,
 	api_key: Option<String>,
+	/// Provider-side sticky session id from `--provider-session-id`.
+	provider_session_id: Option<String>,
+	/// Explicit prompt-cache identity: flag value, else resumed/forked header.
+	prompt_cache_key: Option<String>,
+	/// Where `prompt_cache_key` came from: inherited keys die on a model switch,
+	/// explicit `--prompt-cache-key` values survive (TS `providerPromptCacheKeySource`).
+	prompt_cache_key_source: Option<PromptCacheKeySource>,
 	max_time: Option<Duration>,
 	deadline: Option<Deadline>,
 	max_turns: usize,
@@ -562,7 +631,15 @@ struct Session<'a> {
 
 impl Session<'_> {
 	fn select_model(&mut self, id: String) {
-		self.provider = self.catalog.provider_of(&id).map(str::to_string);
+		let provider = self.catalog.provider_of(&id).map(str::to_string);
+		let changed = self.model.as_deref() != Some(id.as_str()) || self.provider != provider;
+		if changed {
+			invalidate_inherited_cache_key(
+				&mut self.prompt_cache_key,
+				&mut self.prompt_cache_key_source,
+			);
+		}
+		self.provider = provider;
 		self.api_key = self
 			.provider
 			.as_deref()
@@ -593,6 +670,8 @@ impl Session<'_> {
 			model: self.model.clone(),
 			provider: self.provider.clone(),
 			api_key: self.api_key.clone(),
+			provider_session_id: self.provider_session_id.clone(),
+			prompt_cache_key: self.prompt_cache_key.clone(),
 			system_prompt: self.prompts.system.clone(),
 			append_system_prompt: self.prompts.append.clone(),
 			context_files: self.prompts.files.clone(),
@@ -1234,4 +1313,24 @@ fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Resul
 		}
 	}
 	Ok(ProcessedCliFiles { text, images })
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn model_switch_clears_inherited_cache_key_but_keeps_explicit() {
+		let mut key = Some("header-cache".to_string());
+		let mut source = Some(PromptCacheKeySource::Inherited);
+		invalidate_inherited_cache_key(&mut key, &mut source);
+		assert_eq!(key, None);
+		assert_eq!(source, None);
+
+		let mut key = Some("explicit-cache".to_string());
+		let mut source = Some(PromptCacheKeySource::Explicit);
+		invalidate_inherited_cache_key(&mut key, &mut source);
+		assert_eq!(key.as_deref(), Some("explicit-cache"));
+		assert_eq!(source, Some(PromptCacheKeySource::Explicit));
+	}
 }

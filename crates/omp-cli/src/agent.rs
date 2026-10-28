@@ -117,6 +117,11 @@ pub struct RunRequest {
 	pub model: Option<String>,
 	pub provider: Option<String>,
 	pub api_key: Option<String>,
+	/// Provider-side sticky session id (`--provider-session-id`).
+	pub provider_session_id: Option<String>,
+	/// Effective prompt-cache identity for this run (`--prompt-cache-key`, else
+	/// a key inherited from the resumed/forked session header).
+	pub prompt_cache_key: Option<String>,
 	pub system_prompt: Option<String>,
 	pub append_system_prompt: Option<String>,
 	pub context_files: Vec<ContextFile>,

@@ -9,6 +9,7 @@ pub mod agent;
 pub mod approve;
 pub mod args;
 pub mod catalog;
+pub mod completions;
 pub mod config;
 pub mod deadline;
 pub mod dirs;

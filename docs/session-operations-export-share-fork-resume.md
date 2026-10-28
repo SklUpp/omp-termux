@@ -261,7 +261,11 @@ Startup `--fork` is resolved before normal session creation:
 4. The forked file is created in the current cwd/session-dir scope and becomes the active session manager for startup.
 5. Full-context forks automatically seed `providerPromptCacheKey` from the source header's inherited key, falling back to the source session id. Startup drops that automatic inheritance when `--model`, `--thinking`, `--system-prompt`, `--append-system-prompt`, `--tools`, or `--no-tools` changes the provider route or prompt/tool shape.
 
-Use `--prompt-cache-key <key>` to pin the provider prompt-cache identity explicitly and independently from both the OMP session id and `--provider-session-id`. `--provider-session-id` continues to control provider session/routing headers and sticky credential selection; `--prompt-cache-key` controls the OpenAI Responses `prompt_cache_key` payload where supported.
+Use `--prompt-cache-key <key>` to pin the provider prompt-cache identity explicitly and independently from both the OMP session id and `--provider-session-id`. An explicit key wins on resume/fork; otherwise a resumed or forked session inherits its header `providerPromptCacheKey` when `--model`, `--thinking`, `--system-prompt`, `--append-system-prompt`, `--tools`, or `--no-tools` does not change the provider route or prompt/tool shape. `--provider-session-id` supplies the fallback cache identity (`promptCacheKey ?? sessionId`) when no key is pinned.
+
+In the Rust `omp-cli` parity build the only provider wire is `openai-completions`, so both flags feed one effective body field, `prompt_cache_key` (explicit key first, else provider session id; normalized to 64 characters with a `pc_<hash>` fallback). Provider session headers and sticky credential selection for other dialects remain open. The value is not written into the session header: like TS, only forks seed `providerPromptCacheKey` (source key, else source session id).
+
+`--from-claude` and `--from-codex` require the interactive foreign-session picker. In a non-TTY process (`stdin` or `stdout` not a terminal) the CLI exits with code 2 and `Non-interactive environment cannot display session picker. --from-<source> requires an interactive session picker.`; it does not print a success notice and does not create a session log.
 
 ## Resume and continue
 

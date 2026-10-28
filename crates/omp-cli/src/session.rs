@@ -1802,7 +1802,17 @@ pub fn valid_session_id(id: &str) -> bool {
 			.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-pub fn compute_default_session_dir(cwd: &Path, sessions_root: Option<&Path>) -> PathBuf {
+struct SessionDirPaths {
+	current: PathBuf,
+	legacy_absolute: PathBuf,
+	legacy_home: Option<PathBuf>,
+	root: PathBuf,
+}
+
+/// Current and pre-migration session directories for `cwd`.
+///
+/// Pure: computes paths only, never creates, renames, or removes anything.
+fn session_dir_paths(cwd: &Path, sessions_root: Option<&Path>) -> SessionDirPaths {
 	let raw_cwd = if cwd.is_absolute() {
 		cwd.to_path_buf()
 	} else {
@@ -1843,12 +1853,56 @@ pub fn compute_default_session_dir(cwd: &Path, sessions_root: Option<&Path>) -> 
 	let root = sessions_root
 		.map(PathBuf::from)
 		.unwrap_or_else(SessionOptions::default_sessions_root);
+	let legacy_absolute = {
+		let abs_str = resolved_cwd.to_string_lossy();
+		let stripped = abs_str.trim_start_matches(|c| c == '/' || c == '\\');
+		let replaced = stripped.replace(['/', '\\', ':'], "-");
+		root.join(format!("--{replaced}--"))
+	};
+	let legacy_home = raw_home.as_ref().and_then(|home| {
+		let rel = raw_cwd.strip_prefix(home).ok()?;
+		let home_encoded = home
+			.to_string_lossy()
+			.trim_start_matches(|c| c == '/' || c == '\\')
+			.replace(['/', '\\', ':'], "-");
+		let rel_str = rel.to_string_lossy().replace(['/', '\\', ':'], "-");
+		let name = if rel_str.is_empty() {
+			format!("--{home_encoded}--")
+		} else {
+			format!("--{home_encoded}-{rel_str}--")
+		};
+		Some(root.join(name))
+	});
+	SessionDirPaths {
+		current: root.join(encoded_dir_name),
+		legacy_absolute,
+		legacy_home,
+		root,
+	}
+}
 
-	migrate_home_session_dirs(&root);
-	let session_dir = root.join(encoded_dir_name);
-	migrate_legacy_absolute_session_dir(&resolved_cwd, &session_dir, &root);
+/// Read-only session directories a completion helper must scan.
+///
+/// Includes the current encoded directory and the legacy absolute-path
+/// directory that `compute_default_session_dir` would otherwise migrate.
+/// De-duplicated; nothing is created or moved.
+#[must_use]
+pub fn session_completion_dirs(cwd: &Path, sessions_root: Option<&Path>) -> Vec<PathBuf> {
+	let paths = session_dir_paths(cwd, sessions_root);
+	let mut dirs = vec![paths.current];
+	for legacy in [Some(paths.legacy_absolute), paths.legacy_home].into_iter().flatten() {
+		if !dirs.contains(&legacy) {
+			dirs.push(legacy);
+		}
+	}
+	dirs
+}
 
-	session_dir
+pub fn compute_default_session_dir(cwd: &Path, sessions_root: Option<&Path>) -> PathBuf {
+	let paths = session_dir_paths(cwd, sessions_root);
+	migrate_home_session_dirs(&paths.root);
+	migrate_legacy_absolute_session_dir(&paths.legacy_absolute, &paths.current);
+	paths.current
 }
 
 fn migrate_session_dir_path(old_path: &Path, new_path: &Path) {
@@ -1908,16 +1962,11 @@ fn migrate_home_session_dirs(sessions_root: &Path) {
 	}
 }
 
-fn migrate_legacy_absolute_session_dir(cwd: &Path, session_dir: &Path, sessions_root: &Path) {
-	let abs_str = cwd.to_string_lossy();
-	let stripped = abs_str.trim_start_matches(|c| c == '/' || c == '\\');
-	let replaced = stripped.replace(['/', '\\', ':'], "-");
-	let legacy_name = format!("--{replaced}--");
-	let legacy_dir = sessions_root.join(legacy_name);
+fn migrate_legacy_absolute_session_dir(legacy_dir: &Path, session_dir: &Path) {
 	if legacy_dir == session_dir || !legacy_dir.exists() {
 		return;
 	}
-	migrate_session_dir_path(&legacy_dir, session_dir);
+	migrate_session_dir_path(legacy_dir, session_dir);
 }
 
 #[derive(Debug)]

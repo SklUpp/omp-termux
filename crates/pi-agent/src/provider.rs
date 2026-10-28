@@ -118,6 +118,17 @@ pub struct OpenAiCompatibleProvider {
 	model: String,
 	effort: Option<String>,
 	supports_images: bool,
+	/// Provider-side sticky session id (TS `sessionId`).
+	session_id: Option<String>,
+	/// Explicit prompt-cache identity (TS `promptCacheKey`).
+	prompt_cache_key: Option<String>,
+	/// Whether this provider's dialect accepts `prompt_cache_key` on the wire.
+	///
+	/// TS `openai-completions.ts` sends it for `kimi-code`, or for a model whose
+	/// `compat.supportsPromptCacheBreakpoints` is set *and* prompt caching was
+	/// requested. Rust models no prompt-cache mode, so callers enable this only
+	/// for the kimi-code dialect.
+	prompt_cache_enabled: bool,
 }
 
 impl OpenAiCompatibleProvider {
@@ -157,6 +168,9 @@ impl OpenAiCompatibleProvider {
 			model: model.into(),
 			effort: None,
 			supports_images: true,
+			session_id: None,
+			prompt_cache_key: None,
+			prompt_cache_enabled: false,
 		}
 	}
 
@@ -185,6 +199,44 @@ impl OpenAiCompatibleProvider {
 		self.effort.as_deref()
 	}
 
+	/// Set the provider-side session id (TS `sessionId`).
+	///
+	/// Empty values are treated as unset, matching the TS truthy check.
+	pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+		self.session_id = session_id.filter(|value| !value.is_empty());
+		self
+	}
+
+	/// Pin the prompt-cache identity (TS `promptCacheKey`).
+	///
+	/// Empty values are treated as unset, matching the TS truthy check.
+	pub fn with_prompt_cache_key(mut self, key: Option<String>) -> Self {
+		self.prompt_cache_key = key.filter(|value| !value.is_empty());
+		self
+	}
+
+	/// Enable `prompt_cache_key` on the wire for dialects that accept it.
+	///
+	/// Disabled by default so a generic OpenAI-compatible endpoint never sees a
+	/// cache identity it may reject. `kimi-code` is the dialect wired by the CLI.
+	pub fn with_prompt_cache_enabled(mut self, enabled: bool) -> Self {
+		self.prompt_cache_enabled = enabled;
+		self
+	}
+
+	/// Effective prompt-cache identity: explicit key, else provider session id.
+	///
+	/// Mirrors `getOpenAIPromptCacheKey`: `promptCacheKey ?? sessionId`, normalized
+	/// to the 64-character OpenAI limit with the `pc_` hash fallback. Whether it
+	/// is serialized is decided by [`Self::with_prompt_cache_enabled`].
+	pub fn prompt_cache_key(&self) -> Option<String> {
+		self
+			.prompt_cache_key
+			.as_deref()
+			.or(self.session_id.as_deref())
+			.and_then(normalize_prompt_cache_key)
+	}
+
 	/// `{base_url}/chat/completions`, tolerating a trailing slash in `base_url`.
 	pub fn endpoint(&self) -> String {
 		format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
@@ -202,6 +254,7 @@ impl OpenAiCompatibleProvider {
 			tools: tools.to_vec(),
 			stream,
 			reasoning_effort: self.effort.clone(),
+			prompt_cache_key: self.prompt_cache_enabled.then(|| self.prompt_cache_key()).flatten(),
 		})
 	}
 }
@@ -367,6 +420,22 @@ pub struct OpenAiChatRequest {
 	/// OpenAI-compatible `reasoning_effort`; omitted when unset.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reasoning_effort: Option<String>,
+	/// OpenAI-compatible `prompt_cache_key`; omitted when unset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prompt_cache_key: Option<String>,
+}
+
+/// Normalize a cache identity to the OpenAI wire limit (TS `normalizeOpenAIPromptCacheKey`).
+fn normalize_prompt_cache_key(value: &str) -> Option<String> {
+	if value.is_empty() {
+		return None;
+	}
+	// JS `.length` counts UTF-16 code units; ASCII cache ids are the common case.
+	if value.encode_utf16().count() <= 64 {
+		return Some(value.to_string());
+	}
+	let hash = crate::mcp::naming::bun_hash_base36(value.as_bytes());
+	Some(format!("pc_{hash}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -881,6 +950,62 @@ mod tests {
 		assert_eq!(wire[0].role, "tool");
 		assert_eq!(wire[0].content, Some(OpenAiContent::Text("(see attached image)".to_string())));
 		assert_eq!(wire[1].role, "user");
+	}
+
+	#[test]
+	fn chat_request_uses_explicit_prompt_cache_key_before_session_id() {
+		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "key", "model-x")
+			.expect("build")
+			.with_prompt_cache_enabled(true)
+			.with_session_id(Some("provider-session-1".to_string()))
+			.with_prompt_cache_key(Some("explicit-cache-1".to_string()));
+		assert_eq!(provider.prompt_cache_key().as_deref(), Some("explicit-cache-1"));
+		let request = provider.request(&[], &[], true).expect("request");
+		assert_eq!(request.prompt_cache_key.as_deref(), Some("explicit-cache-1"));
+
+		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "key", "model-x")
+			.expect("build")
+			.with_prompt_cache_enabled(true)
+			.with_session_id(Some("provider-session-1".to_string()));
+		assert_eq!(provider.prompt_cache_key().as_deref(), Some("provider-session-1"));
+
+		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "key", "model-x")
+			.expect("build")
+			.with_prompt_cache_enabled(true)
+			.with_session_id(Some(String::new()))
+			.with_prompt_cache_key(Some(String::new()));
+		assert_eq!(provider.prompt_cache_key(), None);
+		let payload = serde_json::to_value(provider.request(&[], &[], true).expect("request"))
+			.expect("serialize");
+		assert!(payload.get("prompt_cache_key").is_none(), "got: {payload}");
+	}
+
+	#[test]
+	fn generic_endpoint_omits_prompt_cache_key_unless_enabled() {
+		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "key", "model-x")
+			.expect("build")
+			.with_session_id(Some("provider-session-1".to_string()))
+			.with_prompt_cache_key(Some("explicit-cache-1".to_string()));
+		assert_eq!(provider.prompt_cache_key().as_deref(), Some("explicit-cache-1"));
+		let payload = serde_json::to_value(provider.request(&[], &[], true).expect("request"))
+			.expect("serialize");
+		assert!(
+			payload.get("prompt_cache_key").is_none(),
+			"generic openai-completions must not receive prompt_cache_key: {payload}"
+		);
+	}
+
+	#[test]
+	fn overlong_prompt_cache_key_uses_ts_hash_form() {
+		let long = "cache-key-".repeat(8);
+		assert!(long.encode_utf16().count() > 64);
+		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "key", "model-x")
+			.expect("build")
+			.with_prompt_cache_key(Some(long.clone()));
+		let key = provider.prompt_cache_key().expect("normalized key");
+		// `Bun.hash("cache-key-".repeat(8)).toString(36)` = 2jtb5bhjsyy44.
+		assert_eq!(key, "pc_2jtb5bhjsyy44");
+		assert_ne!(key, long);
 	}
 
 	#[test]

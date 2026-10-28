@@ -226,6 +226,8 @@ fn fake_request(prompt: &str) -> RunRequest {
 		model: None,
 		provider: None,
 		api_key: None,
+		provider_session_id: None,
+		prompt_cache_key: None,
 		system_prompt: None,
 		append_system_prompt: None,
 		context_files: Vec::new(),

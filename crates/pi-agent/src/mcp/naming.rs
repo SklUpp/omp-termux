@@ -106,6 +106,11 @@ pub fn bun_wyhash(seed: u64, data: &[u8]) -> u64 {
     wymum(a2 ^ WY_SECRET[0] ^ (length as u64), b2 ^ WY_SECRET[1])
 }
 
+/// `Bun.hash(data).toString(36)` for stable-id normalization shared with TS.
+pub fn bun_hash_base36(data: &[u8]) -> String {
+    to_base36(bun_wyhash(0, data))
+}
+
 fn to_base36(mut val: u64) -> String {
     if val == 0 {
         return "0".to_string();

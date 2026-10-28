@@ -352,7 +352,12 @@ fn test_cli_image_only_tool_result_uses_placeholder_on_wire() {
 		"next",
 	]);
 	let out = cmd.output().expect("run resume command");
-	assert!(out.status.success());
+	assert!(
+		out.status.success(),
+		"resume command failed: status={:?}\nstderr:\n{}",
+		out.status,
+		String::from_utf8_lossy(&out.stderr)
+	);
 
 	let reqs = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs.len(), 1);
@@ -425,7 +430,12 @@ fn test_cli_aborted_tool_turn_with_image_replays_properly() {
 		"continue work",
 	]);
 	let out = cmd.output().expect("run resume command");
-	assert!(out.status.success());
+	assert!(
+		out.status.success(),
+		"resume command failed: status={:?}\nstderr:\n{}",
+		out.status,
+		String::from_utf8_lossy(&out.stderr)
+	);
 
 	let reqs = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs.len(), 1);
@@ -538,7 +548,12 @@ fn test_cli_legacy_text_tool_session_replays_without_user_image_insertion() {
 		"proceed",
 	]);
 	let out = cmd.output().expect("run resume command");
-	assert!(out.status.success());
+	assert!(
+		out.status.success(),
+		"resume command failed: status={:?}\nstderr:\n{}",
+		out.status,
+		String::from_utf8_lossy(&out.stderr)
+	);
 
 	let reqs = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs.len(), 1);

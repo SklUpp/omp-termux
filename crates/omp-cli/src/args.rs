@@ -360,6 +360,20 @@ impl Parser for Cli {}
 pub enum Command {
 	/// Read prompts from stdin until `/exit`.
 	Repl,
+
+	/// Print a shell completion script (bash, zsh, or fish).
+	Completions {
+		/// Target shell.
+		shell: Option<String>,
+	},
+
+	/// Emit dynamic completion candidates (hidden helper used by the scripts).
+	#[command(hide = true, name = "__complete", disable_help_flag = true)]
+	Complete {
+		/// Candidate kind (`models` or `sessions`) and an optional prefix.
+		#[arg(value_name = "ARGS", allow_hyphen_values = true, hide = true)]
+		args: Vec<String>,
+	},
 }
 
 
@@ -574,6 +588,25 @@ mod tests {
 		assert!(parse(&["omp", "--yolo"]).yolo);
 		assert!(parse(&["omp", "--auto-approve"]).yolo);
 		assert!(Cli::try_parse_from(["omp", "--yolo", "--approval-mode", "yolo"]).is_err());
+	}
+
+	#[test]
+	fn completion_subcommands_parse() {
+		assert_eq!(
+			parse(&["omp", "completions", "bash"]).command,
+			Some(Command::Completions { shell: Some("bash".to_string()) })
+		);
+		assert_eq!(
+			parse(&["omp", "completions"]).command,
+			Some(Command::Completions { shell: None })
+		);
+		let Some(Command::Complete { args }) = parse(&["omp", "__complete", "models", "--", "gp"]).command
+		else {
+			panic!("__complete must parse as the hidden completion helper");
+		};
+		let args: Vec<&str> =
+			args.iter().map(String::as_str).filter(|arg| *arg != "--").collect();
+		assert_eq!(args, ["models", "gp"]);
 	}
 
 	#[test]
