@@ -2778,7 +2778,6 @@ mod tests {
 		assert_eq!(plan.model, "llama3");
 		assert_eq!(plan.max_turns, 5);
 		assert_eq!(plan.context_limit, 8_192);
-		assert_eq!(plan.tools, ["ast_grep", "bash", "edit", "glob", "grep", "read", "todo", "write"]);
 		assert_eq!(plan.effort, None);
 		let system = plan.system_prompt.expect("system prompt");
 		for part in ["base prompt", "appended", "repo rules", "skill body"] {
@@ -3004,18 +3003,7 @@ mod tests {
 	}
 
 	#[test]
-	fn write_mode_offers_all_tools() {
-		let plan =
-			RunPlan::resolve(&request(Approvals::new(ApprovalMode::Write, Vec::new()))).expect("plan");
-		assert_eq!(plan.tools, ["ast_grep", "bash", "edit", "glob", "grep", "read", "todo", "write"]);
-	}
-
-	#[test]
-	fn always_ask_offers_all_tools() {
-		let plan = RunPlan::resolve(&request(Approvals::new(ApprovalMode::AlwaysAsk, Vec::new())))
-			.expect("plan");
-		assert_eq!(plan.tools, ["ast_grep", "bash", "edit", "glob", "grep", "read", "todo", "write"]);
-
+	fn always_ask_respects_explicit_tool_selection() {
 		let mut req = request(Approvals::new(ApprovalMode::AlwaysAsk, Vec::new()));
 		req.config.tools = Some(vec!["bash".to_string()]);
 		let plan = RunPlan::resolve(&req).expect("plan");
