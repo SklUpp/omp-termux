@@ -156,6 +156,88 @@ impl AskConfig {
 	}
 }
 
+/// `lsp` settings group consumed by the headless runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LspConfig {
+	/// `lsp.enabled`; absent means [`Self::DEFAULT_ENABLED`].
+	pub enabled: Option<bool>,
+	/// `lsp.shared`; absent means [`Self::DEFAULT_SHARED`] (one language
+	/// server per project through the daemon broker).
+	pub shared:  Option<bool>,
+}
+
+impl LspConfig {
+	/// Upstream `lsp.enabled` default.
+	pub const DEFAULT_ENABLED: bool = true;
+	/// Upstream `lsp.shared` default.
+	pub const DEFAULT_SHARED: bool = true;
+
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(Self::DEFAULT_ENABLED)
+	}
+
+	#[must_use]
+	pub fn shared(&self) -> bool {
+		self.shared.unwrap_or(Self::DEFAULT_SHARED)
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+		if overlay.shared.is_some() {
+			self.shared = overlay.shared;
+		}
+	}
+}
+
+/// `debug` settings group: the DAP debug tool.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DebugConfig {
+	/// `debug.enabled`; absent means [`Self::DEFAULT_ENABLED`].
+	pub enabled: Option<bool>,
+}
+
+impl DebugConfig {
+	/// Upstream `debug.enabled` default.
+	pub const DEFAULT_ENABLED: bool = true;
+
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(Self::DEFAULT_ENABLED)
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+	}
+}
+
+/// `checkpoint` settings group: the checkpoint/rewind tools.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckpointConfig {
+	/// `checkpoint.enabled`; absent means [`Self::DEFAULT_ENABLED`].
+	pub enabled: Option<bool>,
+}
+
+impl CheckpointConfig {
+	/// Upstream `checkpoint.enabled` default.
+	pub const DEFAULT_ENABLED: bool = false;
+
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(Self::DEFAULT_ENABLED)
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+	}
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
 	pub default_model:        Option<String>,
@@ -169,6 +251,9 @@ pub struct Config {
 	pub edit:                 EditConfig,
 	pub async_config:         AsyncConfig,
 	pub ask:                  AskConfig,
+	pub lsp:                  LspConfig,
+	pub debug:                DebugConfig,
+	pub checkpoint:           CheckpointConfig,
 	/// `modelRoles` aliases (`task`, `smol`, `slow`, ...). `default` also feeds
 	/// `default_model`.
 	pub model_roles:          BTreeMap<String, String>,
@@ -214,6 +299,9 @@ impl Config {
 		self.edit.merge(overlay.edit);
 		self.async_config.merge(overlay.async_config);
 		self.ask.merge(overlay.ask);
+		self.lsp.merge(overlay.lsp);
+		self.debug.merge(overlay.debug);
+		self.checkpoint.merge(overlay.checkpoint);
 		self.model_roles.extend(overlay.model_roles);
 		if overlay.extensions.is_some() {
 			self.extensions = overlay.extensions;
@@ -581,7 +669,34 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 			config.ask.timeout_ms = parse_ask_timeout(timeout, "ask.timeout", path)?;
 		}
 	}
+	if let Some(enabled) = settings_leaf(value, "lsp", "enabled", "lsp.enabled") {
+		config.lsp.enabled = expect_bool(enabled, "lsp.enabled", path)?;
+	}
+	if let Some(shared) = settings_leaf(value, "lsp", "shared", "lsp.shared") {
+		config.lsp.shared = expect_bool(shared, "lsp.shared", path)?;
+	}
+	if let Some(enabled) = settings_leaf(value, "debug", "enabled", "debug.enabled") {
+		config.debug.enabled = expect_bool(enabled, "debug.enabled", path)?;
+	}
+	if let Some(enabled) = settings_leaf(value, "checkpoint", "enabled", "checkpoint.enabled") {
+		config.checkpoint.enabled = expect_bool(enabled, "checkpoint.enabled", path)?;
+	}
 	Ok(())
+}
+
+/// Settings leaf written either nested (`lsp: { enabled: … }`) or as a quoted
+/// dotted schema path (`"lsp.enabled": …`). The nested form wins, and a
+/// non-object group is dropped wholesale like the upstream settings
+/// group-shadow guard (`dropSettingsGroupShadows`): its leaves fall back to
+/// the defaults instead of erroring.
+fn settings_leaf<'a>(value: &'a Value, group: &str, leaf: &str, dotted: &str) -> Option<&'a Value> {
+	let Some(group_value) = value.get(group) else {
+		return value.get(dotted);
+	};
+	match group_value {
+		Value::Map(_) => group_value.get(leaf),
+		_ => None,
+	}
 }
 
 /// `disabledProviders` entries: bare strings, plus path-scoped maps whose
@@ -1541,6 +1656,86 @@ mod tests {
 	fn invalid_approval_mode_and_auth_are_rejected() {
 		assert!(parse_config("approvalMode: sometimes\n").is_err());
 		assert!(parse_config("providers:\n  p:\n    auth: magic\n").is_err());
+	}
+
+	#[test]
+	fn lsp_debug_checkpoint_settings_default_and_overlay() {
+		let default = parse_config("").expect("default");
+		assert_eq!(default.lsp.enabled, None);
+		assert_eq!(default.lsp.shared, None);
+		assert_eq!(default.debug.enabled, None);
+		assert_eq!(default.checkpoint.enabled, None);
+		assert!(default.lsp.enabled() && default.lsp.shared());
+		assert!(default.debug.enabled());
+		assert!(!default.checkpoint.enabled());
+
+		// Explicit `false` reaches the accessor and wins over a lower layer's
+		// `true`, one group at a time.
+		let explicit = parse_config(
+			"lsp:\n  enabled: false\n  shared: false\ndebug:\n  enabled: false\ncheckpoint:\n  enabled: \
+			 true\n",
+		)
+		.expect("explicit");
+		assert_eq!(explicit.lsp.enabled, Some(false));
+		assert_eq!(explicit.lsp.shared, Some(false));
+		assert_eq!(explicit.debug.enabled, Some(false));
+		assert_eq!(explicit.checkpoint.enabled, Some(true));
+
+		let mut layered = parse_config(
+			"lsp:\n  enabled: true\n  shared: true\ndebug:\n  enabled: true\ncheckpoint:\n  enabled: \
+			 false\n",
+		)
+		.expect("base");
+		layered.merge(
+			parse_config(
+				"lsp:\n  enabled: false\n  shared: false\ndebug:\n  enabled: false\ncheckpoint:\n  \
+				 enabled: true\n",
+			)
+			.expect("overlay"),
+		);
+		assert!(!layered.lsp.enabled() && !layered.lsp.shared());
+		assert!(!layered.debug.enabled());
+		assert!(layered.checkpoint.enabled());
+
+		// Absent keys in a higher layer preserve the lower layer.
+		layered.merge(parse_config("lsp:\n  enabled: true\n").expect("partial overlay"));
+		assert!(layered.lsp.enabled());
+		assert!(!layered.lsp.shared(), "absent key must keep the lower layer");
+
+		// Quoted dotted schema paths parse too, and the nested form wins.
+		let dotted = parse_config(
+			"\"lsp.enabled\": false\n\"lsp.shared\": false\n\
+			 \"debug.enabled\": false\n\"checkpoint.enabled\": true\n",
+		)
+		.expect("dotted");
+		assert_eq!(dotted.lsp.enabled, Some(false));
+		assert_eq!(dotted.lsp.shared, Some(false));
+		assert_eq!(dotted.debug.enabled, Some(false));
+		assert_eq!(dotted.checkpoint.enabled, Some(true));
+
+		let both = parse_config("lsp:\n  enabled: true\n\"lsp.enabled\": false\n").expect("both");
+		assert_eq!(both.lsp.enabled, Some(true), "nested wins over dotted");
+
+		// A non-object group is dropped whole like the upstream group-shadow
+		// guard: its leaves fall back to defaults, and the dotted form is not
+		// consulted once the group key exists.
+		let shadow = parse_config("lsp: false\n").expect("group shadow");
+		assert_eq!(shadow.lsp.enabled, None);
+		assert!(shadow.lsp.enabled() && shadow.lsp.shared());
+		let shadow_dotted =
+			parse_config("lsp: false\n\"lsp.enabled\": false\n").expect("group shadow dotted");
+		assert_eq!(shadow_dotted.lsp.enabled, None);
+
+		// Wrong scalar types fail at the trust boundary with the file path.
+		for text in [
+			"lsp:\n  enabled: yes\n",
+			"lsp:\n  shared: always\n",
+			"debug:\n  enabled: 1\n",
+			"checkpoint:\n  enabled: off\n",
+		] {
+			let err = parse_config(text).expect_err(text);
+			assert!(err.to_string().contains("test.yml"), "{err}");
+		}
 	}
 
 	#[test]
