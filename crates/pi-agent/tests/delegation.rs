@@ -680,9 +680,14 @@ async fn test_t5_hub_jobs_snapshot_after_child_completion() {
 	assert_eq!(cancel_details.jobs.len(), 1);
 	assert_eq!(cancel_details.jobs[0].status, "completed");
 
-	// Unsupported hub ops are explicitly rejected, not silently ignored.
+	// Process listing is a real op in this build; with no bound backend it
+	// reports an empty list rather than erroring.
+	let ps = hub.execute(&json!({ "op": "ps" }), &ctx).await.expect("ps");
+	assert!(!ps.is_error, "{}", ps.content);
+
+	// Unknown hub ops are explicitly rejected, not silently ignored.
 	let unsupported = hub
-		.execute(&json!({ "op": "ps" }), &ctx)
+		.execute(&json!({ "op": "frobnicate" }), &ctx)
 		.await
 		.expect("unsupported op result");
 	assert!(unsupported.is_error);
