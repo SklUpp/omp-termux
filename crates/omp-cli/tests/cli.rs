@@ -270,6 +270,7 @@ fn fake_runner_stream_is_recorded_and_resumed() {
 		dir: Some(dir.clone()),
 		id: Some("smoke".to_string()),
 		continue_latest: false,
+		no_title: false,
 	};
 	let mut store = SessionStore::open(&options);
 	store.append_turn(&record).expect("append");
@@ -305,6 +306,7 @@ fn interrupted_stream_persists_aborted_turn_and_history_excludes_assistant() {
 		dir: Some(dir.clone()),
 		id: Some("aborted_smoke".to_string()),
 		continue_latest: false,
+		no_title: false,
 	};
 	let mut store = SessionStore::open(&options);
 	store.append_turn(&record).expect("append");

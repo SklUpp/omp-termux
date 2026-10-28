@@ -181,6 +181,7 @@ fn test_cli_tool_result_image_replay_to_openai_chat_wire() {
 			dir: Some(session_dir.clone()),
 			id: Some(session_id.to_string()),
 			continue_latest: false,
+			no_title: false,
 		});
 		assert!(store.enabled());
 
@@ -320,6 +321,7 @@ fn test_cli_image_only_tool_result_uses_placeholder_on_wire() {
 			dir: Some(session_dir.clone()),
 			id: Some(session_id.to_string()),
 			continue_latest: false,
+			no_title: false,
 		});
 		assert!(store.enabled());
 
@@ -396,6 +398,7 @@ fn test_cli_aborted_tool_turn_with_image_replays_properly() {
 			dir: Some(session_dir.clone()),
 			id: Some(session_id.to_string()),
 			continue_latest: false,
+			no_title: false,
 		});
 		assert!(store.enabled());
 
@@ -518,6 +521,7 @@ fn test_cli_legacy_text_tool_session_replays_without_user_image_insertion() {
 			dir: Some(session_dir.clone()),
 			id: Some(session_id.to_string()),
 			continue_latest: false,
+			no_title: false,
 		});
 		assert!(store.enabled());
 

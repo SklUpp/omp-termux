@@ -848,6 +848,9 @@ pub struct SessionOptions {
 	pub dir: Option<PathBuf>,
 	pub id: Option<String>,
 	pub continue_latest: bool,
+	/// Suppress automatic first-prompt titles for this invocation only.
+	/// Runtime-only: never read back from or written to the session log.
+	pub no_title: bool,
 }
 
 impl SessionOptions {
@@ -904,6 +907,8 @@ pub struct SessionStore {
 	is_v1: bool,
 	title_slot: Option<TitleSlot>,
 	corrupt_reason: Option<String>,
+	/// Per-invocation auto-title suppression; not persisted.
+	no_title: bool,
 	/// Route stamp from [`SessionOptions`] — real configured values only.
 	model: Option<String>,
 	provider: Option<String>,
@@ -926,6 +931,7 @@ impl SessionStore {
 			enabled: false,
 			model: options.model.clone(),
 			provider: options.provider.clone(),
+			no_title: options.no_title,
 			..Self::default()
 		};
 
@@ -1284,19 +1290,76 @@ impl SessionStore {
 					.map_err(|err| format!("cannot serialize message entry: {err}"))
 			})
 			.collect::<Result<_, _>>()?;
+		// Automatic first-prompt title: one gate shared by the live
+		// `append_message` path and the compat `append_turn` path. Only a real
+		// user text message qualifies; tool/system/assistant batches never do.
+		let now_iso = output::iso8601(SystemTime::now());
+		let title_prompt = self.auto_title_text(entries);
+		let title_slot = title_prompt
+			.as_ref()
+			.map(|prompt| serialize_title_slot(prompt, Some("auto"), &now_iso));
+		let orig_leading_bytes = title_slot
+			.as_ref()
+			.and_then(|_| self.file.as_deref())
+			.and_then(read_title_slot_bytes);
+		if let (Some(file), Some(slot)) = (self.file.as_deref(), title_slot.as_deref())
+			&& let Err(err) = overwrite_title_slot_rolled_back(file, slot)
+		{
+			return Err(err);
+		}
 		let Some(file) = self.file.clone() else {
+			self.apply_auto_title(title_prompt, title_slot);
 			self.history = candidate_history;
 			return Ok(());
 		};
-		self.append_lines_rolled_back(&file, &lines)?;
+		if let Err(err) = self.append_lines_rolled_back(&file, &lines) {
+			if let Some(bytes) = &orig_leading_bytes {
+				restore_title_slot_bytes(&file, bytes);
+			}
+			return Err(err);
+		}
 		for (entry, line) in entries.iter().zip(&lines) {
 			self.messages.push(entry.clone());
 			if let Ok(raw) = serde_json::from_str::<SessionEntry>(line) {
 				self.entries.push(raw);
 			}
 		}
+		self.apply_auto_title(title_prompt, title_slot);
 		self.history = candidate_history;
 		Ok(())
+	}
+
+	/// The text of the first real user message in `entries`, when automatic
+	/// first-prompt titling is allowed for this invocation. `None` while
+	/// disabled (`--no-title`/`PI_NO_TITLE`), once a title exists, or for
+	/// assistant/tool batches.
+	fn auto_title_text(&self, entries: &[MessageEntry]) -> Option<String> {
+		// The in-place write targets the leading 256-byte slot. Slotless v3
+		// logs keep the header on line 1, so writing there would destroy it:
+		// never auto-migrate old formats; require an existing slot.
+		if self.no_title
+			|| self.title_slot.is_none()
+			|| !self.header.as_ref().is_some_and(|header| header.title.is_none())
+		{
+			return None;
+		}
+		entries.iter().find_map(|entry| {
+			let message = &entry.message;
+			(message.role == "user")
+				.then(|| message.content.text())
+				.filter(|text| !text.is_empty())
+		})
+	}
+
+	fn apply_auto_title(&mut self, prompt: Option<String>, slot: Option<String>) {
+		let (Some(prompt), Some(slot)) = (prompt, slot) else {
+			return;
+		};
+		if let Some(header) = &mut self.header {
+			header.title = Some(prompt);
+			header.title_source = Some("auto".to_string());
+		}
+		self.title_slot = parse_title_slot(&slot);
 	}
 
 	/// TS `session-storage.ts#writeNow`: write all lines, truncate back to the
@@ -1572,28 +1635,7 @@ impl SessionStore {
 		let orig_title_slot = self.title_slot.clone();
 
 		let execute = (|| -> Result<(), String> {
-			let should_title = !turn.prompt.is_empty()
-				&& self.header.as_ref().map(|h| h.title.is_none()).unwrap_or(false);
-			let slot_written = if should_title {
-				let slot = serialize_title_slot(&turn.prompt, Some("auto"), &now_iso);
-				if let Some(file) = &self.file {
-					overwrite_title_slot_rolled_back(file, &slot)?;
-				}
-				Some(slot)
-			} else {
-				None
-			};
-
 			self.append_messages_inner(&entries, false)?;
-
-			if let Some(slot) = slot_written {
-				if let Some(header) = &mut self.header {
-					header.title = Some(turn.prompt.clone());
-					header.title_source = Some("auto".to_string());
-				}
-				self.title_slot = parse_title_slot(&slot);
-			}
-
 			Ok(())
 		})();
 
@@ -1661,6 +1703,23 @@ pub fn set_fault_injection(fault: Option<FaultInjection>) {
 #[cfg(test)]
 fn check_fault_injection() -> Option<FaultInjection> {
 	FAULT_INJECTION.with(|cell| cell.get())
+}
+
+fn read_title_slot_bytes(file: &Path) -> Option<[u8; SESSION_TITLE_SLOT_BYTES]> {
+	use std::io::Read;
+	let mut bytes = [0u8; SESSION_TITLE_SLOT_BYTES];
+	let mut handle = fs::File::open(file).ok()?;
+	handle.read_exact(&mut bytes).ok()?;
+	Some(bytes)
+}
+
+fn restore_title_slot_bytes(file: &Path, bytes: &[u8; SESSION_TITLE_SLOT_BYTES]) {
+	use std::io::{Seek, SeekFrom, Write};
+	if let Ok(mut handle) = OpenOptions::new().write(true).open(file) {
+		if handle.seek(SeekFrom::Start(0)).is_ok() && handle.write_all(bytes).is_ok() {
+			let _ = handle.flush();
+		}
+	}
 }
 
 /// TS `session-storage.ts#updateSessionTitle`: overwrite the leading 256-byte
@@ -3353,6 +3412,7 @@ mod tests {
 			dir: Some(dir),
 			id: id.map(str::to_string),
 			continue_latest: false,
+			no_title: false,
 		}
 	}
 

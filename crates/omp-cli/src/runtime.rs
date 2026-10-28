@@ -3962,6 +3962,7 @@ mod tests {
 			dir: Some(dir.clone()),
 			id: Some("todo-runtime".to_string()),
 			continue_latest: false,
+			no_title: false,
 		};
 		let mut store = crate::session::SessionStore::open(&options);
 		assert!(store.enabled());

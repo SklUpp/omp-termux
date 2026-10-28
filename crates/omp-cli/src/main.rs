@@ -351,6 +351,7 @@ fn run() -> std::result::Result<(), CliError> {
 			dir: session_dir.clone(),
 			id: None,
 			continue_latest: false,
+			no_title: false,
 		});
 		let prov = loaded.provenance_entry(selected_info);
 		let prov_entry: session::SessionEntry = serde_json::from_value(prov)
@@ -478,6 +479,11 @@ fn run() -> std::result::Result<(), CliError> {
 	}
 
 	let mut explicitly_existing = chosen_file.is_some();
+	// TS `main.ts` truthiness: any non-empty `PI_NO_TITLE` disables titles,
+	// including `0`. Resolved here (CLI boundary) so the library never reads
+	// process-wide env and tests stay race-free.
+	let no_title = cli.no_title
+		|| std::env::var_os("PI_NO_TITLE").is_some_and(|value| !value.is_empty());
 	let open_opts = if let Some(target) = &chosen_file {
 		let dir = target.parent().map(PathBuf::from);
 		let id = target.file_stem().and_then(|s| s.to_str()).map(str::to_string);
@@ -489,6 +495,7 @@ fn run() -> std::result::Result<(), CliError> {
 			dir,
 			id,
 			continue_latest: false,
+			no_title,
 		}
 	} else {
 		if let Some(req_id) = &cli.session_id {
@@ -508,6 +515,7 @@ fn run() -> std::result::Result<(), CliError> {
 			dir: session_dir,
 			id: cli.session_id.clone(),
 			continue_latest: cli.continue_session,
+			no_title,
 		}
 	};
 

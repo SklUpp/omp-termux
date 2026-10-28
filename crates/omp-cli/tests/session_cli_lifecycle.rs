@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use omp_cli::session::write_terminal_breadcrumb;
+use omp_cli::session::{SessionOptions, SessionStore, write_terminal_breadcrumb};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -1149,6 +1149,177 @@ fn test_cli_file_arg_invalid_utf8_lossy_decoded() {
 	assert!(
 		user_text.contains("hello \u{fffd}\u{fffd} world"),
 		"must contain lossy decoded string with replacement characters: {user_text}"
+	);
+
+	let _ = fs::remove_dir_all(temp);
+}
+
+fn session_file_for(sessions_dir: &Path, id: &str) -> PathBuf {
+	let mut matches = fs::read_dir(sessions_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|entry| entry.path())
+		.filter(|path| {
+			path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+				&& path
+					.file_stem()
+					.and_then(|stem| stem.to_str())
+					.is_some_and(|stem| stem.ends_with(id))
+		});
+	let path = matches.next().expect("session log exists");
+	assert!(matches.next().is_none(), "expected exactly one session log for {id}");
+	path
+}
+
+/// Reopen the persisted session: `header.title` is materialized from the
+/// fixed-width title slot on read, so this observes what a fresh CLI run sees.
+fn session_title(sessions_dir: &Path, id: &str) -> (Option<String>, String) {
+	let store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(sessions_dir.to_path_buf()),
+		id: Some(id.to_string()),
+		continue_latest: false,
+		no_title: false,
+	});
+	assert!(store.enabled(), "session log must reopen for {id}");
+	let header_title = store.header().and_then(|header| header.title.clone());
+	let slot_title = store.title_slot().map(|slot| slot.title.clone()).unwrap_or_default();
+	(header_title, slot_title)
+}
+
+fn run_no_title_fixture(
+	agent_dir: &Path,
+	sessions_dir: &Path,
+	cwd: &Path,
+	selector: &[&str],
+	no_title_env: Option<&str>,
+	prompts: &[&str],
+) {
+	let mut cmd = omp();
+	cmd.env("PI_CODING_AGENT_DIR", agent_dir.as_os_str())
+		.env_remove("PI_NO_TITLE")
+		.args([
+			"--cwd",
+			cwd.to_str().unwrap(),
+			"--session-dir",
+			sessions_dir.to_str().unwrap(),
+			"--no-tools",
+			"-p",
+		]);
+	if let Some(value) = no_title_env {
+		cmd.env("PI_NO_TITLE", value);
+	}
+	cmd.args(selector).args(prompts);
+	let output = cmd.output().expect("run omp");
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert_eq!(output.status.code(), Some(0), "omp must succeed: {stderr}");
+}
+
+#[test]
+fn test_no_title_gates_auto_titles_per_invocation_and_preserves_existing() {
+	let server = MockSseServer::start();
+	let temp = temp_dir("no-title");
+	let agent_dir = temp.join("agent");
+	let sessions_dir = temp.join("sessions");
+	let cwd = temp.join("project");
+	for dir in [&agent_dir, &sessions_dir, &cwd] {
+		fs::create_dir_all(dir).expect("create dir");
+	}
+	setup_mock_agent_dir(&agent_dir, server.port);
+
+	// `--no-title`: both first-prompt and follow-up turns stay untitled.
+	run_no_title_fixture(
+		&agent_dir,
+		&sessions_dir,
+		&cwd,
+		&["--session-id", "no-title-flag", "--no-title"],
+		None,
+		&["first prompt", "second prompt"],
+	);
+	let flag_file = session_file_for(&sessions_dir, "no-title-flag");
+	assert_eq!(
+		session_title(&sessions_dir, "no-title-flag"),
+		(None, String::new()),
+		"--no-title must leave header and title slot empty"
+	);
+	let flag_log = fs::read_to_string(&flag_file).expect("read flag log");
+	assert!(
+		!flag_log.contains("\"title_change\""),
+		"--no-title must not write title_change entries"
+	);
+
+	// A later run without the flag may title the still-untitled session.
+	run_no_title_fixture(
+		&agent_dir,
+		&sessions_dir,
+		&cwd,
+		&["--resume", "no-title-flag"],
+		None,
+		&["resume prompt"],
+	);
+	assert_eq!(
+		session_title(&sessions_dir, "no-title-flag"),
+		(Some("resume prompt".to_string()), "resume prompt".to_string()),
+		"reenabled run must title a still-untitled session"
+	);
+
+	// Non-empty env values match upstream truthiness: `1` and `0` both disable.
+	run_no_title_fixture(
+		&agent_dir,
+		&sessions_dir,
+		&cwd,
+		&["--session-id", "no-title-env"],
+		Some("1"),
+		&["env prompt"],
+	);
+	assert_eq!(
+		session_title(&sessions_dir, "no-title-env"),
+		(None, String::new()),
+		"PI_NO_TITLE=1 must suppress the automatic title"
+	);
+	run_no_title_fixture(
+		&agent_dir,
+		&sessions_dir,
+		&cwd,
+		&["--session-id", "no-title-zero"],
+		Some("0"),
+		&["zero prompt"],
+	);
+	assert_eq!(
+		session_title(&sessions_dir, "no-title-zero"),
+		(None, String::new()),
+		"PI_NO_TITLE=0 is non-empty and must suppress the automatic title"
+	);
+
+	// Empty env is false, and an existing title survives a later gated run.
+	run_no_title_fixture(
+		&agent_dir,
+		&sessions_dir,
+		&cwd,
+		&["--session-id", "named"],
+		Some(""),
+		&["seed title"],
+	);
+	assert_eq!(
+		session_title(&sessions_dir, "named"),
+		(Some("seed title".to_string()), "seed title".to_string()),
+		"empty PI_NO_TITLE must not suppress titles"
+	);
+	run_no_title_fixture(
+		&agent_dir,
+		&sessions_dir,
+		&cwd,
+		&["--resume", "named", "--no-title"],
+		None,
+		&["later prompt"],
+	);
+	assert_eq!(
+		session_title(&sessions_dir, "named"),
+		(Some("seed title".to_string()), "seed title".to_string()),
+		"--no-title must preserve an existing session title"
 	);
 
 	let _ = fs::remove_dir_all(temp);

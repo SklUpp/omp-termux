@@ -84,7 +84,7 @@ literal text `--profile` instead of selecting a profile.
 | `--from-claude` | Import a Claude Code session into OMP. Requires an interactive picker; non-TTY exits 2. |
 | `--from-codex` | Import a Codex session into OMP. Requires an interactive picker; non-TTY exits 2. |
 | `--export <session>` | Export a session file to HTML and exit. |
-| `--no-title` | Disable title auto-generation (equivalent to the `PI_NO_TITLE` [environment variable](./environment-variables.md)). |
+| `--no-title` | Disable automatic first-prompt session titles for this invocation (equivalent to any non-empty `PI_NO_TITLE` [environment variable](./environment-variables.md)). Existing titles are kept, and a later run without it may title a still-untitled session. |
 
 #### Model selection
 
@@ -194,7 +194,7 @@ Related flags for headless runs:
 
 - `--print-thoughts` — include thinking blocks in the printed text output.
 - `--mode json` — emit structured events instead of rendered text.
-- `--no-title` — skip title auto-generation (also `PI_NO_TITLE`).
+- `--no-title` — skip automatic first-prompt titles for this invocation (also any non-empty `PI_NO_TITLE`); existing titles are preserved.
 - `--max-time <duration>` — bound the run.
 
 The [advisor / watchdog](./advisor-watchdog.md#headless-runs) doc describes

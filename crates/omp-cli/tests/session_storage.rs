@@ -41,6 +41,7 @@ fn read_ts_v3_session_fixture() {
 		dir: Some(temp.clone()),
 		id: Some("session".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(store.enabled(), "store must be enabled: {:?}", store.take_warnings());
@@ -113,6 +114,7 @@ fn v1_legacy_log_is_read_only_and_never_overwritten() {
 		dir: Some(temp.clone()),
 		id: Some("v1-legacy-id".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(store.enabled(), "legacy store can be opened for reading");
@@ -179,6 +181,7 @@ fn explicit_import_legacy_v1_creates_valid_v3_copy_without_mutating_v1() {
 		dir: Some(target_dir.clone()),
 		id: None,
 		continue_latest: true,
+		no_title: false,
 	});
 	assert!(store.enabled(), "reopened imported store must be enabled");
 	assert_eq!(store.history().len(), 1);
@@ -204,6 +207,7 @@ fn malformed_header_fails_without_append() {
 		dir: Some(temp.clone()),
 		id: Some("bad".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled(), "store must be disabled on malformed header");
@@ -247,6 +251,7 @@ fn malformed_entry_disables_persistence_and_refuses_append() {
 		dir: Some(temp.clone()),
 		id: Some("malformed".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled(), "store must disable persistence when log contains corrupted records");
@@ -387,6 +392,7 @@ fn fork_session_creates_new_session_with_parent_reference() {
 		dir: Some(target_dir.clone()),
 		id: None,
 		continue_latest: true,
+		no_title: false,
 	});
 	assert!(forked_store.enabled());
 	let forked_header = forked_store.header().expect("forked header");
@@ -469,6 +475,7 @@ fn append_turn_titles_and_appends_entries_and_reopens_cleanly() {
 		dir: Some(temp.clone()),
 		id: Some("01a178ce-append-test".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 	assert!(store.enabled());
 	let file = store.file().expect("file exists").to_path_buf();
@@ -499,12 +506,70 @@ fn append_turn_titles_and_appends_entries_and_reopens_cleanly() {
 		dir: Some(temp.clone()),
 		id: Some("01a178ce-append-test".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 	assert!(reopened.enabled());
 	assert_eq!(reopened.title_slot().expect("title slot").title, "initial prompt");
 	assert_eq!(reopened.history().len(), 1);
 	assert_eq!(reopened.history()[0].prompt, "initial prompt");
 	assert_eq!(reopened.history()[0].assistant, "initial reply");
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn slotless_v3_append_never_overwrites_header_and_reopens_untitled() {
+	let temp = temp_dir("slotless-append");
+	let file = temp.join("2026-10-26T12-00-00-000Z_01a178ce-slotless.jsonl");
+	let header_line = r#"{"type":"session","version":3,"id":"01a178ce-slotless","timestamp":"2026-10-26T12:00:00.000Z","cwd":"/work/slotless"}"#;
+	fs::write(&file, format!("{header_line}\n")).expect("write slotless v3 log");
+	let original = fs::read(&file).expect("read original bytes");
+
+	let options = SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work/slotless"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("01a178ce-slotless".to_string()),
+		continue_latest: false,
+		no_title: false,
+	};
+	let mut store = SessionStore::open(&options);
+	assert!(store.enabled());
+	assert!(store.title_slot().is_none(), "slotless v3 log has no leading slot");
+
+	store
+		.append_turn(&TurnRecord {
+			prompt: "must not overwrite the header".to_string(),
+			assistant: "reply".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: Vec::new(),
+			parts: Vec::new(),
+		})
+		.expect("append to slotless v3 log");
+
+	// No 256-byte slot may be injected over the header.
+	let appended = fs::read_to_string(&file).expect("read appended log");
+	assert!(
+		appended.as_bytes().starts_with(&original),
+		"slotless header bytes must remain untouched"
+	);
+	let header: serde_json::Value =
+		serde_json::from_str(appended.lines().next().expect("header line")).expect("header json");
+	assert_eq!(header["version"], 3);
+	assert_eq!(header["id"], "01a178ce-slotless");
+	assert!(header["title"].is_null(), "header must stay untitled");
+	assert!(store.title_slot().is_none(), "no slot may be created implicitly");
+	assert!(store.header().expect("header").title.is_none());
+
+	let reopened = SessionStore::open(&options);
+	assert!(reopened.enabled(), "slotless log must still reopen");
+	assert_eq!(reopened.history().len(), 1, "appended turn must remain readable");
+	assert_eq!(reopened.history()[0].prompt, "must not overwrite the header");
+	assert_eq!(reopened.history()[0].assistant, "reply");
+	assert!(reopened.title_slot().is_none(), "reopen must not invent a slot");
+	assert!(reopened.header().expect("header").title.is_none());
 
 	fs::remove_dir_all(temp).ok();
 }
@@ -532,6 +597,7 @@ fn overwrite_title_slot_rolled_back_updates_slot_and_preserves_length() {
 		dir: Some(temp.clone()),
 		id: Some("01a178ce-test".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 	assert!(store.enabled());
 	assert_eq!(store.title_slot().expect("slot").title, "Initial Title");
@@ -555,6 +621,7 @@ fn overwrite_title_slot_rolled_back_updates_slot_and_preserves_length() {
 		dir: Some(temp.clone()),
 		id: Some("01a178ce-test".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 	assert!(reopened.enabled());
 	assert_eq!(reopened.title_slot().expect("slot").title, "Updated Title");
@@ -584,6 +651,7 @@ fn unsupported_session_version_rejected_without_append() {
 		dir: Some(temp.clone()),
 		id: Some("unsupported-v4".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled(), "store must be disabled for unsupported session version");
@@ -632,6 +700,7 @@ fn missing_session_version_rejected_without_append() {
 		dir: Some(temp.clone()),
 		id: Some("missing-ver".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled(), "store must be disabled when session version is missing");
@@ -669,6 +738,7 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 		dir: Some(temp.clone()),
 		id: Some("canon-stop-test".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 	assert!(store.enabled());
 	let file = store.file().expect("file exists").to_path_buf();
@@ -730,6 +800,7 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 		dir: Some(temp.clone()),
 		id: Some("canon-stop-test".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 	assert!(reopened.enabled());
 	let hist = reopened.history();
@@ -752,6 +823,7 @@ fn session_storage_preserves_and_replays_tool_result_images() {
 		dir: Some(temp.clone()),
 		id: Some("tool-img-test".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 	assert!(store.enabled());
 
@@ -791,6 +863,7 @@ fn session_storage_preserves_and_replays_tool_result_images() {
 		dir: Some(temp.clone()),
 		id: Some("tool-img-test".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 	assert!(reopened.enabled());
 	let hist = reopened.history();

@@ -39,6 +39,7 @@ fn read_real_ts_v3_session_and_preserve_typed_content() {
 		dir: Some(temp.clone()),
 		id: Some("session".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(store.enabled(), "store must be enabled when reading TS v3 session");
@@ -109,6 +110,7 @@ fn v1_legacy_log_rejects_append_and_stays_immutable() {
 		dir: Some(temp.clone()),
 		id: Some("legacy".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(store.enabled(), "store can open legacy log for reading");
@@ -150,6 +152,7 @@ fn malformed_tail_refuses_append() {
 		dir: Some(temp.clone()),
 		id: Some("bad_tail".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled(), "store must disable persistence on malformed/unclosed tail");
@@ -202,6 +205,7 @@ fn malformed_entry_refuses_append() {
 		dir: Some(temp.clone()),
 		id: Some("bad_entry".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled(), "store must disable persistence on malformed entry");
@@ -316,6 +320,7 @@ fn session_create_new_collision_refuses_overwrite_and_leaves_victim_intact() {
 		dir: Some(temp.clone()),
 		id: Some("collision_target".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled(), "store must be disabled on collision");
@@ -343,6 +348,7 @@ fn session_create_new_collision_refuses_overwrite_and_leaves_victim_intact() {
 			dir: Some(temp.clone()),
 			id: Some("symlink_target".to_string()),
 			continue_latest: false,
+			no_title: false,
 		});
 
 		assert!(!symlink_store.enabled(), "store must be disabled on symlink collision");
@@ -398,6 +404,7 @@ fn parse_error_does_not_leak_raw_line_secrets() {
 		dir: Some(temp.clone()),
 		id: Some("s-secret-1".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled());
@@ -448,6 +455,7 @@ fn parse_error_field_type_mismatch_does_not_leak_field_value_secret() {
 		dir: Some(temp.clone()),
 		id: Some("s-secret-2".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled(), "store must disable persistence on schema error");
@@ -498,6 +506,7 @@ fn parse_error_untyped_record_is_rejected_without_secret_leak() {
 		dir: Some(temp.clone()),
 		id: Some("s-secret-3".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled(), "store must disable persistence on untyped record");
@@ -549,6 +558,7 @@ fn parse_v1_log_field_type_mismatch_does_not_leak_field_value_secret() {
 		dir: Some(temp.clone()),
 		id: Some("s-secret-v1".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled(), "store must disable persistence on malformed v1 log");
@@ -608,6 +618,7 @@ fn raw_content_with_secret_does_not_leak_into_diagnostics_or_warnings() {
 		dir: Some(temp.clone()),
 		id: Some("s-secret-raw".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled());
@@ -689,6 +700,7 @@ fn part_type_secret_does_not_leak_into_diagnostics_or_warnings() {
 		dir: Some(temp.clone()),
 		id: Some("s-secret-part".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled());
@@ -785,6 +797,7 @@ fn session_store_open_with_malformed_text_and_image_disables_store_and_preserves
 		dir: Some(temp.clone()),
 		id: Some("s-malformed-text".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 
 	assert!(!store.enabled(), "store must be disabled on malformed text part in log");
@@ -813,6 +826,7 @@ fn direct_append_message_with_malformed_text_and_image_fails_preflight_and_prese
 		dir: Some(temp.clone()),
 		id: Some("s-direct-malformed-text".to_string()),
 		continue_latest: false,
+		no_title: false,
 	});
 	assert!(store.enabled());
 
