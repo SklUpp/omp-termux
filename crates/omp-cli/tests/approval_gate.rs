@@ -972,6 +972,23 @@ fn test_mcp_tool_call_json_rpc_error_redacts_message_secrets() {
 		let _ = listener.set_nonblocking(true);
 		let deadline = std::time::Instant::now() + FIXTURE_DEADLINE;
 		let mut done = false;
+		let write_http = |socket: &mut std::net::TcpStream,
+		                  status: u16,
+		                  body: &[u8]|
+		 -> std::io::Result<()> {
+			let reason = if status == 200 { "OK" } else { "Bad Request" };
+			let head = format!(
+				"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+				body.len()
+			);
+			socket.write_all(head.as_bytes())?;
+			socket.write_all(body)?;
+			socket.flush()
+		};
+		// Stateless: exactly one request per connection. The response carries
+		// `Connection: close` and the socket is shut down, so the client's next
+		// request arrives on a new connection instead of waiting behind an
+		// accepted socket that the single-threaded accept loop never revisits.
 		while !done && std::time::Instant::now() < deadline {
 			let (mut socket, _) = match listener.accept() {
 				Ok(conn) => conn,
@@ -979,115 +996,152 @@ fn test_mcp_tool_call_json_rpc_error_redacts_message_secrets() {
 					std::thread::sleep(Duration::from_millis(10));
 					continue;
 				}
-				Err(_) => break,
+				Err(e) => {
+					eprintln!("mock MCP fixture: accept failed: {e}");
+					break;
+				},
 			};
-			let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
+			let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
 			let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
+
 			let mut buf = Vec::new();
 			let mut tmp = [0u8; 1024];
-			while !done && std::time::Instant::now() < deadline {
-				let n = match socket.read(&mut tmp) {
+			let header_end = loop {
+				if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+					break Some(pos);
+				}
+				if std::time::Instant::now() >= deadline {
+					break None;
+				}
+				match socket.read(&mut tmp) {
+					Ok(0) => break None,
+					Ok(n) => buf.extend_from_slice(&tmp[..n]),
+					Err(e)
+						if e.kind() == std::io::ErrorKind::WouldBlock
+							|| e.kind() == std::io::ErrorKind::TimedOut =>
+					{
+						eprintln!("mock MCP fixture: header read timed out");
+						break None;
+					},
+					Err(e) => {
+						eprintln!("mock MCP fixture: header read failed: {e}");
+						break None;
+					},
+				}
+			};
+			let Some(header_end) = header_end else {
+				eprintln!("mock MCP fixture: incomplete request headers");
+				let _ = write_http(&mut socket, 400, br#"{"error":"incomplete request headers"}"#);
+				let _ = socket.shutdown(std::net::Shutdown::Both);
+				continue;
+			};
+
+			let header_str = String::from_utf8_lossy(&buf[..header_end]);
+			let content_len = header_str.lines().find_map(|line| {
+				let l = line.to_ascii_lowercase();
+				if l.starts_with("content-length:") {
+					l.split(':').nth(1)?.trim().parse::<usize>().ok()
+				} else {
+					None
+				}
+			});
+			let Some(content_len) = content_len else {
+				eprintln!("mock MCP fixture: missing or invalid Content-Length");
+				let _ = write_http(&mut socket, 400, br#"{"error":"missing content-length"}"#);
+				let _ = socket.shutdown(std::net::Shutdown::Both);
+				continue;
+			};
+
+			let body_start = header_end + 4;
+			while buf.len() < body_start + content_len && std::time::Instant::now() < deadline {
+				match socket.read(&mut tmp) {
 					Ok(0) => break,
-					Ok(n) => n,
-					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-						continue;
-					}
-					Err(_) => break,
-				};
-				buf.extend_from_slice(&tmp[..n]);
-
-				while let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-					let header_str = String::from_utf8_lossy(&buf[..header_end]);
-					let content_len = header_str
-						.lines()
-						.find_map(|line| {
-							let l = line.to_ascii_lowercase();
-							if l.starts_with("content-length:") {
-								l.split(':').nth(1)?.trim().parse::<usize>().ok()
-							} else {
-								None
-							}
-						})
-						.unwrap_or(0);
-					let body_start = header_end + 4;
-					if buf.len() < body_start + content_len {
+					Ok(n) => buf.extend_from_slice(&tmp[..n]),
+					Err(e)
+						if e.kind() == std::io::ErrorKind::WouldBlock
+							|| e.kind() == std::io::ErrorKind::TimedOut =>
+					{
+						eprintln!("mock MCP fixture: body read timed out");
 						break;
-					}
-
-					let body_bytes = &buf[body_start..body_start + content_len];
-					let json_body: serde_json::Value =
-						serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null);
-					let method = json_body.get("method").and_then(|v| v.as_str()).unwrap_or("");
-					let req_id = json_body.get("id").cloned().unwrap_or(serde_json::Value::from(1));
-
-					buf.drain(..body_start + content_len);
-
-					if method == "initialize" {
-						let resp = json!({
-							"jsonrpc": "2.0",
-							"id": req_id,
-							"result": {
-								"protocolVersion": "2024-11-05",
-								"capabilities": { "tools": {} },
-								"serverInfo": { "name": "secure_rpc_srv", "version": "1.0.0" }
-							}
-						});
-						let resp_bytes = serde_json::to_vec(&resp).unwrap();
-						let http_resp = format!(
-							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
-							resp_bytes.len()
-						);
-						let _ = socket.write_all(http_resp.as_bytes());
-						let _ = socket.write_all(&resp_bytes);
-						let _ = socket.flush();
-					} else if method == "notifications/initialized" {
-						let http_resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
-						let _ = socket.write_all(http_resp.as_bytes());
-						let _ = socket.flush();
-					} else if method == "tools/list" {
-						let resp = json!({
-							"jsonrpc": "2.0",
-							"id": req_id,
-							"result": {
-								"tools": [{
-									"name": "call_rpc_tool",
-									"description": "tool that fails with JSON-RPC secret error",
-									"inputSchema": { "type": "object" }
-								}]
-							}
-						});
-						let resp_bytes = serde_json::to_vec(&resp).unwrap();
-						let http_resp = format!(
-							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
-							resp_bytes.len()
-						);
-						let _ = socket.write_all(http_resp.as_bytes());
-						let _ = socket.write_all(&resp_bytes);
-						let _ = socket.flush();
-					} else if method == "tools/call" {
-						let resp = json!({
-							"jsonrpc": "2.0",
-							"id": req_id,
-							"error": {
-								"code": -32603,
-								"message": "database error: secret_key=SUPER_SECRET_JSONRPC_TOKEN"
-							}
-						});
-						let resp_bytes = serde_json::to_vec(&resp).unwrap();
-						let http_resp = format!(
-							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-							resp_bytes.len()
-						);
-						let _ = socket.write_all(http_resp.as_bytes());
-						let _ = socket.write_all(&resp_bytes);
-						let _ = socket.flush();
-						done = true;
+					},
+					Err(e) => {
+						eprintln!("mock MCP fixture: body read failed: {e}");
 						break;
+					},
+				}
+			}
+			if buf.len() < body_start + content_len {
+				eprintln!(
+					"mock MCP fixture: truncated body ({}/{} bytes)",
+					buf.len().saturating_sub(body_start),
+					content_len
+				);
+				let _ = write_http(&mut socket, 400, br#"{"error":"truncated body"}"#);
+				let _ = socket.shutdown(std::net::Shutdown::Both);
+				continue;
+			}
+
+			let body_bytes = &buf[body_start..body_start + content_len];
+			let json_body: serde_json::Value = match serde_json::from_slice(body_bytes) {
+				Ok(value) => value,
+				Err(e) => {
+					// Never echo the body: it may carry secrets.
+					eprintln!("mock MCP fixture: invalid JSON body: {e}");
+					let _ = write_http(&mut socket, 400, br#"{"error":"invalid json"}"#);
+					let _ = socket.shutdown(std::net::Shutdown::Both);
+					continue;
+				},
+			};
+			let method = json_body.get("method").and_then(|v| v.as_str()).unwrap_or("");
+			let req_id = json_body.get("id").cloned().unwrap_or(serde_json::Value::from(1));
+
+			let (status, resp_bytes, finish): (u16, Vec<u8>, bool) = if method == "initialize" {
+				let resp = json!({
+					"jsonrpc": "2.0",
+					"id": req_id,
+					"result": {
+						"protocolVersion": "2024-11-05",
+						"capabilities": { "tools": {} },
+						"serverInfo": { "name": "secure_rpc_srv", "version": "1.0.0" }
 					}
-				}
-				if done {
-					break;
-				}
+				});
+				(200, serde_json::to_vec(&resp).unwrap(), false)
+			} else if method == "notifications/initialized" {
+				(200, Vec::new(), false)
+			} else if method == "tools/list" {
+				let resp = json!({
+					"jsonrpc": "2.0",
+					"id": req_id,
+					"result": {
+						"tools": [{
+							"name": "call_rpc_tool",
+							"description": "tool that fails with JSON-RPC secret error",
+							"inputSchema": { "type": "object" }
+						}]
+					}
+				});
+				(200, serde_json::to_vec(&resp).unwrap(), false)
+			} else if method == "tools/call" {
+				let resp = json!({
+					"jsonrpc": "2.0",
+					"id": req_id,
+					"error": {
+						"code": -32603,
+						"message": "database error: secret_key=SUPER_SECRET_JSONRPC_TOKEN"
+					}
+				});
+				(200, serde_json::to_vec(&resp).unwrap(), true)
+			} else {
+				eprintln!("mock MCP fixture: unexpected method {method:?}");
+				(400, br#"{"error":"unexpected method"}"#.to_vec(), false)
+			};
+
+			if let Err(e) = write_http(&mut socket, status, &resp_bytes) {
+				eprintln!("mock MCP fixture: response write failed: {e}");
+			}
+			let _ = socket.shutdown(std::net::Shutdown::Both);
+			if finish {
+				done = true;
 			}
 		}
 	});
