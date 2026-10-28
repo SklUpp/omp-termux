@@ -32,6 +32,6 @@ pub use mailbox::{
 	format_incoming,
 };
 pub use tools::{
-	AskTool, BashTool, EditTool, GlobTool, GrepTool, HubTool, ReadTool, TaskTool, ThinkTool,
+	AskTool, AstGrepTool, BashTool, EditTool, GlobTool, GrepTool, HubTool, ReadTool, TaskTool, ThinkTool,
 	TodoTool, Tool, ToolError, WriteTool, YieldTool, registry::ToolRegistry, scheduler::ToolScheduler,
 };

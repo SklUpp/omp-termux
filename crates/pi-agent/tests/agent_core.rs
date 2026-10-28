@@ -899,7 +899,7 @@ fn registry_schemas_are_sorted_and_include_edit() {
 		})
 		.collect();
 
-	assert_eq!(names, vec!["bash", "edit", "glob", "grep", "read", "todo", "write"]);
+	assert_eq!(names, vec!["ast_grep", "bash", "edit", "glob", "grep", "read", "todo", "write"]);
 }
 
 #[tokio::test]

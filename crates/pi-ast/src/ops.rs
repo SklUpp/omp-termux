@@ -1,12 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::{
+	collections::BTreeMap,
+	path::{Path, PathBuf},
+};
 
 use anyhow::{Result, anyhow};
 use ast_grep_core::{
-	MatchStrictness,
-	matcher::{Pattern, PatternError},
-	source::Edit,
-	tree_sitter::LanguageExt,
+	MatchStrictness, matcher::PatternError, source::Edit, tree_sitter::LanguageExt,
 };
+pub use ast_grep_core::matcher::Pattern;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 
@@ -37,13 +38,15 @@ impl From<AstMatchStrictness> for MatchStrictness {
 
 #[derive(Debug, Clone)]
 pub struct AstMatch {
-	pub line:       usize,
-	pub column:     usize,
-	pub end_line:   usize,
-	pub end_column: usize,
-	pub byte_start: usize,
-	pub byte_end:   usize,
-	pub text:       String,
+	pub line:           usize,
+	pub column:         usize,
+	pub end_line:       usize,
+	pub end_column:     usize,
+	pub byte_start:     usize,
+	pub byte_end:       usize,
+	pub text:           String,
+	/// Meta-variable bindings captured by this match, keyed without `$`.
+	pub meta_variables: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +251,17 @@ pub fn compile_rewrite_rules(
 		.collect()
 }
 
+/// Report whether `source` contains tree-sitter error nodes for `language`.
+///
+/// Uses the shared parse cache so a caller that only needs the verdict does not
+/// open a second parse path alongside [`collect_matches`].
+pub fn has_parse_error(source: &str, language: SupportLang) -> Result<bool> {
+	let Some(tree) = crate::parse_cache::parse_cached(source, language)? else {
+		return Ok(false);
+	};
+	Ok(tree.root_node().has_error())
+}
+
 #[must_use]
 pub fn collect_matches(source: &str, language: SupportLang, patterns: &[Pattern]) -> Vec<AstMatch> {
 	let ast = language.ast_grep(source);
@@ -258,6 +272,11 @@ pub fn collect_matches(source: &str, language: SupportLang, patterns: &[Pattern]
 			let end = matched.end_pos();
 			let range = matched.range();
 			let node = matched.get_node();
+			let meta_variables = std::collections::HashMap::<String, String>::from(
+				matched.get_env().clone(),
+			)
+			.into_iter()
+			.collect();
 			matches.push(AstMatch {
 				line:       start.line() + 1,
 				column:     start.column(node) + 1,
@@ -266,6 +285,7 @@ pub fn collect_matches(source: &str, language: SupportLang, patterns: &[Pattern]
 				byte_start: range.start,
 				byte_end:   range.end,
 				text:       matched.text().into_owned(),
+				meta_variables,
 			});
 		}
 	}

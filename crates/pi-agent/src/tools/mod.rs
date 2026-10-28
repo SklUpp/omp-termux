@@ -1,4 +1,5 @@
 pub mod ask;
+pub mod ast_grep;
 pub mod hashline;
 pub mod hub;
 pub mod process;
@@ -12,6 +13,7 @@ pub mod todo;
 pub mod yield_tool;
 
 pub use ask::AskTool;
+pub use ast_grep::AstGrepTool;
 pub use hub::HubTool;
 pub use read::{ReadSnapshotSink, ReadTool};
 pub use task::TaskTool;
@@ -1853,6 +1855,7 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
 		Arc::new(EditTool::new(snapshots)),
 		Arc::new(GlobTool),
 		Arc::new(GrepTool),
+		Arc::new(AstGrepTool),
 		Arc::new(TodoTool::new()),
 	]
 }
