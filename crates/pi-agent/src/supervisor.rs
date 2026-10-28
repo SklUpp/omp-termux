@@ -1,5 +1,6 @@
 use std::{
 	collections::{HashMap, HashSet, VecDeque},
+	path::PathBuf,
 	sync::{
 		Arc, Mutex,
 		atomic::{AtomicBool, AtomicU64, Ordering},
@@ -17,10 +18,12 @@ use crate::{
 	provider::ModelProvider,
 	state::ToolApprover,
 	tools::{
-		EditTool, HubTool, TaskTool, ThinkTool, YieldTool,
+		BashTool, EditTool, HubTool, TaskTool, ThinkTool, YieldTool,
 		hashline::{self, NativeSnapshotSink, SnapshotStore},
+		process::{ProcessBackend, ProcessManager},
 		read::ReadTool,
 		registry::ToolRegistry,
+		task_catalog::AgentCatalog,
 	},
 };
 
@@ -215,6 +218,17 @@ pub struct Supervisor {
 	/// Options copied into each child's fresh `EditTool` (same knobs as the
 	/// parent run, but a fresh store/registers/guard).
 	edit_options: Mutex<hashline::edit::EditToolOptions>,
+	/// Agent catalog installed by the host (CLI) runtime. Definitions and policy
+	/// are stable; the catalog's model resolver is refreshed per root turn.
+	agent_catalog: Mutex<Option<Arc<AgentCatalog>>>,
+	/// Process supervisor shared by root/child `bash` and `hub` process ops.
+	/// Injected by the host (broker client); otherwise a lazily created local
+	/// manager rooted at `process_root`.
+	processes: Mutex<Option<Arc<dyn ProcessBackend>>>,
+	process_root: PathBuf,
+	/// Runner-unique prefix for backend-visible process owners. UI ids such as
+	/// `task-1` repeat across concurrent CLIs; process scoping must not.
+	process_owner_ns: String,
 	state: Mutex<SupervisorState>,
 	seq: AtomicU64,
 	/// Wakes `cancel_child`, `hub jobs`, and `hub wait` waiters whenever a child
@@ -228,6 +242,27 @@ pub enum CancelAttempt {
 	Cancelled,
 	NotFound,
 	AlreadyCompleted,
+}
+
+/// Backend owner namespace: random per supervisor, never a bare PID/scope
+/// counter. Without `/dev/urandom`, fall back to this process's kernel start
+/// time (a recycled PID gets a new start time; execve keeps both), and
+/// only then to pid+nanos as an explicitly unsupported proc+entropy fallback.
+fn owner_namespace(scope: u64) -> String {
+	let pid = std::process::id();
+	let nonce = match crate::process_broker::protocol::random_hex(8) {
+		Ok(hex) => hex,
+		Err(_) => match pi_shell::process::Process::from_pid(pid as i32) {
+			Some(process) => format!("start-{}", process.identity_token()),
+			None => format!(
+				"{:x}",
+				std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.map_or(0, |elapsed| elapsed.as_nanos())
+			),
+		},
+	};
+	format!("omp-{pid}-{nonce}-{scope}")
 }
 
 impl Supervisor {
@@ -253,6 +288,8 @@ impl Supervisor {
 		} else {
 			limits.max_concurrency
 		};
+		static SCOPE: AtomicU64 = AtomicU64::new(0);
+		let scope = SCOPE.fetch_add(1, Ordering::SeqCst) + 1;
 		Arc::new(Self {
 			template: Mutex::new(template),
 			provider: Mutex::new(provider),
@@ -265,6 +302,13 @@ impl Supervisor {
 			root_permits: Arc::new(Semaphore::new(permits)),
 			mailbox: Arc::new(Mailbox::default()),
 			edit_options: Mutex::new(hashline::edit::EditToolOptions::default()),
+			agent_catalog: Mutex::new(None),
+			processes: Mutex::new(None),
+			process_root: {
+				std::env::temp_dir()
+					.join(format!("omp-agent-processes-{}-{scope}", std::process::id()))
+			},
+			process_owner_ns: owner_namespace(scope),
 			state: Mutex::new(SupervisorState {
 				records: HashMap::new(),
 				order: Vec::new(),
@@ -303,6 +347,22 @@ impl Supervisor {
 		// running from an earlier turn keeps its handle so `hub cancel` can
 		// reach it. Normal completion, cancellation, and parent-future drop all
 		// unregister their own handle, so this map cannot grow stale.
+	}
+
+	pub fn set_agent_catalog(&self, catalog: Arc<AgentCatalog>) {
+		*self
+			.agent_catalog
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = Some(catalog);
+	}
+
+	#[must_use]
+	pub fn agent_catalog(&self) -> Option<Arc<AgentCatalog>> {
+		self
+			.agent_catalog
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone()
 	}
 
 	/// Evict settled records that are older than [`RECORD_RETENTION_MS`] or
@@ -384,6 +444,37 @@ impl Supervisor {
 
 	pub fn set_async_enabled(&self, enabled: bool) {
 		self.async_enabled.store(enabled, Ordering::SeqCst);
+		if let Some(processes) = self.processes.lock().unwrap().as_ref() {
+			processes.set_async_enabled(enabled);
+		}
+	}
+
+	/// Install the run's process backend (local manager or broker client).
+	/// Mirrors the current `async.enabled` policy onto it.
+	pub fn set_processes(&self, processes: Arc<dyn ProcessBackend>) {
+		processes.set_async_enabled(self.async_enabled());
+		*self.processes.lock().unwrap() = Some(processes);
+	}
+
+	/// Shared backend for `bash async` and hub process ops. Without an injected
+	/// backend, a local in-process manager is created on first use and reused
+	/// for this supervisor's lifetime.
+	/// Backend-visible owner label for a child id, namespaced per runner so
+	/// concurrent CLIs never share process ownership for `task-1`.
+	fn process_owner(&self, owner: Option<&str>) -> Option<String> {
+		owner.map(|id| format!("{}:{id}", self.process_owner_ns))
+	}
+
+	pub fn processes(&self) -> Arc<dyn ProcessBackend> {
+		let mut slot = self.processes.lock().unwrap();
+		if let Some(processes) = slot.as_ref() {
+			return Arc::clone(processes);
+		}
+		let manager: Arc<dyn ProcessBackend> =
+			Arc::new(ProcessManager::new(self.process_root.clone()));
+		manager.set_async_enabled(self.async_enabled());
+		*slot = Some(Arc::clone(&manager));
+		manager
 	}
 
 	/// True only when background execution has both a policy and a delivery
@@ -565,6 +656,14 @@ impl Supervisor {
 
 	pub fn root_registry(self: &Arc<Self>) -> ToolRegistry {
 		let mut reg = self.template.lock().unwrap().clone();
+		let processes = self.processes();
+		if reg.get("bash").is_some() {
+			reg.remove("bash");
+			reg.register(Arc::new(BashTool::with_processes(
+				Arc::clone(&processes),
+				None,
+			)));
+		}
 		reg.register(Arc::new(ThinkTool::new()));
 		let limits = self.limits();
 		if self.task_enabled() && (limits.max_depth < 0 || 0 < limits.max_depth) {
@@ -575,7 +674,9 @@ impl Supervisor {
 			)));
 		}
 		if self.hub_enabled() {
-			reg.register(Arc::new(HubTool::root(Arc::clone(self))));
+			reg.register(Arc::new(
+				HubTool::root(Arc::clone(self)).with_processes(processes, None),
+			));
 		}
 		reg
 	}
@@ -602,6 +703,17 @@ impl Supervisor {
 		reg.remove("todo");
 		// Children are headless: interactive ask has no channel.
 		reg.remove("ask");
+		// One backend snapshot for every child tool: a concurrent root swap
+		// must not give `bash` and `hub` different process scopes.
+		let processes = self.processes();
+		if reg.get("bash").is_some() {
+			reg.remove("bash");
+			let backend_owner = self.process_owner(owner);
+			reg.register(Arc::new(BashTool::with_processes(
+				Arc::clone(&processes),
+				backend_owner,
+			)));
+		}
 		reg.register(Arc::new(YieldTool::new()));
 		reg.register(Arc::new(ThinkTool::new()));
 		let limits = self.limits();
@@ -613,10 +725,11 @@ impl Supervisor {
 			)));
 		}
 		if self.hub_enabled() {
-			reg.register(Arc::new(HubTool::with_owner(
-				Arc::clone(self),
-				owner.map(str::to_string),
-			)));
+			let backend_owner = self.process_owner(owner);
+			reg.register(Arc::new(
+				HubTool::with_owner(Arc::clone(self), owner.map(str::to_string))
+					.with_processes(processes, backend_owner),
+			));
 		}
 		reg
 	}
@@ -977,5 +1090,131 @@ impl Drop for ChildGuard {
 			self.supervisor.mark_aborted(&self.id, "aborted by parent");
 			self.supervisor.unregister_active_child(&self.id);
 		}
+	}
+}
+
+#[cfg(test)]
+mod process_wiring_tests {
+	use std::sync::Arc;
+
+	use async_trait::async_trait;
+
+	use super::*;
+	use crate::{
+		provider::{ChunkStream, ModelProvider, ProviderError},
+		state::Message,
+		tools::{process::ProcessManager, registry::ToolRegistry, Tool},
+	};
+
+	struct QuietProvider;
+
+	#[async_trait]
+	impl ModelProvider for QuietProvider {
+		async fn complete(
+			&self,
+			_messages: &[Message],
+			_tools: &[serde_json::Value],
+		) -> Result<Message, ProviderError> {
+			Err(ProviderError::Protocol("unused".to_string()))
+		}
+
+		async fn stream(
+			&self,
+			_messages: &[Message],
+			_tools: &[serde_json::Value],
+		) -> Result<ChunkStream, ProviderError> {
+			Err(ProviderError::Protocol("unused".to_string()))
+		}
+	}
+
+	fn supervisor() -> Arc<Supervisor> {
+		Supervisor::with_selection(
+			ToolRegistry::with_builtins(),
+			Arc::new(QuietProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			true,
+		)
+	}
+
+	#[test]
+	fn child_registry_owner_namespace_is_unique() {
+		let one = supervisor();
+		let two = supervisor();
+		let backend: Arc<dyn ProcessBackend> =
+			Arc::new(ProcessManager::new(std::env::temp_dir().join("omp-sup-test")));
+		one.set_processes(Arc::clone(&backend));
+
+		assert!(one.root_registry().get("bash").is_some());
+		let child = one.child_registry(1, Some("task-1"));
+		assert!(child.get("bash").is_some());
+		assert!(child.get("hub").is_some());
+
+		let first = one.process_owner(Some("task-1"));
+		assert_eq!(first, Some(format!("{}:task-1", one.process_owner_ns)));
+		assert_ne!(first, two.process_owner(Some("task-1")));
+	}
+
+	#[tokio::test]
+	async fn child_registry_snapshots_backend_across_supervisor_swap() {
+		let one = supervisor();
+		let root_a = std::env::temp_dir().join(format!("omp-sup-consumer-a-{}", std::process::id()));
+		let root_b = std::env::temp_dir().join(format!("omp-sup-consumer-b-{}", std::process::id()));
+		one.set_processes(Arc::new(ProcessManager::new(root_a)));
+		let child = one.child_registry(1, Some("task-1"));
+		let bash = child.get("bash").expect("bash");
+		let hub = child.get("hub").expect("hub");
+
+		// Root swaps to a different backend after the child snapshot exists.
+		one.set_processes(Arc::new(ProcessManager::new(root_b)));
+
+		let ctx = crate::state::AgentContext::new(std::env::temp_dir());
+		let started = bash
+			.execute(
+				&serde_json::json!({"command": "printf CHILD-MARKER", "async": true}),
+				&ctx,
+			)
+			.await
+			.expect("async bash start");
+		assert!(!started.is_error, "{}", started.content);
+		let job = started
+			.details
+			.as_ref()
+			.and_then(|details| details["async"]["jobId"].as_str())
+			.expect("job id")
+			.to_string();
+
+		// The captured backend serves the job: wait + logs observe the marker.
+		let waited = hub
+			.execute(
+				&serde_json::json!({"op": "wait", "name": job, "timeoutMs": 5000}),
+				&ctx,
+			)
+			.await
+			.expect("hub wait");
+		assert!(!waited.is_error, "wait: {}", waited.content);
+		let logs = hub
+			.execute(
+				&serde_json::json!({"op": "logs", "name": job, "grep": "CHILD-MARKER"}),
+				&ctx,
+			)
+			.await
+			.expect("hub logs");
+		assert!(logs.content.contains("CHILD-MARKER"), "logs: {}", logs.content);
+
+		// A registry captured after the swap sees the new backend, which has no
+		// such job: job tables are scoped to one backend snapshot.
+		let swapped = one.child_registry(1, Some("task-1"));
+		let missing = match swapped
+			.get("hub")
+			.expect("hub")
+			.execute(&serde_json::json!({"op": "logs", "name": job}), &ctx)
+			.await
+		{
+			Ok(result) => result.is_error,
+			Err(_) => true,
+		};
+		assert!(missing, "swapped backend must not resolve the old job");
 	}
 }

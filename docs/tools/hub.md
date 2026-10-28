@@ -49,13 +49,15 @@ Merged from the former `irc`, `job`, and `launch` tools; each op family keeps it
 
 ### Native Rust CLI
 
-`crates/pi-agent/src/tools/hub.rs` exposes only the messaging and job subsets over an in-process mailbox and supervisor; there is no launch broker.
+`crates/pi-agent/src/tools/hub.rs` implements messaging, jobs, and process supervision over the shared `ProcessBackend` from `crates/pi-agent/src/tools/process.rs`.
 
-- Supported ops: `send`, `inbox`, `wait`, `jobs`, `list`, `cancel`. Process ops (`start`, `ps`, `logs`, `stop`, `restart`, `describe`, `send` with `name`) return a clear "not supported in this build" error.
-- Mailboxes buffer per recipient. Direct sends to `Main` buffer across REPL turns, while targeting an unknown or finished agent fails instead of reviving it — there is no parked-agent revival and no fabricated live peer. Broadcasts reach currently live agents plus a running root turn.
-- Liveness combines supervisor children with mailbox presence. A `wait` without `from` excludes the caller and returns a "No running peers" result when the last eligible peer exits instead of blocking until its timeout; `wait from: "Main"` works while a root turn with a delegation sink is running. Waits take buffered mail or register a waiter atomically, so a concurrent sender cannot hand a message to a waiter that the same call drops.
-- `wait` with `ids` (or bare) watches background jobs; a settled snapshot consumes the pending auto-delivery so the loop never shows it twice. Settled job records are retained for five minutes or the newest 100 entries; running jobs, queued spawns, and undelivered results are never evicted.
-- `list` reports supervisor children only (root `Main` is not a child record); the schema omits the process `name` target entirely.
+Process ops supported: `start`, `ps`, `logs`, `stop`, `restart`, `describe`, and `send`/`wait` carrying `name`. `bash` with `async: true` and these hub ops use the same backend snapshot captured when the child registry is built; swapping the supervisor's root backend later does not rebind an existing child's tools.
+
+Backend selection and limits: the CLI tries the cross-exit daemon broker per project and, if it is unreachable, prints a warning and uses an in-process `ProcessManager` scoped to a per-runner log root under `<agent-dir>/run/processes/<project+runner hash>`. The runner-scoped manager rejects `persist`/`detached` with a clear error, kills its children and removes its log tree on drop, and gives each runner a unique owner namespace (`omp-<pid>-<random|start-identity>-<scope>`) so concurrent CLIs cannot control each other's jobs. Only broker-owned managers accept `persist`/`detached`, retain logs, and let persistent children outlive broker shutdown. `async.enabled` gates background `bash`; explicit `hub start` supervision is available independently.
+
+Process retention and read caps: settled records stay inspectable for five minutes, capped at the newest 100; `ps` lists every active record plus at most 10 terminal ones. Logs rotate at 25 MiB across current + previous generations; one `logs` call reads up to 2 MiB per generation, returns at most 256 KiB of text, and readiness/pattern matching keeps a 64 KiB sanitized tail. `logs`/`stop`/`wait` timeouts default to 30 s (stop: 5 s).
+
+Messaging/job behavior: mailboxes buffer per recipient. Direct sends to `Main` buffer across REPL turns; targeting an unknown or finished agent fails instead of reviving it. Broadcasts reach currently live agents plus a running root turn. `wait` without `from` excludes the caller; waits take buffered mail or register a waiter atomically, so a concurrent sender cannot hand a message to a waiter the call drops. A settled job snapshot consumes pending auto-delivery so the loop never shows it twice; running jobs and undelivered results are never evicted. `list` reports supervisor children only (root `Main` is not a child record).
 
 ## The unified `wait`
 One blocking primitive. It resolves job legs (explicit `ids`, owner-scoped and silently filtered, or every running job the caller owns) and — when the session can message peers — parks a bus waiter, then races:

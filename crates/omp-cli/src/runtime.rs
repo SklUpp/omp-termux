@@ -5,10 +5,11 @@
 //! converts the loop's turn results back into the CLI [`Event`] stream.
 
 use std::{
-	path::Path,
+	collections::{HashMap, HashSet},
+	path::{Path, PathBuf},
 	sync::{
 		Arc, Mutex,
-		atomic::{AtomicBool, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 };
 
@@ -17,12 +18,15 @@ use pi_agent::{
 	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, AskTool, BashTool, DelegationLimits,
 	EditTool, GlobTool, GrepTool, ModelProvider, OpenAiCompatibleProvider, ReadTool,
 	SteeringEvent, Supervisor, TodoTool, Tool, ToolApprover, ToolRegistry, WriteTool,
+	process_broker::BrokerProcessBackend,
+	tools::process::{ProcessBackend, ProcessManager},
 	mcp::{
 		MCPContent, MCPServerConfig, MCPStdioServerConfig, McpConnection, McpError,
 		McpToolOriginSource, connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key,
 		mcp_tool_match_score, sanitize_mcp_tool_name_part,
 	},
 	tools::hashline::{NativeSnapshotSink, SnapshotStore, edit::EditToolOptions},
+	tools::task_catalog::{AgentCatalog, ChildModel, ChildModelFactory},
 };
 
 use crate::{
@@ -66,6 +70,13 @@ pub struct PiAgentRunner {
 	supervisor: Mutex<Option<Arc<Supervisor>>>,
 	/// Root `read`/`edit` provenance shared by every turn this runner serves.
 	session:    Mutex<Option<Arc<RunnerSession>>>,
+	/// One broker-backed process supervisor per project scope, reused across
+	/// turns. A scope that cannot reach its broker falls back to the
+	/// supervisor's local manager (no entry cached).
+	processes:  Mutex<HashMap<PathBuf, Arc<dyn ProcessBackend>>>,
+	/// Per-runner nonce folded into the local fallback log root, so two CLIs on
+	/// the same project never prune each other's logs when one manager drops.
+	process_scope_ns: String,
 }
 
 /// One snapshot store plus one `EditTool` per runner: tags, seen-line ranges,
@@ -91,8 +102,41 @@ impl PiAgentRunner {
 			.build()
 			.map_err(|err| Error::with_source("cannot start tokio runtime for pi-agent", err))?;
 		let dispatcher = Arc::new(SignalDispatcher::start(&runtime));
-		Ok(Self { runtime, dispatcher, supervisor: Mutex::new(None), session: Mutex::new(None) })
+		Ok(Self {
+			runtime,
+			dispatcher,
+			supervisor: Mutex::new(None),
+			session: Mutex::new(None),
+			processes: Mutex::new(HashMap::new()),
+			process_scope_ns: crate::output::session_id(),
+		})
 	}
+
+	/// Process supervisor for exactly `project`, connected on first use and
+	/// reused by later turns of this runner. Always returns a scope-bound
+	/// backend: when the broker is unreachable, an in-process manager bound to
+	/// that project's log root is used, so a turn never inherits another
+	/// project's backend.
+	fn process_backend(&self, project: &Path) -> Arc<dyn ProcessBackend> {
+		let key = project.to_path_buf();
+		if let Ok(cache) = self.processes.lock()
+			&& let Some(backend) = cache.get(&key)
+		{
+			return Arc::clone(backend);
+		}
+		// Construction must not touch the broker: a turn that never starts a
+		// process (most agent/read turns) must not spend the turn budget on a
+		// worker handshake. The first process op connects, then caches.
+		let backend: Arc<dyn ProcessBackend> = Arc::new(LazyProcessBackend::new(
+			project.to_path_buf(),
+			process_scope_root(project, &self.process_scope_ns),
+		));
+		if let Ok(mut cache) = self.processes.lock() {
+			cache.insert(key, Arc::clone(&backend));
+		}
+		backend
+	}
+
 
 	/// Reuse this runner's root store/`EditTool`, refreshing only the knobs.
 	fn session_tools(&self, options: EditToolOptions) -> Arc<RunnerSession> {
@@ -271,6 +315,26 @@ impl AgentRunner for PiAgentRunner {
 			Some(&session),
 		)?;
 		let (allow_task, allow_hub) = delegation_selection(request);
+		let child_factory: Option<Arc<dyn ChildModelFactory>> = allow_task.then(|| {
+			Arc::new(CliChildModelFactory {
+				config: request.config.clone(),
+				catalog: Arc::clone(&request.catalog),
+				explicit_provider: request.provider.clone(),
+				api_key: request.api_key.clone(),
+				default_model: request.model.clone(),
+				root_provider: Some(plan.provider.clone()),
+			}) as Arc<dyn ChildModelFactory>
+		});
+		let limits = DelegationLimits {
+			max_depth: request
+				.config
+				.max_recursion_depth
+				.unwrap_or_else(|| DelegationLimits::default().max_depth),
+			max_concurrency: request
+				.config
+				.max_concurrency
+				.unwrap_or_else(|| DelegationLimits::default().max_concurrency),
+		};
 		let cwd = request.cwd.clone();
 		let prompt = request.prompt.clone();
 		let mut messages = history_messages(&request.history)?;
@@ -347,6 +411,10 @@ impl AgentRunner for PiAgentRunner {
 		let approvals: Arc<dyn ToolApprover> = Arc::new(approvals);
 		let mut root_supervisor: Option<Arc<Supervisor>> = None;
 		let mut root_sink = None;
+		let process_backend = (allow_task
+			|| allow_hub
+			|| plan.tools.iter().any(|tool| *tool == "bash"))
+			.then(|| self.process_backend(&request.cwd));
 		let mut registry = if allow_task || allow_hub {
 			let mut slot = self.supervisor.lock().map_err(|_| {
 				Error::new("delegation supervisor lock poisoned")
@@ -357,7 +425,7 @@ impl AgentRunner for PiAgentRunner {
 						base_registry,
 						provider.clone(),
 						Some(child_approvals.clone()),
-						DelegationLimits::default(),
+						limits,
 						allow_task,
 						allow_hub,
 					);
@@ -368,7 +436,7 @@ impl AgentRunner for PiAgentRunner {
 						base_registry,
 						provider.clone(),
 						Some(child_approvals.clone()),
-						DelegationLimits::default(),
+						limits,
 						allow_task,
 						allow_hub,
 					);
@@ -377,6 +445,41 @@ impl AgentRunner for PiAgentRunner {
 				},
 			};
 			supervisor.set_edit_options(edit_options);
+			if let Some(processes) = &process_backend {
+				supervisor.set_processes(Arc::clone(processes));
+			}
+			if let Some(factory) = &child_factory {
+				match supervisor.agent_catalog() {
+					// Definitions and policy are discovered once per runner; only
+					// the resolver follows the root model. A running child keeps
+					// the snapshot it captured at spawn.
+					Some(catalog) => catalog.set_model_factory(Arc::clone(factory)),
+					None => {
+						let extension_roots = request
+							.config
+							.extensions
+							.as_deref()
+							.unwrap_or(&[])
+							.iter()
+							.map(|path| crate::dirs::absolute(&request.cwd, path))
+							.collect::<Vec<_>>();
+						let discovery =
+							crate::agents::discover_agents(&request.cwd, &extension_roots)?;
+						let catalog = AgentCatalog::new(
+							discovery.agents,
+							discovery.project_agents_dir,
+						)
+						.with_policy(
+							request.config.disabled_agents.clone().unwrap_or_default(),
+							request.config.agent_model_overrides.clone(),
+							request.config.max_recursion_depth,
+							request.config.max_effort.clone(),
+						)
+						.with_model_factory(Arc::clone(factory));
+						supervisor.set_agent_catalog(Arc::new(catalog));
+					},
+				}
+			}
 			supervisor.set_async_enabled(request.config.async_config.enabled());
 			root_sink = Some(supervisor.owner_results_sink(None));
 			root_supervisor = Some(Arc::clone(&supervisor));
@@ -384,6 +487,16 @@ impl AgentRunner for PiAgentRunner {
 		} else {
 			base_registry
 		};
+		// Bash-only sessions still need the real process backend: `bash async`
+		// must run on the same scoped supervisor as hub process ops.
+		if root_supervisor.is_none()
+			&& let Some(processes) = &process_backend
+			&& registry.get("bash").is_some()
+		{
+			processes.set_async_enabled(request.config.async_config.enabled());
+			registry.remove("bash");
+			registry.register(Arc::new(BashTool::with_processes(Arc::clone(processes), None)));
+		}
 		if plan.tools.contains(&"ask") {
 			registry.register(Arc::new(AskTool::new()));
 		}
@@ -825,8 +938,386 @@ impl RunPlan {
 		})
 	}
 }
-/// Trailing `:effort` selector (`:high`, `:xhi`, …) is not part of the model
-/// id.
+/// Resolves an agent model pattern through config roles, the model catalog, and
+/// `config.yml` connections, then builds a provider for that child only.
+/// The root provider is untouched, so `/model` changes refresh only the
+/// factory snapshot installed on the catalog.
+struct CliChildModelFactory {
+	config:           crate::config::Config,
+	catalog:          Arc<crate::catalog::Catalog>,
+	explicit_provider: Option<String>,
+	api_key:          Option<String>,
+	default_model:    Option<String>,
+	/// Provider the root run actually selected. The root run key may only be
+	/// reused for this provider; every other child uses its own connection key.
+	root_provider:    Option<String>,
+}
+
+impl CliChildModelFactory {
+	/// Resolve a CLI/agent model pattern to an ordered candidate list using the
+	/// same role rules as `model-resolver.ts`: `@role`, `pi/role`, `*` aliases,
+	/// comma lists, thinking suffixes, configured values, default inheritance for
+	/// smol/slow/designer, and the bundled `priority.json` chains.
+	fn patterns_for(&self, raw: &str) -> std::result::Result<Vec<String>, String> {
+		let raw = raw.trim();
+		if raw.is_empty() {
+			return Err("empty model pattern".to_string());
+		}
+		let Some((role, suffix)) = role_alias(raw, &self.config.model_roles) else {
+			return Ok(vec![raw.to_string()]);
+		};
+		let mut visited = HashSet::new();
+		let mut patterns = self.role_patterns(&role, &mut visited)?;
+		if patterns.is_empty() {
+			patterns = self.default_patterns();
+		} else if let Some(level) = suffix {
+			patterns = patterns
+				.into_iter()
+				.map(|pattern| format!("{pattern}:{level}"))
+				.collect();
+		}
+		if patterns.is_empty() {
+			return Err(format!(
+				"model role '@{role}' has no resolvable model and no default model is set"
+			));
+		}
+		Ok(patterns)
+	}
+
+	fn default_patterns(&self) -> Vec<String> {
+		for candidate in [
+			self.default_model.as_deref(),
+			self.config.default_model.as_deref(),
+		] {
+			let Some(candidate) = candidate.map(str::trim).filter(|value| !value.is_empty()) else {
+				continue;
+			};
+			if let Some((role, suffix)) = role_alias(candidate, &self.config.model_roles) {
+				let mut visited = HashSet::new();
+				if let Ok(mut patterns) = self.role_patterns(&role, &mut visited) {
+					if let Some(level) = suffix {
+						patterns = patterns
+							.into_iter()
+							.map(|pattern| format!("{pattern}:{level}"))
+							.collect();
+					}
+					if !patterns.is_empty() {
+						return patterns;
+					}
+				}
+				// An alias that expands to nothing must not be returned as a
+				// literal model id; try the next fallback candidate.
+				continue;
+			}
+			let patterns = split_pattern_list(candidate);
+			if !patterns.is_empty() {
+				return patterns;
+			}
+		}
+		Vec::new()
+	}
+
+	fn role_patterns(
+		&self,
+		role: &str,
+		visited: &mut HashSet<String>,
+	) -> std::result::Result<Vec<String>, String> {
+		if !visited.insert(role.to_string()) {
+			return Err(format!("model role cycle while resolving '@{role}'"));
+		}
+		let configured = self
+			.config
+			.model_roles
+			.get(role)
+			.map(|value| value.trim())
+			.filter(|value| !value.is_empty())
+			.map(str::to_string);
+		let mut patterns = if let Some(configured) = configured {
+			split_pattern_list(&configured)
+		} else if should_inherit_default(role) {
+			match self
+				.config
+				.model_roles
+				.get("default")
+				.map(|value| value.trim())
+				.filter(|value| !value.is_empty())
+			{
+				Some(default) => self.inherited_default(role, default, visited)?,
+				None => self.priority(role),
+			}
+		} else {
+			self.priority(role)
+		};
+		if patterns.is_empty() {
+			patterns = self.priority(role);
+		}
+
+		let mut resolved = Vec::new();
+		for pattern in patterns {
+			if let Some((alias, suffix)) = role_alias(&pattern, &self.config.model_roles) {
+				let mut branch = visited.clone();
+				if let Ok(mut nested) = self.role_patterns(&alias, &mut branch) {
+					if !nested.is_empty() {
+						if let Some(level) = suffix {
+							nested = nested
+								.into_iter()
+								.map(|pattern| format!("{pattern}:{level}"))
+								.collect();
+						}
+						resolved.extend(nested);
+						continue;
+					}
+				}
+			}
+			resolved.push(pattern);
+		}
+		Ok(resolved)
+	}
+
+	fn inherited_default(
+		&self,
+		role: &str,
+		default_value: &str,
+		visited: &HashSet<String>,
+	) -> std::result::Result<Vec<String>, String> {
+		let mut resolved = Vec::new();
+		for pattern in split_pattern_list(default_value) {
+			let (base, level) = split_thinking(&pattern, 0);
+			if let Some((alias, _)) = role_alias(base, &self.config.model_roles) {
+				if alias == role {
+					// `modelRoles.default = "@smol"` must not loop back.
+					let defaults = self.priority(role);
+					resolved.extend(defaults.into_iter().map(|default| match level {
+						Some(level) => format!("{default}:{level}"),
+						None => default,
+					}));
+					continue;
+				}
+				if !visited.contains(&alias) {
+					let mut branch = visited.clone();
+					if let Ok(nested) = self.role_patterns(&alias, &mut branch) {
+						if !nested.is_empty() {
+							resolved.extend(nested);
+							continue;
+						}
+					}
+				}
+			}
+			resolved.push(pattern);
+		}
+		Ok(resolved)
+	}
+
+	fn priority(&self, role: &str) -> Vec<String> {
+		let key = match role {
+			"advisor" => "slow",
+			"tiny" => "smol",
+			other => other,
+		};
+		priority_json()
+			.get(key)
+			.and_then(serde_json::Value::as_array)
+			.map(|patterns| {
+				patterns
+					.iter()
+					.filter_map(|pattern| pattern.as_str().map(str::to_string))
+					.collect()
+			})
+			.unwrap_or_default()
+	}
+
+	fn target(
+		&self,
+		pattern: &str,
+	) -> std::result::Result<(String, String, String, String, bool, Option<String>), String> {
+		let (base, selector) = split_thinking(pattern, -1);
+		let effort = selector.and_then(|selector| match selector {
+			"inherit" | "auto" => None,
+			other => Some(other.to_string()),
+		});
+		let (provider, model) = match base.split_once('/') {
+			Some((provider, id)) if !provider.is_empty() && !id.is_empty() => {
+				(provider.to_string(), id.to_string())
+			},
+			_ => {
+				let provider = self
+					.explicit_provider
+					.clone()
+					.or_else(|| self.catalog.provider_of(base).map(str::to_string))
+					.ok_or_else(|| {
+						format!(
+							"no provider for model `{base}`: pass --provider or use `provider/{base}`"
+						)
+					})?;
+				(provider, base.to_string())
+			},
+		};
+		let connection = self
+			.config
+			.providers
+			.get(&provider)
+			.cloned()
+			.or_else(|| self.catalog.connections.get(&provider).cloned())
+			.ok_or_else(|| format!("provider `{provider}` has no connection block"))?;
+		let base_url = connection
+			.base_url
+			.clone()
+			.ok_or_else(|| format!("provider `{provider}` has no baseUrl"))?;
+		let api_key = if self.root_provider.as_deref() == Some(provider.as_str()) {
+			self
+				.api_key
+				.clone()
+				.or_else(|| connection.resolve_api_key())
+		} else {
+			// Never send the root provider's secret to a different base URL.
+			connection.resolve_api_key()
+		}
+		.unwrap_or_default();
+		let supports_images = self.catalog.supports_images(&provider, &model).unwrap_or(true);
+		Ok((provider, model, base_url, api_key, supports_images, effort))
+	}
+}
+
+impl ChildModelFactory for CliChildModelFactory {
+	fn can_resolve(&self, model: &str) -> bool {
+		self.patterns_for(model)
+			.map(|patterns| patterns.iter().any(|pattern| self.target(pattern).is_ok()))
+			.unwrap_or(false)
+	}
+
+	fn resolve(
+		&self,
+		model: &str,
+		effort: Option<&str>,
+		fallback_effort: Option<&str>,
+	) -> std::result::Result<ChildModel, String> {
+		let patterns = self.patterns_for(model)?;
+		let mut last_error = None;
+		for pattern in patterns {
+			let (provider_id, id, base_url, api_key, supports_images, pattern_effort) =
+				match self.target(&pattern) {
+					Ok(target) => target,
+					Err(error) => {
+						last_error = Some(error);
+						continue;
+					},
+				};
+			let chosen_effort = effort
+				.map(str::to_string)
+				.or(pattern_effort)
+				.or_else(|| fallback_effort.map(str::to_string));
+			let provider = match OpenAiCompatibleProvider::new(base_url, api_key, id.clone()) {
+				Ok(provider) => provider
+					.with_effort(chosen_effort)
+					.with_images(supports_images)
+					.with_prompt_cache_enabled(provider_id == "kimi-code"),
+				Err(error) => {
+					last_error = Some(error.to_string());
+					continue;
+				},
+			};
+			return Ok(ChildModel {
+				provider: Arc::new(provider),
+				model: format!("{provider_id}/{id}"),
+				role: None,
+			});
+		}
+		Err(last_error.unwrap_or_else(|| format!("no model candidate for '{model}'")))
+	}
+}
+
+/// Role ids from `model-roles.ts`; configured custom roles are also accepted.
+const MODEL_ROLE_IDS: [&str; 10] = [
+	"default", "smol", "slow", "vision", "plan", "designer", "commit", "tiny", "task", "advisor",
+];
+
+/// Thinking selectors accepted after `:` in a model pattern (TS `thinking.ts`).
+const THINKING_SELECTORS: [&str; 9] =
+	["inherit", "auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+static PRIORITY_JSON: std::sync::LazyLock<serde_json::Value> =
+	std::sync::LazyLock::new(|| {
+		serde_json::from_str(include_str!(
+			"../../../packages/coding-agent/src/priority.json"
+		))
+		.unwrap_or(serde_json::Value::Null)
+	});
+
+fn priority_json() -> &'static serde_json::Value {
+	&PRIORITY_JSON
+}
+
+fn should_inherit_default(role: &str) -> bool {
+	matches!(role, "smol" | "slow" | "designer")
+}
+
+fn split_pattern_list(value: &str) -> Vec<String> {
+	value
+		.split(',')
+		.map(str::trim)
+		.filter(|pattern| !pattern.is_empty())
+		.map(str::to_string)
+		.collect()
+}
+
+fn is_known_role(role: &str, configured: &std::collections::BTreeMap<String, String>) -> bool {
+	MODEL_ROLE_IDS.contains(&role) || configured.contains_key(role)
+}
+
+/// Recognize `@role`, legacy `pi/role`, and the `*` default alias, returning the
+/// role and an optional `:thinking` suffix.
+fn role_alias(
+	value: &str,
+	configured: &std::collections::BTreeMap<String, String>,
+) -> Option<(String, Option<&'static str>)> {
+	let value = value.trim();
+	let prefix_len = if value == "*" || value.starts_with("*:") {
+		0
+	} else if value.starts_with('@') {
+		1
+	} else if value.starts_with("pi/") {
+		3
+	} else {
+		return None;
+	};
+	let (base, suffix) = split_thinking(value, prefix_len as isize);
+	let candidate = if base == "*" {
+		"default"
+	} else {
+		base.get(prefix_len..)?
+	};
+	if candidate.is_empty() || !is_known_role(candidate, configured) {
+		return None;
+	}
+	Some((candidate.to_string(), suffix))
+}
+
+/// Unique-prefix thinking selector split, mirroring `splitThinkingSuffix`.
+fn split_thinking(model: &str, min_colon_index: isize) -> (&str, Option<&'static str>) {
+	let Some(colon) = model.rfind(':') else {
+		return (model, None);
+	};
+	if (colon as isize) <= min_colon_index {
+		return (model, None);
+	}
+	let suffix = &model[colon + 1..];
+	if suffix.len() < 2 {
+		return (model, None);
+	}
+	let mut matches = THINKING_SELECTORS
+		.iter()
+		.filter(|selector| selector.starts_with(suffix))
+		.copied();
+	let Some(selector) = matches.next() else {
+		return (model, None);
+	};
+	if matches.next().is_some() {
+		return (model, None);
+	}
+	(&model[..colon], Some(selector))
+}
+
+
 const EFFORT_SELECTORS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 pub fn split_effort(model: &str) -> (&str, Option<&str>) {
@@ -947,7 +1438,7 @@ fn build_registry_full(
 				Some(session) => session.edit.clone(),
 				None => Arc::new(EditTool::with_options(snapshots.clone(), edit_options)),
 			},
-			"bash" => Arc::new(BashTool),
+			"bash" => Arc::new(BashTool::new()),
 			"todo" => Arc::new(TodoTool::restored(todo_phases.clone(), session_persisted)),
 			"ask" => Arc::new(AskTool::new()),
 			other => {
@@ -1928,6 +2419,192 @@ pub fn history_messages(history: &[crate::session::TurnRecord]) -> Result<Vec<pi
 	Ok(messages)
 }
 
+/// Process backend that connects to the daemon broker on first use.
+///
+/// Broker startup can take seconds (or fail entirely under a unit-test
+/// harness); doing it during `run()` setup would eat model-turn budgets even
+/// when no process operation is requested. Only trait methods that need a
+/// process resolve the backend.
+struct LazyProcessBackend {
+	project: PathBuf,
+	fallback_log_root: PathBuf,
+	backend: tokio::sync::OnceCell<Arc<dyn ProcessBackend>>,
+	async_enabled: AtomicBool,
+	#[cfg(test)]
+	test_broker_unavailable: bool,
+}
+
+impl LazyProcessBackend {
+	fn new(project: PathBuf, fallback_log_root: PathBuf) -> Self {
+		Self {
+			project,
+			fallback_log_root,
+			backend: tokio::sync::OnceCell::new(),
+			async_enabled: AtomicBool::new(true),
+			#[cfg(test)]
+			test_broker_unavailable: false,
+		}
+	}
+
+	#[cfg(test)]
+	fn for_test_unavailable_broker(fallback_log_root: PathBuf) -> Self {
+		Self {
+			test_broker_unavailable: true,
+			..Self::new(PathBuf::from("/nonexistent-project"), fallback_log_root)
+		}
+	}
+
+	async fn resolved(&self) -> std::result::Result<Arc<dyn ProcessBackend>, pi_agent::tools::process::ProcessError> {
+		// One async initializer for the whole cell: concurrent first process ops
+		// must not each connect/fall back, because the losers' managers would
+		// share the fallback log root and delete the winner's logs on drop.
+		let backend = self
+			.backend
+			.get_or_init(|| async {
+				#[cfg(test)]
+				if self.test_broker_unavailable {
+					eprintln!(
+						"omp: process broker unavailable (test); using the in-process supervisor for {}",
+						self.project.display()
+					);
+					return Arc::new(ProcessManager::new(self.fallback_log_root.clone()))
+						as Arc<dyn ProcessBackend>;
+				}
+				let backend: Arc<dyn ProcessBackend> =
+					match BrokerProcessBackend::connect(&self.project).await {
+						Ok(backend) => backend,
+						Err(error) => {
+							eprintln!(
+								"omp: process broker unavailable ({error}); using the in-process supervisor for {}",
+								self.project.display()
+							);
+							Arc::new(ProcessManager::new(self.fallback_log_root.clone()))
+						},
+					};
+				backend
+			})
+			.await;
+		// A concurrent `set_async_enabled` may have changed the flag while the
+		// connection was in flight; mirror the latest value once.
+		backend.set_async_enabled(self.async_enabled.load(Ordering::SeqCst));
+		Ok(Arc::clone(backend))
+	}
+}
+
+#[async_trait]
+impl ProcessBackend for LazyProcessBackend {
+	async fn start(
+		self: Arc<Self>,
+		spec: pi_agent::tools::process::ProcessSpec,
+		owner: Option<String>,
+	) -> std::result::Result<pi_agent::tools::process::StartOutcome, pi_agent::tools::process::ProcessError> {
+		self.resolved().await?.start(spec, owner).await
+	}
+
+	async fn list(
+		self: Arc<Self>,
+		owner: Option<String>,
+	) -> std::result::Result<Vec<pi_agent::tools::process::ProcessSnapshot>, pi_agent::tools::process::ProcessError> {
+		self.resolved().await?.list(owner).await
+	}
+
+	async fn logs(
+		self: Arc<Self>,
+		name: String,
+		options: pi_agent::tools::process::LogOptions,
+		owner: Option<String>,
+	) -> std::result::Result<pi_agent::tools::process::LogsOutcome, pi_agent::tools::process::ProcessError> {
+		self.resolved().await?.logs(name, options, owner).await
+	}
+
+	async fn wait(
+		self: Arc<Self>,
+		name: String,
+		request: pi_agent::tools::process::WaitRequest,
+		timeout_ms: u64,
+		owner: Option<String>,
+	) -> std::result::Result<pi_agent::tools::process::WaitOutcome, pi_agent::tools::process::ProcessError> {
+		self.resolved().await?.wait(name, request, timeout_ms, owner).await
+	}
+
+	async fn send(
+		self: Arc<Self>,
+		name: String,
+		data: Option<String>,
+		signal: Option<pi_agent::tools::process::Signal>,
+		owner: Option<String>,
+	) -> std::result::Result<pi_agent::tools::process::ProcessSnapshot, pi_agent::tools::process::ProcessError> {
+		self.resolved().await?.send(name, data, signal, owner).await
+	}
+
+	async fn stop(
+		self: Arc<Self>,
+		name: String,
+		timeout_ms: u64,
+		owner: Option<String>,
+	) -> std::result::Result<pi_agent::tools::process::ProcessSnapshot, pi_agent::tools::process::ProcessError> {
+		self.resolved().await?.stop(name, timeout_ms, owner).await
+	}
+
+	async fn restart(
+		self: Arc<Self>,
+		name: String,
+		owner: Option<String>,
+	) -> std::result::Result<pi_agent::tools::process::ProcessSnapshot, pi_agent::tools::process::ProcessError> {
+		self.resolved().await?.restart(name, owner).await
+	}
+
+	async fn describe(
+		self: Arc<Self>,
+		name: String,
+		owner: Option<String>,
+	) -> std::result::Result<(pi_agent::tools::process::ProcessSnapshot, pi_agent::tools::process::ProcessSpec), pi_agent::tools::process::ProcessError> {
+		self.resolved().await?.describe(name, owner).await
+	}
+
+	fn async_enabled(&self) -> bool {
+		self.async_enabled.load(Ordering::SeqCst)
+	}
+
+	fn set_async_enabled(&self, enabled: bool) {
+		self.async_enabled.store(enabled, Ordering::SeqCst);
+		if let Some(backend) = self.backend.get() {
+			backend.set_async_enabled(enabled);
+		}
+	}
+
+	fn next_background_name(&self) -> String {
+		// Process-global sequence: two lazy backends for aliased project paths
+		// (same broker) must never mint the same job name.
+		static NAME_SEQ: AtomicU64 = AtomicU64::new(0);
+		format!(
+			"bash-{}-{}",
+			std::process::id(),
+			NAME_SEQ.fetch_add(1, Ordering::SeqCst)
+		)
+	}
+
+	fn arm_timeout(self: Arc<Self>, name: String, owner: Option<String>, timeout_ms: u64) {
+		tokio::spawn(async move {
+			if let Ok(backend) = self.resolved().await {
+				backend.arm_timeout(name, owner, timeout_ms);
+			}
+		});
+	}
+}
+
+/// Project-scoped log root for the in-process fallback supervisor.
+fn process_scope_root(project: &Path, runner_ns: &str) -> PathBuf {
+	use std::hash::{Hash, Hasher};
+	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	project.hash(&mut hasher);
+	runner_ns.hash(&mut hasher);
+	crate::dirs::agent_dir()
+		.join("run")
+		.join("processes")
+		.join(format!("{:016x}", hasher.finish()))
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{collections::BTreeMap, path::PathBuf};
@@ -2136,6 +2813,115 @@ mod tests {
 		let plan = RunPlan::resolve(&request).expect("plan");
 		assert_eq!(plan.base_url, "http://127.0.0.1:8080/v1");
 		assert_eq!(plan.api_key, "sk-test");
+	}
+
+	#[test]
+	fn child_model_roles_follow_ts_priority_inheritance_and_suffixes() {
+		let factory = |roles: &[(&str, &str)], default: Option<&str>| {
+			let mut config = Config::default();
+			for (role, value) in roles {
+				config
+					.model_roles
+					.insert((*role).to_string(), (*value).to_string());
+			}
+			CliChildModelFactory {
+				config,
+				catalog: Arc::new(catalog()),
+				explicit_provider: None,
+				api_key: None,
+				default_model: default.map(str::to_string),
+				root_provider: None,
+			}
+		};
+
+		let priorities = factory(&[], None);
+		let smol = priorities.patterns_for("@smol").expect("smol priority");
+		assert_eq!(smol.first().map(String::as_str), Some("cerebras/zai-glm-4.7"));
+		assert_eq!(smol.last().map(String::as_str), Some("mini"));
+		assert_eq!(
+			priorities.patterns_for("@advisor").expect("advisor alias")[0],
+			"openai-codex/gpt-5.5"
+		);
+
+		let suffixed = priorities.patterns_for("@smol:hi").expect("suffix");
+		assert!(suffixed.iter().all(|pattern| pattern.ends_with(":high")));
+		let default_suffix = factory(&[("default", "local/llama3")], None);
+		assert_eq!(
+			default_suffix.patterns_for("*:auto").expect("auto suffix"),
+			vec!["local/llama3:auto".to_string()]
+		);
+
+		let self_alias = factory(&[("default", "@smol")], None);
+		assert_eq!(
+			self_alias.patterns_for("@smol").expect("self alias")[0],
+			"cerebras/zai-glm-4.7"
+		);
+
+		let inherited = factory(&[("default", "local/llama3")], None);
+		assert_eq!(
+			inherited.patterns_for("@slow").expect("inherit default"),
+			vec!["local/llama3".to_string()]
+		);
+
+		// Roles with no configured/priority chain fall back to the active model.
+		let active = factory(&[], Some("local/llama3"));
+		assert_eq!(
+			active.patterns_for("@task").expect("active fallback"),
+			vec!["local/llama3".to_string()]
+		);
+
+		let configured = factory(
+			&[("slow", "local/other, local/llama3"), ("task", "@slow")],
+			Some("local/llama3"),
+		);
+		assert_eq!(
+			configured.patterns_for("@task").expect("cross alias"),
+			vec!["local/other".to_string(), "local/llama3".to_string()]
+		);
+	}
+
+	#[test]
+	fn child_targets_never_reuse_root_key_for_other_providers() {
+		let mut config = Config::default();
+		config.providers.insert(
+			"rootprov".to_string(),
+			ProviderConfig {
+				base_url: Some("http://127.0.0.1:1".to_string()),
+				api_key: Some("root-conn-key".to_string()),
+				..ProviderConfig::default()
+			},
+		);
+		config.providers.insert(
+			"otherprov".to_string(),
+			ProviderConfig {
+				base_url: Some("http://127.0.0.1:2".to_string()),
+				api_key: Some("other-key".to_string()),
+				..ProviderConfig::default()
+			},
+		);
+		config.providers.insert(
+			"nokey".to_string(),
+			ProviderConfig {
+				base_url: Some("http://127.0.0.1:3".to_string()),
+				api_key: None,
+				..ProviderConfig::default()
+			},
+		);
+		let factory = CliChildModelFactory {
+			config,
+			catalog: Arc::new(catalog()),
+			explicit_provider: None,
+			api_key: Some("root-session-key".to_string()),
+			default_model: None,
+			root_provider: Some("rootprov".to_string()),
+		};
+
+		let (_, _, _, key, _, _) = factory.target("otherprov/model").expect("other provider");
+		assert_eq!(key, "other-key", "root key must not leak to a foreign provider");
+		let (_, _, _, key, _, _) = factory.target("nokey/model").expect("keyless provider");
+		assert_eq!(key, "", "root key must not be sent to a keyless foreign provider");
+		let (_, _, _, key, _, _) = factory.target("rootprov/model").expect("root provider");
+		assert_eq!(key, "root-session-key");
 	}
 
 	#[test]
@@ -3275,6 +4061,8 @@ mod tests {
 		let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
 		let addr = listener.local_addr().expect("fixture addr");
 		let call_seq = AtomicU64::new(0);
+		let seen_tool_schemas = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+		let seen_tool_schemas_for_server = Arc::clone(&seen_tool_schemas);
 		let server = std::thread::spawn(move || {
 			for _ in 0..5 {
 				let (mut socket, _) = listener.accept().expect("accept fixture");
@@ -3312,8 +4100,23 @@ mod tests {
 				let end = header_end.expect("headers");
 				let body = String::from_utf8_lossy(&buf[end..end + content_len]);
 				let latest = last_message_text(&body);
-				let streaming = serde_json::from_str::<serde_json::Value>(&body)
-					.ok()
+				let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+				let seen: Vec<String> = parsed
+					.as_ref()
+					.and_then(|request| request.get("tools"))
+					.and_then(|tools| tools.as_array())
+					.map(|tools| {
+						tools
+							.iter()
+							.filter_map(|tool| {
+								tool.pointer("/function/name").and_then(|name| name.as_str()).map(str::to_string)
+							})
+							.collect()
+					})
+					.unwrap_or_default();
+				seen_tool_schemas_for_server.lock().expect("schema log").push(seen);
+				let streaming = parsed
+					.as_ref()
 					.and_then(|request| request.get("stream").and_then(|v| v.as_bool()))
 					.unwrap_or(false);
 
@@ -3321,11 +4124,15 @@ mod tests {
 					(
 						Some((
 							"task",
-							serde_json::json!({ "name": "cli-child", "task": "CLI_CHILD_WORK" }),
+							serde_json::json!({
+								"name": "cli-child",
+								"agent": "cli-child",
+								"task": "CLI_CHILD_WORK"
+							}),
 						)),
 						None,
 					)
-				} else if latest == "CLI_CHILD_WORK" {
+				} else if latest.starts_with("Complete assignment thoroughly:") && latest.contains("CLI_CHILD_WORK") {
 					(
 						Some(("yield", serde_json::json!({ "result": { "data": "child-ok" } }))),
 						None,
@@ -3416,8 +4223,19 @@ mod tests {
 			}
 		});
 
+		// Explicit project agent: the bundled `task` agent's model/effort policy
+		// may change, but this test pins synchronous delegation and yield
+		// extraction, so the child must carry its own model and tool allowlist.
+		let project = std::env::temp_dir().join(format!("omp-cli-task-hub-{}", std::process::id()));
+		let agents_dir = project.join(".omp/agents");
+		std::fs::create_dir_all(&agents_dir).expect("project agents dir");
+		std::fs::write(
+			agents_dir.join("cli-child.md"),
+			"---\nname: cli-child\ndescription: CLI delegation fixture child\ntools:\n  - yield\nmodel: local/llama3\n---\nYield the requested data.\n",
+		)
+		.expect("write cli-child agent");
 		let mut req = request(yolo());
-		req.cwd = std::env::temp_dir();
+		req.cwd = project.clone();
 		// This test pins the synchronous delegation contract (inline `task`
 		// results); background delivery is covered by pi-agent's
 		// `async_coordination` suite.
@@ -3458,14 +4276,37 @@ mod tests {
 		assert_eq!(task_details["results"][0]["exitCode"].as_i64(), Some(0));
 		assert_eq!(
 			task_details["results"][0]["extractedToolData"]["yield"][0]["data"],
-			"child-ok"
+			"child-ok",
+			"task result: {task_details}"
 		);
 		assert!(!child_yield_at_root, "yield must stay child-only");
+		let schemas = seen_tool_schemas.lock().expect("schema log");
+		assert!(
+			schemas
+				.iter()
+				.any(|tools| tools.iter().any(|tool| tool == "task") && !tools.iter().any(|tool| tool == "yield")),
+			"root schema must expose task without yield: {schemas:?}"
+		);
+		assert!(
+			schemas
+				.iter()
+				.any(|tools| tools.iter().any(|tool| tool == "yield") && !tools.iter().any(|tool| tool == "task")),
+			"child schema must expose yield: {schemas:?}"
+		);
+		for tools in schemas.iter() {
+			if tools.iter().any(|tool| tool == "task") {
+				assert!(
+					!tools.iter().any(|tool| tool == "yield"),
+					"root tool schema leaked child yield: {tools:?}"
+				);
+			}
+		}
+		drop(schemas);
 
 		// A later REPL turn must still see the completed child in the same
 		// in-memory supervisor.
 		let mut jobs_req = request(yolo());
-		jobs_req.cwd = std::env::temp_dir();
+		jobs_req.cwd = project.clone();
 		jobs_req.config.providers.insert("local".to_string(), ProviderConfig {
 			base_url: Some(format!("http://{addr}/v1")),
 			api_key: Some("sk-test".to_string()),
@@ -3493,4 +4334,69 @@ mod tests {
 
 		server.join().expect("fixture joined");
 	}
+}
+
+#[cfg(test)]
+mod process_scope_tests {
+	use super::*;
+
+	#[test]
+	fn fallback_scope_root_is_stable_and_per_project() {
+		let one = PathBuf::from("/tmp/project-one");
+		let two = PathBuf::from("/tmp/project-two");
+		let (a, b) = ("runner-a", "runner-b");
+		assert_eq!(process_scope_root(&one, a), process_scope_root(&one, a));
+		assert_ne!(process_scope_root(&one, a), process_scope_root(&two, a));
+		// Same project, two runners: distinct roots so one manager's drop
+		// cannot prune the other's logs.
+		let root_a = process_scope_root(&one, a);
+		let root_b = process_scope_root(&one, b);
+		assert_ne!(root_a, root_b);
+		std::fs::create_dir_all(&root_a).unwrap();
+		std::fs::create_dir_all(&root_b).unwrap();
+		std::fs::write(root_a.join("run.log"), b"a").unwrap();
+		std::fs::write(root_b.join("run.log"), b"b").unwrap();
+		let manager_a = pi_agent::tools::process::ProcessManager::new(root_a.clone());
+		let manager_b = pi_agent::tools::process::ProcessManager::new(root_b.clone());
+		drop(manager_a);
+		assert!(!root_a.exists());
+		assert!(root_b.join("run.log").exists());
+		drop(manager_b);
+		assert!(!root_b.exists());
+	}
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn lazy_backend_initializes_once_under_concurrency() {
+		let root = std::env::temp_dir().join(format!(
+			"omp-lazy-singleflight-{}-{}",
+			std::process::id(),
+			crate::output::session_id()
+		));
+		std::fs::create_dir_all(&root).unwrap();
+		std::fs::write(root.join("marker"), b"keep").unwrap();
+		let lazy = Arc::new(LazyProcessBackend::for_test_unavailable_broker(root.clone()));
+		let mut tasks = Vec::new();
+		for _ in 0..8 {
+			let lazy = Arc::clone(&lazy);
+			tasks.push(tokio::spawn(async move { lazy.list(None).await.is_ok() }));
+		}
+		for task in tasks {
+			assert!(task.await.expect("join"), "concurrent first op failed");
+		}
+		// A losing initializer would have dropped its own fallback manager,
+		// deleting this shared root and the marker with it.
+		assert!(root.join("marker").exists(), "fallback root was deleted by a losing initializer");
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[test]
+	fn background_names_are_unique_across_backend_instances() {
+		let root = std::env::temp_dir().join(format!("omp-lazy-names-{}", std::process::id()));
+		let a = LazyProcessBackend::for_test_unavailable_broker(root.join("a"));
+		let b = LazyProcessBackend::for_test_unavailable_broker(root.join("b"));
+		let names: std::collections::HashSet<String> = (0..32)
+			.flat_map(|_| [a.next_background_name(), b.next_background_name()])
+			.collect();
+		assert_eq!(names.len(), 64, "background job names collided across backends");
+	}
+
 }

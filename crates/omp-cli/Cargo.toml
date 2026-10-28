@@ -33,3 +33,4 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 clap.workspace = true
+tokio = { workspace = true, features = ["full"] }

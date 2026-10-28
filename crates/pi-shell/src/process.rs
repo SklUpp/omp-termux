@@ -57,8 +57,16 @@ mod platform {
 		}
 
 
+		#[must_use]
 		pub const fn pid(&self) -> i32 {
 			self.pid
+		}
+
+		/// Opaque per-boot identity token; equal tokens mean the same kernel
+		/// process even after pid reuse.
+		#[must_use]
+		pub fn identity_token(&self) -> String {
+			self.start_time.to_string()
 		}
 
 		pub fn children(&self) -> Vec<Self> {
@@ -394,6 +402,13 @@ mod platform {
 
 		pub const fn pid(&self) -> i32 {
 			self.pid
+		}
+
+		/// Opaque per-boot identity token; equal tokens mean the same kernel
+		/// process even after pid reuse.
+		#[must_use]
+		pub fn identity_token(&self) -> String {
+			format!("{}.{}", self.start_tvsec, self.start_tvusec)
 		}
 
 		pub fn children(&self) -> Vec<Self> {
@@ -910,6 +925,13 @@ mod platform {
 			self.pid
 		}
 
+		/// Opaque per-boot identity token; equal tokens mean the same kernel
+		/// process even after pid reuse.
+		#[must_use]
+		pub fn identity_token(&self) -> String {
+			self.creation_time.to_string()
+		}
+
 		pub fn parent_pid(&self) -> Option<i32> {
 			process_basic_information(self.handle.as_raw())
 				.and_then(|info| i32::try_from(info.inherited_from_unique_process_id).ok())
@@ -1328,6 +1350,13 @@ impl Process {
 	#[must_use]
 	pub const fn pid(&self) -> i32 {
 		self.inner.pid()
+	}
+
+	/// Opaque per-boot identity token; equal tokens mean the same kernel
+	/// process even after pid reuse. Safe to persist for later validation.
+	#[must_use]
+	pub fn identity_token(&self) -> String {
+		self.inner.identity_token()
 	}
 
 	/// Parent process id for this process, when available.

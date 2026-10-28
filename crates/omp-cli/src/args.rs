@@ -395,6 +395,28 @@ pub enum Command {
 		#[arg(value_name = "ARGS", allow_hyphen_values = true, hide = true)]
 		args: Vec<String>,
 	},
+
+	/// Inspect or unpack the bundled agent definitions.
+	Agents {
+		/// Action to run (`unpack`); omitted prints help without writing.
+		#[arg(value_name = "ACTION")]
+		action:      Option<String>,
+		/// Unpack into `<project>/<DIR>`.
+		#[arg(long, value_name = "DIR")]
+		dir:         Option<PathBuf>,
+		/// Unpack into the user agent directory.
+		#[arg(long)]
+		user:        bool,
+		/// Unpack into `<project>/.omp/agents`.
+		#[arg(long)]
+		project:     bool,
+		/// Overwrite existing files.
+		#[arg(short = 'f', long)]
+		force:       bool,
+		/// Print machine-readable JSON.
+		#[arg(long)]
+		json:        bool,
+	},
 }
 
 
@@ -645,6 +667,43 @@ mod tests {
 		let args: Vec<&str> =
 			args.iter().map(String::as_str).filter(|arg| *arg != "--").collect();
 		assert_eq!(args, ["models", "gp"]);
+	}
+
+	#[test]
+	fn agents_subcommand_parses_unpack_flags() {
+		assert_eq!(
+			parse(&["omp", "agents"]).command,
+			Some(Command::Agents {
+				action:  None,
+				dir:     None,
+				user:    false,
+				project: false,
+				force:   false,
+				json:    false,
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "agents", "unpack", "--project", "--force", "--json"]).command,
+			Some(Command::Agents {
+				action:  Some("unpack".to_string()),
+				dir:     None,
+				user:    false,
+				project: true,
+				force:   true,
+				json:    true,
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "agents", "unpack", "--dir", "tmp/agents"]).command,
+			Some(Command::Agents {
+				action:  Some("unpack".to_string()),
+				dir:     Some(PathBuf::from("tmp/agents")),
+				user:    false,
+				project: false,
+				force:   false,
+				json:    false,
+			})
+		);
 	}
 
 	#[test]

@@ -48,7 +48,7 @@ async fn env_overlay_applies_and_values_stay_literal() {
 	let mut ctx = AgentContext::new(dir.path.clone());
 	ctx.env.insert("BASH_CONTRACT".to_string(), "base".to_string());
 
-	let result = BashTool
+	let result = BashTool::new()
 		.execute(
 			&json!({
 				"command": "echo \"$BASH_CONTRACT\"; echo \"$BASH_LITERAL\"",
@@ -78,26 +78,26 @@ async fn invalid_env_names_and_non_string_values_are_rejected() {
 	let dir = TempDir::new("bash-env-invalid");
 	let ctx = AgentContext::new(dir.path.clone());
 
-	let bad_name = BashTool
+	let bad_name = BashTool::new()
 		.execute(&json!({"command": "true", "env": {"BAD-NAME": "x"}}), &ctx)
 		.await
 		.expect_err("invalid name must be rejected");
 	assert!(matches!(&bad_name, ToolError::InvalidArguments(_)));
 	assert!(bad_name.to_string().contains("BAD-NAME"));
 
-	let leading_digit = BashTool
+	let leading_digit = BashTool::new()
 		.execute(&json!({"command": "true", "env": {"1LEAD": "x"}}), &ctx)
 		.await
 		.expect_err("leading digit must be rejected");
 	assert!(leading_digit.to_string().contains("1LEAD"));
 
-	let bad_value = BashTool
+	let bad_value = BashTool::new()
 		.execute(&json!({"command": "true", "env": {"OK": 1}}), &ctx)
 		.await
 		.expect_err("non-string value must be rejected");
 	assert!(matches!(&bad_value, ToolError::InvalidArguments(_)));
 
-	let bad_shape = BashTool
+	let bad_shape = BashTool::new()
 		.execute(&json!({"command": "true", "env": "FOO=bar"}), &ctx)
 		.await
 		.expect_err("string env must be rejected");
@@ -116,26 +116,26 @@ async fn cwd_resolves_relative_absolute_and_tilde() {
 	let mut ctx = AgentContext::new(dir.path.clone());
 	ctx.env.insert("HOME".to_string(), home.display().to_string());
 
-	let relative = BashTool
+	let relative = BashTool::new()
 		.execute(&json!({"command": "pwd", "cwd": "sub"}), &ctx)
 		.await
 		.expect("bash");
 	assert!(!relative.is_error, "got: {}", relative.content);
 	assert_same_dir(first_line(&relative), &sub);
 
-	let absolute = BashTool
+	let absolute = BashTool::new()
 		.execute(&json!({"command": "pwd", "cwd": sub.display().to_string()}), &ctx)
 		.await
 		.expect("bash");
 	assert_same_dir(first_line(&absolute), &sub);
 
-	let tilde = BashTool
+	let tilde = BashTool::new()
 		.execute(&json!({"command": "pwd", "cwd": "~/nested"}), &ctx)
 		.await
 		.expect("bash");
 	assert_same_dir(first_line(&tilde), &nested);
 
-	let bare_tilde = BashTool
+	let bare_tilde = BashTool::new()
 		.execute(&json!({"command": "pwd", "cwd": "~"}), &ctx)
 		.await
 		.expect("bash");
@@ -155,7 +155,7 @@ async fn invalid_cwd_is_an_error_result_and_runs_nothing() {
 	let marker = dir.join("marker.txt");
 	let ctx = AgentContext::new(dir.path.clone());
 
-	let missing = BashTool
+	let missing = BashTool::new()
 		.execute(
 			&json!({
 				"command": format!("touch {}", marker.display()),
@@ -174,7 +174,7 @@ async fn invalid_cwd_is_an_error_result_and_runs_nothing() {
 
 	let file = dir.join("plain-file");
 	std::fs::write(&file, "x").expect("write file");
-	let not_a_directory = BashTool
+	let not_a_directory = BashTool::new()
 		.execute(
 			&json!({
 				"command": format!("touch {}", marker.display()),
@@ -191,7 +191,7 @@ async fn invalid_cwd_is_an_error_result_and_runs_nothing() {
 		not_a_directory.content
 	);
 
-	let numeric = BashTool
+	let numeric = BashTool::new()
 		.execute(&json!({"command": "true", "cwd": 7}), &ctx)
 		.await
 		.expect_err("non-string cwd must be rejected");
@@ -205,7 +205,7 @@ async fn timeout_zero_disables_the_deadline() {
 	let dir = TempDir::new("bash-timeout-zero");
 	let ctx = AgentContext::new(dir.path.clone());
 
-	let result = BashTool
+	let result = BashTool::new()
 		.execute(&json!({"command": "sleep 1.5; echo done", "timeout": 0}), &ctx)
 		.await
 		.expect("bash");
@@ -220,7 +220,7 @@ async fn small_timeouts_clamp_up_to_one_second() {
 	let ctx = AgentContext::new(dir.path.clone());
 
 	// A 1 ms deadline would kill this; the documented floor is one second.
-	let result = BashTool
+	let result = BashTool::new()
 		.execute(&json!({"command": "sleep 0.3; echo clamped", "timeout": 0.001}), &ctx)
 		.await
 		.expect("bash");
@@ -228,7 +228,7 @@ async fn small_timeouts_clamp_up_to_one_second() {
 	assert!(!result.is_error, "timeout was not clamped to the 1s floor: {}", result.content);
 	assert!(result.content.contains("clamped"), "got: {}", result.content);
 
-	let non_finite = BashTool
+	let non_finite = BashTool::new()
 		.execute(&json!({"command": "true", "timeout": "soon"}), &ctx)
 		.await
 		.expect_err("non-numeric timeout must be rejected");
@@ -241,7 +241,7 @@ async fn timeout_kills_a_long_command_and_reports_a_timeout() {
 	let marker = dir.join("finished.txt");
 	let ctx = AgentContext::new(dir.path.clone());
 
-	let result = BashTool
+	let result = BashTool::new()
 		.execute(
 			&json!({
 				"command": format!("sleep 5; touch {}", marker.display()),
@@ -265,7 +265,7 @@ async fn cancellation_aborts_the_run_before_its_deadline() {
 	let ctx = AgentContext::with_cancellation(dir.path.clone(), token.clone());
 
 	let args = json!({"command": format!("sleep 5; touch {}", marker.display())});
-	let handle = tokio::spawn(async move { BashTool.execute(&args, &ctx).await });
+	let handle = tokio::spawn(async move { BashTool::new().execute(&args, &ctx).await });
 	tokio::time::sleep(Duration::from_millis(200)).await;
 	token.cancel();
 
@@ -286,27 +286,27 @@ async fn unsupported_run_modes_are_rejected_not_silently_ignored() {
 	let dir = TempDir::new("bash-modes");
 	let ctx = AgentContext::new(dir.path.clone());
 
-	let pty = BashTool
+	let pty = BashTool::new()
 		.execute(&json!({"command": "true", "pty": true}), &ctx)
 		.await
 		.expect_err("pty must be rejected");
 	assert!(matches!(&pty, ToolError::InvalidArguments(_)));
 	assert!(pty.to_string().contains("pty"));
 
-	let background = BashTool
+	let background = BashTool::new()
 		.execute(&json!({"command": "true", "async": true}), &ctx)
 		.await
 		.expect_err("async must be rejected");
 	assert!(background.to_string().contains("async"));
 
-	let legacy = BashTool
+	let legacy = BashTool::new()
 		.execute(&json!({"command": "true", "timeout_ms": 1000}), &ctx)
 		.await
 		.expect_err("timeout_ms was removed");
 	assert!(matches!(&legacy, ToolError::InvalidArguments(_)));
 	assert!(legacy.to_string().contains("timeout"), "got: {legacy}");
 
-	let explicit_off = BashTool
+	let explicit_off = BashTool::new()
 		.execute(&json!({"command": "echo off", "pty": false, "async": false}), &ctx)
 		.await
 		.expect("explicit false stays accepted");
@@ -319,7 +319,7 @@ async fn output_stays_capped_and_the_status_trailer_survives() {
 	let dir = TempDir::new("bash-cap");
 	let ctx = AgentContext::new(dir.path.clone());
 
-	let result = BashTool
+	let result = BashTool::new()
 		.execute(
 			&json!({"command": "head -c 200000 /dev/zero | tr '\\0' 'a'"}),
 			&ctx,
@@ -331,4 +331,59 @@ async fn output_stays_capped_and_the_status_trailer_survives() {
 	assert!(result.content.contains("output truncated:"), "cap missing: {}", result.content.len());
 	assert!(result.content.len() < 100 * 1024, "output escaped the cap: {}", result.content.len());
 	assert!(result.content.contains("exit code: 0"), "trailer lost: {}", result.content);
+}
+
+#[tokio::test]
+async fn async_bash_shares_the_supervisor_process_table() {
+	use std::sync::Arc;
+
+	use pi_agent::tools::process::{
+		LogOptions, ProcessBackend, ProcessManager, WaitRequest,
+	};
+
+	let dir = TempDir::new("bash-async");
+	let backend: Arc<dyn ProcessBackend> = Arc::new(ProcessManager::new(dir.join("processes")));
+	let tool = BashTool::with_processes(Arc::clone(&backend), None);
+	let ctx = AgentContext::new(dir.path.clone());
+
+	let started = tool
+		.execute(&json!({"command": "sleep 1; echo async-done", "async": true}), &ctx)
+		.await
+		.expect("async bash");
+	assert!(!started.is_error, "got: {}", started.content);
+	assert!(
+		started.content.contains("Backgrounded as job bash-1"),
+		"job id missing: {}",
+		started.content
+	);
+
+	let logs = Arc::clone(&backend)
+		.logs(
+			"bash-1".to_string(),
+			LogOptions {
+				lines: 20,
+				head: false,
+				grep: None,
+				follow: true,
+				cursor: Some(0),
+				timeout_ms: 5_000,
+			},
+			None,
+		)
+		.await
+		.expect("shared logs");
+	assert!(logs.text.contains("async-done"), "got: {}", logs.text);
+
+	let waited = Arc::clone(&backend)
+		.wait(
+			"bash-1".to_string(),
+			WaitRequest { for_exit: true, pattern: None },
+			5_000,
+			None,
+		)
+		.await
+		.expect("shared wait");
+	assert_eq!(waited.snapshot.state.as_str(), "exited");
+	let listed = Arc::clone(&backend).list(None).await.expect("shared list");
+	assert!(listed.iter().any(|item| item.name == "bash-1"));
 }

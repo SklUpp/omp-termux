@@ -145,6 +145,10 @@ Choose the setting by the desired outcome:
 15. On completion, `#buildCompletedResult()` formats `(no output)` when needed, attaches truncation metadata from the output summary, appends wall-time/timeout/exit notices, and re-checks unfinished status before returning.
 16. Local/PTY timeout outcomes become `isError` results with `details.timedOut`; client-terminal timeout and cancellation/missing exit status paths throw with captured output when available.
 
+### Native Rust CLI
+
+`crates/pi-agent/src/tools/mod.rs` implements `bash`. Foreground commands use the shell runtime; `async: true` starts `$SHELL -c <command>` under the session `ProcessBackend` and returns a job name for `hub ps/logs/wait/stop`. Background execution requires `async.enabled`; `pty` is async-only. The same backend serves `hub` process ops for that job, and a child registry captures one backend snapshot at creation, so a later root swap cannot split `bash` and `hub`. In-process fallback managers reject `persist`/`detached`; see [hub](./hub.md#native-rust-cli) for backend selection, owner scoping, and log/retention limits.
+
 ## Modes / Variants
 1. Foreground non-PTY local
    - Default path when no client terminal bridge is available.

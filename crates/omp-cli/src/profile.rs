@@ -47,7 +47,7 @@ const OPTIONAL_VALUE_FLAGS: [&str; 3] = ["--resume", "-r", "--session"];
 
 /// First residual token naming a subcommand stops global extraction, matching
 /// `isSubcommand` in `profile-bootstrap.ts`.
-const SUBCOMMANDS: [&str; 3] = ["repl", "completions", "__complete"];
+const SUBCOMMANDS: [&str; 4] = ["repl", "completions", "__complete", "agents"];
 
 /// Internal marker inserted when stripping `--profile`/`--alias` would let the
 /// following value-like token become an optional flag's value. `args.rs`

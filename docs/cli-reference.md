@@ -220,7 +220,7 @@ Run `omp <command> --help` for each command's own flags and examples.
 | `acp` | Run Oh My Pi as an ACP (Agent Client Protocol) server over stdio. | [approval mode](./approval-mode.md#acp-sessions) |
 | `auth-broker` | Manage the omp auth-broker (credential vault). | [auth broker / gateway](./auth-broker-gateway.md) |
 | `auth-gateway` | Run an auth-gateway forward proxy backed by the configured broker. | [auth broker / gateway](./auth-broker-gateway.md) |
-| `agents` | Manage bundled task agents. | [task agent discovery](./task-agent-discovery.md) |
+| `agents` | Inspect or unpack the seven bundled task agents (`omp agents unpack [--user \| --project \| --dir <path>] [-f] [--json]`). | [task agent discovery](./task-agent-discovery.md) |
 | `bench` | Benchmark models with the same prompt: time-to-first-token and generation throughput (tokens/s). | |
 | `browser-relay` | Run the local CDP relay that lets the browser tool drive your own Chrome tabs. | [computer use](./computer-use.md) |
 | `cleanse` | Detect and fix project diagnostics with weighted parallel subagents. | |

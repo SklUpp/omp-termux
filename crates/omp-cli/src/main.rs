@@ -9,11 +9,13 @@ use clap::Parser;
 use omp_cli::{
 	Error, Result,
 	agent::{self, AgentRunner, RunRequest},
+	agents,
 	approve::Approvals,
 	args::{Cli, Command},
 	catalog::Catalog,
 	completions,
 	config::Config,
+	daemon_broker,
 	deadline::{self, Deadline},
 	dirs,
 	file_mentions,
@@ -88,6 +90,15 @@ fn run() -> std::result::Result<(), CliError> {
 	let bootstrap = profile::extract_cli_flags(std::env::args_os().collect())?;
 	let profile = profile::resolve_cli(bootstrap.profile.as_deref())?;
 	profile::activate(profile.as_deref());
+	// Hidden worker dispatch before clap/config/session boot: the broker worker
+	// is a separate process carrying its own scope in the environment, not a
+	// user CLI invocation.
+	if daemon_broker::is_worker_invocation() {
+		daemon_broker::run_worker().map_err(CliError::fail)?;
+		return Ok(());
+	}
+	// Share this profile's exact runtime scope with `pi-agent` broker clients.
+	daemon_broker::share_runtime_root(&dirs::agent_dir());
 	let cli = Cli::parse_from(bootstrap.argv.iter().cloned());
 	if let Some(alias_name) = &bootstrap.alias {
 		let result = profile::install_alias(alias_name, profile.as_deref())?;
@@ -103,10 +114,36 @@ fn run() -> std::result::Result<(), CliError> {
 		);
 		return Ok(());
 	}
-	// Completion commands run before the agent runtime, config, and sessions are
-	// loaded: generating a script or resolving candidates must never boot a
-	// session, read config, or touch the network.
+	// `agents`, completion commands run before the agent runtime, config, and
+	// sessions are loaded: unpacking definitions or generating a script must
+	// never boot a session, read config, or touch the network.
 	match &cli.command {
+		Some(Command::Agents { action, dir, user, project, force, json }) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			let Some(action) = action.as_deref() else {
+				agents::print_help()?;
+				return Ok(());
+			};
+			if action != "unpack" {
+				return Err(CliError::usage(format!(
+					"Unknown agents action '{action}'. Expected: unpack"
+				)));
+			}
+			let summary = agents::unpack(
+				&base,
+				&agents::UnpackOptions {
+					force: *force,
+					dir: dir.clone(),
+					user: *user,
+					project: *project,
+				},
+			)?;
+			agents::print_unpack(&summary, *json)?;
+			return Ok(());
+		},
 		Some(Command::Completions { shell }) => {
 			return completions::run(shell.as_deref()).map_err(|message| CliError::fail(message));
 		},

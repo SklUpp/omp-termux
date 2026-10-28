@@ -160,6 +160,21 @@ pub struct Config {
 	pub edit:                 EditConfig,
 	pub async_config:         AsyncConfig,
 	pub ask:                  AskConfig,
+	/// `modelRoles` aliases (`task`, `smol`, `slow`, ...). `default` also feeds
+	/// `default_model`.
+	pub model_roles:          BTreeMap<String, String>,
+	/// `extensions` roots searched for `<root>/agents`.
+	pub extensions:           Option<Vec<PathBuf>>,
+	/// `task.disabledAgents`.
+	pub disabled_agents:      Option<Vec<String>>,
+	/// `task.agentModelOverrides` (string or list per agent).
+	pub agent_model_overrides: BTreeMap<String, Vec<String>>,
+	/// `task.maxRecursionDepth`.
+	pub max_recursion_depth:  Option<i32>,
+	/// `task.maxConcurrency`.
+	pub max_concurrency:      Option<usize>,
+	/// `task.maxEffort`.
+	pub max_effort:           Option<String>,
 	/// Paths that contributed, base first.
 	pub sources:              Vec<PathBuf>,
 }
@@ -187,6 +202,25 @@ impl Config {
 		self.edit.merge(overlay.edit);
 		self.async_config.merge(overlay.async_config);
 		self.ask.merge(overlay.ask);
+		self.model_roles.extend(overlay.model_roles);
+		if overlay.extensions.is_some() {
+			self.extensions = overlay.extensions;
+		}
+		if overlay.disabled_agents.is_some() {
+			self.disabled_agents = overlay.disabled_agents;
+		}
+		for (agent, patterns) in overlay.agent_model_overrides {
+			self.agent_model_overrides.insert(agent, patterns);
+		}
+		if overlay.max_recursion_depth.is_some() {
+			self.max_recursion_depth = overlay.max_recursion_depth;
+		}
+		if overlay.max_concurrency.is_some() {
+			self.max_concurrency = overlay.max_concurrency;
+		}
+		if overlay.max_effort.is_some() {
+			self.max_effort = overlay.max_effort;
+		}
 		if !overlay.allow.is_empty() {
 			self.allow = overlay.allow;
 		}
@@ -417,8 +451,61 @@ impl Config {
 }
 
 fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Result<()> {
-	if let Some(default) = value.get("modelRoles").and_then(|roles| roles.get("default")) {
-		config.default_model = expect_text(default, "modelRoles.default", path)?;
+	if let Some(roles) = value.get("modelRoles").and_then(Value::as_map) {
+		for (role, pattern) in roles {
+			let Some(pattern) = expect_text(pattern, &format!("modelRoles.{role}"), path)? else {
+				continue;
+			};
+			if role == "default" {
+				config.default_model = Some(pattern.clone());
+			}
+			config.model_roles.insert(role.clone(), pattern);
+		}
+	}
+	if let Some(task) = value.get("task").and_then(Value::as_map) {
+		for (key, item) in task {
+			match key.as_str() {
+				"disabledAgents" => {
+					config.disabled_agents = Some(expect_list_of_text(
+						item,
+						"task.disabledAgents",
+						path,
+					)?);
+				},
+				"agentModelOverrides" => {
+					let overrides = item.as_map().ok_or_else(|| {
+						invalid(path, "task.agentModelOverrides", "expected a mapping")
+					})?;
+					for (agent, patterns) in overrides {
+						config
+							.agent_model_overrides
+							.insert(agent.clone(), expect_model_patterns(patterns, agent, path)?);
+					}
+				},
+				"maxRecursionDepth" => {
+					config.max_recursion_depth = expect_i32(item, "task.maxRecursionDepth", path)?;
+				},
+				"maxConcurrency" => {
+					config.max_concurrency = expect_usize(item, "task.maxConcurrency", path)?;
+				},
+				"maxEffort" => {
+					config.max_effort = expect_text(item, "task.maxEffort", path)?;
+				},
+				_ => {},
+			}
+		}
+	}
+	if let Some(extensions) = value.get("extensions").and_then(Value::as_list) {
+		config.extensions = Some(
+			extensions
+				.iter()
+				.map(|item| {
+					item.to_text()
+						.map(PathBuf::from)
+						.ok_or_else(|| invalid(path, "extensions", "expected a sequence of paths"))
+				})
+				.collect::<Result<Vec<_>>>()?,
+		);
 	}
 	if let Some(mode) = value
 		.get("tools")
@@ -674,6 +761,49 @@ fn expect_list_of_text(value: &Value, key: &str, path: &Path) -> Result<Vec<Stri
 				.ok_or_else(|| invalid(path, key, "expected a sequence of strings"))
 		})
 		.collect()
+}
+
+fn expect_model_patterns(value: &Value, agent: &str, path: &Path) -> Result<Vec<String>> {
+	match value {
+		Value::Str(text) => Ok(vec![text.clone()]),
+		Value::List(items) => items
+			.iter()
+			.map(|item| {
+				item.to_text().ok_or_else(|| {
+					invalid(
+						path,
+						&format!("task.agentModelOverrides.{agent}"),
+						"expected a string or sequence of strings",
+					)
+				})
+			})
+			.collect(),
+		_ => Err(invalid(
+			path,
+			&format!("task.agentModelOverrides.{agent}"),
+			"expected a string or sequence of strings",
+		)),
+	}
+}
+
+fn expect_i32(value: &Value, key: &str, path: &Path) -> Result<Option<i32>> {
+	match value {
+		Value::Null => Ok(None),
+		Value::Int(value) => i32::try_from(*value)
+			.map(Some)
+			.map_err(|_| invalid(path, key, "expected a 32-bit integer")),
+		_ => Err(invalid(path, key, "expected an integer")),
+	}
+}
+
+fn expect_usize(value: &Value, key: &str, path: &Path) -> Result<Option<usize>> {
+	match value {
+		Value::Null => Ok(None),
+		Value::Int(value) => usize::try_from(*value)
+			.map(Some)
+			.map_err(|_| invalid(path, key, "expected a non-negative integer")),
+		_ => Err(invalid(path, key, "expected an integer")),
+	}
 }
 
 fn invalid(path: &Path, key: &str, expected: &str) -> Error {

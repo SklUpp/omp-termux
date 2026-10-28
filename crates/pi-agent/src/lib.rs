@@ -3,6 +3,7 @@ pub mod mailbox;
 pub mod mcp;
 #[path = "loop.rs"]
 pub mod loop_module;
+pub mod process_broker;
 pub mod provider;
 pub mod state;
 pub mod supervisor;

@@ -6,12 +6,14 @@
 //! registered [`agent::AgentRunner`].
 
 pub mod agent;
+pub mod agents;
 pub mod approve;
 pub mod args;
 pub mod ask;
 pub mod catalog;
 pub mod completions;
 pub mod config;
+pub mod daemon_broker;
 pub mod deadline;
 pub mod dirs;
 pub mod file_mentions;

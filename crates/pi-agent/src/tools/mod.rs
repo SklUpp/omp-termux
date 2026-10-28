@@ -1,10 +1,12 @@
 pub mod ask;
 pub mod hashline;
 pub mod hub;
+pub mod process;
 pub mod read;
 pub mod registry;
 pub mod scheduler;
 pub mod task;
+pub mod task_catalog;
 pub mod think;
 pub mod todo;
 pub mod yield_tool;
@@ -34,6 +36,7 @@ use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::state::{AgentContext, ToolResult};
+use crate::tools::process::{ProcessBackend, ProcessError, ProcessSpec, RestartPolicy};
 
 /// Captured stdout+stderr budget for one bash call.
 const MAX_BASH_OUTPUT_BYTES: usize = 64 * 1024;
@@ -237,23 +240,20 @@ fn bash_timeout_ms(raw: Option<&Value>) -> Result<Option<u32>, ToolError> {
 	Ok(Some((clamped * 1000.0).round() as u32))
 }
 
-/// Reject arguments whose TypeScript semantics this tool does not implement.
-///
-/// Background (`async`) and PTY execution are separate subsystems; accepting
-/// either would promise a run mode that never happens. `timeout_ms` is the
-/// removed legacy spelling of `timeout`. An explicit `false` is safe: it asks
-/// for exactly the foreground, non-PTY behavior this tool provides.
+/// Reject foreground arguments whose TypeScript semantics live in a separate
+/// subsystem. Background (`async`) is routed to the shared process manager
+/// before this check; a *foreground* PTY needs the interactive terminal bridge
+/// this headless tool does not own (supervised PTYs run via `hub start` or
+/// `bash async` with `pty:true`). `timeout_ms` is the removed legacy spelling.
 fn reject_unsupported_bash_args(args: &Value) -> Result<(), ToolError> {
-	for name in ["async", "pty"] {
-		match args.get(name) {
-			None => {},
-			Some(value) if value.as_bool() == Some(false) => {},
-			Some(_) => {
-				return Err(ToolError::InvalidArguments(format!(
-					"Unsupported argument '{name}': this bash tool runs commands in the foreground only"
-				)));
-			},
-		}
+	match args.get("pty") {
+		None | Some(Value::Null) => {},
+		Some(value) if value.as_bool() == Some(false) => {},
+		Some(_) => {
+			return Err(ToolError::InvalidArguments(
+				"Foreground 'pty' needs an interactive terminal UI; use hub start with pty:true (or async bash with pty:true) for a PTY-backed process".to_string(),
+			));
+		},
 	}
 	if args.get("timeout_ms").is_some() {
 		return Err(ToolError::InvalidArguments(
@@ -264,7 +264,126 @@ fn reject_unsupported_bash_args(args: &Value) -> Result<(), ToolError> {
 }
 
 /// Builtin bash execution tool.
-pub struct BashTool;
+///
+/// Foreground execution is unchanged. When a process backend is wired in
+/// (`with_processes`), `async:true` starts a real supervised OS process through
+/// the same [`ProcessBackend`] that serves `hub` process ops, so `hub ps`,
+/// `logs`, `wait`, `send`, and `stop` operate on the exact job id returned here.
+pub struct BashTool {
+	processes: Option<Arc<dyn ProcessBackend>>,
+	owner: Option<String>,
+}
+
+impl BashTool {
+	#[must_use]
+	pub fn new() -> Self {
+		Self { processes: None, owner: None }
+	}
+
+	#[must_use]
+	pub fn with_processes(processes: Arc<dyn ProcessBackend>, owner: Option<String>) -> Self {
+		Self { processes: Some(processes), owner }
+	}
+
+	/// Background path: `$SHELL -c <command>` under the shared manager.
+	async fn execute_background(
+		&self,
+		command: &str,
+		args: &Value,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, ToolError> {
+		let Some(processes) = self.processes.as_ref() else {
+			return Err(ToolError::InvalidArguments(
+				"Background bash ('async') requires the session process supervisor; use hub start for a supervised process".to_string(),
+			));
+		};
+		if !processes.async_enabled() {
+			return Err(ToolError::InvalidArguments(
+				"Background bash ('async') is disabled by config async.enabled".to_string(),
+			));
+		}
+		let timeout_ms = bash_timeout_ms(args.get("timeout"))?;
+		let env = bash_env(args.get("env"), &ctx.env)?;
+		let cwd_arg = match args.get("cwd") {
+			None | Some(Value::Null) => None,
+			Some(Value::String(cwd)) => Some(cwd.as_str()),
+			Some(_) => return Err(ToolError::InvalidArguments("'cwd' must be a string".to_string())),
+		};
+		let cwd = match resolve_bash_cwd(cwd_arg, ctx) {
+			Ok(cwd) => cwd,
+			Err(message) => return Ok(tool_result(message, true)),
+		};
+		if let Some(error) = invalid_bash_cwd(&cwd).await {
+			return Ok(error);
+		}
+		let pty = match args.get("pty") {
+			None | Some(Value::Null) => false,
+			Some(value) => value
+				.as_bool()
+				.ok_or_else(|| ToolError::InvalidArguments("'pty' must be a boolean".to_string()))?,
+		};
+		let shell = env
+			.get("SHELL")
+			.map(String::as_str)
+			.filter(|shell| !shell.trim().is_empty())
+			.unwrap_or("sh")
+			.to_string();
+		let name = processes.next_background_name();
+		let spec = ProcessSpec {
+			name: name.clone(),
+			application: shell,
+			args: vec!["-c".to_string(), command.to_string()],
+			env,
+			cwd: cwd.to_string_lossy().into_owned(),
+			pty,
+			ready: None,
+			restart: RestartPolicy::No,
+			persist: false,
+			detached: false,
+		};
+		let outcome = processes
+			.clone()
+			.start(spec, self.owner.clone())
+			.await
+			.map_err(process_tool_error)?;
+		if let Some(timeout_ms) = timeout_ms {
+			processes
+				.clone()
+				.arm_timeout(name.clone(), self.owner.clone(), u64::from(timeout_ms));
+		}
+		let content = format!(
+			"Backgrounded as job {name}.\nFollow with hub logs name=\"{name}\" (follow:true), stop with hub stop name=\"{name}\", or wait for exit with hub wait name=\"{name}\"."
+		);
+		let details = serde_json::json!({
+			"async": {
+				"state": outcome.snapshot.state.as_str(),
+				"jobId": name,
+				"type": "bash",
+			},
+			"daemon": outcome.snapshot,
+		});
+		Ok(ToolResult {
+			tool_call_id: String::new(),
+			content,
+			is_error: false,
+			terminate: false,
+			details: Some(details),
+		})
+	}
+}
+
+impl Default for BashTool {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+fn process_tool_error(error: ProcessError) -> ToolError {
+	match error {
+		ProcessError::Invalid(message) => ToolError::InvalidArguments(message),
+		ProcessError::Failed(message) => ToolError::ExecutionFailed(message),
+	}
+}
 
 #[async_trait]
 impl Tool for BashTool {
@@ -296,6 +415,14 @@ impl Tool for BashTool {
 				"timeout": {
 					"type": "number",
 					"description": "Timeout in seconds; 0 disables the command deadline; nonzero values are clamped to 1-3600"
+				},
+				"async": {
+					"type": "boolean",
+					"description": "Run in the background under the session process supervisor; returns a job name for hub ps/logs/wait/stop"
+				},
+				"pty": {
+					"type": "boolean",
+					"description": "Allocate a PTY for the process (async only; requires the session process supervisor)"
 				}
 			},
 			"required": ["command"]
@@ -311,6 +438,16 @@ impl Tool for BashTool {
 			.get("command")
 			.and_then(Value::as_str)
 			.ok_or_else(|| ToolError::InvalidArguments("missing 'command' parameter".to_string()))?;
+
+		let run_async = match args.get("async") {
+			None | Some(Value::Null) => false,
+			Some(value) => value
+				.as_bool()
+				.ok_or_else(|| ToolError::InvalidArguments("'async' must be a boolean".to_string()))?,
+		};
+		if run_async {
+			return self.execute_background(command, args, ctx).await;
+		}
 
 		reject_unsupported_bash_args(args)?;
 		let timeout_ms = bash_timeout_ms(args.get("timeout"))?;
@@ -1710,7 +1847,7 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
 	let snapshots = Arc::new(hashline::SnapshotStore::new());
 	let sink = Arc::new(hashline::NativeSnapshotSink::new(snapshots.clone()));
 	vec![
-		Arc::new(BashTool),
+		Arc::new(BashTool::new()),
 		Arc::new(ReadTool::with_snapshot_sink(sink)),
 		Arc::new(WriteTool),
 		Arc::new(EditTool::new(snapshots)),

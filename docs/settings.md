@@ -703,6 +703,21 @@ For a custom status line, set `statusLine.preset: custom` and configure `statusL
 | `ask.notify`           | enum    | `on`            | `on`, `off`.                                                                                            |
 | `async.enabled`        | boolean | `true`          | Run ordinary `task` spawns in the background and deliver their results at the next agent-loop turn boundary; `false` makes calls block and return inline results. |
 
+### Native agent/task settings
+
+These keys are read by the native Rust CLI (`crates/omp-cli/src/config.rs`, `task_catalog.rs`) for agent discovery and delegation policy.
+
+| Key | Type | Default | Behavior |
+| --- | --- | --- | --- |
+| `extensions` | array | `[]` | Extra roots searched for `<root>/agents/*.md` after project and user agents. |
+| `task.disabledAgents` | array | `[]` | Agent names removed from selection; spawning one fails with the available names. |
+| `task.agentModelOverrides` | record | `{}` | Agent name → selector or selector list; tried before the agent frontmatter `model`. Role aliases resolve through `modelRoles`. |
+| `task.maxRecursionDepth` | number | `2` | Maximum task depth; `-1` means unlimited. |
+| `task.maxConcurrency` | number | `32` | Concurrent spawns per session; `0` means effectively unlimited. |
+| `task.maxEffort` | string | unset | Upper effort bound for item `effort` and agent `thinking-level`; invalid values fail the spawn. |
+
+The TypeScript-only keys `task.enableEffort`, `task.isolation.*`, `task.agentPrewalk`, and `task.agentIdleTtlMs` have no effect in the native runtime; item `effort` is always available and worktree isolation, prewalk, and parked-agent revival are not implemented.
+
 ### Providers and services
 
 ```yaml

@@ -380,7 +380,7 @@ async fn interrupt_cancels_tools_without_orphans() {
 #[tokio::test]
 async fn bash_output_is_bounded() {
 	let dir = TempDir::new("bash-bounded");
-	let tool = pi_agent::BashTool;
+	let tool = pi_agent::BashTool::new();
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
 
 	let result = tool

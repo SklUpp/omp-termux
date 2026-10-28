@@ -26,13 +26,26 @@
 
 ### Native Rust CLI
 
-`crates/pi-agent/src/tools/task.rs` implements one-item and `tasks[]` batches over a fixed `task` child session:
+`crates/pi-agent/src/tools/task.rs` plus `task_catalog.rs` implement discovery, policy, and spawning; `crates/omp-cli/src/agents.rs` owns discovery and `omp agents unpack`.
 
-- Wire fields: `task`, `name` (`[A-Za-z0-9_-]+`), `agent` (only `"task"`), `context`, and `tasks[]`. `outputSchema`, `schemaMode`, `effort`, and `isolated` are rejected as unsupported. There is no agent discovery or catalog: an `agent` value other than `task` fails with a clear error instead of loading a file.
-- With `async.enabled` (default `true`) and a root result sink, ordinary calls reserve real supervisor ids and return a receipt (`details.async = { state: "running", jobId }`). Results auto-deliver exactly once at the next agent-loop turn boundary, or are consumed by a settled `hub jobs`/`hub wait` snapshot. Delivery cannot interrupt a provider request that is still streaming; it waits for the boundary. With `async.enabled=false`, the call runs inline and returns the full `details.results` batch.
-- Concurrency is one semaphore per `TaskTool` instance: the root session reuses one across REPL turns and each child registry creates its own, so a parent holding a permit while descendants spawn cannot deadlock. The built-in limits are depth 2 and 32 concurrent spawns per session; they are not configurable in this build.
-- Admission is explicitly bounded: at most 64 outstanding results (running + undelivered) are admitted, and a batch larger than the remaining capacity is rejected before any record is allocated or child spawned. Result bodies are capped at 64 KiB with an honest `[truncated: N bytes total]` marker; queued undelivered text additionally has an aggregate byte cap and is never silently evicted or reserialized.
-- Caller or `hub cancel` cancellation cascades into child loops; reserved jobs settle as aborted and release their slot when no body is queued. A background child that panics is settled as aborted by an RAII guard and releases its slot, so a crash cannot strand a `Running` record. There is no isolation/worktree mode, parked-agent revival, or custom-agent runtime.
+Catalog discovery (first name wins; unreadable/invalid files warn and are skipped):
+
+1. the nearest `.omp/agents/*.md`, walking up from the cwd (project);
+2. `<agent-dir>/agents/*.md` (user; `omp agents unpack --user` writes here);
+3. every configured `extensions` root at `<root>/agents/*.md`;
+4. seven bundled prompts embedded from the repository assets: `scout`, `designer`, `reviewer`, `security-reviewer`, `librarian`, `task`, `sonic`.
+
+`omp agents unpack [--user | --project | --dir <path>] [-f|--force] [--json]` writes the bundled seven; `--user` and `--project` are mutually exclusive, and the default target is the user agent directory unless `--project`/`--dir` is given.
+
+Frontmatter honored at spawn: `name`, `description`, prompt body, `tools` (allowlist; `yield` auto-added; an empty list means no tools), `spawns` (`*` or list; inferred as `*` when absent and `task` is in `tools`), `model` (selector list, role aliases via `modelRoles` and `task.agentModelOverrides`), `thinking-level`, `output` schema, `blocking`, and `read-summarize: false`. `prewalk`, `advisor`, `autoloadSkills`, and `read-summarize: true` fail closed at spawn with an explicit unsupported-capability error rather than being silently ignored.
+
+Policy: self-spawn is rejected; the parent agent's `spawns` allowlist is enforced; `task.disabledAgents`, `task.maxRecursionDepth`, and `task.maxConcurrency` apply. Batch items are resolved per item, so a `blocking: true` agent runs inline while non-blocking siblings run in the background in the same call.
+
+Wire fields: `task`, `name` (`[A-Za-z0-9_-]+`), `agent`, `context`, `tasks[]`, `effort` (accepts thinking-level names; `auto` inherits the model/agent default), `outputSchema` (JSON Schema object, JSON-encoded schema string, or `true`; `null`/omitted means none; `false` is rejected because it rejects every output), and `schemaMode` (`permissive` default, or `strict`). `isolated: true` is rejected because this build has no worktree create/apply/cleanup. Both the request and the agent `output` schema are normalized, and a schema declaration is validated before spawn: supported keywords are `type`, `properties`, `optionalProperties`, `required`, `elements`, `items`, `values`, `enum`, `oneOf`, `anyOf`, `allOf`, `additionalProperties`, plus `metadata`/`description`/`title`/`default`/`examples`; any other keyword is an explicit error, never silently dropped.
+
+With `async.enabled` (default `true`) and a root result sink, ordinary items reserve supervisor ids and return a receipt (`details.async = { state: "running", jobId }`). Results auto-deliver exactly once at the next agent-loop turn boundary, or are consumed by a settled `hub jobs`/`hub wait` snapshot. With `async.enabled=false`, or for every item being `blocking: true`, the call runs inline and returns `details.results`.
+
+Limits: depth 2 and 32 concurrent spawns per session (`task.maxRecursionDepth`/`task.maxConcurrency` can lower or raise these), at most 64 outstanding results admitted per session, result bodies capped at 64 KiB with an honest `[truncated: N bytes total]` marker. Cancellation (caller or `hub cancel`) cascades; panics settle as aborted and release their slot. No worktree isolation, parked-agent revival, or lifecycle manager exists in the native runtime.
 
 ## Inputs
 

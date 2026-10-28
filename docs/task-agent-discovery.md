@@ -86,6 +86,14 @@ For a dispatch, set the agent name and task:
 
 `/model`'s Roles view can assign and persist custom role mappings such as `review`, `fast`, and `good`. Changing only the active or default session selection does not remap those roles.
 
+### Native Rust runtime
+
+The native CLI (`crates/omp-cli/src/agents.rs`, `crates/pi-agent/src/tools/task_catalog.rs`) discovers project `.omp/agents/*.md` by walking up from the cwd, then `<agent-dir>/agents/*.md`, then configured extension roots (`<root>/agents/*.md`), then the seven embedded prompts (`scout`, `designer`, `reviewer`, `security-reviewer`, `librarian`, `task`, `sonic`). First definition wins by name; unreadable or invalid files emit a warning and are skipped.
+
+Honored frontmatter: `name`, `description`, prompt body, `tools`, `spawns`, `model`, `thinking-level`, `output`, `blocking`, and `read-summarize: false`. Unsupported capabilities (`prewalk`, `advisor`, `autoloadSkills`, `read-summarize: true`) fail the spawn with a clear error instead of being ignored. Dispatch enforces self-spawn rejection, the parent `spawns` allowlist, `task.disabledAgents`, `task.maxRecursionDepth`, and `task.maxConcurrency`; `task.agentModelOverrides` and `modelRoles` resolve models.
+
+`omp agents unpack [--user | --project | --dir <path>] [-f|--force] [--json]` writes the seven bundled agents; without flags it targets the user agent directory. See [task](./tools/task.md#native-rust-cli) for fields, schema enforcement, and async behavior.
+
 ## Watch running agents
 
 After dispatch, press `Alt+A` to open [Agent Hub](./agent-hub.md). Its live roster shows each task agent's status, current activity, model, age, and usage. Select an agent to read its transcript and steer it directly; parked agents can be revived from the same view.
