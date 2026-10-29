@@ -27,9 +27,12 @@ pi-ast = { workspace = true }
 portable-pty = { workspace = true }
 xxhash-rust = { workspace = true }
 similar = { workspace = true }
+# Same package/version as `omp-cli`; `hooks` enables the read-only authorizer.
+rusqlite = { version = "0.33.0", features = ["bundled", "hooks"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 futures = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
+rusqlite = { version = "0.33.0", features = ["bundled", "hooks"] }

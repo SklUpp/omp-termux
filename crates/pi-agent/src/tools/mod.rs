@@ -8,6 +8,7 @@ pub mod hub;
 pub mod pending;
 pub mod process;
 pub mod read;
+mod read_sqlite;
 pub mod registry;
 pub mod scheduler;
 pub mod task;

@@ -6217,6 +6217,7 @@ dependencies = [
  "portable-pty",
  "regex",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "similar 3.2.0",

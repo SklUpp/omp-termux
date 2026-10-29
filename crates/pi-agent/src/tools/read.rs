@@ -6,8 +6,9 @@
 //! trailing-selector grammar, literal-colon filenames, context expansion,
 //! line numbering, and 3000-line / 50 KiB / 768-column caps.
 //!
-//! Remaining read slices (planned, not yet ported): archives, SQLite,
-//! markit documents, images/`:img`, and the internal-URL router. `:conflicts`
+//! Remaining read slices (planned, not yet ported): archives, markit
+//! documents, images/`:img`, and the internal-URL router. SQLite databases are
+//! handled by `read_sqlite.rs`. `:conflicts`
 //! is blocked on the conflict-history store that
 //! `write({path:"conflict://<N>"})` resolves against; until that store lands
 //! the selector errors rather than listing ids nothing can act on.
@@ -47,8 +48,8 @@ use super::{
 use crate::state::{AgentContext, ToolResult};
 
 /// Shared read caps (`packages/coding-agent/src/session/streaming-output.ts`).
-const DEFAULT_MAX_LINES: u64 = 3000;
-const DEFAULT_MAX_BYTES: u64 = 50 * 1024;
+pub(super) const DEFAULT_MAX_LINES: u64 = 3000;
+pub(super) const DEFAULT_MAX_BYTES: u64 = 50 * 1024;
 /// Open-ended reads stop after this many lines (`read.defaultLimit`).
 const DEFAULT_READ_LIMIT: u64 = 300;
 /// Per-line display cap (`tools.outputMaxColumns` default).
@@ -87,7 +88,6 @@ const CONVERTIBLE_EXTENSIONS: &[&str] =
 const IMAGE_EXTENSIONS: &[&str] = &[
 	".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff", ".avif", ".heic", ".svgz",
 ];
-const SQLITE_EXTENSIONS: &[&str] = &[".sqlite", ".sqlite3", ".db", ".db3"];
 const ARCHIVE_SUFFIXES: &[&str] = &[
 	".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".zip", ".jar", ".war", ".ear", ".apk", ".whl", ".tar",
 	".rar", ".7z", ".iso", ".cab", ".deb", ".rpm", ".cpio", ".ar", ".a", ".lzh", ".arj", ".asar", ".gz", ".bz2",
@@ -242,20 +242,15 @@ impl Tool for ReadTool {
 		// Literal filesystem names win over selector interpretation when the
 		// whole path exists (or the probe is inconclusive), per
 		// `splitPathAndSelPreferringLiteral`.
-		let (path_part, sel_part) = match split_path_and_sel(&raw_path) {
+		let (path_part, sel_part, literal_whole_path) = match split_path_and_sel(&raw_path) {
 			Some(strict) => {
 				let literal = resolve_path(ctx, &raw_path);
 				match probe_literal(&literal).await {
-					LiteralState::Missing => (strict.path, Some(strict.sel)),
-					LiteralState::Exists | LiteralState::Unknown => (raw_path.clone(), None),
+					LiteralState::Missing => (strict.path, Some(strict.sel), false),
+					LiteralState::Exists | LiteralState::Unknown => (raw_path.clone(), None, true),
 				}
 			},
-			None => (raw_path.clone(), None),
-		};
-
-		let parsed = match parse_sel(sel_part.as_deref()) {
-			Ok(parsed) => parsed,
-			Err(message) => return Ok(tool_result(message, true)),
+			None => (raw_path.clone(), None, false),
 		};
 
 		let mut target = resolve_path(ctx, &path_part);
@@ -267,6 +262,25 @@ impl Tool for ReadTool {
 				&target,
 			));
 		}
+
+		// SQLite databases are addressed as `<db>:table[:key][?query]` or bare;
+		// route before generic selector/path handling (upstream order: archive,
+		// then sqlite). A path that exists literally keeps precedence, matching
+		// `splitPathAndSelPreferringLiteral`.
+		if !literal_whole_path {
+			match super::read_sqlite::resolve_sqlite_read_path(&raw_path, ctx).await {
+				Ok(Some(resolved)) => {
+					return Ok(super::read_sqlite::read_sqlite(resolved, ctx).await);
+				},
+				Ok(None) => {},
+				Err(message) => return Ok(tool_result(message, true)),
+			}
+		}
+
+		let parsed = match parse_sel(sel_part.as_deref()) {
+			Ok(parsed) => parsed,
+			Err(message) => return Ok(tool_result(message, true)),
+		};
 
 		let mut suffix_resolution: Option<(String, String)> = None;
 		let meta = match tokio::fs::metadata(&target).await {
@@ -356,15 +370,6 @@ impl Tool for ReadTool {
 		}
 		drop(file);
 
-		if has_extension(&target, SQLITE_EXTENSIONS) && head.starts_with(b"SQLite format 3\0") {
-			return Ok(unsupported(
-				format!(
-					"SQLite reads are not supported in this build: '{}'. Query it with the sqlite3 CLI.",
-					target.display()
-				),
-				&target,
-			));
-		}
 		if image_ext {
 			return Ok(unsupported(
 				format!(
@@ -718,7 +723,7 @@ fn split_path_and_sel(raw_path: &str) -> Option<StrictSplit> {
 // Path handling and source walls
 // ---------------------------------------------------------------------------
 
-fn resolve_path(ctx: &AgentContext, raw: &str) -> PathBuf {
+pub(super) fn resolve_path(ctx: &AgentContext, raw: &str) -> PathBuf {
 	// A bare `/` means the session cwd, not the filesystem root.
 	if raw == "/" {
 		return ctx.cwd.clone();
@@ -749,7 +754,7 @@ fn expand_tilde(raw: &str, ctx: &AgentContext) -> String {
 	raw.to_string()
 }
 
-fn is_not_found(err: &io::Error) -> bool {
+pub(super) fn is_not_found(err: &io::Error) -> bool {
 	matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
 }
 
@@ -783,7 +788,7 @@ fn escape_glob_metachars(value: &str) -> String {
 
 /// Unique workspace entry whose trailing path matches a missing authored path.
 /// `None` for no match, ambiguity, timeout, cancellation, or scan failure.
-async fn find_unique_workspace_suffix(
+pub(super) async fn find_unique_workspace_suffix(
 	raw: &str,
 	ctx: &AgentContext,
 ) -> Option<(PathBuf, String)> {
@@ -819,7 +824,7 @@ async fn find_unique_workspace_suffix(
 }
 
 /// Inline the suffix-resolution notice so the model sees the real path.
-fn prepend_suffix_notice(content: String, suffix: Option<&(String, String)>) -> String {
+pub(super) fn prepend_suffix_notice(content: String, suffix: Option<&(String, String)>) -> String {
 	match suffix {
 		Some((from, to)) => format!(
 			"[Path '{from}' not found; resolved to '{to}' via suffix match]\n{content}"
@@ -1628,7 +1633,7 @@ async fn read_multi_range(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn truncation_json(
+pub(super) fn truncation_json(
 	content: &str,
 	truncated: bool,
 	truncated_by: Option<&str>,
@@ -1654,7 +1659,7 @@ fn truncation_json(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn meta_truncation_json(
+pub(super) fn meta_truncation_json(
 	truncated_by: &str,
 	total_lines: u64,
 	total_bytes: u64,
@@ -1677,17 +1682,17 @@ fn meta_truncation_json(
 
 /// `truncateHead` for listing text: exact UTF-8 byte budget, never a partial
 /// line, with the TS `content`/top-level and `meta.truncation` shapes.
-struct HeadTruncation {
-	content:            String,
-	truncated_by:       &'static str,
-	total_lines:        u64,
-	total_bytes:        u64,
-	output_lines:       u64,
-	output_bytes:       u64,
-	first_line_exceeds: bool,
+pub(super) struct HeadTruncation {
+	pub(super) content:            String,
+	pub(super) truncated_by:       &'static str,
+	pub(super) total_lines:        u64,
+	pub(super) total_bytes:        u64,
+	pub(super) output_lines:       u64,
+	pub(super) output_bytes:       u64,
+	pub(super) first_line_exceeds: bool,
 }
 
-fn truncate_head(content: &str, max_bytes: u64) -> HeadTruncation {
+pub(super) fn truncate_head(content: &str, max_bytes: u64) -> HeadTruncation {
 	let total_bytes = content.len() as u64;
 	let total_lines = content.bytes().filter(|byte| *byte == b'\n').count() as u64 + 1;
 	if total_bytes <= max_bytes {
@@ -2369,7 +2374,7 @@ fn pad_end(text: &str, width: usize) -> String {
 	}
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(super) fn format_bytes(bytes: u64) -> String {
 	if bytes < 1024 {
 		return format!("{bytes}B");
 	}
