@@ -109,6 +109,10 @@ pub struct EvalMountContext {
 	pub session_file: Option<PathBuf>,
 	pub artifacts_dir: Option<PathBuf>,
 	pub limits:       DelegationLimits,
+	/// Session goal/budget controller backing `budget()` and the `+Nk!` gate.
+	/// `None` for a caller that has no goal runtime: the helpers fail closed
+	/// instead of fabricating a snapshot.
+	pub goal:         Option<Arc<crate::goal::GoalRuntime>>,
 }
 
 /// Mounts eval into a registry. Root uses `owner = None`; children use their
@@ -150,6 +154,7 @@ impl CliEvalBinder {
 			limits: self.context.limits,
 			artifacts_dir: self.context.artifacts_dir.clone(),
 			next_artifact: Mutex::new(None),
+			goal: self.context.goal.clone(),
 		});
 		let session = EvalSessionInfo::new(session_id)
 			.with_owner(owner.map(str::to_string))
@@ -213,6 +218,7 @@ pub struct CliEvalHost {
 	limits:        DelegationLimits,
 	artifacts_dir: Option<PathBuf>,
 	next_artifact: Mutex<Option<u64>>,
+	goal:          Option<Arc<crate::goal::GoalRuntime>>,
 }
 
 impl CliEvalHost {
@@ -402,22 +408,59 @@ impl EvalHost for CliEvalHost {
 		if !supervisor.task_enabled() {
 			return Err("subagents are disabled for this session".to_string());
 		}
+		// TS `runEvalAgent` hard gate: a `+Nk!` ceiling refuses to spawn once the
+		// turn's spend reached it. Advisory ceilings never block.
+		if let Some(goal) = &self.goal {
+			let snapshot = goal.budget_snapshot();
+			if snapshot.hard
+				&& let Some(total) = snapshot.total
+				&& snapshot.spent >= total
+			{
+				return Err(format!(
+					"agent() blocked: turn token budget exhausted ({}/{total} output tokens). \
+					 Raise or drop the +Nk! ceiling to continue.",
+					snapshot.spent
+				));
+			}
+		}
 		let tool = supervisor.eval_task_tool(self.owner.as_deref(), self.parent_tools.clone());
 		// No outer cancellation race: `run_single_task` already selects on this
 		// token, cancels the child, and disposes its eval owner. Dropping the
 		// future here would abort the child without that cleanup.
-		tool.run_eval_agent(&args, ctx).await
+		let result = tool.run_eval_agent(&args, ctx).await?;
+		// Child output is part of this turn's spend once, from the reported
+		// usage the delegation result carries (absent -> nothing added).
+		if let Some(goal) = &self.goal
+			&& let Some(output) = result
+				.get("details")
+				.and_then(|details| details.get("usage"))
+				.and_then(|usage| usage.get("output"))
+				.and_then(Value::as_u64)
+		{
+			goal.record_eval_subagent_output(output);
+		}
+		Ok(result)
 	}
 
 	async fn budget(&self, _args: Value, ctx: &AgentContext) -> Result<Value, String> {
 		if ctx.cancellation_token.is_cancelled() {
 			return Err("budget() cancelled".to_string());
 		}
-		Err(
-			"Goal Mode token budget is unavailable: this build has no Goal Mode token \
-			 accounting source, so eval will not fabricate a snapshot"
-				.to_string(),
-		)
+		let Some(goal) = &self.goal else {
+			return Err(
+				"Goal Mode token budget is unavailable: this build has no Goal Mode token \
+				 accounting source, so eval will not fabricate a snapshot"
+					.to_string(),
+			);
+		};
+		// Precedence lives on the runtime: `+Nk` window, enabled goal budget,
+		// then the advisory output delta. `spent` is always this session's spend.
+		let snapshot = goal.budget_snapshot();
+		Ok(json!({
+			"total": snapshot.total,
+			"spent": snapshot.spent,
+			"hard": snapshot.hard,
+		}))
 	}
 
 	fn concurrency(&self, _args: &Value) -> Result<Value, String> {

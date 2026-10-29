@@ -8,7 +8,7 @@ use std::time::Duration;
 use clap::Parser;
 use omp_cli::{
 	Error, Result,
-	agent::{self, AgentRunner, RunRequest},
+	agent::{self, AgentRunner, ExtraTool, RunRequest},
 	agents,
 	approve::Approvals,
 	args::{Command, normalize_continue_session_args, parse_cli, refused_verb_message},
@@ -21,6 +21,8 @@ use omp_cli::{
 	dirs,
 	file_mentions,
 	foreign_session::{self, ForeignSessionSource, ForeignSessionStore},
+	goal::{self, GoalMode, GoalModeState, GoalPersist, GoalRuntime, RestorePlan, TokenCounters},
+	goal_tool::{GOAL_TOOL_NAME, GoalTool},
 	local_models,
 	output::{self, OutputMode, Reporter, session_id},
 	process_cli,
@@ -618,6 +620,7 @@ fn run() -> std::result::Result<(), CliError> {
 		checkpoint_host: CheckpointHost::new(),
 		in_memory_messages: None,
 		session_dir: session_dir.clone(),
+		goal: Arc::new(GoalRuntime::new()),
 	};
 	if let Some(model) = requested_model.or(default_model) {
 		session.select_model(model);
@@ -804,6 +807,9 @@ fn run() -> std::result::Result<(), CliError> {
 	};
 	session.checkpoint_host.rehydrate(&store);
 	session.store = store;
+	// Restore the persisted goal mode from the active branch before any turn:
+	// a malformed/disabled record is cleared, an active replay is paused.
+	session.reconcile_goal_mode();
 
 	let mode = cli.mode;
 	let reporter_id = if session.store.enabled() {
@@ -868,6 +874,12 @@ fn run() -> std::result::Result<(), CliError> {
 
 	for (ctx, prompt, parts) in prompts_to_run {
 		if let Err(error) = session.turn(ctx, prompt, parts, mode, &mut reporter) {
+			reporter.finish().ok();
+			return Err(CliError::from(error));
+		}
+		// Opt-in headless continuation (`goal.continuationModes`); the default
+		// `["interactive"]` leaves this a no-op.
+		if let Err(error) = session.drive_goal_continuation(mode, &mut reporter) {
 			reporter.finish().ok();
 			return Err(CliError::from(error));
 		}
@@ -956,6 +968,12 @@ fn run_repl<W: Write, E: Write>(
 					eprintln!("{error}");
 					continue;
 				}
+				// Opt-in headless continuation (`goal.continuationModes`).
+				if let Err(error) = session.drive_goal_continuation(mode, reporter) {
+					reporter.finish().ok();
+					eprintln!("{error}");
+					continue;
+				}
 				// Text mode buffers the final assistant message until `finish`:
 				// flush it per turn so REPL output is visible immediately instead
 				// of only when `/exit` ends the session.
@@ -981,6 +999,25 @@ fn invalidate_inherited_cache_key(
 	if *source == Some(PromptCacheKeySource::Inherited) {
 		*key = None;
 		*source = None;
+	}
+}
+
+/// Drain queued goal writes into the session log, in order.
+///
+/// The goal tool runs inside the agent loop, which must never open a second
+/// writer on the same log, so transitions are queued and applied here by the
+/// one owner. Headless has no live `goal_updated` subscriber: the typed events
+/// are consumed so the queue cannot grow across turns.
+fn apply_goal_intents(store: &mut SessionStore, goal_runtime: &GoalRuntime) {
+	let _ = goal_runtime.take_events();
+	for intent in goal_runtime.take_pending() {
+		let result = match intent {
+			GoalPersist::ModeChange { mode, data } => store.append_mode_change(mode, data),
+			GoalPersist::Completed(data) => store.append_goal_completed(data),
+		};
+		if let Err(err) = result {
+			eprintln!("warning: {err}");
+		}
 	}
 }
 
@@ -1019,6 +1056,8 @@ struct Session<'a> {
 	/// message). Rewinds rewrite it; each later request replays it verbatim.
 	in_memory_messages: Option<Vec<pi_agent::Message>>,
 	session_dir: Option<PathBuf>,
+	/// Session goal/budget controller (Goal Mode accounting + `+Nk` window).
+	goal: Arc<GoalRuntime>,
 }
 
 impl Session<'_> {
@@ -1050,6 +1089,133 @@ impl Session<'_> {
 			&self.cwd,
 		)?;
 		self.skills = skills::load(&self.cwd, self.skills_filter.0, &self.skills_filter.1)?;
+		Ok(())
+	}
+
+	/// Whether the current tool selection includes `name` (no restriction = all).
+	fn tool_selected(&self, name: &str) -> bool {
+		match &self.config.tools {
+			None => true,
+			Some(allowed) => allowed.iter().any(|tool| tool == name),
+		}
+	}
+
+	/// Headless registration rule for the hidden goal tool: eager when
+	/// `goal.enabled` does not exclude it, and always for a live or paused goal
+	/// so a restored goal stays manageable (TS issue #9444).
+	fn goal_tool_mounted(&self) -> bool {
+		self.tools_enabled
+			&& self.config.goal.enabled()
+			&& (self.goal.has_goal() || self.tool_selected(GOAL_TOOL_NAME))
+	}
+
+	fn goal_extra_tools(&self) -> Vec<ExtraTool> {
+		if !self.goal_tool_mounted() {
+			return Vec::new();
+		}
+		let tool: Arc<dyn pi_agent::tools::Tool> =
+			Arc::new(GoalTool::new(Arc::clone(&self.goal)));
+		vec![ExtraTool::from(tool)]
+	}
+
+	/// Session usage at turn start: the goal accounting baseline and budget seed.
+	fn goal_seed(&self) -> TokenCounters {
+		let usage = self.store.session_usage();
+		TokenCounters {
+			input:       usage.input,
+			output:      usage.output,
+			cache_read:  usage.cache_read,
+			cache_write: usage.cache_write,
+		}
+	}
+
+	/// Hidden per-turn goal context (TS `goal-mode-context`): the active prompt
+	/// plus live persisted todos when the `todo` tool is available.
+	fn goal_mode_context(
+		&self,
+		todo_phases: &[pi_agent::tools::todo::TodoPhase],
+	) -> Option<String> {
+		let active = self.goal.build_active_prompt()?;
+		let todo = goal::build_goal_todo_context(todo_phases, self.tool_selected("todo"));
+		Some(goal::render_goal_mode_context(&active, todo.as_deref()))
+	}
+
+	/// Apply queued goal session writes through this session's single writer, in
+	/// order. A tool transition is queued inside the agent loop and drained here
+	/// so no second writer ever touches the log.
+	fn apply_goal_pending(&mut self) {
+		apply_goal_intents(&mut self.store, &self.goal);
+	}
+
+	/// Complete-exit (TS `#exitGoalMode(reason: "completed")`): the goal tool
+	/// already set `exiting`; after this turn drains, clear the mode and write the
+	/// terminal metric exactly once.
+	fn finish_goal_turn(&mut self) {
+		self.apply_goal_pending();
+		let Some(completed) = self.goal.take_exiting() else {
+			return;
+		};
+		if let Err(err) = self.store.append_mode_change(goal::MODE_NONE, None) {
+			eprintln!("warning: {err}");
+		}
+		if let Err(err) =
+			self.store.append_goal_completed(goal::encode_completed_data(&completed))
+		{
+			eprintln!("warning: {err}");
+		}
+		self.apply_goal_pending();
+	}
+
+	/// TS `#reconcileModeFromSession` for the headless paths.
+	fn reconcile_goal_mode(&mut self) {
+		let goal_enabled = self.config.goal.enabled();
+		match goal::plan_restore(&self.store, goal_enabled) {
+			RestorePlan::Idle => self.goal.clear_accounting(),
+			RestorePlan::ClearGoalMode => {
+				self.goal.set_restored_state(None);
+				self.goal.clear_accounting();
+				if let Err(err) = self.store.append_mode_change(goal::MODE_NONE, None) {
+					eprintln!("warning: {err}");
+				}
+			},
+			RestorePlan::Restore { enabled, goal } => {
+				self.goal.set_restored_state(Some(GoalModeState {
+					enabled,
+					mode: GoalMode::Active,
+					goal,
+				}));
+				// Replayed without an explicit preserve: an active goal pauses.
+				let _ = self.goal.on_thread_resumed(false);
+				self.apply_goal_pending();
+			},
+		}
+	}
+
+	/// Between-turn headless continuation, gated by `goal.continuationModes`
+	/// (`"interactive"` by default, so nothing loops unless the user opted in).
+	fn drive_goal_continuation<W: Write, E: Write>(
+		&mut self,
+		mode: OutputMode,
+		reporter: &mut Reporter<W, E>,
+	) -> Result<()> {
+		if !self.config.goal.enabled()
+			|| !goal::headless_continuation_allowed(&self.config.goal.continuation_modes())
+		{
+			return Ok(());
+		}
+		loop {
+			let Some(prompt) = self.goal.build_continuation_prompt() else {
+				break;
+			};
+			self.turn_inner(
+				None,
+				prompt,
+				Vec::new(),
+				Some(goal::GOAL_CONTINUATION_CUSTOM_TYPE),
+				mode,
+				reporter,
+			)?;
+		}
 		Ok(())
 	}
 
@@ -1090,6 +1256,7 @@ impl Session<'_> {
 		} else {
 			runtime::latest_todo_phases_from_turns(&self.history)
 		};
+		let goal_context = self.goal_mode_context(&todo_phases);
 		RunRequest {
 			prompt,
 			parts,
@@ -1121,11 +1288,13 @@ impl Session<'_> {
 			max_turns: self.max_turns,
 			tools_enabled: self.tools_enabled,
 			cancellation_token: None,
-			extra_tools: Vec::new(),
+			extra_tools: self.goal_extra_tools(),
 			internal_urls: None,
 			url_scope: None,
 			subagent_observer: None,
 			child_session_root: None,
+			goal: Some(Arc::clone(&self.goal)),
+			goal_context,
 			credential_resolver: None,
 		}
 	}
@@ -1135,6 +1304,21 @@ impl Session<'_> {
 		context_prefix: Option<String>,
 		raw_prompt: String,
 		initial_parts: Vec<ContentPart>,
+		mode: OutputMode,
+		reporter: &mut Reporter<W, E>,
+	) -> Result<()> {
+		self.turn_inner(context_prefix, raw_prompt, initial_parts, None, mode, reporter)
+	}
+
+	/// One turn. `hidden_custom_type` marks an agent-initiated hidden prompt
+	/// (goal continuation): it is journaled as a `custom_message` instead of a
+	/// user message and never resets the `+Nk` budget window.
+	fn turn_inner<W: Write, E: Write>(
+		&mut self,
+		context_prefix: Option<String>,
+		raw_prompt: String,
+		initial_parts: Vec<ContentPart>,
+		hidden_custom_type: Option<&str>,
 		mode: OutputMode,
 		reporter: &mut Reporter<W, E>,
 	) -> Result<()> {
@@ -1223,6 +1407,14 @@ impl Session<'_> {
 			}
 		}
 
+		// TS `#createMagicKeywordNotices`: a user prompt opens the `+Nk` budget
+		// window and the goal accounting baseline before any request. A hidden
+		// synthetic turn keeps the window the user set.
+		let seed = self.goal_seed();
+		self
+			.goal
+			.begin_turn(hidden_custom_type.is_none().then_some(full_prompt.as_str()), seed);
+
 		let (turn_parts, user_content) = if has_images {
 			let mut assembled = Vec::new();
 			if !full_prompt.is_empty() {
@@ -1248,7 +1440,18 @@ impl Session<'_> {
 			SessionMessage::user(user_content, now_ms),
 		);
 		if self.store.enabled() {
-			if let Err(err) = user_entry.validate() {
+			if let Some(custom_type) = hidden_custom_type {
+				// Hidden continuation: never replayed as a user prompt, but it is
+				// part of the branch context a resumed session rebuilds.
+				if let Err(err) = self.store.append_custom_message(
+					custom_type,
+					&full_prompt,
+					false,
+					serde_json::Value::Null,
+				) {
+					eprintln!("warning: {err}");
+				}
+			} else if let Err(err) = user_entry.validate() {
 				eprintln!("warning: {err}");
 			} else if let Err(err) = self.store.append_message(&user_entry) {
 				eprintln!("warning: {err}");
@@ -1549,6 +1752,9 @@ impl Session<'_> {
 					model_opt.as_deref(),
 					provider_opt.as_deref(),
 				);
+				// A goal tool transition queued during this event lands before the
+				// turn-end entries, like TS `appendModeChange` during execution.
+				apply_goal_intents(&mut self.store, &self.goal);
 				if let Err(err) = reporter.event(event) {
 					reporter_failed = true;
 					return Err(err);
@@ -1580,6 +1786,9 @@ impl Session<'_> {
 				}
 			}
 		}
+		// Drain the final goal writes (agent-end flush, interrupt pause) and, if
+		// the goal tool completed this goal, write `none` + the terminal metric.
+		self.finish_goal_turn();
 
 		let mut record = builder.finish();
 		if let Err(err) = drive_result {

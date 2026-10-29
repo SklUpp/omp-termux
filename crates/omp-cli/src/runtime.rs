@@ -642,6 +642,7 @@ pub fn reserved_tool_names() -> Vec<String> {
 	names.push(Tool::name(&AskTool::new()).to_string());
 	names.push(pi_agent::tools::checkpoint::CHECKPOINT_TOOL_NAME.to_string());
 	names.push(pi_agent::tools::checkpoint::REWIND_TOOL_NAME.to_string());
+	names.push(crate::goal_tool::GOAL_TOOL_NAME.to_string());
 	names.extend(crate::eval_host::OWNED_TOOL_NAMES.iter().map(|name| (*name).to_string()));
 	names
 }
@@ -957,6 +958,12 @@ impl AgentRunner for PiAgentRunner {
 			messages.insert(0, pi_agent::Message::system(system));
 		}
 
+		// TS pre-LLM slot: plan reference, plan mode, goal mode, vibe, then the
+		// user message. This build carries no plan/vibe context, so the goal
+		// context is the last hidden message before the user turn.
+		if let Some(context) = &request.goal_context {
+			messages.push(pi_agent::Message::user(context.clone()));
+		}
 		let user_message = user_message_from_parts(&prompt, &request.parts)?;
 
 		if !plan.supports_images
@@ -1149,6 +1156,7 @@ impl AgentRunner for PiAgentRunner {
 				session_file: request.session_file.clone(),
 				artifacts_dir,
 				limits,
+				goal: request.goal.clone(),
 			};
 			Some(Arc::new(crate::eval_host::CliEvalBinder::new(context))
 				as Arc<dyn pi_agent::eval::EvalToolBinder>)
@@ -1193,6 +1201,19 @@ impl AgentRunner for PiAgentRunner {
 		let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<Event>>(64);
 		let (pi_events_tx, mut pi_events_rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
 		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel::<SteeringEvent>(8);
+		// The goal limit steer rides this run's own steering channel: replacing
+		// the hook per run means a stale closure can only reach a dead channel.
+		if let Some(goal) = request.goal.clone() {
+			let steer_tx = steering_tx.clone();
+			goal.set_steer(Some(std::sync::Arc::new(move |text: &str| {
+				steer_tx
+					.try_send(SteeringEvent::InjectMessage(vec![
+						pi_agent::ContentPart::text(text),
+					]))
+					.is_ok()
+			})));
+		}
+		let goal_runtime = request.goal.clone();
 		let completed = Arc::new(AtomicBool::new(false));
 		let completed_clone = Arc::clone(&completed);
 
@@ -1257,6 +1278,10 @@ impl AgentRunner for PiAgentRunner {
 						}
 					},
 					AgentEvent::MessageEnd { message, status } => {
+						// The only accounting tick: one report per provider request.
+						if let Some(goal) = &goal_runtime {
+							goal.observe_message(&message);
+						}
 						if !message_started {
 							if event_tx_clone
 								.send(Ok(Event::MessageStart { role: "assistant".to_string() }))
@@ -1319,6 +1344,11 @@ impl AgentRunner for PiAgentRunner {
 						}
 					},
 					AgentEvent::ToolEnd { id, name, result, is_error, images, details } => {
+						// Child delegation usage rides `details.usage`; goal-tool
+						// flushes are suppressed inside the runtime.
+						if let Some(goal) = &goal_runtime {
+							goal.observe_tool_end(&name, details.as_ref());
+						}
 						let error = is_error.then(|| result.clone());
 						if event_tx_clone
 							.send(Ok(Event::ToolEnd { id, tool: name, result, error, images, details }))
@@ -1381,6 +1411,11 @@ impl AgentRunner for PiAgentRunner {
 
 			match dialog_result {
 				Ok(turns) => {
+					// Final suppressed flush before the turn settles; the owner
+					// drains queued persistence after `AgentEnd`.
+					if let Some(goal) = &goal_runtime {
+						goal.on_agent_end();
+					}
 					let mut new_messages = vec![end_user_message];
 					for turn in turns {
 						let tool_names: std::collections::HashMap<String, String> = turn
@@ -1414,6 +1449,9 @@ impl AgentRunner for PiAgentRunner {
 					completed_clone.store(true, Ordering::SeqCst);
 				},
 				Err(AgentError::Interrupted) => {
+					if let Some(goal) = &goal_runtime {
+						goal.on_task_aborted(crate::goal::GoalAbortReason::Interrupted);
+					}
 					completed_clone.store(true, Ordering::SeqCst);
 					if timed_out.load(Ordering::SeqCst) {
 						let _ = event_tx_clone
@@ -3739,6 +3777,8 @@ mod tests {
 			url_scope: None,
 			subagent_observer: None,
 			child_session_root: None,
+			goal: None,
+			goal_context: None,
 			credential_resolver: None,
 		}
 	}

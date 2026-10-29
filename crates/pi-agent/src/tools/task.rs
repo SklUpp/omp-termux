@@ -26,7 +26,7 @@ use super::{
 };
 use crate::{
 	loop_module::{AgentError, AgentEvent, AgentLoop, SteeringEvent},
-	state::{AgentConfig, AgentContext, AgentState, Message, ToolResult, TurnResult},
+	state::{AgentConfig, AgentContext, AgentState, Message, TokenUsage, ToolResult, TurnResult},
 	supervisor::{ChildGuard, ChildSpawn, Supervisor, cap_result_text},
 };
 
@@ -435,6 +435,7 @@ impl TaskTool {
 				isolation: None,
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
+				usage: None,
 			};
 		};
 		let mut reservation = ReservationGuard::new(
@@ -477,6 +478,7 @@ impl TaskTool {
 				isolation: None,
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
+				usage: None,
 				};
 			}
 		};
@@ -509,6 +511,7 @@ impl TaskTool {
 				isolation: None,
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
+				usage: None,
 			};
 		}
 
@@ -736,6 +739,7 @@ impl TaskTool {
 				isolation: None,
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
+				usage: None,
 			};
 		}
 
@@ -888,6 +892,7 @@ impl TaskTool {
 				isolation: None,
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
+				usage: child_usage(&turn_results),
 				}
 			},
 			Err(AgentError::Interrupted) => {
@@ -916,6 +921,7 @@ impl TaskTool {
 				isolation: None,
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
+				usage: None,
 				}
 			},
 			Err(err) => {
@@ -945,6 +951,7 @@ impl TaskTool {
 				isolation: None,
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
+				usage: None,
 				}
 			},
 		};
@@ -1318,6 +1325,14 @@ impl TaskTool {
 					Value::String(summary.clone()),
 				);
 			}
+		}
+		if let Some(usage) = single.usage
+			&& let Some(details) = result["details"].as_object_mut()
+		{
+			details.insert(
+				"usage".to_string(),
+				serde_json::to_value(usage).unwrap_or(Value::Null),
+			);
 		}
 		if let Some(data) = data {
 			result["data"] = data;
@@ -2218,6 +2233,7 @@ fn single_failure(
 		isolation: None,
 		isolation_artifacts: IsolationArtifacts::default(),
 		merge_summary: None,
+		usage: None,
 	}
 }
 
@@ -2292,6 +2308,10 @@ pub struct SingleResult {
 	/// embedded inside the child output).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub merge_summary: Option<String>,
+	/// Provider-reported usage summed over this child's turns. Absent when the
+	/// provider reported nothing (unknown, never a zero-filled stand-in).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2327,6 +2347,52 @@ pub struct TaskToolDetails {
 	/// while blocking ids reconcile with `results`.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub spawns: Vec<SpawnReceipt>,
+	/// Sum of every child's reported usage in this batch. Absent when no child
+	/// reported usage; the session usage index reads this once per result.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub usage: Option<TokenUsage>,
+}
+
+/// Adds one reported snapshot into an optional aggregate. An aggregate that
+/// stays `None` means "the provider never reported", never "zero".
+fn merge_usage(total: &mut Option<TokenUsage>, usage: TokenUsage) {
+	let entry = total.get_or_insert_with(TokenUsage::default);
+	entry.input = entry.input.saturating_add(usage.input);
+	entry.output = entry.output.saturating_add(usage.output);
+	entry.cache_read = entry.cache_read.saturating_add(usage.cache_read);
+	entry.cache_write = entry.cache_write.saturating_add(usage.cache_write);
+	entry.total_tokens = entry.total_tokens.saturating_add(usage.total_tokens);
+	entry.reasoning_tokens = match (entry.reasoning_tokens, usage.reasoning_tokens) {
+		(Some(total), Some(reported)) => Some(total.saturating_add(reported)),
+		(Some(total), None) => Some(total),
+		(None, Some(reported)) => Some(reported),
+		(None, None) => None,
+	};
+}
+
+/// Provider-reported usage summed over one child's turns.
+///
+/// Every turn contributes at most once (its assistant message), including the
+/// turns that completed before a later failure or abort in the same child.
+fn child_usage(turns: &[TurnResult]) -> Option<TokenUsage> {
+	let mut total = None;
+	for turn in turns {
+		if let Some(usage) = turn.message.usage {
+			merge_usage(&mut total, usage);
+		}
+	}
+	total
+}
+
+/// Batch aggregate of per-item child usage.
+fn batch_usage(results: &[SingleResult]) -> Option<TokenUsage> {
+	let mut total = None;
+	for result in results {
+		if let Some(usage) = result.usage {
+			merge_usage(&mut total, usage);
+		}
+	}
+	total
 }
 
 #[async_trait]
@@ -2563,6 +2629,7 @@ impl TaskTool {
 						.and_then(|catalog| catalog.project_agents_dir.clone()),
 					results: Vec::new(),
 					total_duration_ms: 0,
+					usage: None,
 					message: Some(content),
 					async_state: Some(AsyncTaskState {
 						state: "running".to_string(),
@@ -2636,6 +2703,7 @@ impl TaskTool {
 				project_agents_dir: catalog
 					.as_ref()
 					.and_then(|catalog| catalog.project_agents_dir.clone()),
+				usage: batch_usage(&results),
 				results,
 				total_duration_ms,
 				message: Some(message),
@@ -2649,12 +2717,13 @@ impl TaskTool {
 			let serialized = serde_json::to_string(&details).map_err(|e| {
 				ToolError::ExecutionFailed(format!("Failed to serialize TaskToolDetails: {e}"))
 			})?;
+			let usage_details = details.usage.map(|usage| json!({ "usage": usage }));
 			return Ok(ToolResult {
 				tool_call_id: String::new(),
 				content: serialized,
 				is_error: false,
 				terminate: false,
-				details: None,
+				details: usage_details,
 			});
 		}
 
@@ -2678,6 +2747,7 @@ impl TaskTool {
 			project_agents_dir: catalog
 				.as_ref()
 				.and_then(|catalog| catalog.project_agents_dir.clone()),
+			usage: batch_usage(&results),
 			results,
 			total_duration_ms,
 			message: None,
@@ -2688,13 +2758,14 @@ impl TaskTool {
 		let content = serde_json::to_string(&details).map_err(|e| {
 			ToolError::ExecutionFailed(format!("Failed to serialize TaskToolDetails: {e}"))
 		})?;
+		let usage_details = details.usage.map(|usage| json!({ "usage": usage }));
 
 		Ok(ToolResult {
 			tool_call_id: String::new(),
 			content,
 			is_error: false,
 			terminate: false,
-			details: None,
+			details: usage_details,
 		})
 	}
 }
@@ -2707,6 +2778,59 @@ mod tests {
 		provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
 		supervisor::DelegationLimits,
 	};
+
+	/// Child usage aggregation: reported totals sum once, unreported children
+	/// stay absent (no zero-filled stand-in), and turns that completed before a
+	/// later failure keep contributing.
+	#[test]
+	fn child_usage_sums_reported_turns_without_zero_filling() {
+		fn turn(input: u64, output: u64, usage: bool) -> TurnResult {
+			let mut message = Message::assistant("out");
+			if usage {
+				message.usage = Some(TokenUsage { input, output, ..TokenUsage::default() });
+			}
+			TurnResult { message, tool_results: Vec::new(), is_completed: true }
+		}
+		assert_eq!(child_usage(&[turn(0, 0, false)]), None, "no report is unknown");
+		let summed = child_usage(&[turn(10, 2, true), turn(0, 0, false), turn(5, 3, true)])
+			.expect("reported turns");
+		assert_eq!((summed.input, summed.output), (15, 5));
+
+		let result = |usage: Option<TokenUsage>| SingleResult {
+			index: 0,
+			id: "a".to_string(),
+			name: "a".to_string(),
+			agent: "a".to_string(),
+			agent_source: "builtin".to_string(),
+			task: "t".to_string(),
+			exit_code: 0,
+			output: String::new(),
+			stderr: String::new(),
+			truncated: false,
+			duration_ms: 0,
+			tokens: 0,
+			requests: 0,
+			error: None,
+			aborted: None,
+			abort_reason: None,
+			extracted_tool_data: None,
+			structured_output: None,
+			resolved_model: None,
+			model_role: None,
+			isolation: None,
+			isolation_artifacts: IsolationArtifacts::default(),
+			merge_summary: None,
+			usage,
+		};
+		assert_eq!(batch_usage(&[result(None)]), None);
+		let batch = batch_usage(&[
+			result(Some(TokenUsage { input: 1, output: 2, ..TokenUsage::default() })),
+			result(None),
+			result(Some(TokenUsage { input: 3, output: 4, ..TokenUsage::default() })),
+		])
+		.expect("batch usage");
+		assert_eq!((batch.input, batch.output), (4, 6));
+	}
 
 	struct NullProvider;
 

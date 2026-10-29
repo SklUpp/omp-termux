@@ -389,6 +389,49 @@ impl CheckpointConfig {
 	}
 }
 
+/// `goal` settings group: Goal Mode and its headless continuation policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GoalConfig {
+	/// `goal.enabled`; absent means [`Self::DEFAULT_ENABLED`].
+	pub enabled:            Option<bool>,
+	/// `goal.continuationModes`; absent means
+	/// [`Self::DEFAULT_CONTINUATION_MODES`] (`["interactive"]`, i.e. no headless
+	/// loop until the user opts in).
+	pub continuation_modes: Option<Vec<String>>,
+}
+
+impl GoalConfig {
+	/// Upstream `goal.enabled` default.
+	pub const DEFAULT_ENABLED: bool = true;
+	/// Upstream `goal.continuationModes` default. The TUI mode is the only
+	/// upstream value; headless continuation is an explicit opt-in.
+	pub const DEFAULT_CONTINUATION_MODES: [&'static str; 1] = ["interactive"];
+
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(Self::DEFAULT_ENABLED)
+	}
+
+	#[must_use]
+	pub fn continuation_modes(&self) -> Vec<String> {
+		self.continuation_modes.clone().unwrap_or_else(|| {
+			Self::DEFAULT_CONTINUATION_MODES
+				.iter()
+				.map(|mode| (*mode).to_string())
+				.collect()
+		})
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+		if overlay.continuation_modes.is_some() {
+			self.continuation_modes = overlay.continuation_modes;
+		}
+	}
+}
+
 /// `eval` / `python` / `ruby` / `julia` settings groups.
 ///
 /// Raw layer values only: environment booleans (`PI_PY` …) are folded in by the
@@ -465,6 +508,8 @@ pub struct Config {
 	pub lsp:                  LspConfig,
 	pub debug:                DebugConfig,
 	pub checkpoint:           CheckpointConfig,
+	/// `goal.*`: Goal Mode enablement and continuation policy.
+	pub goal:                 GoalConfig,
 	/// `eval.*` backend enablement and interpreter groups.
 	pub eval_config:          EvalConfig,
 	/// `task.isolation.mode`; `None` means unset (defaults to `none`).
@@ -530,6 +575,7 @@ impl Config {
 		self.lsp.merge(overlay.lsp);
 		self.debug.merge(overlay.debug);
 		self.checkpoint.merge(overlay.checkpoint);
+		self.goal.merge(overlay.goal);
 		self.eval_config.merge(overlay.eval_config);
 		if overlay.task_isolation_mode.is_some() {
 			self.task_isolation_mode = overlay.task_isolation_mode;
@@ -951,6 +997,15 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	}
 	if let Some(enabled) = settings_leaf(value, "checkpoint", "enabled", "checkpoint.enabled") {
 		config.checkpoint.enabled = expect_bool(enabled, "checkpoint.enabled", path)?;
+	}
+	if let Some(enabled) = settings_leaf(value, "goal", "enabled", "goal.enabled") {
+		config.goal.enabled = expect_bool(enabled, "goal.enabled", path)?;
+	}
+	if let Some(modes) =
+		settings_leaf(value, "goal", "continuationModes", "goal.continuationModes")
+	{
+		config.goal.continuation_modes =
+			Some(expect_list_of_text(modes, "goal.continuationModes", path)?);
 	}
 	for (language, group, dotted) in [
 		("python", "py", "eval.py"),
@@ -2145,6 +2200,31 @@ mod tests {
 		}
 		let err = result.err().expect("missing overlay must fail");
 		assert!(err.to_string().contains("config file not found"), "error was {err}");
+	}
+
+	#[test]
+	fn goal_settings_default_and_overlay() {
+		let default = parse_config("").expect("default");
+		assert_eq!(default.goal.enabled, None);
+		assert!(default.goal.enabled());
+		assert_eq!(default.goal.continuation_modes(), vec!["interactive".to_string()]);
+		assert!(
+			!crate::goal::headless_continuation_allowed(&default.goal.continuation_modes()),
+			"headless continuation is opt-in"
+		);
+
+		let explicit = parse_config(
+			"goal:\n  enabled: false\n  continuationModes:\n    - headless\n",
+		)
+		.expect("explicit");
+		assert!(!explicit.goal.enabled());
+		assert_eq!(explicit.goal.continuation_modes(), vec!["headless".to_string()]);
+		assert!(crate::goal::headless_continuation_allowed(&explicit.goal.continuation_modes()));
+
+		let dotted = parse_config("\"goal.enabled\": false\n").expect("dotted");
+		assert!(!dotted.goal.enabled());
+		assert_eq!(dotted.goal.continuation_modes(), vec!["interactive".to_string()]);
+		assert!(parse_config("goal:\n  enabled: maybe\n").is_err());
 	}
 
 	#[test]

@@ -873,13 +873,24 @@ impl RpcMode {
 						"Cannot start a new session while a response is streaming".to_string(),
 					));
 				}
-				Some(match self.lock_session().new_session(parent_session.as_deref()) {
+				let mut guard = self.lock_session();
+				let outcome = guard.new_session(parent_session.as_deref());
+				let goal_frames = if outcome.is_ok() {
+					guard.reconcile_goal_mode()
+				} else {
+					Vec::new()
+				};
+				drop(guard);
+				Some(match outcome {
 					Ok(()) => {
 						// A new session must not surface the previous session's
 						// agents: live snapshots drop and their ids go stale, so
 						// late events for them are ignored. The observer handle
 						// stays attached for the next supervisor's subscription.
 						self.registry.clear();
+						for frame in goal_frames {
+							self.sink.send(frame);
+						}
 						ok_data(json!({ "cancelled": false }))
 					},
 					Err(error) => err(error.to_string()),
@@ -1078,7 +1089,18 @@ impl RpcMode {
 						"Cannot switch sessions while a response is streaming".to_string(),
 					));
 				}
-				Some(match self.lock_session().switch_session(Path::new(&session_path)) {
+				let mut guard = self.lock_session();
+				let outcome = guard.switch_session(Path::new(&session_path));
+				let goal_frames = if outcome.is_ok() {
+					guard.reconcile_goal_mode()
+				} else {
+					Vec::new()
+				};
+				drop(guard);
+				for frame in goal_frames {
+					self.sink.send(frame);
+				}
+				Some(match outcome {
 					Ok(()) => ok_data(json!({ "cancelled": false })),
 					Err(error) => err(error.to_string()),
 				})
@@ -1092,7 +1114,18 @@ impl RpcMode {
 						"cannot branch while a turn is streaming: abort it first",
 					))
 				} else {
-					match self.lock_session().branch(&entry_id) {
+					let mut guard = self.lock_session();
+					let outcome = guard.branch(&entry_id);
+					let goal_frames = if outcome.is_ok() {
+						guard.reconcile_goal_mode()
+					} else {
+						Vec::new()
+					};
+					drop(guard);
+					for frame in goal_frames {
+						self.sink.send(frame);
+					}
+					match outcome {
 						Ok(result) => ok_data(result),
 						Err(prerequisite) => prereq(prerequisite),
 					}
@@ -1662,6 +1695,9 @@ fn run_turn(
 				.lock()
 				.unwrap_or_else(std::sync::PoisonError::into_inner);
 			guard.finish_turn(&mut prepared, &outcome);
+			for frame in guard.finish_goal_turn() {
+				sink.send(frame);
+			}
 			return outcome;
 		}
 		// Provider failures do not surface here: `runner.run` only rejects setup
@@ -1691,6 +1727,11 @@ fn run_turn(
 								.unwrap_or_else(std::sync::PoisonError::into_inner);
 							guard.observe_event(&mut prepared, event);
 							frames.emit(event, sink.as_ref(), &meta, &guard);
+							// Goal accounting/persistence produced by this event lands
+							// after the event frame, so ordering is deterministic.
+							for frame in guard.goal_frames() {
+								sink.send(frame);
+							}
 						}
 						Ok(())
 					},
@@ -1802,6 +1843,11 @@ fn run_turn(
 			.lock()
 			.unwrap_or_else(std::sync::PoisonError::into_inner);
 		guard.finish_turn(&mut prepared, &outcome);
+		// Drain goal persistence and complete-exit after the turn settles, so a
+		// goal tool call cannot lose its `goal_updated`/terminal metric.
+		for frame in guard.finish_goal_turn() {
+			sink.send(frame);
+		}
 	}
 	outcome
 }

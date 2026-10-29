@@ -205,6 +205,14 @@ pub struct RunRequest {
 	/// Directory child transcripts are written to; `None` leaves
 	/// `get_subagent_messages` without a file to page.
 	pub child_session_root: Option<std::path::PathBuf>,
+	/// Session goal/budget controller. The live pump records `MessageEnd`/
+	/// tool-end usage into it, sends the limit steer through the run's own
+	/// steering channel, and the eval host reads its `budget()` snapshot.
+	pub goal: Option<std::sync::Arc<crate::goal::GoalRuntime>>,
+	/// Hidden goal-mode context for this request (TS `goal-mode-context`),
+	/// inserted immediately before the user message and never journaled as a
+	/// user turn.
+	pub goal_context: Option<String>,
 	/// Per-request credential resolver installed by the RPC auth bridge. Key
 	/// precedence stays TS `getApiKey` order: an explicit `--api-key`/config key
 	/// wins, then this store (login, env, static), then the connection block.

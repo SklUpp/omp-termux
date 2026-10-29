@@ -300,6 +300,8 @@ pub struct RpcSession {
 	/// Observer fed to `RunRequest.subagent_observer` so the runner subscribes
 	/// the registry to whichever supervisor it builds.
 	pub(crate) observer: Arc<dyn SubagentObserver>,
+	/// Session goal/budget controller (Goal Mode accounting + `+Nk` window).
+	pub(crate) goal:     Arc<crate::goal::GoalRuntime>,
 }
 
 impl RpcSession {
@@ -371,7 +373,7 @@ impl RpcSession {
 		let mut checkpoint_host = CheckpointHost::new();
 		checkpoint_host.rehydrate(&store);
 		let todo_phases = store.latest_todo_phases();
-		Ok(Self {
+		let mut session = Self {
 			runner,
 			resolver,
 			config,
@@ -418,7 +420,10 @@ impl RpcSession {
 			protocol_version: 1,
 			internal_urls,
 			observer,
-		})
+			goal: Arc::new(crate::goal::GoalRuntime::new()),
+		};
+		session.reconcile_goal_mode();
+		Ok(session)
 	}
 
 	// ---------------------------------------------------------------- state --
@@ -1189,6 +1194,110 @@ impl RpcSession {
 		Ok(())
 	}
 
+	/// Session usage at turn start: the goal accounting baseline and budget seed.
+	fn goal_seed(&self) -> crate::goal::TokenCounters {
+		let usage = self.store.session_usage();
+		crate::goal::TokenCounters {
+			input:       usage.input,
+			output:      usage.output,
+			cache_read:  usage.cache_read,
+			cache_write: usage.cache_write,
+		}
+	}
+
+	fn tool_selected(&self, name: &str) -> bool {
+		self.tools_enabled
+			&& self
+				.config
+				.tools
+				.as_ref()
+				.is_none_or(|allowed| allowed.iter().any(|tool| tool == name))
+	}
+
+	/// Headless registration rule: eager under `goal.enabled` unless the
+	/// selection excludes it, and always while a goal exists (#9444).
+	fn goal_tool_mounted(&self) -> bool {
+		self.config.goal.enabled()
+			&& self.tools_enabled
+			&& (self.goal.has_goal() || self.tool_selected(crate::goal_tool::GOAL_TOOL_NAME))
+	}
+
+	/// Hidden per-turn goal context (TS `goal-mode-context`).
+	fn goal_mode_context(&self) -> Option<String> {
+		let active = self.goal.build_active_prompt()?;
+		let todo = crate::goal::build_goal_todo_context(
+			&self.todo_phases,
+			self.tool_selected("todo"),
+		);
+		Some(crate::goal::render_goal_mode_context(&active, todo.as_deref()))
+	}
+
+	/// Drain queued goal writes through this session's single writer and return
+	/// the live `goal_updated` frames in order.
+	pub fn goal_frames(&mut self) -> Vec<Value> {
+		for intent in self.goal.take_pending() {
+			let result = match intent {
+				crate::goal::GoalPersist::ModeChange { mode, data } => {
+					self.store.append_mode_change(mode, data)
+				},
+				crate::goal::GoalPersist::Completed(data) => {
+					self.store.append_goal_completed(data)
+				},
+			};
+			if let Err(err) = result {
+				eprintln!("warning: {err}");
+			}
+		}
+		self
+			.goal
+			.take_events()
+			.iter()
+			.map(crate::goal::goal_updated_frame)
+			.collect()
+	}
+
+	/// Complete-exit once the turn drained: clear the mode and write `none` plus
+	/// the terminal metric exactly once.
+	pub fn finish_goal_turn(&mut self) -> Vec<Value> {
+		let mut frames = self.goal_frames();
+		if let Some(goal) = self.goal.take_exiting() {
+			if let Err(err) = self.store.append_mode_change(crate::goal::MODE_NONE, None) {
+				eprintln!("warning: {err}");
+			}
+			if let Err(err) =
+				self.store.append_goal_completed(crate::goal::encode_completed_data(&goal))
+			{
+				eprintln!("warning: {err}");
+			}
+			frames.extend(self.goal_frames());
+		}
+		frames
+	}
+
+	/// TS `#reconcileModeFromSession` over the active branch.
+	pub fn reconcile_goal_mode(&mut self) -> Vec<Value> {
+		match crate::goal::plan_restore(&self.store, self.config.goal.enabled()) {
+			crate::goal::RestorePlan::Idle => self.goal.clear_accounting(),
+			crate::goal::RestorePlan::ClearGoalMode => {
+				self.goal.set_restored_state(None);
+				self.goal.clear_accounting();
+				if let Err(err) = self.store.append_mode_change(crate::goal::MODE_NONE, None) {
+					eprintln!("warning: {err}");
+				}
+			},
+			crate::goal::RestorePlan::Restore { enabled, goal } => {
+				self.goal.set_restored_state(Some(crate::goal::GoalModeState {
+					enabled,
+					mode: crate::goal::GoalMode::Active,
+					goal,
+				}));
+				// Replayed without an explicit preserve: an active goal pauses.
+				let _ = self.goal.on_thread_resumed(false);
+			},
+		}
+		self.goal_frames()
+	}
+
 	/// Build the provider request for a prompt, recording the user entry.
 	pub fn prepare_turn(
 		&mut self,
@@ -1229,6 +1338,10 @@ impl RpcSession {
 		let entry = MessageEntry::new(user_id.clone(), parent_id, &iso, message);
 
 		let in_memory_before = self.in_memory_messages.as_ref().map_or(0, Vec::len);
+		// TS `#createMagicKeywordNotices`: the user prompt opens the `+Nk` budget
+		// window and the accounting baseline before the request is built.
+		let seed = self.goal_seed();
+		self.goal.begin_turn(Some(&input.text), seed);
 		// Build the request BEFORE the user entry is appended: with a durable
 		// `branch_summary` the context is rebuilt from the store, so an entry
 		// written first would come back as history and the runner would append
@@ -1310,6 +1423,18 @@ impl RpcSession {
 		} else {
 			runtime::latest_todo_phases_from_turns(&self.history)
 		};
+		let mut extra_tools: Vec<crate::agent::ExtraTool> = Vec::new();
+		if self.goal_tool_mounted() {
+			let tool: Arc<dyn pi_agent::tools::Tool> =
+				Arc::new(crate::goal_tool::GoalTool::new(Arc::clone(&self.goal)));
+			extra_tools.push(crate::agent::ExtraTool::from(tool));
+		}
+		// The live host tool set, mounted by the runner after every
+		// builtin/ask/checkpoint/eval tool; empty when the host registered none.
+		for tool in self.host_tools.adapters() {
+			extra_tools.push(crate::agent::ExtraTool::from(tool));
+		}
+		let goal_context = self.goal_mode_context();
 		Ok(RunRequest {
 			prompt,
 			parts,
@@ -1341,19 +1466,16 @@ impl RpcSession {
 			max_turns: self.max_turns,
 			tools_enabled: self.tools_enabled,
 			cancellation_token: None,
-			// The live host tool set, mounted by the runner after every
-			// builtin/ask/checkpoint/eval tool; empty when the host registered none.
-			extra_tools: self
-				.host_tools
-				.adapters()
-				.into_iter()
-				.map(crate::agent::ExtraTool::from)
-				.collect(),
+			// Goal tool first, then the live host tool set; both mount after every
+			// builtin/ask/checkpoint/eval tool and a duplicate name is a hard error.
+			extra_tools,
 			internal_urls: Some(Arc::clone(&self.internal_urls)),
 			url_scope: Some(self.url_scope()),
 			subagent_observer: Some(crate::agent::ObserverHandle(Arc::clone(&self.observer))),
 			credential_resolver: Some(crate::agent::ResolverHandle(Arc::clone(&self.resolver))),
 			child_session_root: self.child_session_root(),
+			goal: Some(Arc::clone(&self.goal)),
+			goal_context,
 		})
 	}
 
