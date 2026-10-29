@@ -1186,7 +1186,7 @@ pub fn env_config_files() -> Vec<PathBuf> {
 
 /// Overlay paths resolve relative to the effective project cwd after `~`
 /// expansion, matching the TS `Settings` constructor.
-fn resolve_layer_path(cwd: &Path, raw: &Path) -> PathBuf {
+pub(crate) fn resolve_layer_path(cwd: &Path, raw: &Path) -> PathBuf {
 	let text = raw.to_string_lossy();
 	let expanded = if let Some(home) = dirs::home_dir() {
 		if text == "~" {
@@ -1205,7 +1205,7 @@ fn resolve_layer_path(cwd: &Path, raw: &Path) -> PathBuf {
 /// Lexically collapse `.`/`..` components without touching the filesystem
 /// (`path.resolve` semantics): a `..` above the root is dropped, and a
 /// relative path keeps its leading `..` components.
-fn normalize_lexically(path: &Path) -> PathBuf {
+pub(crate) fn normalize_lexically(path: &Path) -> PathBuf {
 	let mut normalized = PathBuf::new();
 	for component in path.components() {
 		match component {
@@ -1230,7 +1230,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 /// Keep YAML diagnostics useful without echoing file contents (which may hold
 /// credentials). The in-tree parser only quotes payloads in `unterminated flow
 /// sequence`, but strip every backticked span defensively.
-fn sanitize_yaml_error(message: &str) -> String {
+pub(crate) fn sanitize_yaml_error(message: &str) -> String {
 	let mut out = String::with_capacity(message.len());
 	let mut in_span = false;
 	for ch in message.chars() {
@@ -1246,7 +1246,7 @@ fn sanitize_yaml_error(message: &str) -> String {
 	if trimmed.is_empty() { "invalid YAML".to_string() } else { trimmed }
 }
 
-fn json_to_value(json: &serde_json::Value) -> Value {
+pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
 	match json {
 		serde_json::Value::Null => Value::Null,
 		serde_json::Value::Bool(value) => Value::Bool(*value),

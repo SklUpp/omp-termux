@@ -5732,6 +5732,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "xxhash-rust",
 ]
 
 [[package]]

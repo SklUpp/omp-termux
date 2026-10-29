@@ -419,8 +419,8 @@ const EXCLUDED_VERBS: [(&str, &str); 6] = [
 ];
 
 /// Known upstream verbs this binary does not implement yet, including the
-/// upstream registry aliases `img`, `wt`, and `q`.
-const MISSING_VERBS: [&str; 30] = [
+/// upstream registry aliases `img` and `q`.
+const MISSING_VERBS: [&str; 27] = [
 	"acp",
 	"auth-broker",
 	"auth-gateway",
@@ -429,7 +429,6 @@ const MISSING_VERBS: [&str; 30] = [
 	"cleanse",
 	"commit",
 	"compress",
-	"config",
 	"dry-balance",
 	"gc",
 	"gallery",
@@ -447,8 +446,6 @@ const MISSING_VERBS: [&str; 30] = [
 	"tiny-models",
 	"token",
 	"ttsr",
-	"worktree",
-	"wt",
 	"search",
 	"q",
 ];
@@ -809,6 +806,40 @@ pub enum Command {
 		/// Include files excluded by `.gitignore`.
 		#[arg(long = "no-gitignore")]
 		no_gitignore: bool,
+	},
+
+	/// Inspect and edit settings.
+	Config {
+		/// `list` (default) | `get` | `set` | `reset` | `path` | `init-xdg`.
+		#[arg(value_name = "ACTION")]
+		action: Option<String>,
+		/// Setting path, such as `compaction.enabled` or `defaultThinkingLevel`.
+		#[arg(value_name = "KEY")]
+		key:    Option<String>,
+		/// Value for `set`; multiple words are joined with spaces.
+		#[arg(value_name = "VALUE")]
+		value:  Vec<String>,
+		/// Print machine-readable JSON.
+		#[arg(long)]
+		json:   bool,
+	},
+
+	/// List or safely reclaim agent-managed worktrees under the worktree base.
+	#[command(name = "worktree", alias = "wt")]
+	Worktree {
+		/// `list` (default) | `clear`.
+		#[arg(value_name = "ACTION")]
+		action:   Option<String>,
+		/// Clear every entry, including live checkouts; live isolation owners,
+		/// locked worktrees, and submodule checkouts are still refused.
+		#[arg(long)]
+		all:      bool,
+		/// Print the plan without moving anything (`clear`).
+		#[arg(short = 'n', long = "dry-run")]
+		dry_run:  bool,
+		/// Emit machine-readable JSON.
+		#[arg(short = 'j', long)]
+		json:     bool,
 	},
 
 	/// List and control daemon-supervised background processes.
@@ -1202,7 +1233,7 @@ mod tests {
 
 	#[test]
 	fn known_missing_verbs_are_refused_not_absorbed_as_prompts() {
-		for verb in ["acp", "config", "browser-relay", "auth-broker", "img", "wt", "q"] {
+		for verb in ["acp", "browser-relay", "auth-broker", "img", "q"] {
 			let message = refusal(&[verb]).unwrap_or_else(|| panic!("{verb} must be refused"));
 			assert!(message.contains(&format!("`omp {verb}`")), "{message}");
 			assert!(!message.contains("excluded"), "{verb} is missing, not excluded: {message}");
@@ -1250,7 +1281,7 @@ mod tests {
 		assert_eq!(refusal(&["--model=acp", "hello"]), None);
 		// A leading valueless flag does not turn the following verb into a prompt.
 		assert!(refusal(&["--no-tools", "acp"]).is_some());
-		assert!(refusal(&["-p", "config"]).is_some());
+		assert!(refusal(&["-p", "compress"]).is_some());
 		assert!(refusal(&["-c", "acp"]).is_some());
 		// Combined short flags: valueless ones keep the verb in the command slot…
 		assert!(refusal(&["-pc", "acp"]).is_some());

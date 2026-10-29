@@ -116,6 +116,19 @@ pub fn agent_subdir(subdir: &str, category: AgentDirCategory) -> PathBuf {
 	agent_category_root(category).join(subdir)
 }
 
+/// Agent-managed worktrees root (`getWorktreesDir()` default,
+/// `packages/utils/src/dirs.ts`): `rootSubdir("wt", "data")`, i.e. the XDG data
+/// root when `omp config init-xdg` migrated it, else `<config root>/wt`.
+///
+/// `OMP_WORKTREE_DIR` and the `worktree.base` setting are applied by
+/// [`crate::worktree_cmd::resolve_base`], which calls this only as the fallback.
+#[must_use]
+pub fn worktrees_root() -> PathBuf {
+	xdg_agent_root(AgentDirCategory::Data)
+		.unwrap_or_else(config_root)
+		.join("wt")
+}
+
 fn agent_category_root(category: AgentDirCategory) -> PathBuf {
 	xdg_agent_root(category).unwrap_or_else(agent_dir)
 }
@@ -140,12 +153,24 @@ fn xdg_agent_root(category: AgentDirCategory) -> Option<PathBuf> {
 	if agent_dir_from(profile_name, override_dir.as_deref()) != default_agent {
 		return None;
 	}
-	let app_root = env_path(category.env_var())?.join("omp");
-	let candidate = match profile_name {
+	xdg_pin(env_path(category.env_var()).as_deref(), profile_name, Path::exists)
+}
+
+/// Resolve the XDG app root for one category: `$XDG_*/omp` for the default
+/// profile, `$XDG_*/omp/profiles/<name>` for a named one, and only when that
+/// exact directory exists. The base app root is never consulted for a named
+/// profile, so a profile's location cannot change once the base appears.
+fn xdg_pin(
+	env_root: Option<&Path>,
+	profile: Option<&str>,
+	exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+	let app_root = env_root?.join("omp");
+	let candidate = match profile {
 		Some(name) => app_root.join("profiles").join(name),
 		None => app_root,
 	};
-	candidate.exists().then_some(candidate)
+	exists(&candidate).then_some(candidate)
 }
 
 /// Project-local config directory (`<cwd>/.omp`).
@@ -219,5 +244,34 @@ mod tests {
 			profile_config_root(base, "work").join("agent"),
 			PathBuf::from("/home/u/.omp/profiles/work/agent")
 		);
+	}
+
+	fn pin(env: Option<&str>, profile: Option<&str>, existing: &[&str]) -> Option<PathBuf> {
+		let existing: Vec<PathBuf> = existing.iter().map(PathBuf::from).collect();
+		xdg_pin(env.map(Path::new), profile, |path| existing.iter().any(|item| item == path))
+	}
+
+	#[test]
+	fn xdg_pin_requires_the_category_directory_to_exist() {
+		assert_eq!(pin(None, None, &[]), None, "an unset variable never redirects");
+		assert_eq!(
+			pin(Some("/xdg"), None, &["/xdg/omp"]),
+			Some(PathBuf::from("/xdg/omp"))
+		);
+		assert_eq!(pin(Some("/xdg"), None, &[]), None, "no migrated app root yet");
+	}
+
+	#[test]
+	fn xdg_pin_never_uses_the_base_app_root_for_a_named_profile() {
+		assert_eq!(
+			pin(Some("/xdg"), Some("work"), &["/xdg/omp", "/xdg/omp/profiles/work"]),
+			Some(PathBuf::from("/xdg/omp/profiles/work"))
+		);
+		assert_eq!(
+			pin(Some("/xdg"), Some("work"), &["/xdg/omp"]),
+			None,
+			"the base app root is not consulted for a named profile"
+		);
+		assert_eq!(pin(Some("/xdg"), Some("work"), &[]), None);
 	}
 }

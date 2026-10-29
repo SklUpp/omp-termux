@@ -15,6 +15,7 @@ use omp_cli::{
 	catalog::Catalog,
 	completions,
 	config::Config,
+	config_cmd,
 	daemon_broker,
 	deadline::{self, Deadline},
 	dirs,
@@ -34,6 +35,7 @@ use omp_cli::{
 	session_checkpoint::CheckpointHost,
 	skills::{self, Skill},
 	tool_commands,
+	worktree_cmd,
 };
 
 struct CliError {
@@ -54,6 +56,11 @@ impl CliError {
 			message: msg.into(),
 			code: omp_cli::EXIT_USAGE,
 		}
+	}
+
+	/// Non-zero exit whose explanation was already printed on stdout.
+	fn silent(code: u8) -> Self {
+		Self { message: String::new(), code }
 	}
 }
 
@@ -90,7 +97,9 @@ fn main() -> std::process::ExitCode {
 	match run() {
 		Ok(()) => std::process::ExitCode::from(omp_cli::EXIT_SUCCESS),
 		Err(error) => {
-			eprintln!("{}", error.message);
+			if !error.message.is_empty() {
+				eprintln!("{}", error.message);
+			}
 			std::process::ExitCode::from(error.code)
 		},
 	}
@@ -233,6 +242,72 @@ fn run() -> std::result::Result<(), CliError> {
 			let stdout = io::stdout();
 			let mut out = io::BufWriter::new(stdout.lock());
 			tool_commands::run_grep(&request, &base, &mut out).map_err(CliError::fail)?;
+			return Ok(());
+		},
+		Some(Command::Config { action, key, value, json }) => {
+			let action = match action.as_deref() {
+				None => config_cmd::Action::List,
+				Some(raw) => config_cmd::Action::parse(raw)
+					.ok_or_else(|| CliError::fail(config_cmd::unknown_action(raw).to_string()))?,
+			};
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			let request = config_cmd::Request {
+				action,
+				key: key.clone(),
+				value: if value.is_empty() { None } else { Some(value.join(" ")) },
+				json: *json,
+				cwd: base,
+				overlays: cli.config.clone(),
+			};
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			config_cmd::run(&request, &mut out).map_err(|err| CliError::fail(err.to_string()))?;
+			out.flush().map_err(|err| CliError::fail(err.to_string()))?;
+			return Ok(());
+		},
+		Some(Command::Worktree { action, all, dry_run, json }) => {
+			let cwd = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			// `worktree.base` is the raw effective setting value (same layers as
+			// `config get`); `resolve_base` owns getWorktreesDir semantics:
+			// `OMP_WORKTREE_DIR` first, then `~` expansion + absolute
+			// normalisation, then the XDG data-root default.
+			let configured =
+				match config_cmd::effective_setting(&cwd, &cli.config, "worktree.base")? {
+					Some(serde_json::Value::String(path)) => Some(PathBuf::from(path)),
+					_ => None,
+				};
+			let base = worktree_cmd::resolve_base(configured.as_deref()).map_err(CliError::usage)?;
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			match action.as_deref().unwrap_or("list") {
+				"list" => {
+					worktree_cmd::list_worktrees(&base, *json, &mut out)
+						.map_err(|err| CliError::fail(err.to_string()))?;
+				},
+				"clear" => {
+					let options =
+						worktree_cmd::ClearOptions { all: *all, dry_run: *dry_run, json: *json };
+					let report = worktree_cmd::clear_worktrees(&base, &options, &mut out)
+						.map_err(|err| CliError::fail(err.to_string()))?;
+					out.flush().map_err(|err| CliError::fail(err.to_string()))?;
+					if report.exit_failure() {
+						return Err(CliError::silent(omp_cli::EXIT_FAILURE));
+					}
+					return Ok(());
+				},
+				other => {
+					return Err(CliError::usage(format!(
+						"Unknown worktree action '{other}'. Expected: list | clear"
+					)));
+				},
+			}
+			out.flush().map_err(|err| CliError::fail(err.to_string()))?;
 			return Ok(());
 		},
 		Some(Command::Ps {
@@ -1183,7 +1258,7 @@ impl Session<'_> {
 						asst_api,
 						asst_provider,
 						asst_model,
-						None,
+						session::reported_usage(&message),
 						canon_stop,
 						evt_ms,
 					);

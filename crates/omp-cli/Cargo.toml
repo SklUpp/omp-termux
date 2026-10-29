@@ -34,6 +34,8 @@ serde_json.workspace = true
 rusqlite = { version = "0.33.0", features = ["bundled"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "fs", "io-util", "sync", "macros"] }
 tokio-util.workspace = true
+# Same crate and version the native lock names its abstract socket with.
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 clap.workspace = true
