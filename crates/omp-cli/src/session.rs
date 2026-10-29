@@ -210,6 +210,7 @@ impl From<pi_agent::TokenUsage> for Usage {
 			cache_read: usage.cache_read,
 			cache_write: usage.cache_write,
 			total_tokens: usage.total_tokens,
+			reasoning_tokens: usage.reasoning_tokens,
 			..Self::default()
 		}
 	}
@@ -222,6 +223,27 @@ impl From<pi_agent::TokenUsage> for Usage {
 #[must_use]
 pub fn reported_usage(message: &pi_agent::Message) -> Option<Usage> {
 	message.usage.map(Usage::from)
+}
+
+/// Subagent usage persisted on a `task` tool result (`details.usage`), as TS
+/// `taskUsageFrom` reads it. `None` when the result carries no usage object.
+fn task_tool_usage(message: &SessionMessage) -> Option<Usage> {
+	let usage = message.extra.get("details")?.get("usage")?;
+	serde_json::from_value(usage.clone()).ok()
+}
+
+/// Provider-side orchestration tokens (`Usage.orchestration`, kept verbatim in
+/// [`Usage::extra`] from TS-written logs): billed, but not part of the
+/// conversation prompt/cache buckets.
+fn orchestration_tokens(usage: &Usage) -> u64 {
+	let Some(orchestration) = usage.extra.get("orchestration").and_then(serde_json::Value::as_object)
+	else {
+		return 0;
+	};
+	["input", "output", "cacheRead"]
+		.iter()
+		.filter_map(|key| orchestration.get(*key).and_then(serde_json::Value::as_u64))
+		.sum()
 }
 
 /// Cumulative token usage of a session log.
@@ -251,10 +273,21 @@ pub struct SessionUsage {
 }
 
 impl SessionUsage {
-	/// Whether any request actually reported usage.
+	fn add(&mut self, usage: &Usage) {
+		self.input += usage.input;
+		self.output += usage.output;
+		self.cache_read += usage.cache_read;
+		self.cache_write += usage.cache_write;
+		self.total_tokens += usage.total_tokens;
+	}
+
+	/// Whether any request actually reported usage: an assistant entry, or a
+	/// `task` tool result carrying subagent usage.
 	#[must_use]
 	pub fn is_known(&self) -> bool {
 		self.reported_messages > 0
+			|| self.total_tokens > 0
+			|| self.input + self.output + self.cache_read + self.cache_write > 0
 	}
 
 	/// Whether every assistant message in the log reported usage.
@@ -1264,23 +1297,30 @@ impl SessionStore {
 	/// so reopening the log, forking it, or compacting it never changes the
 	/// reported counters. Entries without usage only raise the coverage
 	/// denominator; they never contribute zeros.
+	///
+	/// Like TS `entryUsage` (`session-manager.ts`), a `task` tool result also
+	/// contributes the subagent usage persisted in its `details.usage` (present
+	/// only in TS-written/imported logs; native Rust never writes it).
 	#[must_use]
 	pub fn session_usage(&self) -> SessionUsage {
 		let mut total = SessionUsage::default();
 		for entry in &self.messages {
-			if entry.message.role != "assistant" {
-				continue;
+			match entry.message.role.as_str() {
+				"assistant" => {
+					total.assistant_messages += 1;
+					let Some(usage) = &entry.message.usage else {
+						continue;
+					};
+					total.reported_messages += 1;
+					total.add(usage);
+				},
+				"toolResult" if entry.message.tool_name.as_deref() == Some("task") => {
+					if let Some(usage) = task_tool_usage(&entry.message) {
+						total.add(&usage);
+					}
+				},
+				_ => {},
 			}
-			total.assistant_messages += 1;
-			let Some(usage) = &entry.message.usage else {
-				continue;
-			};
-			total.reported_messages += 1;
-			total.input += usage.input;
-			total.output += usage.output;
-			total.cache_read += usage.cache_read;
-			total.cache_write += usage.cache_write;
-			total.total_tokens += usage.total_tokens;
 		}
 		total
 	}
@@ -1288,9 +1328,11 @@ impl SessionStore {
 	/// Prompt-side token occupancy of the newest reported request.
 	///
 	/// Mirrors TS `calculatePromptTokens` (`packages/agent/src/compaction/compaction.ts`):
-	/// `input + cache_read + cache_write`, falling back to `total_tokens` only
-	/// when that sum is zero. Only the active branch counts, and `None` means no
-	/// request on the branch reported usage — never an invented number.
+	/// authoritative `contextTokens` first, then `input + cache_read + cache_write`,
+	/// then `calculateContextTokens` (`totalTokens` or the four-counter sum, minus
+	/// provider-side `orchestration` tokens). Only the active branch counts, and
+	/// `None` means no request on the branch reported usage — never an invented
+	/// number.
 	#[must_use]
 	pub fn latest_context_tokens(&self) -> Option<u64> {
 		self
@@ -1300,8 +1342,20 @@ impl SessionStore {
 			.filter(|entry| entry.message.role == "assistant")
 			.find_map(|entry| entry.message.usage.as_ref())
 			.map(|usage| {
+				if let Some(context) = usage.context_tokens {
+					return context;
+				}
 				let prompt = usage.input + usage.cache_read + usage.cache_write;
-				if prompt > 0 { prompt } else { usage.total_tokens }
+				if prompt > 0 {
+					return prompt;
+				}
+				let total = usage.total_tokens;
+				let raw = if total > 0 {
+					total
+				} else {
+					usage.input + usage.output + usage.cache_read + usage.cache_write
+				};
+				raw.saturating_sub(orchestration_tokens(usage))
 			})
 	}
 
@@ -3906,6 +3960,113 @@ mod tests {
 				.filter(|entry| entry.message.role == "assistant")
 				.any(|entry| entry.message.usage.is_none()),
 			"the unreported entry round-trips as absence, never as zeros"
+		);
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn session_usage_counts_task_tool_result_details_usage() {
+		const TS: &str = "2026-01-01T00:00:00.000Z";
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("task-usage")));
+		assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+		let mut task = SessionMessage::tool_result(
+			"c1",
+			"task",
+			MessageContent::Text("done".to_string()),
+			false,
+			1,
+		);
+		task.extra.insert(
+			"details".to_string(),
+			serde_json::json!({
+				"usage": {
+					"input": 4,
+					"output": 6,
+					"cacheRead": 1,
+					"cacheWrite": 0,
+					"totalTokens": 11,
+				},
+			}),
+		);
+		store
+			.append_messages(&[MessageEntry::new("t1", None, TS, task)])
+			.expect("append task result");
+		let usage = store.session_usage();
+		assert_eq!(
+			(
+				usage.input,
+				usage.output,
+				usage.cache_read,
+				usage.cache_write,
+				usage.total_tokens
+			),
+			(4, 6, 1, 0, 11),
+			"TS entryUsage adds `task` tool-result details.usage"
+		);
+		assert_eq!(usage.assistant_messages, 0, "task usage is not an assistant message");
+		assert_eq!(usage.reported_messages, 0);
+		assert!(usage.is_known(), "subagent usage is still reported usage");
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn latest_context_tokens_prefers_reported_context_then_total() {
+		const TS: &str = "2026-01-01T00:00:00.000Z";
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("context-tokens")));
+		assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+		let append = |store: &mut SessionStore, id: &str, usage: Usage, ts: u64| {
+			let parent = store.leaf_id().map(str::to_string);
+			store
+				.append_messages(&[MessageEntry::new(
+					id,
+					parent,
+					TS,
+					SessionMessage::assistant(
+						MessageContent::Text("x".to_string()),
+						"chat",
+						"local",
+						"llama3",
+						Some(usage),
+						"stop",
+						ts,
+					),
+				)])
+				.expect("append usage entry");
+		};
+		append(
+			&mut store,
+			"a1",
+			Usage { context_tokens: Some(99), input: 5, total_tokens: 12, ..Usage::default() },
+			1,
+		);
+		assert_eq!(
+			store.latest_context_tokens(),
+			Some(99),
+			"authoritative contextTokens wins over the prompt-side sum"
+		);
+		append(&mut store, "a2", Usage { output: 7, ..Usage::default() }, 2);
+		assert_eq!(
+			store.latest_context_tokens(),
+			Some(7),
+			"totalTokens 0 falls back to the four-counter sum, like TS calculateContextTokens"
+		);
+		let mut extra = serde_json::Map::new();
+		extra.insert(
+			"orchestration".to_string(),
+			serde_json::json!({ "input": 20, "output": 5 }),
+		);
+		append(
+			&mut store,
+			"a3",
+			Usage { output: 5, total_tokens: 50, extra, ..Usage::default() },
+			3,
+		);
+		assert_eq!(
+			store.latest_context_tokens(),
+			Some(25),
+			"TS calculateContextTokens subtracts provider-side orchestration tokens"
 		);
 		fs::remove_dir_all(dir).ok();
 	}

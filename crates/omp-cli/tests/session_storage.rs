@@ -90,9 +90,10 @@ fn read_ts_v3_session_fixture() {
 	assert_eq!(asst.model.as_deref(), Some("gpt-4o"));
 	let usage = asst.usage.as_ref().expect("usage must round-trip");
 	assert_eq!((usage.input, usage.output, usage.total_tokens), (10, 20, 30));
-	assert!((usage.cost.total - 0.0003).abs() < 1e-6, "cost.total must round-trip truthfully: {:?}", usage.cost);
-	assert!((usage.cost.input - 0.0001).abs() < 1e-6);
-	assert!((usage.cost.output - 0.0002).abs() < 1e-6);
+	let cost = usage.cost.as_ref().expect("cost must round-trip");
+	assert!((cost.total - 0.0003).abs() < 1e-6, "cost.total must round-trip truthfully: {:?}", usage.cost);
+	assert!((cost.input - 0.0001).abs() < 1e-6);
+	assert!((cost.output - 0.0002).abs() < 1e-6);
 	assert_eq!(asst.stop_reason.as_deref(), Some("toolUse"));
 	fs::remove_dir_all(temp).ok();
 }

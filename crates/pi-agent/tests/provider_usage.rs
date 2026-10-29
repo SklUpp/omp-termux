@@ -30,6 +30,7 @@ fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> TokenUsa
 		cache_read,
 		cache_write,
 		total_tokens: input + output + cache_read + cache_write,
+		reasoning_tokens: None,
 	}
 }
 
@@ -317,6 +318,26 @@ fn cache_read_spellings_and_deepseek_pair_normalize_without_double_count() {
 		.expect("write shape"),
 	);
 	assert_eq!(anthropic_style, usage(50, 5, 30, 20));
+
+	// Reasoning tokens are preserved (subset of output) and never invented.
+	let reasoning = normalize_usage(
+		&serde_json::from_value::<OpenAiUsage>(json!({
+			"prompt_tokens": 100,
+			"completion_tokens": 20,
+			"completion_tokens_details": { "reasoning_tokens": 7 },
+		}))
+		.expect("reasoning shape"),
+	);
+	assert_eq!(reasoning, TokenUsage { reasoning_tokens: Some(7), ..usage(100, 20, 0, 0) });
+	let no_reasoning = normalize_usage(
+		&serde_json::from_value::<OpenAiUsage>(json!({
+			"prompt_tokens": 100,
+			"completion_tokens": 20,
+			"completion_tokens_details": { "reasoning_tokens": 0 },
+		}))
+		.expect("zero reasoning shape"),
+	);
+	assert_eq!(no_reasoning.reasoning_tokens, None, "zero means unreported, not a value");
 }
 
 #[test]

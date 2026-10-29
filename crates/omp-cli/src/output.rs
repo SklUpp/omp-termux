@@ -308,7 +308,7 @@ fn format_ts_assistant_message(
 			}
 		},
 	};
-	serde_json::json!({
+	let mut asst = serde_json::json!({
 		"role": "assistant",
 		"content": content,
 		"api": api,
@@ -316,7 +316,14 @@ fn format_ts_assistant_message(
 		"model": model,
 		"stopReason": stop_reason_ts,
 		"timestamp": timestamp,
-	})
+	});
+	// TS `AssistantMessage.usage` — emitted only when the provider actually
+	// reported usage; an unreported turn stays absent instead of serializing
+	// zeros-as-fact. `cost` is omitted too because no price is known here.
+	if let Some(usage) = crate::session::reported_usage(message) {
+		asst["usage"] = serde_json::json!(usage);
+	}
+	asst
 }
 
 fn format_ts_tool_result(
@@ -482,6 +489,40 @@ mod tests {
 		assert_eq!(v["message"]["stopReason"], "stop");
 		assert!(v["message"].get("providerPayload").is_none());
 		assert!(v["message"].get("usage").is_none());
+		assert!(err.is_empty());
+	}
+
+	#[test]
+	fn json_mode_emits_reported_usage_without_fake_cost() {
+		let mut out = Vec::new();
+		let mut err = Vec::new();
+		{
+			let mut reporter = Reporter::new(OutputMode::Json, &mut out, &mut err)
+				.with_model_info("openai-completions", "openai", "gpt-4o");
+			let mut asst = pi_agent::Message::assistant("final");
+			asst.usage = Some(pi_agent::TokenUsage {
+				input: 10,
+				output: 4,
+				cache_read: 2,
+				cache_write: 1,
+				total_tokens: 17,
+				reasoning_tokens: None,
+			});
+			reporter.event(&Event::message_end(asst)).expect("event");
+			reporter.finish().expect("finish");
+		}
+		let out = String::from_utf8(out).expect("utf8");
+		let line = out.lines().last().expect("message_end line");
+		let v: serde_json::Value = serde_json::from_str(line).expect("json");
+		assert_eq!(v["type"], "message_end");
+		// TS `Usage` shape: camelCase counters, no `cost` when no price is known.
+		assert_eq!(v["message"]["usage"], serde_json::json!({
+			"input": 10,
+			"output": 4,
+			"cacheRead": 2,
+			"cacheWrite": 1,
+			"totalTokens": 17,
+		}));
 		assert!(err.is_empty());
 	}
 

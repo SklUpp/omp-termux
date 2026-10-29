@@ -617,9 +617,10 @@ impl AgentRunner for PiAgentRunner {
 			.with_effort(plan.effort)
 			.with_images(plan.supports_images)
 			.with_prompt_cache_enabled(plan.provider == "kimi-code")
-			// TS compat `supportsUsageInStreaming: !isCerebras` (`compat/openai.ts`):
-			// the Cerebras dialect rejects the `stream_options` field.
-			.with_usage_in_streaming(plan.provider != "cerebras")
+			// Per-model `compat.supportsUsageInStreaming` override, else the TS
+			// provider default (`!isCerebras`, `compat/openai.ts`): the Cerebras
+			// dialect rejects the `stream_options` field.
+			.with_usage_in_streaming(plan.supports_usage_in_streaming)
 			.with_session_id(request.provider_session_id.clone())
 			.with_prompt_cache_key(request.prompt_cache_key.clone());
 		let config = AgentConfig {
@@ -1115,6 +1116,10 @@ struct RunPlan {
 	system_prompt: Option<String>,
 	tools:         Vec<&'static str>,
 	supports_images: bool,
+	/// Whether the streaming request asks for a usage trailer. Per-model
+	/// `compat.supportsUsageInStreaming` wins; otherwise the TS provider default
+	/// (`!isCerebras`) applies.
+	supports_usage_in_streaming: bool,
 }
 
 impl RunPlan {
@@ -1208,6 +1213,10 @@ impl RunPlan {
 				true
 			},
 		};
+		let supports_usage_in_streaming = request
+			.catalog
+			.supports_usage_in_streaming(&provider, &model)
+			.unwrap_or(provider != "cerebras");
 		Ok(Self {
 			base_url,
 			api_key,
@@ -1220,6 +1229,7 @@ impl RunPlan {
 			system_prompt: compose_system_prompt(request),
 			tools: allowed_tools(request, has_mcp_tools)?,
 			supports_images,
+			supports_usage_in_streaming,
 		})
 	}
 }
@@ -1496,8 +1506,14 @@ impl ChildModelFactory for CliChildModelFactory {
 					.with_effort(chosen_effort)
 					.with_images(supports_images)
 					.with_prompt_cache_enabled(provider_id == "kimi-code")
-					// TS compat `supportsUsageInStreaming: !isCerebras`.
-					.with_usage_in_streaming(provider_id != "cerebras"),
+					// Per-model `compat.supportsUsageInStreaming`, else TS
+					// provider default `!isCerebras`.
+					.with_usage_in_streaming(
+						self
+							.catalog
+							.supports_usage_in_streaming(&provider_id, &id)
+							.unwrap_or(provider_id != "cerebras"),
+					),
 				Err(error) => {
 					last_error = Some(error.to_string());
 					continue;
@@ -4183,6 +4199,39 @@ mod tests {
 			"provider must reject image message when model is text-only, got: {:?}",
 			err
 		);
+	}
+
+	#[test]
+	fn run_plan_honors_per_model_usage_in_streaming_compat() {
+		let mut cat = catalog_with_connection("cerebras", "http://127.0.0.1:8080/v1", Some("sk-test"));
+		cat.providers.insert(
+			"cerebras".to_string(),
+			BTreeMap::from([("llama".to_string(), ModelInfo {
+				provider: "cerebras".to_string(),
+				supports_usage_in_streaming: Some(true),
+				..ModelInfo::default()
+			})]),
+		);
+		let mut req = request(Approvals::default());
+		req.model = Some("cerebras/llama".to_string());
+		req.catalog = Arc::new(cat);
+		let plan = RunPlan::resolve(&req).expect("plan");
+		// Per-model override beats the Cerebras provider default (`!isCerebras`).
+		assert!(plan.supports_usage_in_streaming);
+
+		let mut cat = catalog_with_connection("venice", "http://127.0.0.1:8080/v1", Some("sk-test"));
+		cat.providers.insert(
+			"venice".to_string(),
+			BTreeMap::from([("v1".to_string(), ModelInfo {
+				provider: "venice".to_string(),
+				supports_usage_in_streaming: Some(false),
+				..ModelInfo::default()
+			})]),
+		);
+		req.model = Some("venice/v1".to_string());
+		req.catalog = Arc::new(cat);
+		let plan = RunPlan::resolve(&req).expect("plan");
+		assert!(!plan.supports_usage_in_streaming);
 	}
 
 	#[test]

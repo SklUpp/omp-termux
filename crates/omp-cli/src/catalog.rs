@@ -47,6 +47,11 @@ pub struct ModelInfo {
 	/// (`input`/`output`/`cacheRead`/`cacheWrite`, missing ones `0`); extra
 	/// keys such as `longContext` are preserved for `--json`.
 	pub cost:            Option<serde_json::Value>,
+	/// TS `compat.supportsUsageInStreaming` override for this model
+	/// (`models.json`/`models.yml`). `None` means the model declares nothing,
+	/// so the provider-level default applies (`!isCerebras`, as
+	/// `compat/openai.ts` resolves it).
+	pub supports_usage_in_streaming: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +74,16 @@ struct ModelEntry {
 	thinking: Option<serde_json::Value>,
 	#[serde(default)]
 	cost: Option<serde_json::Value>,
+	#[serde(default)]
+	compat: Option<CompatEntry>,
+}
+
+/// Sparse TS `ModelSpec.compat` block; only the keys the runtime consumes are
+/// typed, everything else in the block is ignored.
+#[derive(Deserialize)]
+struct CompatEntry {
+	#[serde(default, rename = "supportsUsageInStreaming")]
+	supports_usage_in_streaming: Option<bool>,
 }
 
 /// `thinking.efforts` from a catalog `thinking` block; `true`-only or absent
@@ -174,6 +189,9 @@ impl Catalog {
 						reasoning: entry.reasoning,
 						efforts: thinking_efforts(entry.thinking),
 						cost: normalize_cost(entry.cost),
+						supports_usage_in_streaming: entry
+							.compat
+							.and_then(|compat| compat.supports_usage_in_streaming),
 					},
 				);
 			}
@@ -215,6 +233,12 @@ fn yml_sections(
 		};
 		for (id, provider) in pairs {
 			connections.insert(id.clone(), config::parse_provider(provider, id, path)?);
+			// Provider-level `compat` is a default for every model below it;
+			// a model-level `compat` wins (TS `mergeCompat`).
+			let provider_usage_in_streaming = provider
+				.get("compat")
+				.and_then(|compat| compat.get("supportsUsageInStreaming"))
+				.and_then(yaml::Value::as_bool);
 			let mut models = BTreeMap::new();
 			if let Some(list) = provider.get("models") {
 				let Some(items) = list.as_list() else {
@@ -264,6 +288,11 @@ fn yml_sections(
 									.unwrap_or(false),
 								efforts,
 								cost: yml_cost(item),
+								supports_usage_in_streaming: item
+									.get("compat")
+									.and_then(|compat| compat.get("supportsUsageInStreaming"))
+									.and_then(yaml::Value::as_bool)
+									.or(provider_usage_in_streaming),
 							},
 						);
 					}
@@ -353,6 +382,17 @@ impl Catalog {
 	pub fn supports_images(&self, provider: &str, model: &str) -> Option<bool> {
 		let input = self.model_input(provider, model)?;
 		Some(input.iter().any(|m| m == "image"))
+	}
+
+	/// Per-model `compat.supportsUsageInStreaming` override, when the catalog
+	/// declares one. `None` leaves the provider default in charge.
+	#[must_use]
+	pub fn supports_usage_in_streaming(&self, provider: &str, model: &str) -> Option<bool> {
+		self
+			.providers
+			.get(provider)?
+			.get(model)?
+			.supports_usage_in_streaming
 	}
 	pub fn model_count(&self) -> usize {
 		self.providers.values().map(BTreeMap::len).sum()
@@ -511,6 +551,38 @@ mod tests {
 		assert_eq!(cost["cacheRead"], serde_json::json!(0));
 		assert_eq!(cost["cacheWrite"], serde_json::json!(0));
 		assert_eq!(cost["longContext"], serde_json::json!({ "input": 3 }));
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn parses_per_model_usage_in_streaming_compat() {
+		let dir = temp_dir();
+		let json = dir.join("models.json");
+		write(
+			&json,
+			r#"{"cerebras":{"llama":{"id":"llama","compat":{"supportsUsageInStreaming":true}},"other":{"id":"other"}}}"#,
+		);
+		let catalog = Catalog::load_from(&[json], &dir.join("missing.yml")).expect("catalog");
+		assert_eq!(catalog.supports_usage_in_streaming("cerebras", "llama"), Some(true));
+		assert_eq!(catalog.supports_usage_in_streaming("cerebras", "other"), None);
+		assert_eq!(catalog.supports_usage_in_streaming("absent", "llama"), None);
+
+		let yml = dir.join("models.yml");
+		write(
+			&yml,
+			"providers:\n  venice:\n    baseUrl: http://127.0.0.1:1/v1\n    compat:\n      supportsUsageInStreaming: false\n    models:\n      - id: v1\n      - id: v2\n        compat:\n          supportsUsageInStreaming: true\n",
+		);
+		let catalog = Catalog::load_from(&[dir.join("missing.json")], &yml).expect("catalog");
+		assert_eq!(
+			catalog.supports_usage_in_streaming("venice", "v1"),
+			Some(false),
+			"provider-level compat is the default for its models"
+		);
+		assert_eq!(
+			catalog.supports_usage_in_streaming("venice", "v2"),
+			Some(true),
+			"model-level compat overrides the provider default"
+		);
 		fs::remove_dir_all(dir).ok();
 	}
 

@@ -439,6 +439,7 @@ mod tests {
 			reasoning,
 			efforts: efforts.map(|items| items.iter().map(|item| (*item).to_string()).collect()),
 			cost,
+			supports_usage_in_streaming: None,
 		}
 	}
 

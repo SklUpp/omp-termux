@@ -777,6 +777,13 @@ pub fn normalize_usage(raw: &OpenAiUsage) -> TokenUsage {
 		cache_read,
 		cache_write,
 		total_tokens: input + output + cache_read + cache_write,
+		// TS `calculateOpenAIUsageAccounting`: only positive reports are kept,
+		// absent stays unknown instead of zero.
+		reasoning_tokens: raw
+			.completion_tokens_details
+			.as_ref()
+			.and_then(|details| details.reasoning_tokens)
+			.filter(|tokens| *tokens > 0),
 	}
 }
 

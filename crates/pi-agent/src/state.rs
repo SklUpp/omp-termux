@@ -34,6 +34,12 @@ pub struct TokenUsage {
 	pub cache_write: u64,
 	#[serde(default, rename = "totalTokens")]
 	pub total_tokens: u64,
+	/// Provider-reported reasoning/thinking tokens, a subset of `output`
+	/// (OpenAI `completion_tokens_details.reasoning_tokens`). Absent when the
+	/// provider reports none — `None` means unknown, not zero (TS
+	/// `calculateOpenAIUsageAccounting` adds the key only when positive).
+	#[serde(default, rename = "reasoningTokens", skip_serializing_if = "Option::is_none")]
+	pub reasoning_tokens: Option<u64>,
 }
 
 /// A tool invocation request by model.
