@@ -829,8 +829,11 @@ fn execute_entry(entry: &WorktreeEntry, canonical_base: &Path) -> ClearOutcome {
 		);
 		return outcome;
 	}
-	// Re-check liveness at the last moment: a fresh owner may have appeared.
-	if entry.kind == WorktreeKind::TaskIsolation && isolation_owner(&entry.path).0 {
+	// Re-check liveness at the last moment: a fresh owner may have appeared, and
+	// the scan's classification can already be stale (an empty or orphaned
+	// directory may have been claimed by a task since), so the owner marker is
+	// probed regardless of `entry.kind`.
+	if isolation_owner(&entry.path).0 {
 		outcome.action = ClearAction::Refused;
 		outcome.error = Some(
 			"a live task still owns this isolation sandbox; stop that task (or wait for it to \
@@ -1249,7 +1252,10 @@ mod tests {
 		time::{SystemTime, UNIX_EPOCH},
 	};
 
-	use super::{Reservation, move_registered_checkout_with};
+	use super::{
+		ClearAction, ISOLATION_OWNER_FILE, Reservation, WorktreeKind, execute_entry,
+		move_registered_checkout_with, scan_worktrees,
+	};
 
 	/// Pointer bytes kept deliberately relative, so a restore that re-serialises
 	/// instead of copying is visible.
@@ -1461,6 +1467,52 @@ mod tests {
 		assert!(
 			reserved.join("payload.txt").is_file(),
 			"release never removes content that was moved in"
+		);
+	}
+
+	#[test]
+	fn owner_published_after_the_scan_blocks_clearing_a_stale_empty_entry() {
+		let scratch = Scratch::new("late-owner");
+		let base = scratch.0.clone();
+		let sandbox = base.join("sandbox");
+		fs::create_dir(&sandbox).expect("sandbox");
+
+		// Scanned while the directory was still empty: no owner marker, so the
+		// entry is classified as a reclaimable legacy shell.
+		let entry = scan_worktrees(&base)
+			.expect("scan")
+			.into_iter()
+			.find(|entry| entry.path == sandbox)
+			.expect("empty entry");
+		assert_eq!(entry.kind, WorktreeKind::Empty);
+		assert!(entry.orphan_reason.is_some(), "the scan targets it for clear");
+
+		// A task claims the directory after the scan and before the clear runs.
+		fs::write(
+			sandbox.join(ISOLATION_OWNER_FILE),
+			format!(r#"{{"pid":{},"id":"late"}}"#, std::process::id()),
+		)
+		.expect("owner marker");
+
+		let canonical_base = fs::canonicalize(&base).expect("base");
+		let outcome = execute_entry(&entry, &canonical_base);
+
+		assert_eq!(outcome.action, ClearAction::Refused);
+		assert!(
+			outcome.error.as_deref().is_some_and(|error| error.contains("live task")),
+			"the refusal names the live owner: {:?}",
+			outcome.error
+		);
+		assert!(
+			sandbox.join(ISOLATION_OWNER_FILE).is_file(),
+			"the live sandbox was not relocated"
+		);
+		assert!(
+			fs::read_dir(&base)
+				.expect("base")
+				.flatten()
+				.all(|item| item.file_name() == "sandbox"),
+			"nothing was quarantined into the base"
 		);
 	}
 }
