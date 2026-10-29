@@ -12,11 +12,13 @@
 //! `write({path:"conflict://<N>"})` resolves against; until that store lands
 //! the selector errors rather than listing ids nothing can act on.
 //!
-//! Hashline display mode is injected, not implemented here: a
-//! [`ReadSnapshotSink`] (the hashline module owns the concrete store) records
-//! the whole normalized file plus the displayed line numbers and returns the
-//! `[path#TAG]` header. With no sink the tool emits plain `N|TEXT` bodies and
-//! never fabricates a header.
+//! Display mode is resolved per call from [`FileDisplayInputs`] plus the
+//! per-read `raw` / `immutable` flags (`resolve_file_display_mode`), exactly as
+//! upstream `file-display-mode.ts`. A [`ReadSnapshotSink`] (the hashline module
+//! owns the concrete store) records the whole normalized file plus the
+//! displayed line numbers and returns the `[path#TAG]` header, but only when
+//! hashline is active. A tool built without inputs keeps the historical
+//! sink-driven display: a sink means hashline, otherwise plain `N|TEXT`.
 //!
 //! Cancellation is checked at entry and between scanner chunks for Rust
 //! interrupt safety. TS deliberately makes deterministic local reads
@@ -37,7 +39,11 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::sync::CancellationToken;
 
-use super::{Tool, ToolError, tool_result};
+use super::{
+	Tool, ToolError,
+	edit_variants::mode::{EditMode, FileDisplayMode, resolve_file_display_mode},
+	tool_result,
+};
 use crate::state::{AgentContext, ToolResult};
 
 /// Shared read caps (`packages/coding-agent/src/session/streaming-output.ts`).
@@ -104,9 +110,41 @@ pub trait ReadSnapshotSink: Send + Sync {
 	fn header(&self, absolute_path: &Path, tag: &str, cwd: &Path) -> String;
 }
 
+/// Per-instance display inputs for `resolve_file_display_mode`:
+/// the session's edit mode, whether an `edit` tool is mounted, and
+/// `readLineNumbers`. The per-call `raw` and `immutable` flags are supplied by
+/// the read itself, so one tool instance serves every selector.
+///
+/// Shared with `ast_grep` and `ast_edit`, which resolve the same session inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileDisplayInputs {
+	pub edit_mode:         EditMode,
+	pub has_edit_tool:     bool,
+	pub read_line_numbers: bool,
+}
+
+impl FileDisplayInputs {
+	pub fn new(edit_mode: EditMode, has_edit_tool: bool, read_line_numbers: bool) -> Self {
+		Self { edit_mode, has_edit_tool, read_line_numbers }
+	}
+
+	/// Display for one call: `raw` suppresses numbering, `immutable` sources
+	/// suppress hashline anchors while still allowing line numbers.
+	pub fn resolve(self, raw: bool, immutable: bool) -> FileDisplayMode {
+		resolve_file_display_mode(
+			self.edit_mode,
+			self.has_edit_tool,
+			self.read_line_numbers,
+			raw,
+			immutable,
+		)
+	}
+}
+
 /// Builtin file reading tool.
 pub struct ReadTool {
-	sink: Option<Arc<dyn ReadSnapshotSink>>,
+	sink:    Option<Arc<dyn ReadSnapshotSink>>,
+	display: Option<FileDisplayInputs>,
 }
 
 impl Default for ReadTool {
@@ -117,12 +155,31 @@ impl Default for ReadTool {
 
 impl ReadTool {
 	pub fn new() -> Self {
-		Self { sink: None }
+		Self { sink: None, display: None }
 	}
 
 	/// Read with hashline headers and snapshot recording enabled.
 	pub fn with_snapshot_sink(sink: Arc<dyn ReadSnapshotSink>) -> Self {
-		Self { sink: Some(sink) }
+		Self { sink: Some(sink), display: None }
+	}
+
+	/// Opt into resolver-driven display. Without this call the tool keeps the
+	/// historical sink-driven behavior for existing consumers.
+	pub fn with_display_inputs(mut self, display: FileDisplayInputs) -> Self {
+		self.display = Some(display);
+		self
+	}
+
+	/// Display for one read. Legacy construction (no explicit inputs) derives
+	/// hashline from the sink and always numbers non-raw output.
+	fn display_mode(&self, raw: bool, immutable: bool) -> FileDisplayMode {
+		match self.display {
+			Some(inputs) => inputs.resolve(raw, immutable),
+			None => FileDisplayMode {
+				hash_lines:   !raw && !immutable && self.sink.is_some(),
+				line_numbers: !raw,
+			},
+		}
 	}
 }
 
@@ -280,6 +337,7 @@ impl Tool for ReadTool {
 
 		let image_ext = has_extension(&target, IMAGE_EXTENSIONS);
 		let raw_selector = is_raw(&parsed);
+		let display_mode = self.display_mode(raw_selector, is_immutable_source(&raw_path));
 
 		let mut file = match open_regular(&target).await {
 			Ok(file) => file,
@@ -342,18 +400,26 @@ impl Tool for ReadTool {
 		if matches!(parsed, Sel::None) && !is_prose_summary_path(&target) {
 			if let Some(summary) = try_summarize(&target, meta.len(), ctx).await {
 				return Ok(
-					read_summary_result(&target, meta.len(), &summary, sink, suffix_resolution.as_ref(), ctx)
-						.await,
+					read_summary_result(
+						&target,
+						meta.len(),
+						&summary,
+						sink,
+						display_mode,
+						suffix_resolution.as_ref(),
+						ctx,
+					)
+					.await,
 				);
 			}
 		}
 		let outcome = match &parsed {
 			Sel::Lines { ranges, raw } if ranges.len() > 1 => {
-				read_multi_range(&target, meta.len(), ranges, *raw, sink, ctx).await
+				read_multi_range(&target, meta.len(), ranges, *raw, sink, display_mode, ctx).await
 			},
 			Sel::Lines { ranges, raw } => {
 				let range = ranges[0];
-				read_single_range(&target, meta.len(), range, *raw, sink, ctx).await
+				read_single_range(&target, meta.len(), range, *raw, sink, display_mode, ctx).await
 			},
 			Sel::Raw | Sel::None => {
 				read_single_range(
@@ -362,6 +428,7 @@ impl Tool for ReadTool {
 					LineRange { start_line: 1, end_line: None },
 					raw_selector,
 					sink,
+					display_mode,
 					ctx,
 				)
 				.await
@@ -817,6 +884,15 @@ async fn read_bounded_regular(path: &Path, cap: u64) -> Option<Vec<u8>> {
 	((bytes.len() as u64) <= cap).then_some(bytes)
 }
 
+/// Sources with no edit path: hashline anchors would be dead weight, so
+/// `resolve_file_display_mode` drops them while still allowing line numbers.
+/// Mirrors upstream's `immutable` flag for `artifact://`, `agent://`, and
+/// `memory://` reads.
+fn is_immutable_source(raw: &str) -> bool {
+	internal_scheme(raw)
+		.is_some_and(|scheme| matches!(scheme.as_str(), "artifact" | "agent" | "memory"))
+}
+
 fn internal_scheme(raw: &str) -> Option<String> {
 	let idx = raw.find("://")?;
 	let scheme = &raw[..idx];
@@ -1124,6 +1200,7 @@ async fn read_single_range(
 	range: LineRange,
 	raw: bool,
 	sink: Option<&dyn ReadSnapshotSink>,
+	display_mode: FileDisplayMode,
 	ctx: &AgentContext,
 ) -> Result<ToolResult, String> {
 	let requested_start = range.start_line - 1;
@@ -1226,12 +1303,16 @@ async fn read_single_range(
 			.collect()
 	};
 	let unnumbered = display_lines.join("\n");
-	let line_separator = if sink.is_some() { ':' } else { '|' };
+	let hash_lines = display_mode.hash_lines;
+	let line_numbers = hash_lines || display_mode.line_numbers;
+	let line_separator = if hash_lines { ':' } else { '|' };
 	let format_body = |lines: &[String]| -> String {
 		if raw {
 			lines.join("\n")
-		} else {
+		} else if line_numbers {
 			format_numbered(lines, display_start, line_separator)
+		} else {
+			lines.join("\n")
 		}
 	};
 
@@ -1242,7 +1323,7 @@ async fn read_single_range(
 	if first_line_exceeds {
 		let first_line_bytes = window.first_line_bytes.unwrap_or(0);
 		let preview = String::from_utf8_lossy(&window.first_line_preview).into_owned();
-		if sink.is_some() && !raw {
+		if hash_lines {
 			output = format!(
 				"[Line {display_start} is {}, exceeds {} limit. Hashline output requires full lines; cannot emit an editable numbered preview for a truncated line.]",
 				format_bytes(first_line_bytes),
@@ -1255,7 +1336,7 @@ async fn read_single_range(
 				format_bytes(max_bytes)
 			);
 		} else {
-			output = if raw {
+			output = if raw || !line_numbers {
 				preview
 			} else {
 				format_numbered(&[preview], display_start, line_separator)
@@ -1319,13 +1400,13 @@ async fn read_single_range(
 		output = format_body(&display_lines);
 	}
 
-	if let (Some(sink), Some(text)) = (sink, snapshot_text.as_deref()) {
-		if !first_line_exceeds && !window.lines.is_empty() {
-			let seen: Vec<u64> = (0..window.lines.len() as u64)
-				.map(|offset| display_start + offset)
-				.collect();
-			if let Some(header) = record_snapshot_text(sink, path, &ctx.cwd, text, &seen) {
-				if !raw {
+	if hash_lines {
+		if let (Some(sink), Some(text)) = (sink, snapshot_text.as_deref()) {
+			if !first_line_exceeds && !window.lines.is_empty() {
+				let seen: Vec<u64> = (0..window.lines.len() as u64)
+					.map(|offset| display_start + offset)
+					.collect();
+				if let Some(header) = record_snapshot_text(sink, path, &ctx.cwd, text, &seen) {
 					output = format!("{header}\n{output}");
 				}
 			}
@@ -1372,6 +1453,7 @@ async fn read_multi_range(
 	ranges: &[LineRange],
 	raw: bool,
 	sink: Option<&dyn ReadSnapshotSink>,
+	display_mode: FileDisplayMode,
 	ctx: &AgentContext,
 ) -> Result<ToolResult, String> {
 	let mut blocks: Vec<(LineRange, Vec<String>)> = Vec::new();
@@ -1460,7 +1542,9 @@ async fn read_multi_range(
 	let mut seen_lines: Vec<u64> = Vec::new();
 	let mut first_display: Option<u64> = None;
 	let mut previous_end: Option<u64> = None;
-	let line_separator = if sink.is_some() { ':' } else { '|' };
+	let hash_lines = display_mode.hash_lines;
+	let line_numbers = hash_lines || display_mode.line_numbers;
+	let line_separator = if hash_lines { ':' } else { '|' };
 
 	for (range, lines) in &blocks {
 		if lines.is_empty() {
@@ -1480,7 +1564,7 @@ async fn read_multi_range(
 				column_truncated |= was_truncated;
 				text
 			};
-			formatted.push(if raw {
+			formatted.push(if raw || !line_numbers {
 				text.clone()
 			} else {
 				format!("{number}{line_separator}{text}")
@@ -1504,10 +1588,10 @@ async fn read_multi_range(
 		output.push_str(&notices.join("\n"));
 	}
 
-	if let (Some(sink), Some(text)) = (sink, snapshot_text.as_deref()) {
-		if !seen_lines.is_empty() {
-			if let Some(header) = record_snapshot_text(sink, path, &ctx.cwd, text, &seen_lines) {
-				if !raw {
+	if hash_lines {
+		if let (Some(sink), Some(text)) = (sink, snapshot_text.as_deref()) {
+			if !seen_lines.is_empty() {
+				if let Some(header) = record_snapshot_text(sink, path, &ctx.cwd, text, &seen_lines) {
 					output = format!("{header}\n{output}");
 				}
 			}
@@ -1681,7 +1765,7 @@ fn truncate_line(line: &str, max_chars: usize) -> (String, bool) {
 
 /// LF-normalize and strip a UTF-8 BOM before handing text to the hashline
 /// store, whose tag hash expects canonical line endings.
-fn normalize_snapshot_text(bytes: &[u8]) -> String {
+pub(super) fn normalize_snapshot_text(bytes: &[u8]) -> String {
 	let text = String::from_utf8_lossy(bytes);
 	let borrowed: &str = &text;
 	let stripped = borrowed.strip_prefix('\u{feff}').unwrap_or(borrowed);
@@ -1815,7 +1899,7 @@ fn can_merge_brace_pair(head_line: &str, tail_line: &str) -> bool {
 /// `renderSummary`: kept lines numbered in the active display mode, elided
 /// spans as `…`, and kept-head/elided/kept-tail sandwiches collapsed to one
 /// `S-E` brace-pair row.
-fn render_summary(result: &SummaryResult, hash_lines: bool) -> RenderedSummary {
+fn render_summary(result: &SummaryResult, display_mode: FileDisplayMode) -> RenderedSummary {
 	let mut raw: Vec<SummaryUnit> = Vec::new();
 	for segment in &result.segments {
 		if segment.kind == "elided" {
@@ -1853,7 +1937,8 @@ fn render_summary(result: &SummaryResult, hash_lines: bool) -> RenderedSummary {
 		index += 1;
 	}
 
-	let separator = if hash_lines { ':' } else { '|' };
+	let hash_lines = display_mode.hash_lines;
+	let line_numbers = display_mode.line_numbers && !hash_lines;
 	let mut model_parts: Vec<String> = Vec::new();
 	let mut display_parts: Vec<String> = Vec::new();
 	let mut elided_ranges: Vec<(u32, u32)> = Vec::new();
@@ -1862,16 +1947,26 @@ fn render_summary(result: &SummaryResult, hash_lines: bool) -> RenderedSummary {
 	for unit in units {
 		match unit {
 			SummaryUnit::Line { line, text } => {
-				model_parts.push(if hash_lines {
+				let model = if hash_lines {
 					format!("{line}:{text}")
-				} else {
+				} else if line_numbers {
 					format!("{line}|{text}")
-				});
+				} else {
+					text.clone()
+				};
+				model_parts.push(model);
 				display_parts.push(text);
 				seen.push(u64::from(line));
 			},
 			SummaryUnit::Merged { start, end, merged } => {
-				model_parts.push(format!("{start}-{end}{separator}{merged}"));
+				let model = if hash_lines {
+					format!("{start}-{end}:{merged}")
+				} else if line_numbers {
+					format!("{start}-{end}|{merged}")
+				} else {
+					merged.clone()
+				};
+				model_parts.push(model);
 				display_parts.push(merged);
 				elided_ranges.push((start, end));
 				elided_lines += u64::from(end.saturating_sub(start).saturating_sub(1));
@@ -1930,18 +2025,21 @@ async fn read_summary_result(
 	file_size: u64,
 	summary: &SummaryResult,
 	sink: Option<&dyn ReadSnapshotSink>,
+	display_mode: FileDisplayMode,
 	suffix: Option<&(String, String)>,
 	ctx: &AgentContext,
 ) -> ToolResult {
-	let rendered = render_summary(summary, sink.is_some());
+	let rendered = render_summary(summary, display_mode);
 	let footer = summary_footer(&display_path(path, &ctx.cwd), &rendered.elided_ranges, rendered.elided_lines);
 	let mut text = rendered.text.clone();
 	if !footer.is_empty() {
 		text = format!("{text}\n\n{footer}");
 	}
-	if let Some(sink) = sink {
-		if let Some(header) = record_read_snapshot(sink, path, &ctx.cwd, file_size, &rendered.seen).await {
-			text = format!("{header}\n{text}");
+	if display_mode.hash_lines {
+		if let Some(sink) = sink {
+			if let Some(header) = record_read_snapshot(sink, path, &ctx.cwd, file_size, &rendered.seen).await {
+				text = format!("{header}\n{text}");
+			}
 		}
 	}
 
@@ -2334,5 +2432,159 @@ fn result_with_details(content: String, details: Value, is_error: bool) -> ToolR
 		is_error,
 		terminate: false,
 		details: Some(details),
+	}
+}
+
+#[cfg(test)]
+mod display_tests {
+	use std::{
+		fs,
+		path::{Path, PathBuf},
+		sync::{Arc, Mutex},
+		time::{SystemTime, UNIX_EPOCH},
+	};
+
+	use serde_json::json;
+
+	use super::*;
+	use crate::{state::ToolResult, tools::Tool as _};
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new(label: &str) -> Self {
+			let nanos = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.map(|duration| duration.as_nanos())
+				.unwrap_or_default();
+			let path = std::env::temp_dir().join(format!(
+				"omp-read-display-{label}-{}-{nanos}",
+				std::process::id()
+			));
+			fs::create_dir_all(&path).expect("create temp dir");
+			fs::write(path.join("f.txt"), "alpha\nbeta\n").expect("write fixture");
+			Self(path)
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	#[derive(Default)]
+	struct TestSink {
+		files: Mutex<Vec<(PathBuf, String)>>,
+	}
+
+	impl ReadSnapshotSink for TestSink {
+		fn record_file(&self, absolute_path: &Path, full_text: &str) -> Option<String> {
+			self
+				.files
+				.lock()
+				.expect("files")
+				.push((absolute_path.to_path_buf(), full_text.to_string()));
+			Some("0A1B".to_string())
+		}
+
+		fn record_seen_lines(&self, _absolute_path: &Path, _tag: &str, _lines: &[u32]) {}
+
+		fn header(&self, absolute_path: &Path, tag: &str, cwd: &Path) -> String {
+			format!("[{}#{tag}]", display_path(absolute_path, cwd))
+		}
+	}
+
+	async fn read_with(tool: &ReadTool, dir: &TempDir, selector: &str) -> ToolResult {
+		tool
+			.execute(&json!({ "path": selector }), &AgentContext::new(dir.0.clone()))
+			.await
+			.expect("read executes")
+	}
+
+	fn configured(mode: EditMode, has_edit_tool: bool, line_numbers: bool) -> (ReadTool, Arc<TestSink>) {
+		let sink = Arc::new(TestSink::default());
+		let tool = ReadTool::with_snapshot_sink(sink.clone())
+			.with_display_inputs(FileDisplayInputs::new(mode, has_edit_tool, line_numbers));
+		(tool, sink)
+	}
+
+	#[tokio::test]
+	async fn hashline_mode_emits_header_and_colon_numbers() {
+		let dir = TempDir::new("hash");
+		let (tool, sink) = configured(EditMode::Hashline, true, false);
+
+		let result = read_with(&tool, &dir, "f.txt").await;
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(result.content, "[f.txt#0A1B]\n1:alpha\n2:beta");
+		assert_eq!(sink.files.lock().expect("files").len(), 1);
+	}
+
+	#[tokio::test]
+	async fn raw_selector_suppresses_header_and_numbers() {
+		let dir = TempDir::new("raw");
+		let (tool, sink) = configured(EditMode::Hashline, true, true);
+
+		let result = read_with(&tool, &dir, "f.txt:raw").await;
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(result.content, "alpha\nbeta");
+		assert!(sink.files.lock().expect("files").is_empty());
+	}
+
+	#[tokio::test]
+	async fn read_line_numbers_numbers_without_hashline() {
+		let dir = TempDir::new("numbers");
+		let (tool, sink) = configured(EditMode::Sloppy, true, true);
+
+		let result = read_with(&tool, &dir, "f.txt").await;
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(result.content, "1|alpha\n2|beta");
+		assert!(sink.files.lock().expect("files").is_empty());
+	}
+
+	#[tokio::test]
+	async fn missing_edit_tool_keeps_plain_text() {
+		let dir = TempDir::new("noedit");
+		let (tool, _sink) = configured(EditMode::Hashline, false, false);
+
+		let result = read_with(&tool, &dir, "f.txt").await;
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(result.content, "alpha\nbeta");
+	}
+
+	#[tokio::test]
+	async fn line_numbers_still_apply_without_edit_tool() {
+		let dir = TempDir::new("noedit-numbers");
+		let (tool, _sink) = configured(EditMode::Hashline, false, true);
+
+		let result = read_with(&tool, &dir, "f.txt").await;
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(result.content, "1|alpha\n2|beta");
+	}
+
+	#[tokio::test]
+	async fn immutable_sources_never_fabricate_anchors() {
+		// Internal reads are not ported yet, so the immutable path ends in the
+		// honest unsupported error; what matters is that no hashline header or
+		// numbering is invented for a source no edit could ever target.
+		let dir = TempDir::new("immutable");
+		let (tool, sink) = configured(EditMode::Hashline, true, true);
+		for path in ["artifact://x", "agent://x", "memory://x"] {
+			let result = read_with(&tool, &dir, path).await;
+			assert!(result.is_error, "{}", result.content);
+			assert!(result.content.contains("Internal resource reads are not supported"), "{}", result.content);
+			assert!(!result.content.contains("0A1B"), "{}", result.content);
+		}
+		assert!(sink.files.lock().expect("files").is_empty());
+	}
+
+	#[test]
+	fn immutable_classifier_matches_only_anchorless_sources() {
+		for path in ["artifact://x", "agent://x", "memory://x", "memory://x:5"] {
+			assert!(is_immutable_source(path), "{path}");
+		}
+		for path in ["file:///tmp/x", "https://example.com/x", "src/f.txt", "C:/x"] {
+			assert!(!is_immutable_source(path), "{path}");
+		}
 	}
 }

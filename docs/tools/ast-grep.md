@@ -73,6 +73,7 @@ Pattern grammar and language support exposed to the model:
 - Multiple explicit paths/globs: wrapper unions them into one synthetic scope or runs per-target native calls when paths only meet at root.
 - Internal URL inputs: supported when the router resolves them to a backing file path. Readable external URLs are materialized to immutable temporary files.
 - Hashline output mode vs plain line-number mode: controlled by `resolveFileDisplayMode()`; hashline mode requires the edit tool and hashline edit mode, and per-file anchors additionally require a successful whole-file snapshot (`recordFileSnapshot()`) — over-cap or unreadable files fall back to plain output.
+- Rust wiring (`crates/pi-agent/src/tools/ast_grep.rs`): `AstGrepTool::with_snapshot_sink(sink).with_display_inputs(FileDisplayInputs)` feeds the shared resolver; matches render as `*LINE:TEXT` under a `[PATH#TAG]` header when hashline is selected, otherwise `*LINE|TEXT`. Grouped directory/multi-path runs use the shared `formatGroupedFiles` tree with `#TAG` header suffixes, and `details.displayContent` carries the `*LINE│TEXT` code-frame view. `AstGrepTool::new()` keeps the plain output for existing consumers.
 
 ## Side Effects
 - Filesystem

@@ -37,10 +37,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
 	Tool, ToolError,
-	ast_grep::{Candidate, collect_candidates, common_base, plan_targets_single},
+	ast_grep::{
+		Candidate, GroupedSection, code_frame_line, collect_candidates, common_base,
+		format_grouped_files, plan_targets_single,
+	},
 	format_path_relative_to_cwd,
 	hashline::{SnapshotStore, canonical_key, format_header},
 	pending::{PendingAction, PendingStore, REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH},
+	read::{FileDisplayInputs, normalize_snapshot_text},
 	tool_result, write_atomic,
 };
 use crate::state::{AgentContext, ToolResult};
@@ -64,10 +68,9 @@ fn preview_pending_notice() -> String {
 /// upstream `resolveFileDisplayMode(...).hashLines` branch of
 /// `packages/coding-agent/src/tools/ast-edit.ts`.
 ///
-/// The mode is an explicit constructor input: this port has no settings store
-/// for `edit.mode`, so the caller that builds the tool picks the mode (the
-/// builtin registry selects [`PreviewDisplay::Hashline`], matching upstream's
-/// default `hashline` edit mode).
+/// Kept as an explicit test/legacy input. New callers pass
+/// [`FileDisplayInputs`] through [`AstEditTool::with_display_inputs`] so the
+/// session's `edit.mode` decides the branch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PreviewDisplay {
 	/// `-LINE:COLUMN text` / `+LINE:COLUMN text`, no headers.
@@ -79,6 +82,12 @@ pub enum PreviewDisplay {
 	Hashline,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplaySelection {
+	Legacy(PreviewDisplay),
+	Resolved(FileDisplayInputs),
+}
+
 /// Builtin structural rewrite tool.
 ///
 /// `snapshots` is the session's hashline store (fresh tags after apply);
@@ -86,7 +95,7 @@ pub enum PreviewDisplay {
 pub struct AstEditTool {
 	snapshots: Arc<SnapshotStore>,
 	pending:   Arc<PendingStore>,
-	display:   PreviewDisplay,
+	display:   DisplaySelection,
 }
 
 impl AstEditTool {
@@ -95,13 +104,32 @@ impl AstEditTool {
 		Self::with_display(snapshots, pending, PreviewDisplay::Plain)
 	}
 
-	/// Preview in the given display mode.
+	/// Preview in the given legacy display mode.
 	pub fn with_display(
 		snapshots: Arc<SnapshotStore>,
 		pending: Arc<PendingStore>,
 		display: PreviewDisplay,
 	) -> Self {
-		Self { snapshots, pending, display }
+		Self { snapshots, pending, display: DisplaySelection::Legacy(display) }
+	}
+
+	/// Preview using the session's resolved display inputs. The preview is a
+	/// mutable, non-raw view, so only `edit.mode` / `hasEditTool` /
+	/// `readLineNumbers` vary.
+	pub fn with_display_inputs(
+		snapshots: Arc<SnapshotStore>,
+		pending: Arc<PendingStore>,
+		display: FileDisplayInputs,
+	) -> Self {
+		Self { snapshots, pending, display: DisplaySelection::Resolved(display) }
+	}
+
+	fn hash_lines(&self) -> bool {
+		match self.display {
+			DisplaySelection::Legacy(PreviewDisplay::Hashline) => true,
+			DisplaySelection::Legacy(PreviewDisplay::Plain) => false,
+			DisplaySelection::Resolved(inputs) => inputs.resolve(false, false).hash_lines,
+		}
 	}
 }
 
@@ -242,7 +270,7 @@ impl Tool for AstEditTool {
 		// Hashline previews record the pre-edit bytes so the tag the model sees
 		// is the one a follow-up `edit` validates against (upstream records the
 		// live file the same way before rendering).
-		let tags: BTreeMap<String, String> = if self.display == PreviewDisplay::Hashline {
+		let tags: BTreeMap<String, String> = if self.hash_lines() {
 			computed
 				.prepared
 				.iter()
@@ -292,7 +320,7 @@ impl Tool for AstEditTool {
 			parse_errors: parse_errors.clone(),
 			parse_errors_total,
 			scope_path,
-			display: self.display,
+			hash_lines: self.hash_lines(),
 			snapshots: Arc::clone(&self.snapshots),
 			attempts: Mutex::new(AttemptWrites::default()),
 		}));
@@ -697,16 +725,27 @@ fn render_preview(
 			.iter()
 			.map(|(path, count)| (path.as_str(), *count))
 			.collect();
-		let tree = build_path_tree(computed.file_changes.iter().map(|(path, _)| path.as_str()));
-		let mut writer = GroupedWriter {
-			computed,
-			tags,
-			counts,
-			render: &mut render,
-			emitted: false,
-		};
-		walk_path_tree(&tree, 0, &mut writer);
-		return render;
+		let files: Vec<String> = computed
+			.file_changes
+			.iter()
+			.map(|(path, _)| path.clone())
+			.collect();
+		let rendered = format_grouped_files(&files, |path| {
+			let tag = tags.get(path).map(String::as_str);
+			let file = render_file_changes(computed, path, tag);
+			let count = counts.get(path).copied().unwrap_or(0);
+			GroupedSection {
+				header_suffix: format!(
+					"{} ({count} replacement{})",
+					tag.map(|tag| format!("#{tag}")).unwrap_or_default(),
+					plural(count as usize)
+				),
+				skip:          file.model.is_empty(),
+				model:         file.model,
+				display:       file.display,
+			}
+		});
+		return PreviewRender { model: rendered.model, display: rendered.display };
 	}
 	if let Some((path, _)) = computed.file_changes.first() {
 		let tag = tags.get(path).map(String::as_str);
@@ -771,132 +810,6 @@ fn render_file_changes(computed: &ComputedEdits, path: &str, tag: Option<&str>) 
 	render
 }
 
-/// `-LINE│text` / `+LINE│text` with the gutter padded to the widest line
-/// number (`formatCodeFrameLine` in `render-utils.ts`).
-fn code_frame_line(marker: char, line: usize, content: &str, line_number_width: usize) -> String {
-	let gutter = format!("{marker}{line}");
-	let padded = pad_start(&gutter, line_number_width + 1);
-	format!("{padded}│{content}")
-}
-
-fn pad_start(text: &str, width: usize) -> String {
-	let length = text.chars().count();
-	if length >= width {
-		text.to_string()
-	} else {
-		format!("{}{text}", " ".repeat(width - length))
-	}
-}
-
-/// Port of `buildPathTree` in `packages/utils/src/path-tree.ts`: first-seen
-/// child order, file names deduped per node, URL-like entries kept whole.
-#[derive(Default)]
-struct PathTreeNode {
-	files:   Vec<(String, String)>,
-	subdirs: Vec<(String, PathTreeNode)>,
-}
-
-fn build_path_tree<'a>(paths: impl IntoIterator<Item = &'a str>) -> PathTreeNode {
-	let mut root = PathTreeNode::default();
-	for raw in paths {
-		let normalized = raw.replace('\\', "/");
-		if is_url_like_path(&normalized) {
-			add_tree_file(&mut root, &normalized, raw);
-			continue;
-		}
-		let trimmed = normalized.trim_end_matches('/');
-		if trimmed.is_empty() {
-			continue;
-		}
-		let segments: Vec<&str> = trimmed.split('/').collect();
-		let mut node = &mut root;
-		for segment in &segments[..segments.len() - 1] {
-			let index = match node.subdirs.iter().position(|(name, _)| name == segment) {
-				Some(index) => index,
-				None => {
-					node.subdirs.push(((*segment).to_string(), PathTreeNode::default()));
-					node.subdirs.len() - 1
-				},
-			};
-			node = &mut node.subdirs[index].1;
-		}
-		add_tree_file(node, segments[segments.len() - 1], raw);
-	}
-	root
-}
-
-fn add_tree_file(node: &mut PathTreeNode, name: &str, path: &str) {
-	if node.files.iter().any(|(existing, _)| existing == name) {
-		return;
-	}
-	node.files.push((name.to_string(), path.to_string()));
-}
-
-fn is_url_like_path(path: &str) -> bool {
-	let Some((scheme, _)) = path.split_once("://") else {
-		return false;
-	};
-	let mut chars = scheme.chars();
-	matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
-		&& chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
-}
-
-struct GroupedWriter<'a> {
-	computed: &'a ComputedEdits,
-	tags:     &'a BTreeMap<String, String>,
-	counts:   BTreeMap<&'a str, u32>,
-	render:   &'a mut PreviewRender,
-	emitted:  bool,
-}
-
-fn push_separator(render: &mut PreviewRender, emitted: &mut bool) {
-	if *emitted {
-		render.model.push(String::new());
-		render.display.push(String::new());
-	}
-	*emitted = true;
-}
-
-fn walk_path_tree(node: &PathTreeNode, depth: usize, writer: &mut GroupedWriter) {
-	for (file_name, path) in &node.files {
-		let tag = writer.tags.get(path).map(String::as_str);
-		let file = render_file_changes(writer.computed, path, tag);
-		if file.model.is_empty() {
-			continue;
-		}
-		if depth == 0 {
-			push_separator(writer.render, &mut writer.emitted);
-		} else {
-			writer.emitted = true;
-		}
-		let count = writer.counts.get(path.as_str()).copied().unwrap_or(0);
-		let tag_suffix = tag.map(|tag| format!("#{tag}")).unwrap_or_default();
-		let header = format!(
-			"{} {file_name}{tag_suffix} ({count} replacement{})",
-			"#".repeat(depth + 1),
-			plural(count as usize)
-		);
-		writer.render.model.push(header.clone());
-		writer.render.model.extend(file.model);
-		writer.render.display.push(header);
-		writer.render.display.extend(file.display);
-	}
-	for (dir_name, subdir) in &node.subdirs {
-		let mut dir_node = subdir;
-		let mut parts = vec![dir_name.clone()];
-		while dir_node.files.is_empty() && dir_node.subdirs.len() == 1 {
-			let only = &dir_node.subdirs[0];
-			parts.push(only.0.clone());
-			dir_node = &only.1;
-		}
-		push_separator(writer.render, &mut writer.emitted);
-		let header = format!("{} {}/", "#".repeat(depth + 1), parts.join("/"));
-		writer.render.model.push(header.clone());
-		writer.render.display.push(header);
-		walk_path_tree(dir_node, depth + 1, writer);
-	}
-}
-
 fn first_line(text: &str) -> String {
 	text.split('\n').next().unwrap_or("").chars().take(DIFF_LINE_CHARS).collect()
 }
@@ -954,7 +867,7 @@ struct AstEditPending {
 	parse_errors:       Vec<String>,
 	parse_errors_total: usize,
 	scope_path:         String,
-	display:            PreviewDisplay,
+	hash_lines:         bool,
 	snapshots:          Arc<SnapshotStore>,
 	attempts:           Mutex<AttemptWrites>,
 }
@@ -1114,7 +1027,7 @@ impl PendingAction for AstEditPending {
 					// matching upstream's `useHashLines` gate.
 					let text = normalize_snapshot_text(output);
 					let tag = self.snapshots.record(&key, &text, None);
-					if self.display == PreviewDisplay::Hashline {
+					if self.hash_lines {
 						fresh_tags.extend(tag.map(|tag| format_header(&file.display, &tag)));
 					}
 				},
@@ -1236,13 +1149,6 @@ impl AstEditPending {
 	}
 }
 
-fn normalize_snapshot_text(bytes: &[u8]) -> String {
-	let text = String::from_utf8_lossy(bytes);
-	let borrowed: &str = &text;
-	let stripped = borrowed.strip_prefix('\u{feff}').unwrap_or(borrowed);
-	stripped.replace("\r\n", "\n").replace('\r', "\n")
-}
-
 #[cfg(test)]
 mod tests {
 	use std::{
@@ -1353,6 +1259,37 @@ mod tests {
 			.expect("edit executes");
 		assert!(!applied.is_error, "{}", applied.content);
 		assert_eq!(fs::read_to_string(&file).expect("read"), "const a = baz(1);\n");
+	}
+
+	#[tokio::test]
+	async fn resolved_display_inputs_pick_the_preview_branch() {
+		use crate::tools::edit_variants::mode::EditMode;
+
+		let dir = TempDir::new("resolved-display");
+		let file = dir.0.join("a.ts");
+		fs::write(&file, "const a = foo(1);\n").expect("write");
+		let ctx = AgentContext::new(dir.0.clone());
+
+		let snapshots = Arc::new(SnapshotStore::new());
+		let plain = AstEditTool::with_display_inputs(
+			Arc::clone(&snapshots),
+			Arc::new(PendingStore::new()),
+			FileDisplayInputs::new(EditMode::Sloppy, true, true),
+		);
+		let result = plain.execute(&args(&["a.ts"]), &ctx).await.expect("execute");
+		assert!(!result.is_error, "{}", result.content);
+		assert!(result.content.contains("-1:11 foo(1)"), "{}", result.content);
+		assert!(!result.content.contains("[a.ts#"), "{}", result.content);
+
+		let hashline = AstEditTool::with_display_inputs(
+			Arc::clone(&snapshots),
+			Arc::new(PendingStore::new()),
+			FileDisplayInputs::new(EditMode::Hashline, true, false),
+		);
+		let result = hashline.execute(&args(&["a.ts"]), &ctx).await.expect("execute");
+		assert!(!result.is_error, "{}", result.content);
+		assert!(result.content.contains("[a.ts#"), "{}", result.content);
+		assert!(!result.content.contains("-1:11 "), "{}", result.content);
 	}
 
 	#[tokio::test]

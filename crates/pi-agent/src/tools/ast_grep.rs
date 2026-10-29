@@ -13,6 +13,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
 	path::{Path, PathBuf},
+	sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -29,8 +30,9 @@ use serde_json::{Value, json};
 use super::{
 	ParsedFindPattern, Tool, ToolError, extract_raw_paths, fix_unclosed_braces,
 	format_path_relative_to_cwd, has_glob_path_chars, is_root_path, normalize_path,
-	normalize_path_like_input, parse_find_pattern, resolve_to_cwd, split_top_level_delimited,
-	tool_result,
+	normalize_path_like_input, parse_find_pattern,
+	read::{FileDisplayInputs, ReadSnapshotSink, normalize_snapshot_text},
+	resolve_to_cwd, split_top_level_delimited, tool_result,
 };
 use crate::state::{AgentContext, ToolResult};
 
@@ -40,7 +42,47 @@ const DEFAULT_AST_LIMIT: usize = 50;
 const MAX_PARSE_ERRORS: usize = 20;
 
 /// Builtin structural search tool.
-pub struct AstGrepTool;
+///
+/// `sink` is the session hashline store seam, used only when the resolved
+/// display mode selects hashline; `display` carries the session inputs
+/// (`edit.mode`, whether `edit` is mounted, `readLineNumbers`). No inputs keeps
+/// the historical plain `*LINE|text` output.
+pub struct AstGrepTool {
+	sink:    Option<Arc<dyn ReadSnapshotSink>>,
+	display: Option<FileDisplayInputs>,
+}
+
+impl Default for AstGrepTool {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl AstGrepTool {
+	pub fn new() -> Self {
+		Self { sink: None, display: None }
+	}
+
+	/// Search with hashline tags available when the display mode selects them.
+	pub fn with_snapshot_sink(sink: Arc<dyn ReadSnapshotSink>) -> Self {
+		Self { sink: Some(sink), display: None }
+	}
+
+	/// Opt into resolver-driven display; without it the tool stays plain.
+	pub fn with_display_inputs(mut self, display: FileDisplayInputs) -> Self {
+		self.display = Some(display);
+		self
+	}
+
+	/// Matches are always mutable and never `:raw`, so only the session inputs
+	/// vary. Without explicit inputs the historical plain output is kept.
+	fn hash_lines(&self) -> bool {
+		match self.display {
+			Some(inputs) => inputs.resolve(false, false).hash_lines,
+			None => false,
+		}
+	}
+}
 
 #[async_trait]
 impl Tool for AstGrepTool {
@@ -74,7 +116,7 @@ impl Tool for AstGrepTool {
 	}
 
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
-		run_ast_grep(args, ctx)
+		run_ast_grep(self, args, ctx)
 	}
 }
 
@@ -130,7 +172,7 @@ impl PartialEq for RetainedMatch {
 	}
 }
 
-fn run_ast_grep(args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+fn run_ast_grep(tool: &AstGrepTool, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
 	if ctx.cancellation_token.is_cancelled() {
 		return Ok(tool_result("AST grep cancelled", true));
 	}
@@ -298,31 +340,86 @@ fn run_ast_grep(args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolErro
 	}
 
 	let grouped = targets.len() > 1 || targets.iter().any(|target| !target.is_file);
+
+	// Hashline is per resolved display mode; a file that cannot be snapshotted
+	// (over cap, unreadable, vanished) falls back to plain `|` lines.
+	let absolute_by_display: BTreeMap<&str, &Path> = candidates
+		.iter()
+		.map(|candidate| (candidate.display.as_str(), candidate.absolute.as_path()))
+		.collect();
+	let sink = tool.sink.as_deref();
+	let mut tags: BTreeMap<String, String> = BTreeMap::new();
+	if tool.hash_lines() {
+		if let Some(sink) = sink {
+			for path in matches_by_file.keys() {
+				let Some(absolute) = absolute_by_display.get(path.as_str()) else {
+					continue;
+				};
+				let Ok(bytes) = std::fs::read(absolute) else {
+					continue;
+				};
+				let text = normalize_snapshot_text(&bytes);
+				if let Some(tag) = sink.record_file(absolute, &text) {
+					tags.insert(path.clone(), tag);
+				}
+			}
+		}
+	}
+
 	let mut output: Vec<String> = Vec::new();
-	for (index, (path, matches)) in matches_by_file.iter().enumerate() {
-		if grouped {
-			if index > 0 {
+	let mut display: Vec<String> = Vec::new();
+	let render_file = |path: &str| -> RenderedMatches {
+		let matches = matches_by_file.get(path).map(Vec::as_slice).unwrap_or(&[]);
+		let hash_tag = tags.get(path).map(String::as_str);
+		let rendered = render_matches(matches, hash_tag);
+		if let (Some(sink), Some(tag), Some(absolute)) = (
+			sink,
+			hash_tag,
+			absolute_by_display.get(path).copied(),
+		) {
+			if !rendered.seen.is_empty() {
+				sink.record_seen_lines(absolute, tag, &rendered.seen);
+			}
+		}
+		rendered
+	};
+
+	if grouped {
+		let files: Vec<String> = matches_by_file.keys().cloned().collect();
+		let rendered = format_grouped_files(&files, |path| {
+			let file = render_file(path);
+			GroupedSection {
+				header_suffix: tags.get(path).map(|tag| format!("#{tag}")).unwrap_or_default(),
+				skip:          file.model.is_empty(),
+				model:         file.model,
+				display:       file.display,
+			}
+		});
+		output = rendered.model;
+		display = rendered.display;
+	} else {
+		for path in matches_by_file.keys() {
+			let file = render_file(path);
+			if file.model.is_empty() {
+				continue;
+			}
+			if !output.is_empty() {
 				output.push(String::new());
+				display.push(String::new());
 			}
-			output.push(format!("# {path}"));
+			if let (Some(sink), Some(tag), Some(absolute)) = (
+				sink,
+				tags.get(path),
+				absolute_by_display.get(path.as_str()).copied(),
+			) {
+				output.push(sink.header(absolute, tag, &ctx.cwd));
+			}
+			output.extend(file.model);
+			display.extend(file.display);
 		}
-		for matched in matches {
-			let lines: Vec<&str> = matched.text.split('\n').collect();
-			for (offset, line) in lines.iter().enumerate() {
-				let line_number = matched.key.start_line + offset;
-				let marker = if offset == 0 { '*' } else { ' ' };
-				output.push(format!("{marker}{line_number}|{line}"));
-			}
-			if !matched.meta.is_empty() {
-				let serialized = matched
-					.meta
-					.iter()
-					.map(|(key, value)| format!("{key}={value}"))
-					.collect::<Vec<_>>()
-					.join(", ");
-				output.push(format!("  meta: {serialized}"));
-			}
-		}
+	}
+	if let Value::Object(map) = &mut details {
+		map.insert("displayContent".to_string(), json!(display.join("\n")));
 	}
 
 	if limit_reached {
@@ -348,6 +445,219 @@ fn run_ast_grep(args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolErro
 	}
 
 	Ok(ast_grep_result(output.join("\n"), details, false))
+}
+
+/// One file's match lines: the model text plus the TUI code-frame view.
+struct RenderedMatches {
+	model: Vec<String>,
+	display: Vec<String>,
+	seen: Vec<u32>,
+}
+
+/// Port of `match-line-format.ts` + the ast-grep renderer: under a hashline
+/// tag lines use `*LINE:text`; otherwise the display-only `*LINE|text`.
+/// Continuation lines keep a space marker so line numbers align. Frames are
+/// mode independent.
+fn render_matches(matches: &[&RetainedMatch], hash_tag: Option<&str>) -> RenderedMatches {
+	let line_number_width = matches
+		.iter()
+		.map(|matched| {
+			let count = matched.text.split('\n').count();
+			let end_line = matched.key.start_line + count - 1;
+			matched.key.start_line.to_string().len().max(end_line.to_string().len())
+		})
+		.max()
+		.unwrap_or(0);
+	let hash = hash_tag.is_some();
+	let mut rendered = RenderedMatches { model: Vec::new(), display: Vec::new(), seen: Vec::new() };
+	for matched in matches {
+		for (offset, line) in matched.text.split('\n').enumerate() {
+			let line_number = matched.key.start_line + offset;
+			let is_match = offset == 0;
+			let marker = if is_match { '*' } else { ' ' };
+			let separator = if hash { ':' } else { '|' };
+			rendered.model.push(format!("{marker}{line_number}{separator}{line}"));
+			rendered.display.push(code_frame_line(
+				marker,
+				line_number,
+				line,
+				line_number_width,
+			));
+			if let Ok(number) = u32::try_from(line_number) {
+				rendered.seen.push(number);
+			}
+		}
+		if !matched.meta.is_empty() {
+			let serialized = matched
+				.meta
+				.iter()
+				.map(|(key, value)| format!("{key}={value}"))
+				.collect::<Vec<_>>()
+				.join(", ");
+			rendered.model.push(format!("  meta: {serialized}"));
+			rendered.display.push(format!("  meta: {serialized}"));
+		}
+	}
+	rendered
+}
+
+/// `-LINE│text` / `*LINE│text` with the gutter padded to the widest line
+/// number (`formatCodeFrameLine` in `render-utils.ts`).
+pub(super) fn code_frame_line(marker: char, line: usize, content: &str, line_number_width: usize) -> String {
+	let gutter = format!("{marker}{line}");
+	let padded = pad_start(&gutter, line_number_width + 1);
+	format!("{padded}│{content}")
+}
+
+pub(super) fn pad_start(text: &str, width: usize) -> String {
+	let length = text.chars().count();
+	if length >= width {
+		text.to_string()
+	} else {
+		format!("{}{text}", " ".repeat(width - length))
+	}
+}
+
+/// One file's contribution to [`format_grouped_files`].
+pub(super) struct GroupedSection {
+	/// Extra text appended to the `## name` header, e.g. `#TAG` or
+	/// ` (1 replacement)`.
+	pub header_suffix: String,
+	pub model:         Vec<String>,
+	pub display:       Vec<String>,
+	/// When true the file and its header are omitted entirely.
+	pub skip:          bool,
+}
+
+pub(super) struct GroupedOutput {
+	pub model:   Vec<String>,
+	pub display: Vec<String>,
+}
+
+/// Port of `formatGroupedFiles` in `grouped-file-output.ts`: one `#` per
+/// nesting level, single-child directory chains folded into one header, a
+/// blank line before every directory header and root-level file.
+pub(super) fn format_grouped_files<F>(files: &[String], mut render: F) -> GroupedOutput
+where
+	F: FnMut(&str) -> GroupedSection,
+{
+	let mut sections: BTreeMap<String, GroupedSection> = BTreeMap::new();
+	let mut included: Vec<&str> = Vec::new();
+	for path in files {
+		if sections.contains_key(path) {
+			continue;
+		}
+		let section = render(path);
+		if section.skip {
+			continue;
+		}
+		included.push(path.as_str());
+		sections.insert(path.clone(), section);
+	}
+	let tree = build_path_tree(included);
+	let mut output = GroupedOutput { model: Vec::new(), display: Vec::new() };
+	let mut emitted = false;
+	walk_path_tree(&tree, 0, &mut emitted, &sections, &mut output);
+	output
+}
+
+/// Port of `buildPathTree` in `packages/utils/src/path-tree.ts`: first-seen
+/// child order, file names deduped per node, URL-like entries kept whole.
+#[derive(Default)]
+struct PathTreeNode {
+	files:   Vec<(String, String)>,
+	subdirs: Vec<(String, PathTreeNode)>,
+}
+
+fn build_path_tree<'a>(paths: impl IntoIterator<Item = &'a str>) -> PathTreeNode {
+	let mut root = PathTreeNode::default();
+	for raw in paths {
+		let normalized = raw.replace('\\', "/");
+		if is_url_like_path(&normalized) {
+			add_tree_file(&mut root, &normalized, raw);
+			continue;
+		}
+		let trimmed = normalized.trim_end_matches('/');
+		if trimmed.is_empty() {
+			continue;
+		}
+		let segments: Vec<&str> = trimmed.split('/').collect();
+		let mut node = &mut root;
+		for segment in &segments[..segments.len() - 1] {
+			let index = match node.subdirs.iter().position(|(name, _)| name == segment) {
+				Some(index) => index,
+				None => {
+					node.subdirs.push(((*segment).to_string(), PathTreeNode::default()));
+					node.subdirs.len() - 1
+				},
+			};
+			node = &mut node.subdirs[index].1;
+		}
+		add_tree_file(node, segments[segments.len() - 1], raw);
+	}
+	root
+}
+
+fn add_tree_file(node: &mut PathTreeNode, name: &str, path: &str) {
+	if node.files.iter().any(|(existing, _)| existing == name) {
+		return;
+	}
+	node.files.push((name.to_string(), path.to_string()));
+}
+
+fn is_url_like_path(path: &str) -> bool {
+	let Some((scheme, _)) = path.split_once("://") else {
+		return false;
+	};
+	let mut chars = scheme.chars();
+	matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
+		&& chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn walk_path_tree(
+	node: &PathTreeNode,
+	depth: usize,
+	emitted: &mut bool,
+	sections: &BTreeMap<String, GroupedSection>,
+	output: &mut GroupedOutput,
+) {
+	for (file_name, path) in &node.files {
+		let Some(section) = sections.get(path) else {
+			continue;
+		};
+		if *emitted && depth == 0 {
+			output.model.push(String::new());
+			output.display.push(String::new());
+		}
+		*emitted = true;
+		let header = format!("{} {file_name}{}", "#".repeat(depth + 1), section.header_suffix);
+		output.model.push(header.clone());
+		output.model.extend(section.model.iter().cloned());
+		output.display.push(header);
+		if section.display.is_empty() {
+			output.display.extend(section.model.iter().cloned());
+		} else {
+			output.display.extend(section.display.iter().cloned());
+		}
+	}
+	for (dir_name, subdir) in &node.subdirs {
+		let mut dir_node = subdir;
+		let mut parts = vec![dir_name.clone()];
+		while dir_node.files.is_empty() && dir_node.subdirs.len() == 1 {
+			let only = &dir_node.subdirs[0];
+			parts.push(only.0.clone());
+			dir_node = &only.1;
+		}
+		if *emitted {
+			output.model.push(String::new());
+			output.display.push(String::new());
+		}
+		*emitted = true;
+		let header = format!("{} {}/", "#".repeat(depth + 1), parts.join("/"));
+		output.model.push(header.clone());
+		output.display.push(header);
+		walk_path_tree(dir_node, depth + 1, emitted, sections, output);
+	}
 }
 
 /// `compile_search_patterns` adds Rust's contextual fallback on top of the
@@ -843,7 +1153,7 @@ mod tests {
 		fs::write(dir.join("two.rs"), calls(30, 30)).expect("write two");
 		fs::write(dir.join("broken.rs"), "fn main( {\n}\n").expect("write broken");
 
-		let tool = AstGrepTool;
+		let tool = AstGrepTool::new();
 		let ctx = AgentContext::new(dir.clone());
 
 		let paged = tool
@@ -887,7 +1197,7 @@ mod tests {
 		fs::write(dir.join("src/nested/b.rs"), calls(1, 10)).expect("write b");
 		fs::write(dir.join("top.rs"), calls(1, 20)).expect("write top");
 
-		let tool = AstGrepTool;
+		let tool = AstGrepTool::new();
 		let ctx = AgentContext::new(dir.clone());
 
 		let result = tool
@@ -915,7 +1225,7 @@ mod tests {
 		fs::write(dir.join("root.rs"), calls(1, 0)).expect("write root");
 		fs::write(dir.join("nested/inner.rs"), calls(1, 10)).expect("write inner");
 
-		let tool = AstGrepTool;
+		let tool = AstGrepTool::new();
 		let ctx = AgentContext::new(dir.clone());
 
 		let single = tool
@@ -944,7 +1254,7 @@ mod tests {
 		let dir = temp_dir("root-guard");
 		fs::write(dir.join("root.rs"), calls(1, 0)).expect("write root");
 
-		let tool = AstGrepTool;
+		let tool = AstGrepTool::new();
 		let ctx = AgentContext::new(dir.clone());
 
 		// An absolute glob with an empty literal prefix has base `/`, exactly
@@ -966,7 +1276,7 @@ mod tests {
 		fs::write(&spaced, calls(1, 0)).expect("write spaced");
 		fs::write(dir.join("one.rs"), calls(2, 10)).expect("write one");
 
-		let tool = AstGrepTool;
+		let tool = AstGrepTool::new();
 		let ctx = AgentContext::new(dir.clone());
 
 		let encoded_path = spaced.to_string_lossy().replace(' ', "%20");
@@ -1013,7 +1323,7 @@ mod tests {
 		let dir = temp_dir("schemes");
 		fs::write(dir.join("one.rs"), calls(1, 0)).expect("write one");
 
-		let tool = AstGrepTool;
+		let tool = AstGrepTool::new();
 		let ctx = AgentContext::new(dir.clone());
 
 		for path in [
@@ -1055,7 +1365,7 @@ mod tests {
 		// call, so a correct single-parse scan reports both.
 		fs::write(dir.join("half.rs"), "fn main() {\n    foo(a1);\n").expect("write half");
 
-		let tool = AstGrepTool;
+		let tool = AstGrepTool::new();
 		let ctx = AgentContext::new(dir.clone());
 
 		let result = tool
@@ -1074,5 +1384,67 @@ mod tests {
 			result.content
 		);
 		assert!(result.content.contains("meta: A=a1"), "{}", result.content);
+	}
+
+	#[derive(Default)]
+	struct TestSink {
+		files: std::sync::Mutex<Vec<(PathBuf, String)>>,
+	}
+
+	impl ReadSnapshotSink for TestSink {
+		fn record_file(&self, absolute_path: &Path, full_text: &str) -> Option<String> {
+			self
+				.files
+				.lock()
+				.expect("files")
+				.push((absolute_path.to_path_buf(), full_text.to_string()));
+			Some("0A1B".to_string())
+		}
+
+		fn record_seen_lines(&self, _absolute_path: &Path, _tag: &str, _lines: &[u32]) {}
+
+		fn header(&self, absolute_path: &Path, tag: &str, cwd: &Path) -> String {
+			let relative = absolute_path.strip_prefix(cwd).unwrap_or(absolute_path);
+			format!("[{}#{tag}]", relative.to_string_lossy().replace('\\', "/"))
+		}
+	}
+
+	#[tokio::test]
+	async fn hashline_display_tags_files_and_uses_colon_lines() {
+		use crate::tools::edit_variants::mode::EditMode;
+
+		let dir = temp_dir("hashline-display");
+		fs::write(dir.join("one.rs"), calls(1, 0)).expect("write one");
+		let sink = Arc::new(TestSink::default());
+		let tool = AstGrepTool::with_snapshot_sink(sink.clone())
+			.with_display_inputs(FileDisplayInputs::new(EditMode::Hashline, true, false));
+		let ctx = AgentContext::new(dir.clone());
+
+		let result = tool
+			.execute(&json!({ "pat": "foo($A)", "path": "one.rs" }), &ctx)
+			.await
+			.expect("ast_grep executes");
+		assert!(!result.is_error, "{}", result.content);
+		assert!(result.content.starts_with("[one.rs#0A1B]\n"), "{}", result.content);
+		assert!(result.content.contains("*2:    foo(a0);"), "{}", result.content);
+		assert!(!result.content.contains("*2|"), "{}", result.content);
+		assert_eq!(sink.files.lock().expect("files").len(), 1);
+		let details = result.details.as_ref().expect("details");
+		assert!(
+			details["displayContent"]
+				.as_str()
+				.is_some_and(|display| display.contains("*2│    foo(a0);")),
+			"{}",
+			result.content
+		);
+
+		// No display inputs keeps the historical plain separator.
+		let plain = AstGrepTool::new();
+		let result = plain
+			.execute(&json!({ "pat": "foo($A)", "path": "one.rs" }), &ctx)
+			.await
+			.expect("ast_grep executes");
+		assert!(result.content.contains("*2|    foo(a0);"), "{}", result.content);
+		assert!(!result.content.contains("[one.rs#"), "{}", result.content);
 	}
 }

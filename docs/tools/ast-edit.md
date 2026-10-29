@@ -37,7 +37,7 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
 ## Outputs
 - Single-shot preview result from `ast_edit` itself. A non-empty proposal begins with `Staged as a proposal — files NOT modified yet...` and names the resolve/reject device paths.
 - Model-facing `content` is one text block showing proposed edits, grouped by file for directory/multi-file runs.
-  - Rendering follows the explicit `PreviewDisplay` input (`AstEditTool::with_display`):
+  - Rendering follows the resolved display mode: `AstEditTool::with_display_inputs(FileDisplayInputs)` runs `resolve_file_display_mode` (preview is mutable and non-raw) and selects hashline from `edit.mode` + `hasEditTool`. The legacy explicit `PreviewDisplay` input (`AstEditTool::with_display`, default `Plain` from `new`) is kept for existing consumers and tests:
     - `Plain`: `-LINE:COLUMN before` / `+LINE:COLUMN after`, no tag headers (grouped runs still get the folded `# dir/` / `## file (N replacement)` headers).
     - `Hashline`: a `[PATH#TAG]` header above a single-file preview, `-LINE:before` / `+LINE:after` changes (no column), and grouped headers with the tag appended (`# dir/`, `## file#TAG (N replacement)`).
     - Grouped output is the upstream `formatGroupedFiles` tree: one `#` per nesting level, single-child directory chains folded into one header, files listed under their deepest directory header, and blank lines before directory headers and root-level files.
@@ -70,7 +70,7 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
    - infers a language per candidate and compiles each rule for every discovered language, reporting per-language parse issues,
    - parses each file once, skips error trees, collects `replace_by(...)` edits, deduplicates byte-identical edits, and enforces the `maxFiles` cap,
    - stores the **exact original bytes** of every affected file plus the prepared rewritten bytes; no content hash stands in for the bytes,
-   - renders the preview in the tool's `PreviewDisplay` mode (plain `-LINE:COLUMN` pairs or hashline `[PATH#TAG]`/tag-header output), builds grouped runs as the folded `formatGroupedFiles` tree, emits code frames as `details.displayContent`, and exposes captures in `details.changes`.
+   - resolves the preview branch once per call (`hash_lines = resolve_file_display_mode(...).hash_lines`, or the legacy `PreviewDisplay` input), renders plain `-LINE:COLUMN` pairs or hashline `[PATH#TAG]`/tag-header output, builds grouped runs as the shared folded `formatGroupedFiles` tree, emits code frames as `details.displayContent`, and exposes captures in `details.changes`.
 7. Parse errors are deduplicated and capped at 20; `details.parseErrors` carries the capped list and `parseErrorsTotal` the pre-cap count.
 8. A non-zero preview registers `AstEditPending` in the session `PendingStore`. Zero replacements register nothing. Apply/discard is a plain `write` to `xd://resolve` / `xd://reject`.
 9. Apply first re-reads **all** affected files and compares bytes to the preview's originals. Any changed or unreadable file is stale: zero files are written and the action is requeued. A same-count content change fails this gate; counts alone never validate a preview.
@@ -85,7 +85,7 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
 - Internal URL inputs: only supported when the router resolves them to a backing file path.
 - Preview mode: always the direct `ast_edit` tool result.
 - Apply mode: only reachable through the queued resolve callback (a `write` to `xd://resolve` or `xd://reject`) after a preview.
-- Preview display mode: explicit `PreviewDisplay` constructor input. `Plain` renders `LINE:COLUMN`; `Hashline` renders `[PATH#TAG]` / tagged grouped headers and records the shown tags from pre-edit bytes. `builtin_tools()` selects `Hashline` (upstream's default `edit.mode` is `hashline`; `read` in this registry always shows hashline headers), while standalone `AstEditTool::new` keeps `Plain`. No runtime `edit.mode`/model-variant settings resolver exists in this port yet, so the mode is fixed at construction.
+- Preview display mode: `AstEditTool::with_display_inputs(FileDisplayInputs)` resolves hashline per call through `resolve_file_display_mode`; hashline renders `[PATH#TAG]` / tagged grouped headers and records the shown tags from pre-edit bytes, plain renders `LINE:COLUMN`. The legacy explicit `PreviewDisplay` input still exists for tests and consumers that construct the tool directly (`AstEditTool::new` keeps `Plain`). The registry owner passes the same session inputs it gives `read` and `ast_grep`.
 
 ## Side Effects
 - Filesystem

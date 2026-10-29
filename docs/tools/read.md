@@ -117,6 +117,7 @@ Literal filesystem paths take precedence over selector interpretation, so an exi
     - raw mode suppresses both
 - Prefix format in hashline mode is a `[PATH#TAG]` header followed by `LINE:TEXT`, e.g. `[src/foo.ts#0A1B]` and `41:def alpha():`, from the session snapshot store plus `formatNumberedLine()` / `formatHashlineHeader()`.
 - The `edit`/hashline path consumes that header plus bare line numbers later; the four-hex tag is a content-derived hash of the whole normalized file, resolvable through the session snapshot store that recorded it. Immutable sources and `:raw` intentionally suppress hashline headers.
+- Rust wiring (`crates/pi-agent/src/tools/read.rs`): the tool carries `FileDisplayInputs` (`edit.mode`, `hasEditTool`, `readLineNumbers`) via `ReadTool::with_display_inputs`, and resolves `resolve_file_display_mode(..., raw, immutable)` once per call before formatting. `raw` comes from the selector; `immutable` is set for `artifact://`, `agent://`, and `memory://` sources. The same resolver drives single-range, multi-range, and structural-summary bodies: hashline uses `LINE:TEXT` under `[PATH#TAG]`, line-number-only mode uses `LINE|TEXT`, plain mode emits the bare text, and `:raw` suppresses both. A tool built with only `new()` / `with_snapshot_sink` keeps the historical sink-driven display for existing consumers.
 
 ### Directory listings
 - `#readDirectory()` calls `buildDirectoryTree()` with:
