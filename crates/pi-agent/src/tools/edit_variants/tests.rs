@@ -315,7 +315,11 @@ async fn sloppy_aligns_explicit_rewrite_that_echoes_surrounding_boundaries() {
 	let file = dir.join("demo.txt");
 	std::fs::write(&file, "const x = 1;\n").unwrap();
 	let ctx = context(&dir);
-	let payload = "§demo.txt\n«\nconst x = ⟪1⟫;\n»\nconst x = 2";
+	// A bare one-line selection whose REWRITE restates the prefix is first
+	// expanded to the whole line (upstream expandEchoedLineSelection), so that
+	// shape cannot test boundary alignment. A gap keeps the selection scoped
+	// while the echoed prefix/suffix still lets the aligner drop the duplicate.
+	let payload = "§demo.txt\n«\nconst x = …⟪1⟫…;\n»\nconst x = 2";
 	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
