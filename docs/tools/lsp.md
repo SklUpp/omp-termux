@@ -321,17 +321,18 @@ Uses the same location normalization and output shape as `definition`, but sends
 - `configCache` is per-process and is not automatically invalidated. Use workspace `reload` (omitted `file` or `file: "*"`) to re-read config, root markers, and plugin configuration; a concrete-file reload only reloads that server and keeps the cached configuration.
 ## Rust runtime (`crates/pi-agent/src/lsp`)
 
-Status: the native Rust stack is implemented inside its own module tree and declared by `pub mod lsp;`. Remaining parent integration steps:
+The CLI mounts `lsp` behind `lsp.enabled`, with `lsp.shared` selecting the transport. Each runner keeps one `LspSession` across turns; child agents receive separate ownership scopes. Acquisitions register an owner on the cached client. Releasing a scope detaches and shuts down only clients with no remaining owners, without terminating a shared mux broker. There is no process-wide shutdown on an individual session's teardown.
 
-- register `Arc::new(crate::lsp::LspTool::with_shared(shared))` behind the existing `lsp.enabled` gate, where `shared` is `lsp.shared` (default `true`); `LspTool::new()` is `with_shared(true)`;
-- call `crate::lsp::client::get_config(cwd)` for cached configuration (it applies `idleTimeoutMs`) and `crate::lsp::client::shutdown_all().await` on session teardown;
+- `LspTool::with_session(shared, session)` binds the runner's ownership scope; standalone tools create their own scope.
+- `crate::lsp::client::get_config(cwd)` provides cached configuration and applies `idleTimeoutMs`.
 - the hidden CLI worker `omp __omp_worker_lsp_mux` is dispatched before clap/config/session boot (see `Rust mux worker` below);
 - optional shared decoder for DAP: `crate::lsp::framing::MessageFramer` is std-only and is not part of the LSP-specific state.
 
 Exact settings seam (no global environment mutation):
 
-- `LspTool::with_shared(bool)` stores the preference; every client lookup (`get_or_create_client`), diagnostics pipeline, formatter, and stale-client cleanup takes it as an explicit argument.
-- Client cache identity includes the preference, so a shared and a private client for the same server cannot alias each other. Non-tool entry points (`diagnostics::get_diagnostics_for_file`, `format_file`, `capture_*_versions`) take the flag as a parameter; there is no process-global switch.
+- `LspTool::with_shared(bool)` creates a standalone ownership scope; client acquisition uses `get_or_create_client_for` with that scope.
+- Client cache identity includes the transport preference, so shared and private clients cannot alias. Diagnostics and formatting carry both the preference and the ownership scope explicitly; neither uses a process-global transport switch.
+- The active-client registry contains owned, registered clients. A client still completing initialization is not listed there; `status` can report it as configured until acquisition completes.
 
 Modules:
 
