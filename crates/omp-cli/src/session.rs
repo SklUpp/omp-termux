@@ -996,6 +996,48 @@ impl SessionEntry {
 	}
 }
 
+/// Normalizes recorded turn `parts` into persisted message content. Shared by
+/// compatibility writes ([`SessionStore::append_turn`]) and legacy v1 imports
+/// so both validate images identically; empty parts fall back to the prompt.
+fn turn_content(
+	parts: &[ContentPart],
+	prompt: &str,
+	action: &str,
+) -> Result<MessageContent, String> {
+	if parts.is_empty() {
+		return Ok(MessageContent::Text(prompt.to_string()));
+	}
+	let mut normalized = Vec::with_capacity(parts.len());
+	for (index, part) in parts.iter().enumerate() {
+		if part.is_image() {
+			let Some(data) = part.data.as_deref() else {
+				return Err(format!("cannot {action} with image part missing data at index {index}"));
+			};
+			let Some(mime) = part.mime_type.as_deref() else {
+				return Err(format!(
+					"cannot {action} with image part missing mimeType at index {index}"
+				));
+			};
+			let (clean_b64, norm_mime) = pi_agent::state::normalize_image_payload(data, mime)
+				.map_err(|err| {
+					format!("cannot {action} with invalid image part at index {index}: {err}")
+				})?;
+			let mut norm_part = part.clone();
+			norm_part.data = Some(clean_b64);
+			norm_part.mime_type = Some(norm_mime);
+			normalized.push(norm_part);
+		} else if part.kind == "text" {
+			if part.text.is_none() {
+				return Err(format!("cannot {action} with text part missing text at index {index}"));
+			}
+			normalized.push(part.clone());
+		} else {
+			return Err(format!("cannot {action} with unsupported content part kind at index {index}"));
+		}
+	}
+	Ok(MessageContent::Parts(normalized))
+}
+
 /// Session log handle. Failures are collected as warnings so a broken log never
 /// changes the answer or the exit code.
 #[derive(Debug, Default)]
@@ -1902,39 +1944,7 @@ impl SessionStore {
 			.unwrap_or(0);
 
 		let mut entries = Vec::new();
-		let user_content = if !turn.parts.is_empty() {
-			let mut normalized = Vec::with_capacity(turn.parts.len());
-			for (index, part) in turn.parts.iter().enumerate() {
-				if part.is_image() {
-					let Some(data) = part.data.as_deref() else {
-						return Err(format!("cannot append turn with image part missing data at index {index}"));
-					};
-					let Some(mime) = part.mime_type.as_deref() else {
-						return Err(format!("cannot append turn with image part missing mimeType at index {index}"));
-					};
-					let (clean_b64, norm_mime) = pi_agent::state::normalize_image_payload(data, mime)
-						.map_err(|err| format!("cannot append turn with invalid image part at index {index}: {err}"))?;
-					let mut norm_part = part.clone();
-					norm_part.data = Some(clean_b64);
-					norm_part.mime_type = Some(norm_mime);
-					normalized.push(norm_part);
-				} else if part.kind == "text" {
-					if part.text.is_none() {
-						return Err(format!(
-							"cannot append turn with text part missing text at index {index}"
-						));
-					}
-					normalized.push(part.clone());
-				} else {
-					return Err(format!(
-						"cannot append turn with unsupported content part kind at index {index}"
-					));
-				}
-			}
-			MessageContent::Parts(normalized)
-		} else {
-			MessageContent::Text(turn.prompt.clone())
-		};
+		let user_content = turn_content(&turn.parts, &turn.prompt, "append turn")?;
 		let user_id = format!("msg-{}", output::session_id());
 		entries.push(MessageEntry::new(
 			user_id.clone(),
@@ -3675,13 +3685,16 @@ pub fn import_legacy_v1(
 	let mut parent_id: Option<String> = None;
 	for (turn_idx, turn) in v1_turns.iter().enumerate() {
 		let user_id = format!("msg-user-{turn_idx}");
+		// v1 records carry the ordered user parts; dropping them loses images
+		// before resume/fork can ever see them.
+		let user_content = turn_content(&turn.parts, &turn.prompt, "import v1 turn")?;
 		let user_entry = MessageEntry::new(
 			user_id.clone(),
 			parent_id.take(),
 			v1_header.timestamp.clone(),
 			SessionMessage {
 				timestamp_ms: import_ms,
-				..SessionMessage::user(MessageContent::Text(turn.prompt.clone()), 0)
+				..SessionMessage::user(user_content, 0)
 			},
 		);
 		lines.push(format!("{}\n", serde_json::to_string(&user_entry).map_err(|e| e.to_string())?));
@@ -3762,8 +3775,11 @@ pub fn import_legacy_v1(
 		}
 
 		let asst_id = format!("msg-asst-{turn_idx}");
-		let stop_reason =
-			if turn.stop_reason.is_empty() { None } else { Some(turn.stop_reason.clone()) };
+		let stop_reason = if turn.stop_reason.is_empty() {
+			None
+		} else {
+			Some(canonical_stop_reason(&turn.stop_reason).to_string())
+		};
 		let asst_entry = MessageEntry::new(
 			asst_id.clone(),
 			parent_id.take(),
@@ -5127,5 +5143,99 @@ mod tests {
 
 		fs::remove_dir_all(dir).ok();
 		fs::remove_dir_all(fork_dir).ok();
+	}
+
+	#[test]
+	fn import_legacy_v1_preserves_ordered_user_parts_and_canonical_stop_reason() {
+		let dir = temp_dir();
+		let v1_path = dir.join("v1-parts-case.jsonl");
+		let v1 = concat!(
+			r#"{"type":"header","version":1,"id":"v1-parts-case","timestamp":"2026-10-25T10:00:00Z","cwd":"/work/legacy","model":"openai/gpt-5","provider":"openai"}"#,
+			"\n",
+			r#"{"type":"turn","prompt":"look at chart","assistant":"done","stop_reason":"end_turn","parts":[{"type":"text","text":"look at chart"},{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}],"tool_calls":[{"id":"call-1","name":"read","arguments":{"path":"main.rs"},"result":"fn main() {}","is_error":false,"result_parts":[{"type":"image","data":"aW1nMQ==","mimeType":"image/png"}],"details":{"phases":[{"id":"p1","status":"done"}]}}]}"#,
+			"\n"
+		);
+		fs::write(&v1_path, v1).expect("write v1");
+
+		let target_dir = dir.join("v3-target");
+		let imported = import_legacy_v1(&v1_path, &target_dir, None).expect("import v1");
+
+		let disk = fs::read_to_string(&imported).expect("read imported");
+		assert!(!disk.contains("end_turn"), "imported log must not carry raw v1 stop reasons");
+		let mut user_content = None;
+		let mut stop_reasons = Vec::new();
+		let mut tool_image = None;
+		let mut tool_details = None;
+		for line in disk.lines().filter(|line| !line.trim().is_empty()) {
+			let value: serde_json::Value = serde_json::from_str(line).expect("json line");
+			let Some(message) = value.get("message") else {
+				continue;
+			};
+			match message["role"].as_str() {
+				Some("user") => user_content = Some(message["content"].clone()),
+				Some("assistant") => {
+					if let Some(reason) = message["stopReason"].as_str() {
+						stop_reasons.push(reason.to_string());
+					}
+				},
+				Some("toolResult") => {
+					tool_image = message["content"]
+						.as_array()
+						.and_then(|parts| parts.iter().find(|part| part["type"] == "image"))
+						.cloned();
+					tool_details = message.get("details").cloned();
+				},
+				_ => {},
+			}
+		}
+
+		let user_content = user_content.expect("user message must be written");
+		let user_parts = user_content.as_array().expect("user content must stay a parts array");
+		assert_eq!(user_parts.len(), 2, "text and image must both survive: {user_parts:?}");
+		assert_eq!(user_parts[0]["type"], "text");
+		assert_eq!(user_parts[0]["text"], "look at chart");
+		assert_eq!(user_parts[1]["type"], "image");
+		assert_eq!(user_parts[1]["data"], "aGVsbG8=");
+		assert_eq!(user_parts[1]["mimeType"], "image/png");
+		assert_eq!(
+			stop_reasons,
+			vec!["toolUse".to_string(), "stop".to_string()],
+			"raw end_turn must be canonicalized on disk"
+		);
+		let tool_image = tool_image.expect("tool result image must survive import");
+		assert_eq!(tool_image["data"], "aW1nMQ==");
+		assert_eq!(tool_image["mimeType"], "image/png");
+		let expected_details = json!({"phases": [{"id": "p1", "status": "done"}]});
+		assert_eq!(tool_details, Some(expected_details.clone()), "tool details must survive import");
+
+		let mut reopened = SessionStore::open(&options(target_dir.clone(), Some("v1-parts-case")));
+		assert!(reopened.enabled(), "reopened import must load: {:?}", reopened.take_warnings());
+		assert_eq!(reopened.history().len(), 1);
+		let turn = &reopened.history()[0];
+		assert_eq!(turn.prompt, "look at chart");
+		assert_eq!(turn.stop_reason, "stop");
+		assert_eq!(turn.parts.len(), 2, "reopen must replay user parts: {:?}", turn.parts);
+		assert_eq!(turn.parts[1].data.as_deref(), Some("aGVsbG8="));
+		assert_eq!(turn.parts[1].mime_type.as_deref(), Some("image/png"));
+		assert_eq!(turn.tool_calls[0].details, Some(expected_details.clone()));
+		assert!(reopened.has_image_content());
+
+		let fork_file = fork_session(&imported, None, Some(&target_dir)).expect("fork import");
+		let fork_disk = fs::read_to_string(&fork_file).expect("read fork");
+		assert!(!fork_disk.contains("end_turn"), "fork must not carry raw v1 stop reasons");
+		let fork_stem = fork_file
+			.file_stem()
+			.and_then(std::ffi::OsStr::to_str)
+			.expect("fork stem")
+			.to_string();
+		let mut forked = SessionStore::open(&options(target_dir.clone(), Some(&fork_stem)));
+		assert!(forked.enabled(), "forked import must load: {:?}", forked.take_warnings());
+		let turn = &forked.history()[0];
+		assert_eq!(turn.stop_reason, "stop", "fork must not reintroduce raw stop reasons");
+		assert_eq!(turn.parts.len(), 2, "fork must carry user parts: {:?}", turn.parts);
+		assert_eq!(turn.parts[1].data.as_deref(), Some("aGVsbG8="));
+		assert_eq!(turn.tool_calls[0].details, Some(expected_details));
+
+		fs::remove_dir_all(dir).ok();
 	}
 }
