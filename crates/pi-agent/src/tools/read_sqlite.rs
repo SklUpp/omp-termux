@@ -551,15 +551,16 @@ fn authorize(context: AuthContext<'_>) -> Authorization {
 				name.as_str(),
 				"table_info"
 					| "table_xinfo" | "table_list" | "index_list" | "index_info"
-					| "index_xinfo" | "foreign_key_list" | "database_list"
+					| "index_xinfo" | "foreign_key_list" | "foreign_key_check" | "database_list"
 					| "collation_list" | "function_list" | "module_list" | "pragma_list"
+					| "integrity_check" | "quick_check"
 			);
 			let reads_setting = pragma_value.is_none()
 				&& matches!(
 					name.as_str(),
 					"synchronous"
 						| "page_size" | "encoding" | "user_version" | "schema_version"
-						| "application_id" | "auto_vacuum" | "integrity_check" | "quick_check"
+						| "application_id" | "auto_vacuum"
 				);
 			if reads_schema || reads_setting {
 				Authorization::Allow

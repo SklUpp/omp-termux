@@ -547,6 +547,8 @@ async fn read_only_pragma_introspection_works_but_writes_stay_blocked() {
 		("?q=PRAGMA%20index_info('child_parent')", "parent_id"),
 		("?q=PRAGMA%20index_xinfo('child_parent')", "parent_id"),
 		("?q=PRAGMA%20foreign_key_list('child')", "parent"),
+		("?q=PRAGMA%20integrity_check(5)", "ok"),
+		("?q=PRAGMA%20quick_check(5)", "ok"),
 		("?q=PRAGMA%20table_info('child')", "parent_id"),
 		("?q=PRAGMA%20table_xinfo('child')", "parent_id"),
 		("?q=PRAGMA%20table_list", "child"),
@@ -558,6 +560,9 @@ async fn read_only_pragma_introspection_works_but_writes_stay_blocked() {
 		assert!(!result.is_error, "{query}: {}", result.content);
 		assert!(result.content.contains(expected), "{query}: {}", result.content);
 	}
+	let checked = read(&dir, &selector(&path, "?q=PRAGMA%20foreign_key_check('child')")).await;
+	assert!(!checked.is_error, "{}", checked.content);
+	assert!(ascii_table(&checked.content).1.is_empty(), "unexpected foreign-key violations");
 
 	for query in [
 		"?q=PRAGMA%20journal_mode%3DWAL",
