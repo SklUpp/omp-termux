@@ -9,12 +9,13 @@
 //! row-count estimates, and WAL-sidecar initialization.
 //!
 //! Every connection is opened read-only and carries `PRAGMA query_only = ON`
-//! plus a prepare-time authorizer that only permits reads and
-//! `table_info`/`table_xinfo`, so a raw query cannot write, ATTACH/DETACH, or
-//! flip pragmas that touch the database file. The single exception is the
-//! upstream WAL initialization: a database whose header says WAL but whose
-//! `-wal`/`-shm` sidecars are missing is opened read-write once so SQLite can
-//! recreate them, exactly as `openSqliteReadConnection` does.
+//! plus a prepare-time authorizer that only permits reads, read-only pragma
+//! introspection (`table_info`, `index_list`, `foreign_key_list`, ...), and
+//! bare setting queries, so a raw query cannot write, ATTACH/DETACH, or flip
+//! pragmas that touch the database file. The single exception is the upstream
+//! WAL initialization: a database whose header says WAL but whose `-wal`/`-shm`
+//! sidecars are missing is opened read-write once so SQLite can recreate them,
+//! exactly as `openSqliteReadConnection` does.
 //!
 //! ponytail: display width uses a compact East-Asian-width table instead of a
 //! full UAX#11 crate (no new dependency); swap in a width crate if emoji ZWJ
@@ -540,10 +541,31 @@ fn authorize(context: AuthContext<'_>) -> Authorization {
 		| AuthAction::Recursive
 		| AuthAction::Transaction { .. }
 		| AuthAction::Savepoint { .. } => Authorization::Allow,
-		AuthAction::Pragma { pragma_name, .. }
-			if matches!(pragma_name.to_ascii_lowercase().as_str(), "table_info" | "table_xinfo") =>
-		{
-			Authorization::Allow
+		AuthAction::Pragma { pragma_name, pragma_value } => {
+			// Read-only introspection pragmas take arguments (`index_list('t')`);
+			// settings are admitted only in their bare query form. `journal_mode`
+			// is absent: SQLite compiles even its bare query to a non-read-only
+			// statement, so `execute_read_query`'s readonly gate rejects it.
+			let name = pragma_name.to_ascii_lowercase();
+			let reads_schema = matches!(
+				name.as_str(),
+				"table_info"
+					| "table_xinfo" | "table_list" | "index_list" | "index_info"
+					| "index_xinfo" | "foreign_key_list" | "database_list"
+					| "collation_list" | "function_list" | "module_list" | "pragma_list"
+			);
+			let reads_setting = pragma_value.is_none()
+				&& matches!(
+					name.as_str(),
+					"synchronous"
+						| "page_size" | "encoding" | "user_version" | "schema_version"
+						| "application_id" | "auto_vacuum" | "integrity_check" | "quick_check"
+				);
+			if reads_schema || reads_setting {
+				Authorization::Allow
+			} else {
+				Authorization::Deny
+			}
 		},
 		_ => Authorization::Deny,
 	}
@@ -989,11 +1011,15 @@ fn get_row(
 			SqlValue::Integer(coerce_integer_key(key, "SQLite ROWID")?),
 		),
 	};
-	let columns = get_table_columns(connection, table)?;
 	let mut statement = connection.prepare(&sql)?;
+	let columns: Vec<String> =
+		statement.column_names().into_iter().map(str::to_string).collect();
 	let mut rows = statement.query(params![binding])?;
 	match rows.next()? {
-		Some(row) => Ok(Some((columns.clone(), read_row(row, &columns)?))),
+		Some(row) => {
+			let row = read_row(row, &columns)?;
+			Ok(Some((columns, row)))
+		},
 		None => Ok(None),
 	}
 }
@@ -1056,12 +1082,12 @@ fn query_rows(
 	where_clause: Option<&str>,
 	token: &CancellationToken,
 ) -> ReadResult<Page> {
-	let columns = get_table_columns(connection, table)?;
+	let schema_columns = get_table_columns(connection, table)?;
 	let where_sql = match validate_where_clause(where_clause)? {
 		Some(validated) => format!(" WHERE {validated}"),
 		None => String::new(),
 	};
-	let order_sql = resolve_order_clause(order, &columns)?;
+	let order_sql = resolve_order_clause(order, &schema_columns)?;
 	let count_sql =
 		format!("SELECT COUNT(*) AS count FROM {}{where_sql}", quote_identifier(table));
 	let total_count: i64 = connection.query_row(&count_sql, [], |row| row.get(0))?;
@@ -1076,6 +1102,10 @@ fn query_rows(
 				.into(),
 		);
 	}
+	// `SELECT *` includes generated columns that `PRAGMA table_info` omits, so
+	// the statement's result columns — not the schema list — must key cells.
+	let columns: Vec<String> =
+		statement.column_names().into_iter().map(str::to_string).collect();
 	let mut rows = statement.query(params![limit, offset])?;
 	let mut collected = Vec::new();
 	while let Some(row) = rows.next()? {
@@ -1119,9 +1149,23 @@ fn read_row(
 ) -> ReadResult<HashMap<String, SqlValue>> {
 	let mut mapped = HashMap::with_capacity(columns.len());
 	for (index, column) in columns.iter().enumerate() {
-		mapped.insert(column.clone(), row.get::<_, SqlValue>(index)?);
+		mapped.insert(column.clone(), row_value(row, index)?);
 	}
 	Ok(mapped)
+}
+
+/// SQLite returns arbitrary bytes for TEXT; `rusqlite`'s `Value` conversions
+/// panic on invalid UTF-8, so decode lossily instead of going through them.
+fn row_value(row: &rusqlite::Row<'_>, index: usize) -> ReadResult<SqlValue> {
+	Ok(match row.get_ref(index)? {
+		rusqlite::types::ValueRef::Null => SqlValue::Null,
+		rusqlite::types::ValueRef::Integer(value) => SqlValue::Integer(value),
+		rusqlite::types::ValueRef::Real(value) => SqlValue::Real(value),
+		rusqlite::types::ValueRef::Text(bytes) => {
+			SqlValue::Text(String::from_utf8_lossy(bytes).into_owned())
+		},
+		rusqlite::types::ValueRef::Blob(bytes) => SqlValue::Blob(bytes.to_vec()),
+	})
 }
 
 fn load_row_estimates(connection: &Connection) -> ReadResult<HashMap<String, i64>> {

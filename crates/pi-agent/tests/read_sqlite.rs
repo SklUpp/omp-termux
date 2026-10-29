@@ -83,6 +83,21 @@ fn selector(path: &Path, suffix: &str) -> String {
 	format!("{}{suffix}", path.display())
 }
 
+/// Header plus data cells of the first rendered ASCII table, skipping the
+/// divider row. Cells are trimmed; counts stay semantic, not prose.
+fn ascii_table(content: &str) -> (Vec<String>, Vec<Vec<String>>) {
+	let cell_split = |line: &str| -> Vec<String> {
+		line.trim_matches('|')
+			.split('|')
+			.map(|cell| cell.trim().to_string())
+			.collect()
+	};
+	let mut lines = content.lines().filter(|line| line.starts_with("| "));
+	let header = cell_split(lines.next().expect("rendered table header"));
+	let rows = lines.skip(1).map(cell_split).collect();
+	(header, rows)
+}
+
 #[tokio::test]
 async fn bare_database_path_lists_tables_with_row_counts() {
 	let dir = TempDir::new("list");
@@ -90,18 +105,28 @@ async fn bare_database_path_lists_tables_with_row_counts() {
 
 	let result = read(&dir, &path.display().to_string()).await;
 	assert!(!result.is_error, "{}", result.content);
-	let lines: Vec<&str> = result.content.lines().collect();
-	for name in ["codes", "loose", "many", "notes", "pairs"] {
-		let line = lines
-			.iter()
-			.find(|line| **line == name || line.strip_prefix(name).is_some_and(|rest| rest.starts_with(' ')))
-			.unwrap_or_else(|| panic!("missing table {name}: {}", result.content));
-		assert!(
-			line.chars().any(|character| character.is_ascii_digit()),
-			"row count missing for {name}: {line}"
-		);
-	}
 	assert!(!result.content.contains("sqlite_"), "{}", result.content);
+
+	let connection = create_connection(&path);
+	let fixture_counts = [("codes", 1), ("loose", 1), ("many", 7), ("notes", 2), ("pairs", 1)];
+	let mut listed = 0usize;
+	for (name, fixture_count) in fixture_counts {
+		let expected: i64 = connection
+			.query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |row| row.get(0))
+			.expect("count fixture rows");
+		assert_eq!(expected, fixture_count, "{name} fixture count");
+		let line = result
+			.content
+			.lines()
+			.find(|line| line.starts_with(&format!("{name} ")))
+			.unwrap_or_else(|| panic!("missing table {name}: {}", result.content));
+		let counts_match = line
+			.split(|character: char| !character.is_ascii_digit())
+			.any(|digits| digits == expected.to_string().as_str());
+		assert!(counts_match, "{name} should report {expected} rows: {line}");
+		listed += 1;
+	}
+	assert_eq!(listed, 5, "{}", result.content);
 
 	let details = result.details.expect("details");
 	assert_eq!(details["resolvedPath"], json!(path.display().to_string()));
@@ -194,6 +219,12 @@ async fn pagination_where_order_and_errors_follow_the_query_contract() {
 
 	let result = read(&dir, &selector(&path, ":many?limit=999")).await;
 	assert!(!result.is_error, "{}", result.content);
+	let (headers, rows) = ascii_table(&result.content);
+	assert_eq!(headers, ["id"]);
+	assert_eq!(rows.len(), 7, "{}", result.content);
+	for (index, row) in rows.into_iter().enumerate() {
+		assert_eq!(row, vec![(index + 1).to_string()], "{}", result.content);
+	}
 
 	for (suffix, message) in [
 		(":many?limit=0", "SQLite limit must be a positive integer; got '0'"),
@@ -412,4 +443,131 @@ async fn table_listing_stops_at_500_and_reports_the_limit() {
 	let details = result.details.expect("details");
 	assert_eq!(details["meta"]["limits"]["resultLimit"]["reached"], json!(500));
 	assert_eq!(details["meta"]["limits"]["resultLimit"]["suggestion"], json!(1000));
+}
+
+#[tokio::test]
+async fn generated_columns_render_under_their_own_headers() {
+	let dir = TempDir::new("generated");
+	let path = dir.file("generated.sqlite");
+	{
+		let connection = create_connection(&path);
+		connection
+			.execute_batch(
+				"CREATE TABLE gen(
+					id INTEGER PRIMARY KEY,
+					a INTEGER,
+					doubled INTEGER GENERATED ALWAYS AS (a * 2) STORED,
+					tripled INTEGER GENERATED ALWAYS AS (a * 3) VIRTUAL,
+					label TEXT
+				 );
+				 INSERT INTO gen(id, a, label) VALUES (1, 7, 'x');",
+			)
+			.expect("create generated fixture");
+	}
+
+	let result = read(&dir, &selector(&path, ":gen:1")).await;
+	assert!(!result.is_error, "{}", result.content);
+	let rendered: Vec<(String, String)> = result
+		.content
+		.lines()
+		.filter_map(|line| line.split_once(": "))
+		.map(|(column, value)| {
+			(column.trim().to_string(), value.trim().to_string())
+		})
+		.collect();
+	let expected_rows = vec![
+		("id".to_string(), "1".to_string()),
+		("a".to_string(), "7".to_string()),
+		("doubled".to_string(), "14".to_string()),
+		("tripled".to_string(), "21".to_string()),
+		("label".to_string(), "x".to_string()),
+	];
+	assert_eq!(rendered, expected_rows, "{}", result.content);
+
+	let result = read(&dir, &selector(&path, ":gen?limit=1")).await;
+	assert!(!result.is_error, "{}", result.content);
+	let (headers, rows) = ascii_table(&result.content);
+	assert_eq!(headers, ["id", "a", "doubled", "tripled", "label"]);
+	assert_eq!(rows, vec![vec!["1", "7", "14", "21", "x"]]);
+
+	let result = read(&dir, &selector(&path, ":gen")).await;
+	assert!(!result.is_error, "{}", result.content);
+	let (headers, rows) = ascii_table(&result.content);
+	assert_eq!(headers, ["id", "a", "doubled", "tripled", "label"]);
+	assert_eq!(rows, vec![vec!["1", "7", "14", "21", "x"]]);
+
+	let result = read(&dir, &selector(&path, "?q=SELECT%20*%20FROM%20gen")).await;
+	assert!(!result.is_error, "{}", result.content);
+	let (headers, rows) = ascii_table(&result.content);
+	assert_eq!(headers, ["id", "a", "doubled", "tripled", "label"]);
+	assert_eq!(rows, vec![vec!["1", "7", "14", "21", "x"]]);
+}
+
+#[tokio::test]
+async fn invalid_utf8_text_cells_are_replaced_without_panicking() {
+	let dir = TempDir::new("utf8");
+	let path = dir.file("bytes.sqlite");
+	{
+		let connection = create_connection(&path);
+		connection
+			.execute_batch(
+				"CREATE TABLE raw(id INTEGER PRIMARY KEY, body TEXT);
+				 INSERT INTO raw(id, body) VALUES (1, CAST(x'80' AS TEXT));",
+			)
+			.expect("create raw fixture");
+	}
+
+	for suffix in ["?q=SELECT%20body%20FROM%20raw", ":raw", ":raw:1"] {
+		let result = read(&dir, &selector(&path, suffix)).await;
+		assert!(!result.is_error, "{suffix}: {}", result.content);
+		assert!(result.content.contains('\u{FFFD}'), "{suffix}: {}", result.content);
+	}
+}
+
+#[tokio::test]
+async fn read_only_pragma_introspection_works_but_writes_stay_blocked() {
+	let dir = TempDir::new("pragma");
+	let path = dir.file("pragma.sqlite");
+	{
+		let connection = create_connection(&path);
+		connection
+			.execute_batch(
+				"CREATE TABLE parent(id INTEGER PRIMARY KEY);
+				 CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+				 CREATE INDEX child_parent ON child(parent_id);
+				 INSERT INTO parent VALUES (1);
+				 INSERT INTO child VALUES (1, 1);",
+			)
+			.expect("create pragma fixture");
+	}
+	let before = fs::read(&path).expect("read fixture bytes");
+
+	for (query, expected) in [
+		("?q=PRAGMA%20index_list('child')", "child_parent"),
+		("?q=PRAGMA%20index_info('child_parent')", "parent_id"),
+		("?q=PRAGMA%20index_xinfo('child_parent')", "parent_id"),
+		("?q=PRAGMA%20foreign_key_list('child')", "parent"),
+		("?q=PRAGMA%20table_info('child')", "parent_id"),
+		("?q=PRAGMA%20table_xinfo('child')", "parent_id"),
+		("?q=PRAGMA%20table_list", "child"),
+		("?q=PRAGMA%20database_list", "main"),
+		("?q=PRAGMA%20collation_list", "BINARY"),
+		("?q=PRAGMA%20user_version", "user_version"),
+	] {
+		let result = read(&dir, &selector(&path, query)).await;
+		assert!(!result.is_error, "{query}: {}", result.content);
+		assert!(result.content.contains(expected), "{query}: {}", result.content);
+	}
+
+	for query in [
+		"?q=PRAGMA%20journal_mode%3DWAL",
+		"?q=PRAGMA%20user_version%3D5",
+		"?q=PRAGMA%20page_size%3D8192",
+		"?q=PRAGMA%20schema_version%3D7",
+		"?q=PRAGMA%20query_only",
+	] {
+		let result = read(&dir, &selector(&path, query)).await;
+		assert!(result.is_error, "{query} must be rejected: {}", result.content);
+	}
+	assert_eq!(fs::read(&path).expect("read fixture bytes"), before, "database mutated");
 }
