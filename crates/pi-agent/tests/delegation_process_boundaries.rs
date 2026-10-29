@@ -84,7 +84,8 @@ async fn process_visibility_and_control_are_owner_scoped() {
 	assert_eq!(daemon(&started)["owner"], "owner-a");
 
 	let seen_by_a = owner_a.execute(&json!({ "op": "ps" }), &ctx).await.expect("ps a");
-	let names_a: Vec<&str> = daemons(&seen_by_a)
+	let listed_a = daemons(&seen_by_a);
+	let names_a: Vec<&str> = listed_a
 		.iter()
 		.filter_map(|daemon| daemon["name"].as_str())
 		.collect();
