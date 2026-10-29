@@ -1182,6 +1182,7 @@ fn session_title(sessions_dir: &Path, id: &str) -> (Option<String>, String) {
 		dir: Some(sessions_dir.to_path_buf()),
 		id: Some(id.to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 	assert!(store.enabled(), "session log must reopen for {id}");

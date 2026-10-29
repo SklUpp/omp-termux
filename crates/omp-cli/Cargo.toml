@@ -22,6 +22,7 @@ path = "src/main.rs"
 # `src/yaml.rs` so the binary keeps a small, offline-buildable dependency set and
 # avoids the archived `serde_yaml`.
 async-trait.workspace = true
+base64.workspace = true
 clap.workspace = true
 globset.workspace = true
 grep-searcher.workspace = true
@@ -29,8 +30,11 @@ libc.workspace = true
 pi-agent = { path = "../pi-agent" }
 pi-grep-pattern = { path = "../pi-grep-pattern" }
 pi-walker.workspace = true
+reqwest = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+# Pinned: the lock already resolves sha2 0.10.9 and 0.11.0; auth parity uses 0.10.
+sha2 = "0.10.9"
 rusqlite = { version = "0.33.0", features = ["bundled"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "fs", "io-util", "sync", "macros"] }
 tokio-util.workspace = true

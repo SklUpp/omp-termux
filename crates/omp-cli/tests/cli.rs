@@ -84,10 +84,19 @@ fn parses_the_documented_flag_surface() {
 
 #[test]
 fn rejects_values_outside_the_typescript_domains() {
-	assert!(Cli::try_parse_from(["omp", "--mode", "rpc"]).is_err());
+	assert!(Cli::try_parse_from(["omp", "--mode", "yaml"]).is_err());
 	assert!(Cli::try_parse_from(["omp", "--approval-mode", "auto"]).is_err());
 	assert!(Cli::try_parse_from(["omp", "--unknown-flag"]).is_err());
 	assert!(Cli::try_parse_from(["omp", "--max-time", "soon"]).is_err());
+}
+
+#[test]
+fn rpc_mode_parses_without_a_prompt() {
+	let cli = parse(&["omp", "--mode", "rpc"]);
+	assert_eq!(cli.mode, OutputMode::Rpc);
+	assert!(cli.prompt.is_empty());
+	assert!(cli.file_args.is_empty());
+	assert!(!cli.print);
 }
 
 #[test]
@@ -402,6 +411,8 @@ impl AgentRunner for ScriptedRunner {
 				tool: "read".to_string(),
 				result: "contents".to_string(),
 				error: None,
+				images: Vec::new(),
+				details: None,
 			},
 			Event::message_end(asst.clone()),
 			Event::turn_end(
@@ -451,6 +462,11 @@ fn fake_request(prompt: &str) -> RunRequest {
 		max_turns: 1,
 		tools_enabled: false,
 		cancellation_token: None,
+		extra_tools: Vec::new(),
+		internal_urls: None,
+		url_scope: None,
+		subagent_observer: None,
+		child_session_root: None,
 	}
 }
 
@@ -478,6 +494,7 @@ fn fake_runner_stream_is_recorded_and_resumed() {
 		dir: Some(dir.clone()),
 		id: Some("smoke".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	};
 	let mut store = SessionStore::open(&options);
@@ -514,6 +531,7 @@ fn interrupted_stream_persists_aborted_turn_and_history_excludes_assistant() {
 		dir: Some(dir.clone()),
 		id: Some("aborted_smoke".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	};
 	let mut store = SessionStore::open(&options);

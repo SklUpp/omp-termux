@@ -19,7 +19,12 @@ use std::{
 use pi_agent::{
 	CancellationToken, TurnAck,
 	state::{ContentPart as AgentContentPart, Message},
-	tools::{task_catalog::EFFORT_SELECTORS, todo::TodoPhase},
+	supervisor::SubagentObserver,
+	tools::{
+		internal_urls::{InternalUrlRouter, UrlScope},
+		task_catalog::EFFORT_SELECTORS,
+		todo::TodoPhase,
+	},
 };
 use serde_json::{Value, json};
 
@@ -75,10 +80,11 @@ pub trait FrameSink: Send + Sync {
 /// One steering message carrying the exact user parts the client sent.
 ///
 /// The native steering channel injects a message into the live conversation, so
-/// images travel with it instead of being rejected. The runner owner converts
-/// these parts to `pi_agent` content parts when the seam lands
-/// (`PiAgentRunner::steer(&SteeringMessage)` -> `SignalDispatcher` active turn
-/// `SteeringEvent::InjectMessage(SteeringMessage)`).
+/// images travel with it instead of being rejected. The wiring is
+/// `RpcLaunch.steer` -> `PiAgentRunner::steer(Vec<pi_agent::ContentPart>)` ->
+/// `SignalDispatcher` -> `SteeringEvent::InjectMessage(Vec<ContentPart>)`; the
+/// parts are rebuilt by the CLI entry point, which is the only place that may
+/// know both types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SteeringMessage {
 	pub text:   String,
@@ -129,6 +135,9 @@ pub struct ActiveTurn {
 
 #[derive(Default)]
 struct ActiveState {
+	/// Run that currently owns this surface. A worker from an older run must not
+	/// clear the steering hook of the run that replaced it.
+	generation:  u64,
 	cancel:      Option<CancellationToken>,
 	steer:       Option<SteerFn>,
 	bash:        std::collections::BTreeMap<u64, CancellationToken>,
@@ -136,23 +145,6 @@ struct ActiveState {
 }
 
 impl ActiveTurn {
-	#[must_use]
-	pub fn is_streaming(&self) -> bool {
-		self.lock().cancel.is_some()
-	}
-
-	/// Cancel the running turn; returns whether a turn was live.
-	pub fn abort(&self) -> bool {
-		let guard = self.lock();
-		match guard.cancel.as_ref() {
-			Some(token) => {
-				token.cancel();
-				true
-			},
-			None => false,
-		}
-	}
-
 	#[must_use]
 	pub fn steer_hook(&self) -> Option<SteerFn> {
 		self.lock().steer.clone()
@@ -170,8 +162,7 @@ impl ActiveTurn {
 		let Some(hook) = guard.steer.as_ref() else {
 			return Err(Prerequisite::new(
 				"steer_unavailable",
-				"steering is unavailable: this runner does not expose a live steering channel \
-				 (native seam: PiAgentRunner::steer forwarding to SignalDispatcher's active turn)",
+				"steering is unavailable: this host installed no steering channel for the session",
 			));
 		};
 		if hook(message) {
@@ -214,16 +205,29 @@ impl ActiveTurn {
 		self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 	}
 
-	pub(super) fn begin(&self, token: CancellationToken, steer: Option<SteerFn>) {
+	pub(super) fn begin(
+		&self,
+		generation: u64,
+		token: CancellationToken,
+		steer: Option<SteerFn>,
+	) {
 		let mut guard = self.lock();
+		guard.generation = generation;
 		guard.cancel = Some(token);
 		guard.steer = steer;
 	}
 
-	pub(super) fn end(&self) {
+	/// Release the surface only for the run that owns it; a superseded worker's
+	/// `end` is a no-op so it cannot wipe the new run's steering hook.
+	#[must_use]
+	pub(super) fn end_if(&self, generation: u64) -> bool {
 		let mut guard = self.lock();
+		if guard.generation != generation {
+			return false;
+		}
 		guard.cancel = None;
 		guard.steer = None;
+		true
 	}
 }
 
@@ -283,6 +287,13 @@ pub struct RpcSession {
 	pub(crate) host_uris: Arc<HostUriBridge>,
 	pub(crate) subagent_level: SubagentSubscriptionLevel,
 	pub(crate) protocol_version: u8,
+	/// One router for every turn: the host URI bridge mounts its validated
+	/// schemes here, and the runner hands the same handle to root and child
+	/// `read`/`write` tools.
+	pub(crate) internal_urls: Arc<InternalUrlRouter>,
+	/// Observer fed to `RunRequest.subagent_observer` so the runner subscribes
+	/// the registry to whichever supervisor it builds.
+	pub(crate) observer: Arc<dyn SubagentObserver>,
 }
 
 impl RpcSession {
@@ -292,6 +303,8 @@ impl RpcSession {
 		approvals: Approvals,
 		host_tools: Arc<HostToolBridge>,
 		host_uris: Arc<HostUriBridge>,
+		internal_urls: Arc<InternalUrlRouter>,
+		observer: Arc<dyn SubagentObserver>,
 	) -> Result<Self> {
 		let RpcLaunch {
 			runner,
@@ -335,11 +348,7 @@ impl RpcSession {
 			store.history().to_vec()
 		};
 		let messages = if store.enabled() {
-			store
-				.messages()
-				.iter()
-				.filter_map(|entry| serde_json::to_value(&entry.message).ok())
-				.collect()
+			branch_wire_messages(&store)
 		} else {
 			Vec::new()
 		};
@@ -398,6 +407,8 @@ impl RpcSession {
 			host_uris,
 			subagent_level: SubagentSubscriptionLevel::Off,
 			protocol_version: 1,
+			internal_urls,
+			observer,
 		})
 	}
 
@@ -886,6 +897,7 @@ impl RpcSession {
 		let mut options = self.store_options.clone();
 		options.id = None;
 		options.continue_latest = false;
+		options.parent_session = parent_session.map(str::to_string);
 		options.dir = self
 			.store
 			.file()
@@ -898,18 +910,8 @@ impl RpcSession {
 		if store.is_v1() {
 			return Err(Error::new("cannot start a new session from a legacy v1 log"));
 		}
-		if let Some(parent) = parent_session {
-			// `SessionHeader.parent_session` exists, but `SessionStore::open`
-			// builds the header from `SessionOptions`, which has no lineage
-			// field. The exact seam is `SessionOptions.parent_session:
-			// Option<String>` copied into the header at creation; until then the
-			// value is reported instead of silently dropped.
-			eprintln!(
-				"warning: parentSession lineage is not persisted by this build (native seam: \
-				 SessionOptions.parent_session -> SessionHeader.parent_session); continuing \
-				 without it: {parent}"
-			);
-		}
+		// `parent_session` is persisted in `SessionHeader` at creation, so the
+		// lineage survives a reload of the new log.
 		self.store = store;
 		self.history.clear();
 		self.history_messages = None;
@@ -943,16 +945,21 @@ impl RpcSession {
 		if store.is_v1() {
 			return Err(Error::new("cannot switch to a legacy v1 session log: read-only"));
 		}
+		// Switching targets an existing log, so persistence was requested: a
+		// store that failed to open must not silently run in memory where its
+		// entries would be lost on exit.
+		if !store.enabled() {
+			return Err(Error::new(format!(
+				"cannot switch to {}: the session log cannot be persisted",
+				path.display()
+			)));
+		}
 		self.history = if store.has_branch_context() {
 			store.branch_history().map_err(Error::new)?
 		} else {
 			store.history().to_vec()
 		};
-		self.messages = store
-			.messages()
-			.iter()
-			.filter_map(|entry| serde_json::to_value(&entry.message).ok())
-			.collect();
+		self.messages = branch_wire_messages(&store);
 		self.session_name = store
 			.title_slot()
 			.map(|slot| slot.title.clone())
@@ -1036,8 +1043,9 @@ impl RpcSession {
 			.collect()
 	}
 
-	/// `branch` selection result. The store owns leaf mutation, which this build
-	/// does not expose (see the returned prerequisite).
+	/// `branch` selection result. The store owns the leaf mutation: a durable
+	/// metadata marker moves the active branch to `entry_id` without editing or
+	/// deleting entries, so the selection survives a reload.
 	pub fn branch(&mut self, entry_id: &str) -> std::result::Result<Value, Prerequisite> {
 		if !self.store.has_entry(entry_id) {
 			return Err(Prerequisite::new(
@@ -1052,14 +1060,32 @@ impl RpcSession {
 			.find(|entry| entry.id == entry_id)
 			.map(|entry| entry.message.content.text())
 			.unwrap_or_default();
-		Err(Prerequisite::new(
-			"branch_unavailable",
-			format!(
-				"cannot switch the session leaf to {entry_id}: the session store exposes no leaf \
-				 mutation in this build (native seam: SessionStore::branch_to(entry_id)); selected \
-				 text would be: {text}"
-			),
-		))
+		self.store.branch_to(entry_id).map_err(|error| {
+			Prerequisite::new("branch_unavailable", format!("cannot branch to {entry_id}: {error}"))
+		})?;
+		// The branch changed under the same log: rebuild the context the next
+		// request and the frame surface read from.
+		self.history = if self.store.has_branch_context() {
+			self.store.branch_history().map_err(|error| {
+				Prerequisite::new("branch_unavailable", error)
+			})?
+		} else {
+			self.store.history().to_vec()
+		};
+		self.history_messages = None;
+		self.todo_phases = self.store.latest_todo_phases();
+		self.last_assistant_text = self
+			.history
+			.last()
+			.map(|turn| turn.assistant.clone())
+			.filter(|text| !text.is_empty());
+		self.messages = self
+			.store
+			.branch_messages()
+			.into_iter()
+			.filter_map(|entry| serde_json::to_value(&entry.message).ok())
+			.collect();
+		Ok(json!({ "text": text, "cancelled": false }))
 	}
 
 	// ---------------------------------------------------------------- todos --
@@ -1090,6 +1116,70 @@ impl RpcSession {
 		}
 	}
 
+	/// Convert request images to agent parts, rejecting malformed data and
+	/// models that cannot take image input.
+	fn image_parts(&self, images: &[RpcImage]) -> Result<Vec<ContentPart>> {
+		let mut parts: Vec<ContentPart> = Vec::new();
+		for image in images {
+			match AgentContentPart::image(&image.data, &image.mime_type) {
+				Ok(AgentContentPart::Image { data, mime_type }) => {
+					parts.push(ContentPart::image(&data, &mime_type));
+				},
+				Ok(AgentContentPart::Text { .. }) => {
+					return Err(Error::new("image content is required for prompt images"));
+				},
+				Err(err) => return Err(Error::new(format!("invalid image: {err}"))),
+			}
+		}
+		if parts.is_empty() {
+			return Ok(parts);
+		}
+		let Some(raw) = self.model.as_deref() else {
+			return Err(Error::new("cannot send images without a selected model"));
+		};
+		let (base, _) = runtime::split_effort(raw);
+		let provider = self
+			.provider
+			.clone()
+			.or_else(|| self.catalog.provider_of(base).map(str::to_string))
+			.unwrap_or_default();
+		if self.catalog.supports_images(&provider, base) == Some(false) {
+			return Err(Error::new(format!(
+				"model '{provider}/{base}' does not support image input"
+			)));
+		}
+		Ok(parts)
+	}
+
+	/// Validate steering images before they reach the live turn, so the host
+	/// gets a protocol error instead of a silently dropped message.
+	pub fn validate_steering_images(
+		&self,
+		images: &[RpcImage],
+	) -> std::result::Result<(), Prerequisite> {
+		self.image_parts(images).map(|_| ()).map_err(|err| {
+			Prerequisite::new("invalid_steering_image", format!("cannot steer: {err}"))
+		})
+	}
+
+	/// Refuse a prompt whose host tools cannot mount, before the user entry is
+	/// journaled: a reserved or duplicated name fails the turn with the log
+	/// untouched, instead of leaving an unanswered prompt behind.
+	fn check_host_tool_names(&self) -> Result<()> {
+		if !self.tools_enabled {
+			return Ok(());
+		}
+		let reserved = runtime::reserved_tool_names();
+		let mut seen = std::collections::HashSet::new();
+		for tool in self.host_tools.adapters() {
+			let name = tool.name().to_string();
+			if reserved.iter().any(|known| known == &name) || !seen.insert(name.clone()) {
+				return Err(Error::new(format!("Duplicate tool name: {name}")));
+			}
+		}
+		Ok(())
+	}
+
 	/// Build the provider request for a prompt, recording the user entry.
 	pub fn prepare_turn(
 		&mut self,
@@ -1104,35 +1194,8 @@ impl RpcSession {
 			));
 		}
 
-		let mut parts: Vec<ContentPart> = Vec::new();
-		for image in &input.images {
-			match AgentContentPart::image(&image.data, &image.mime_type) {
-				Ok(AgentContentPart::Image { data, mime_type }) => {
-					parts.push(ContentPart::image(&data, &mime_type));
-				},
-				Ok(AgentContentPart::Text { .. }) => {
-					return Err(Error::new("image content is required for prompt images"));
-				},
-				Err(err) => return Err(Error::new(format!("invalid image: {err}"))),
-			}
-		}
-		if !parts.is_empty() {
-			let Some(raw) = self.model.as_deref() else {
-				return Err(Error::new("cannot send images without a selected model"));
-			};
-			let (base, _) = runtime::split_effort(raw);
-			let provider = self
-				.provider
-				.clone()
-				.or_else(|| self.catalog.provider_of(base).map(str::to_string))
-				.unwrap_or_default();
-			if self.catalog.supports_images(&provider, base) == Some(false) {
-				return Err(Error::new(format!(
-					"model '{provider}/{base}' does not support image input"
-				)));
-			}
-		}
-
+		let parts = self.image_parts(&input.images)?;
+		self.check_host_tool_names()?;
 		let started = SystemTime::now();
 		let iso = output::iso8601(started);
 		let started_ms = started
@@ -1155,6 +1218,13 @@ impl RpcSession {
 		let parent_id = self.store.leaf_id().map(str::to_string);
 		let message = SessionMessage::user(user_content, started_ms);
 		let entry = MessageEntry::new(user_id.clone(), parent_id, &iso, message);
+
+		let in_memory_before = self.in_memory_messages.as_ref().map_or(0, Vec::len);
+		// Build the request BEFORE the user entry is appended: with a durable
+		// `branch_summary` the context is rebuilt from the store, so an entry
+		// written first would come back as history and the runner would append
+		// the same prompt (text and images) a second time.
+		let mut request = self.request(input.text.clone(), turn_parts)?;
 		if self.store.enabled() {
 			if let Err(err) = entry.validate() {
 				eprintln!("warning: {err}");
@@ -1165,14 +1235,15 @@ impl RpcSession {
 		if let Ok(value) = serde_json::to_value(&entry.message) {
 			self.messages.push(value);
 		}
-
-		let in_memory_before = self.in_memory_messages.as_ref().map_or(0, Vec::len);
-		let mut request = self.request(input.text.clone(), turn_parts)?;
 		if !self.store.enabled() {
 			let user_message = runtime::user_message_from_parts(&input.text, &request.parts)
 				.map_err(|err| Error::new(err.to_string()))?;
 			self.in_memory_messages.get_or_insert_with(Vec::new).push(user_message);
 		}
+		// One token per turn: `StreamHandles::drop` cancels the request token when
+		// the provider stream ends, so sharing it across turns would abort the
+		// next queued turn. Run-wide stickiness lives in the RPC command loop's
+		// abort flag, which owns the queue, not in this token.
 		let token = CancellationToken::new();
 		request.cancellation_token = Some(token.clone());
 		let turn_ack = TurnAck::new();
@@ -1192,6 +1263,7 @@ impl RpcSession {
 			model_fallback: self.model.clone(),
 			provider_fallback: self.provider.clone(),
 			tool_names: std::collections::HashMap::new(),
+			tool_images: std::collections::HashMap::new(),
 			wire_user_message: self.messages.last().cloned(),
 			aborted: false,
 		};
@@ -1260,7 +1332,50 @@ impl RpcSession {
 			max_turns: self.max_turns,
 			tools_enabled: self.tools_enabled,
 			cancellation_token: None,
+			// The live host tool set, mounted by the runner after every
+			// builtin/ask/checkpoint/eval tool; empty when the host registered none.
+			extra_tools: self
+				.host_tools
+				.adapters()
+				.into_iter()
+				.map(crate::agent::ExtraTool::from)
+				.collect(),
+			internal_urls: Some(Arc::clone(&self.internal_urls)),
+			url_scope: Some(self.url_scope()),
+			subagent_observer: Some(crate::agent::ObserverHandle(Arc::clone(&self.observer))),
+			child_session_root: self.child_session_root(),
 		})
+	}
+
+	/// Immutable URL scope for this session's turns: the session file plus its
+	/// session-scoped artifacts directory as the `local://` root.
+	fn url_scope(&self) -> Arc<UrlScope> {
+		let session_file = self
+			.store
+			.file()
+			.filter(|_| self.store.enabled())
+			.map(Path::to_path_buf);
+		let local_root = session_file
+			.as_deref()
+			.and_then(session::artifacts_directory_for);
+		Arc::new(UrlScope {
+			session_file,
+			local_roots: local_root
+				.map(|dir| std::collections::BTreeMap::from([("local".to_string(), dir)]))
+				.unwrap_or_default(),
+		})
+	}
+
+	/// Directory child transcripts live in. Only a persisted session has a
+	/// stable one; in-memory sessions keep `get_subagent_messages` unavailable
+	/// instead of inventing a temp path.
+	fn child_session_root(&self) -> Option<PathBuf> {
+		self
+			.store
+			.file()
+			.filter(|_| self.store.enabled())
+			.and_then(session::artifacts_directory_for)
+			.map(|dir| dir.join("subagents"))
 	}
 
 	/// Persist and account for one finished turn.
@@ -1285,11 +1400,98 @@ impl RpcSession {
 		self.tokens_per_second = None;
 		let _ = prepared.started.elapsed();
 		if self.store.enabled() {
-			if let Err(err) = self.store.append_turn(&record) {
-				eprintln!("warning: {err}");
+			// The live path already journaled the prompt (prepare_turn) and every
+			// assistant/tool tail entry (persist_turn_end, record_user_steer), so
+			// appending the turn record here would write the whole turn twice.
+			// Rebuild the view from the log instead.
+			self.refresh_history_from_store();
+		} else {
+			self.history.push(record);
+		}
+	}
+
+	/// Persist a steering message the loop accepted, at its real position, and
+	/// mirror it on the wire.
+	///
+	/// Called from the event pump after acceptance, never at queue time: a
+	/// message that was queued but not injected must not appear in the log.
+	fn record_user_steer(&mut self, prepared: &mut PreparedTurn, parts: &[AgentContentPart]) {
+		let mut text = Vec::new();
+		let mut images: Vec<ContentPart> = Vec::new();
+		for part in parts {
+			match part {
+				AgentContentPart::Text { text: value } => text.push(value.clone()),
+				AgentContentPart::Image { data, mime_type } => {
+					images.push(ContentPart::image(data, mime_type));
+				},
 			}
 		}
-		self.history.push(record);
+		let joined = text.join("\n");
+		let content = if images.is_empty() {
+			MessageContent::Text(joined.clone())
+		} else {
+			let mut assembled = Vec::new();
+			if !joined.is_empty() {
+				assembled.push(ContentPart::text(&joined));
+			}
+			assembled.extend(images.iter().cloned());
+			MessageContent::Parts(assembled)
+		};
+		let now = SystemTime::now();
+		let timestamp_ms = now
+			.duration_since(SystemTime::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_millis() as u64;
+		// Parent is the current physical leaf, so the injected user lands at the
+		// position the loop accepted it instead of being replayed at the tail of
+		// the turn record.
+		let entry = MessageEntry::new(
+			format!("msg-{}", output::session_id()),
+			self.store.leaf_id().map(str::to_string),
+			output::iso8601(now),
+			SessionMessage::user(content, timestamp_ms),
+		);
+		let message = runtime::user_message_from_parts(&joined, &images).ok();
+		if self.store.enabled() {
+			if let Err(err) = entry.validate() {
+				eprintln!("warning: {err}");
+			} else if let Err(err) = self.store.append_message(&entry) {
+				eprintln!("warning: {err}");
+			} else {
+				// The accepted entry becomes the parent for everything this turn
+				// appends next (assistant text, tool results), so the active branch
+				// includes the steering message instead of orphaning it.
+				prepared.parent_id = Some(entry.id.clone());
+				// The next request rebuilds its context from the store, so follow
+				// it now: otherwise the injected message would be missing from
+				// the very next prompt even though the log holds it.
+				if let (Some(messages), Some(message)) =
+					(self.history_messages.as_mut(), message.as_ref())
+				{
+					messages.push(message.clone());
+				}
+				self.refresh_history_from_store();
+			}
+		} else if let Some(message) = message {
+			self.in_memory_messages.get_or_insert_with(Vec::new).push(message);
+		}
+		if let Ok(value) = serde_json::to_value(&entry.message) {
+			self.messages.push(value);
+		}
+	}
+
+	/// Re-derive the turn view from the log after an entry landed outside a
+	/// turn record (steering); the active branch decides which entries count.
+	fn refresh_history_from_store(&mut self) {
+		let rebuilt = if self.store.has_branch_context() {
+			self.store.branch_history()
+		} else {
+			Ok(self.store.history().to_vec())
+		};
+		match rebuilt {
+			Ok(history) => self.history = history,
+			Err(err) => eprintln!("warning: cannot rebuild session history: {err}"),
+		}
 	}
 
 	/// Apply one streamed turn event to session state. Returns `true` when the
@@ -1299,6 +1501,21 @@ impl RpcSession {
 			AgentEvent::ToolStart { id, tool, .. } => {
 				prepared.tool_names.insert(id.clone(), tool.clone());
 			},
+			AgentEvent::ToolEnd { id, images, .. } => {
+				if !images.is_empty() {
+					let converted: Vec<ContentPart> = images
+						.iter()
+						.filter_map(|part| match part {
+							AgentContentPart::Image { data, mime_type } => {
+								Some(ContentPart::image(data, mime_type))
+							},
+							AgentContentPart::Text { .. } => None,
+						})
+						.collect();
+					prepared.tool_images.insert(id.clone(), converted);
+				}
+			},
+			AgentEvent::UserSteer { parts } => self.record_user_steer(prepared, parts),
 			AgentEvent::TurnEnd { message, tool_results, stop_reason, api, provider, model } => {
 				self.persist_turn_end(
 					prepared,
@@ -1415,10 +1632,27 @@ impl RpcSession {
 				.get(&result.tool_call_id)
 				.cloned()
 				.unwrap_or_default();
+			let images = prepared
+				.tool_images
+				.get(&result.tool_call_id)
+				.cloned()
+				.unwrap_or_default();
+			let tool_content = if images.is_empty() {
+				MessageContent::Text(result.content.clone())
+			} else {
+				// Same parts the provider request carries (validated once in
+				// pi-agent from `details.images`), so the journal replays them.
+				let mut assembled = Vec::new();
+				if !result.content.is_empty() {
+					assembled.push(ContentPart::text(&result.content));
+				}
+				assembled.extend(images);
+				MessageContent::Parts(assembled)
+			};
 			let mut tool_msg = SessionMessage::tool_result(
 				result.tool_call_id.clone(),
 				name,
-				MessageContent::Text(result.content.clone()),
+				tool_content,
 				result.is_error,
 				now_ms,
 			);
@@ -1587,6 +1821,9 @@ pub struct PreparedTurn {
 	pub model_fallback: Option<String>,
 	pub provider_fallback: Option<String>,
 	pub tool_names: std::collections::HashMap<String, String>,
+	/// Validated result images per tool call, as the provider request carries
+	/// them; persisted as tool-result parts and replayed on resume.
+	pub tool_images: std::collections::HashMap<String, Vec<ContentPart>>,
 	pub wire_user_message: Option<Value>,
 	pub aborted:    bool,
 }
@@ -1836,6 +2073,26 @@ fn now_ms() -> u64 {
 		.duration_since(SystemTime::UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_millis() as u64
+}
+
+/// Wire mirror of the messages on the store's active branch.
+///
+/// `messages()` returns every entry on the file; when the log carries a
+/// `branch_summary` the visible conversation is only the selected path, so the
+/// mirror has to follow the same entries `history()` was rebuilt from.
+fn branch_wire_messages(store: &SessionStore) -> Vec<Value> {
+	if !store.has_branch_context() {
+		return store
+			.messages()
+			.iter()
+			.filter_map(|entry| serde_json::to_value(&entry.message).ok())
+			.collect();
+	}
+	store
+		.branch_messages()
+		.into_iter()
+		.filter_map(|entry| serde_json::to_value(&entry.message).ok())
+		.collect()
 }
 
 fn compaction_prompt(custom: Option<&str>) -> String {

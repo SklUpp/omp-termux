@@ -18,6 +18,9 @@ pub enum OutputMode {
 	Text,
 	/// Newline-delimited session header and events.
 	Json,
+	/// NDJSON command/event transport (`--mode rpc`): stdout carries protocol
+	/// frames only and `RpcMode` owns the writer, so no `Reporter` is built.
+	Rpc,
 }
 
 #[derive(Debug)]
@@ -169,12 +172,37 @@ impl<W: Write, E: Write> Reporter<W, E> {
 					});
 					writeln!(self.out, "{envelope}")?;
 				},
-				Event::ToolEnd { id, tool, result, error } => {
+				Event::ToolUpdate { id, tool, args, partial } => {
+					let envelope = serde_json::json!({
+						"type": "tool_execution_update",
+						"toolCallId": id,
+						"toolName": tool,
+						"args": args,
+						"partialResult": partial,
+					});
+					writeln!(self.out, "{envelope}")?;
+				},
+				Event::ToolEnd { id, tool, result, error, images, details } => {
+					let mut blocks =
+						vec![serde_json::json!({ "type": "text", "text": result })];
+					for part in images {
+						if let pi_agent::ContentPart::Image { data, mime_type } = part {
+							blocks.push(serde_json::json!({
+								"type": "image",
+								"data": data,
+								"mimeType": mime_type,
+							}));
+						}
+					}
+					let mut payload = serde_json::json!({ "content": blocks });
+					if let Some(details) = details {
+						payload["details"] = details.clone();
+					}
 					let envelope = serde_json::json!({
 						"type": "tool_execution_end",
 						"toolCallId": id,
 						"toolName": tool,
-						"result": result,
+						"result": payload,
 						"isError": error.is_some(),
 					});
 					writeln!(self.out, "{envelope}")?;
@@ -224,6 +252,10 @@ impl<W: Write, E: Write> Reporter<W, E> {
 					});
 					writeln!(self.out, "{envelope}")?;
 				},
+				// Accepted steering is part of the conversation, not a stream
+				// event: it reaches the wire inside `agent_end.messages` and, for
+				// persisted sessions, as its own user entry.
+				Event::UserSteer { .. } => {},
 			}
 			self.out.flush()?;
 		}
@@ -561,6 +593,8 @@ mod tests {
 					tool: "read".to_string(),
 					result: "file data".to_string(),
 					error: None,
+					images: Vec::new(),
+					details: None,
 				})
 				.unwrap();
 			reporter

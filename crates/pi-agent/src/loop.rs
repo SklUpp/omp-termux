@@ -25,52 +25,56 @@ const MIN_RECENT_MESSAGES: usize = 4;
 /// batch is closed with this marker instead of leaving orphan calls behind.
 pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution interrupted by user]";
 
-/// Extract `details.images` into validated content parts for the next provider
-/// request. Invalid payloads fail closed: the tool result becomes an error and
-/// the image is not attached, so a bad kernel payload cannot break every later
-/// request in the turn.
+/// Validate `details.images` into content parts for one tool result.
+///
+/// Single source of truth for the policy: the provider request, the live
+/// `tool_execution_end` frame and the RPC child turn's `toolResults` all go
+/// through it. `Err` names why a payload was rejected, so callers decide the
+/// fallout: the loop fails the result closed, wire-only views drop the images.
+pub fn tool_image_parts_of(result: &ToolResult) -> Result<Vec<ContentPart>, String> {
+	let Some(images) = result
+		.details
+		.as_ref()
+		.and_then(|details| details.get("images"))
+		.and_then(serde_json::Value::as_array)
+	else {
+		return Ok(Vec::new());
+	};
+	let mut parts = Vec::with_capacity(images.len());
+	for image in images {
+		let data = image.get("data").and_then(serde_json::Value::as_str);
+		let mime = image
+			.get("mimeType")
+			.or_else(|| image.get("mime_type"))
+			.and_then(serde_json::Value::as_str);
+		match (data, mime) {
+			(Some(data), Some(mime)) => {
+				parts.push(ContentPart::image(data, mime)?);
+			},
+			_ => return Err("image entry needs base64 `data` and `mimeType`".to_string()),
+		}
+	}
+	Ok(parts)
+}
+
+/// Per-call image map for the provider request. Invalid payloads fail closed:
+/// the tool result becomes an error and the image is not attached, so a bad
+/// kernel payload cannot break every later request in the turn.
 fn tool_image_parts(
 	results: &mut [ToolResult],
 ) -> std::collections::HashMap<String, Vec<ContentPart>> {
 	let mut by_call = std::collections::HashMap::new();
 	for result in results {
-		let Some(images) = result
-			.details
-			.as_ref()
-			.and_then(|details| details.get("images"))
-			.and_then(serde_json::Value::as_array)
-		else {
-			continue;
-		};
-		let mut parts = Vec::with_capacity(images.len());
-		let mut rejected = None;
-		for image in images {
-			let data = image.get("data").and_then(serde_json::Value::as_str);
-			let mime = image
-				.get("mimeType")
-				.or_else(|| image.get("mime_type"))
-				.and_then(serde_json::Value::as_str);
-			match (data, mime) {
-				(Some(data), Some(mime)) => match ContentPart::image(data, mime) {
-					Ok(part) => parts.push(part),
-					Err(error) => {
-						rejected = Some(error);
-						break;
-					},
-				},
-				_ => {
-					rejected = Some("image entry needs base64 `data` and `mimeType`".to_string());
-					break;
-				},
-			}
-		}
-		if let Some(error) = rejected {
-			result.is_error = true;
-			result.content = format!("{}\n\n[image payload rejected: {error}]", result.content);
-			continue;
-		}
-		if !parts.is_empty() {
-			by_call.insert(result.tool_call_id.clone(), parts);
+		match tool_image_parts_of(result) {
+			Ok(parts) if !parts.is_empty() => {
+				by_call.insert(result.tool_call_id.clone(), parts);
+			},
+			Ok(_) => {},
+			Err(error) => {
+				result.is_error = true;
+				result.content =
+					format!("{}\n\n[image payload rejected: {error}]", result.content);
+			},
 		}
 	}
 	by_call
@@ -188,10 +192,38 @@ pub enum AgentEvent {
 	MessageEnd { message: Message, status: TurnStatus },
 	/// Tool invocation started before batch execution.
 	ToolStart { id: String, name: String, arguments: serde_json::Value },
-	/// Tool invocation finished with result or error.
-	ToolEnd { id: String, name: String, result: String, is_error: bool },
+	/// Partial tool output reported while the tool still runs (TS
+	/// `tool_execution_update`). Sent by the tool through
+	/// [`crate::state::AgentContext::report_progress`] on the same queue as
+	/// `ToolStart`/`ToolEnd`, so an update always precedes its own end.
+	ToolUpdate { id: String, name: String, args: serde_json::Value, partial: serde_json::Value },
+	/// Tool invocation finished with result or error. `images` are the validated
+	/// `details.images` parts the provider request will carry, so the host wire
+	/// sees exactly what the model sees.
+	ToolEnd {
+		id: String,
+		name: String,
+		result: String,
+		is_error: bool,
+		images: Vec<ContentPart>,
+		/// Structured result details (TS `AgentToolResult.details`), replayed on
+		/// the wire verbatim and persisted with the tool result.
+		details: Option<serde_json::Value>,
+	},
 	/// After tool results resolved (or immediately when tool_calls empty / on abort). Once per assistant message.
 	TurnEnd { message: Message, tool_results: Vec<ToolResult>, status: TurnStatus },
+	/// A user message accepted from the steering channel, exactly as it entered
+	/// the history. Emitted only after acceptance — never for a queued message
+	/// that was not injected — so the host can persist it at that position and
+	/// mirror it instead of losing the accepted instruction.
+	UserSteer { parts: Vec<ContentPart> },
+}
+
+/// Announce one accepted steering message to the host event stream.
+async fn announce_user_steer(events: &Option<mpsc::Sender<AgentEvent>>, parts: &[ContentPart]) {
+	if let Some(sink) = events {
+		let _ = sink.send(AgentEvent::UserSteer { parts: parts.to_vec() }).await;
+	}
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -210,13 +242,15 @@ pub enum AgentError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SteeringEvent {
 	Interrupt,
-	InjectMessage(String),
+	/// Exact user parts (text and images) injected as one user message, so a
+	/// steering image survives instead of being flattened to text.
+	InjectMessage(Vec<ContentPart>),
 }
 
 /// Events drained from the steering channel at one point in time.
 #[derive(Default)]
 struct Steering {
-	injections: Vec<String>,
+	injections: Vec<Vec<ContentPart>>,
 	interrupted: bool,
 }
 
@@ -241,7 +275,7 @@ impl Steering {
 /// Outcome of one tool batch.
 struct BatchOutcome {
 	results: Vec<ToolResult>,
-	injections: Vec<String>,
+	injections: Vec<Vec<ContentPart>>,
 	interrupted: bool,
 }
 
@@ -634,7 +668,8 @@ impl AgentLoop {
 			self.config.cwd.clone(),
 			cancellation_token.clone(),
 			self.scheduler.approver().cloned(),
-		);
+		)
+		.with_progress(events.clone());
 		let mut turn_results = Vec::new();
 		let mut soft = SoftRequirementState::default();
 
@@ -645,8 +680,9 @@ impl AgentLoop {
 					cancellation_token.cancel();
 					return Err(AgentError::Interrupted);
 				}
-				for message in steering.injections {
-					state.messages.push(Message::user(message));
+				for parts in steering.injections {
+					announce_user_steer(&events, &parts).await;
+					state.messages.push(Message::user_with_parts(parts));
 				}
 			}
 			// Results that settled while the previous assistant turn ran land
@@ -756,6 +792,8 @@ impl AgentLoop {
 								name: call.name.clone(),
 								result: notice.clone(),
 								is_error: true,
+								images: Vec::new(),
+								details: None,
 							})
 							.await;
 					}
@@ -774,12 +812,16 @@ impl AgentLoop {
 					));
 					results.push(result);
 				}
-				for message in pending_injections {
-					state.messages.push(Message::user(message));
-				}
 				soft.force_next = true;
 				soft.escalations += 1;
-				let ack_rx = self.begin_turn_ack(turn_start, state.messages.len());
+				// The ack must exist before `TurnEnd` is published: the consumer
+				// takes it while handling that event and the loop would wait
+				// forever on a registration that came later. The boundary already
+				// counts the injections journaled below, in this same block.
+				let ack_rx = self.begin_turn_ack(
+					turn_start,
+					state.messages.len() + pending_injections.len(),
+				);
 				if let Some(events_sink) = events.as_ref() {
 					let _ = events_sink
 						.send(AgentEvent::TurnEnd {
@@ -788,6 +830,13 @@ impl AgentLoop {
 							status: TurnStatus::ToolUse,
 						})
 						.await;
+				}
+				// After `TurnEnd`, for the same reason as the end-turn path: the
+				// assistant/tool tail is journaled first, the injected user chains
+				// behind it.
+				for parts in pending_injections {
+					announce_user_steer(&events, &parts).await;
+					state.messages.push(Message::user_with_parts(parts));
 				}
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
 				self.apply_turn_rewrite(&mut state.messages, decision);
@@ -800,10 +849,16 @@ impl AgentLoop {
 			}
 
 			if assistant.tool_calls.is_empty() {
-				for message in pending_injections {
-					state.messages.push(Message::user(message));
-				}
-				let ack_rx = self.begin_turn_ack(turn_start, state.messages.len());
+				// Register the ack before publishing `TurnEnd` (the consumer takes
+				// it there), and count the injections this block journals next so
+				// the boundary is final when the host sees it.
+				let ack_rx = self.begin_turn_ack(
+					turn_start,
+					state.messages.len() + pending_injections.len(),
+				);
+				// The assistant entry reaches the journal through `TurnEnd`, so it
+				// is emitted before the injected users: an accepted steering message
+				// must chain after the message it interrupted, not before it.
 				if let Some(events_sink) = events.as_ref() {
 					let _ = events_sink
 						.send(AgentEvent::TurnEnd {
@@ -812,6 +867,10 @@ impl AgentLoop {
 							status: TurnStatus::EndTurn,
 						})
 						.await;
+				}
+				for parts in pending_injections {
+					announce_user_steer(&events, &parts).await;
+					state.messages.push(Message::user_with_parts(parts));
 				}
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
 				let continue_turn = self.apply_turn_rewrite(&mut state.messages, decision);
@@ -860,6 +919,11 @@ impl AgentLoop {
 							name: name.to_string(),
 							result: result.content.clone(),
 							is_error: result.is_error,
+							images: image_parts
+								.get(&result.tool_call_id)
+								.cloned()
+								.unwrap_or_default(),
+							details: result.details.clone(),
 						})
 						.await;
 				}
@@ -888,11 +952,6 @@ impl AgentLoop {
 					)),
 				}
 			}
-			// Injected messages land after the tool responses, so the history stays valid.
-			for message in pending_injections.into_iter().chain(outcome.injections) {
-				state.messages.push(Message::user(message));
-			}
-
 			// A tool may cancel the turn itself (interactive `ask` cancel/abort).
 			// TS ToolAbortError interrupts the whole turn; never issue another
 			// provider request merely because the tool returned an Aborted result.
@@ -903,7 +962,11 @@ impl AgentLoop {
 				TurnStatus::ToolUse
 			};
 
-			let ack_rx = self.begin_turn_ack(turn_start, state.messages.len());
+			// Ack first (the consumer takes it on `TurnEnd`), with the boundary
+			// already counting the injections journaled right after it.
+			let injection_count = pending_injections.len() + outcome.injections.len();
+			let ack_rx =
+				self.begin_turn_ack(turn_start, state.messages.len() + injection_count);
 			if let Some(events_sink) = events.as_ref() {
 				let _ = events_sink
 					.send(AgentEvent::TurnEnd {
@@ -912,6 +975,13 @@ impl AgentLoop {
 						status,
 					})
 					.await;
+			}
+			// Injected messages land after the tool responses and after the turn
+			// tail is journaled, so the history stays valid and the accepted user
+			// chains behind the messages it interrupted.
+			for parts in pending_injections.into_iter().chain(outcome.injections) {
+				announce_user_steer(&events, &parts).await;
+				state.messages.push(Message::user_with_parts(parts));
 			}
 			let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
 			let _ = self.apply_turn_rewrite(&mut state.messages, decision);
@@ -1022,7 +1092,7 @@ impl AgentLoop {
 		events: Option<&mpsc::Sender<AgentEvent>>,
 		cancellation_token: &CancellationToken,
 		mut steering_rx: Option<&mut mpsc::Receiver<SteeringEvent>>,
-		injections: &mut Vec<String>,
+		injections: &mut Vec<Vec<ContentPart>>,
 	) -> Result<Message, AgentError> {
 		if cancellation_token.is_cancelled() {
 			return Err(AgentError::Interrupted);
@@ -1428,5 +1498,30 @@ mod live_cut_tests {
 		assert!(results[1].is_error, "invalid image fails closed");
 		assert!(results[1].content.contains("image payload rejected"));
 		assert!(!parts.contains_key("bad"));
+	}
+}
+
+#[cfg(test)]
+mod steering_parts_tests {
+	use super::*;
+
+	/// A steering message must reach the model chat with its exact parts: an
+	/// image is never flattened to text or dropped at the channel boundary.
+	#[test]
+	fn injected_message_keeps_text_and_image_parts() {
+		let parts = vec![
+			ContentPart::text("look at this"),
+			ContentPart::image("aW1n", "image/png").expect("valid image part"),
+		];
+		let (tx, mut rx) = mpsc::channel(4);
+		tx.try_send(SteeringEvent::InjectMessage(parts.clone()))
+			.expect("steering channel must accept a message");
+		let steering = Steering::drain(&mut rx);
+		assert!(!steering.interrupted, "an injected message is not an interrupt");
+		assert_eq!(steering.injections, vec![parts.clone()]);
+		let injected = steering.injections.into_iter().next().expect("one injection");
+		let message = Message::user_with_parts(injected);
+		assert_eq!(message.parts, parts);
+		assert!(message.has_image(), "steering image must survive into the chat");
 	}
 }

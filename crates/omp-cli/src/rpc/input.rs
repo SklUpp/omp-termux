@@ -212,12 +212,39 @@ impl ExtensionUiBridge {
 	/// cancel, timeout, shutdown or an unknown reply.
 	pub fn request(
 		&self,
-		mut frame: serde_json::Value,
+		frame: serde_json::Value,
 		timeout: Option<Duration>,
 	) -> Option<RpcExtensionUiResponse> {
+		self.request_cancellable(frame, timeout, &|| false)
+	}
+
+	/// [`Self::request`] bound to one owner's cancellation signal.
+	///
+	/// While waiting, `cancelled()` is polled; once it turns true this dialog —
+	/// and only this dialog — is dismissed with the upstream `method:"cancel"`
+	/// frame (`rpc-mode.ts#requestRpcDialog.onAbort`, `targetId` = dialog id),
+	/// dropped from the pending table and the caller returns `None`. A signal that
+	/// is already set never sends a frame, so a cancel racing a prompt cannot
+	/// leave a live dialog behind; answers that arrive after the cancel are
+	/// dropped by [`Self::handle`]. A timeout removes the entry without a cancel
+	/// frame, exactly like upstream's `setTimeout` branch.
+	pub fn request_cancellable(
+		&self,
+		mut frame: serde_json::Value,
+		timeout: Option<Duration>,
+		cancelled: &dyn Fn() -> bool,
+	) -> Option<RpcExtensionUiResponse> {
+		const POLL: Duration = Duration::from_millis(40);
+		if cancelled() {
+			return None;
+		}
 		let id = format!("ui-{}-{}", std::process::id(), self.next_id.fetch_add(1, Ordering::Relaxed));
 		let (tx, rx) = mpsc::channel();
 		self.lock_pending().insert(id.clone(), tx);
+		if cancelled() {
+			self.lock_pending().remove(&id);
+			return None;
+		}
 		frame["type"] = serde_json::json!("extension_ui_request");
 		frame["id"] = serde_json::json!(id);
 		if let Some(timeout) = timeout {
@@ -227,32 +254,41 @@ impl ExtensionUiBridge {
 
 		let deadline = timeout.map(|timeout| Instant::now() + timeout);
 		loop {
-			let response = match deadline {
-				Some(deadline) => {
-					let remaining = deadline.saturating_duration_since(Instant::now());
-					match rx.recv_timeout(remaining) {
-						Ok(response) => response,
-						Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
-							self.lock_pending().remove(&id);
-							return None;
-						},
+			let wait = match deadline {
+				Some(deadline) => deadline.saturating_duration_since(Instant::now()).min(POLL),
+				None => POLL,
+			};
+			match rx.recv_timeout(wait) {
+				Ok(response) => {
+					if response.id != id {
+						continue;
 					}
+					if response.cancelled {
+						return None;
+					}
+					return Some(response);
 				},
-				None => match rx.recv() {
-					Ok(response) => response,
-					Err(_) => {
+				Err(mpsc::RecvTimeoutError::Disconnected) => {
+					self.lock_pending().remove(&id);
+					return None;
+				},
+				Err(mpsc::RecvTimeoutError::Timeout) => {
+					if cancelled() {
+						// A response may have raced the signal: it wins.
+						if let Ok(response) = rx.try_recv() {
+							if response.id == id {
+								return if response.cancelled { None } else { Some(response) };
+							}
+						}
+						self.cancel_dialog(&id);
+						return None;
+					}
+					if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
 						self.lock_pending().remove(&id);
 						return None;
-					},
+					}
 				},
-			};
-			if response.id != id {
-				continue;
 			}
-			if response.cancelled {
-				return None;
-			}
-			return Some(response);
 		}
 	}
 
@@ -262,6 +298,23 @@ impl ExtensionUiBridge {
 			return false;
 		};
 		sender.send(response).is_ok()
+	}
+
+	/// Dismiss one registered dialog with the upstream cancel notification.
+	fn cancel_dialog(&self, id: &str) {
+		self.lock_pending().remove(id);
+		self.sink.send(serde_json::json!({
+			"type": "extension_ui_request",
+			"id": format!("ui-{}-{}", std::process::id(), self.next_id.fetch_add(1, Ordering::Relaxed)),
+			"method": "cancel",
+			"targetId": id,
+		}));
+	}
+
+	/// Test-only: dialogs still waiting for a response.
+	#[cfg(test)]
+	pub(crate) fn pending_dialogs(&self) -> usize {
+		self.lock_pending().len()
 	}
 
 	/// Fail every pending dialog (abort, EOF, shutdown) so callers fail closed.
@@ -552,6 +605,83 @@ mod tests {
 		tasks.sort_unstable();
 		assert_eq!(tasks, vec![0, 1, 2]);
 		assert_eq!(coordinator.drain(), 0);
+	}
+
+	fn test_ui() -> (Arc<ExtensionUiBridge>, mpsc::Receiver<Value>) {
+		let (tx, rx) = mpsc::channel();
+		struct TestSink(Mutex<Sender<Value>>);
+		impl FrameSink for TestSink {
+			fn send(&self, frame: Value) {
+				let _ = self.0.lock().expect("sink").send(frame);
+			}
+		}
+		(Arc::new(ExtensionUiBridge::new(Arc::new(TestSink(Mutex::new(tx))))), rx)
+	}
+
+	#[test]
+	fn cancellable_request_dismisses_only_its_dialog_with_the_upstream_cancel_frame() {
+		use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+		let (ui, rx) = test_ui();
+		let cancelled = Arc::new(AtomicBool::new(false));
+		let handle = {
+			let ui = Arc::clone(&ui);
+			let flag = Arc::clone(&cancelled);
+			thread::spawn(move || {
+				ui.request_cancellable(
+					serde_json::json!({ "method": "input", "title": "Paste" }),
+					None,
+					&|| flag.load(AtomicOrdering::SeqCst),
+				)
+			})
+		};
+		let request = rx.recv_timeout(Duration::from_secs(5)).expect("request");
+		let id = request["id"].as_str().expect("id").to_string();
+		assert_eq!(ui.pending_dialogs(), 1, "the dialog is registered while shown");
+
+		cancelled.store(true, AtomicOrdering::SeqCst);
+		let cancel_frame = rx.recv_timeout(Duration::from_secs(5)).expect("cancel frame");
+		assert_eq!(cancel_frame["type"], serde_json::json!("extension_ui_request"));
+		assert_eq!(cancel_frame["method"], serde_json::json!("cancel"));
+		assert_eq!(cancel_frame["targetId"], serde_json::json!(id), "targets exactly this dialog");
+		assert_ne!(cancel_frame["id"], serde_json::json!(id), "the notification carries its own id");
+
+		assert!(handle.join().expect("join").is_none());
+		assert_eq!(ui.pending_dialogs(), 0);
+		assert!(
+			!ui.handle(RpcExtensionUiResponse {
+				id,
+				value: Some("late".to_string()),
+				confirmed: None,
+				cancelled: false,
+				timed_out: None,
+			}),
+			"an answer arriving after the cancel is dropped"
+		);
+	}
+
+	#[test]
+	fn already_cancelled_request_emits_no_dialog_frame() {
+		let (ui, rx) = test_ui();
+		assert!(ui
+			.request_cancellable(serde_json::json!({ "method": "input" }), Some(Duration::from_secs(5)), &|| true)
+			.is_none());
+		assert!(rx.try_recv().is_err(), "a cancelled token never sends the prompt");
+		assert_eq!(ui.pending_dialogs(), 0);
+	}
+
+	#[test]
+	fn timeout_removes_the_dialog_without_a_cancel_frame() {
+		let (ui, rx) = test_ui();
+		assert!(ui
+			.request_cancellable(
+				serde_json::json!({ "method": "input" }),
+				Some(Duration::from_millis(60)),
+				&|| false
+			)
+			.is_none());
+		let _request = rx.recv_timeout(Duration::from_secs(5)).expect("request");
+		assert!(rx.try_recv().is_err(), "upstream's timeout branch emits no cancel frame");
+		assert_eq!(ui.pending_dialogs(), 0);
 	}
 }
 

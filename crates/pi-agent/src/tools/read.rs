@@ -43,6 +43,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
 	Tool, ToolError,
 	edit_variants::mode::{EditMode, FileDisplayMode, resolve_file_display_mode},
+	internal_urls::{self, InternalResource, InternalUrlRouter},
 	tool_result,
 };
 use crate::state::{AgentContext, ToolResult};
@@ -145,6 +146,11 @@ impl FileDisplayInputs {
 pub struct ReadTool {
 	sink:    Option<Arc<dyn ReadSnapshotSink>>,
 	display: Option<FileDisplayInputs>,
+	/// Internal URL router consulted before any filesystem probe. Mounted by
+	/// the registry builder; absent in embedders with no protocol handlers.
+	router:  Option<Arc<InternalUrlRouter>>,
+	/// Per-session scope handed to handlers; never mutated after construction.
+	scope:   Arc<internal_urls::UrlScope>,
 }
 
 impl Default for ReadTool {
@@ -155,12 +161,34 @@ impl Default for ReadTool {
 
 impl ReadTool {
 	pub fn new() -> Self {
-		Self { sink: None, display: None }
+		Self {
+			sink:    None,
+			display: None,
+			router:  None,
+			scope:   Arc::new(internal_urls::UrlScope::default()),
+		}
 	}
 
 	/// Read with hashline headers and snapshot recording enabled.
 	pub fn with_snapshot_sink(sink: Arc<dyn ReadSnapshotSink>) -> Self {
-		Self { sink: Some(sink), display: None }
+		Self {
+			sink:    Some(sink),
+			display: None,
+			router:  None,
+			scope:   Arc::new(internal_urls::UrlScope::default()),
+		}
+	}
+
+	/// Mount the session's internal URL router with its per-session scope.
+	#[must_use]
+	pub fn with_internal_urls(
+		mut self,
+		router: Arc<InternalUrlRouter>,
+		scope: Arc<internal_urls::UrlScope>,
+	) -> Self {
+		self.router = Some(router);
+		self.scope = scope;
+		self
 	}
 
 	/// Opt into resolver-driven display. Without this call the tool keeps the
@@ -236,6 +264,72 @@ impl Tool for ReadTool {
 			return Ok(tool_result("Read cancelled", true));
 		}
 
+		// Internal URLs are resolved by the mounted router before any
+		// filesystem probe. A `scheme://` target with no handler is an explicit
+		// protocol error, never a path that happens to contain a colon. A trailing
+		// selector is peeled first, and the resolved text runs through the same
+		// range/`raw` rendering and 3000-line / 50 KiB caps as a file read: the
+		// resource's `content` is never handed to the model verbatim.
+		if let Some(scheme) = internal_scheme(raw_path) {
+			let Some(router) = &self.router else {
+				return Ok(tool_result(
+					internal_urls::unknown_protocol_error(&scheme, &[]),
+					true,
+				));
+			};
+			let (base, sel_part) = split_internal_selector(raw_path);
+			let parsed = match parse_sel(sel_part) {
+				Ok(parsed) => parsed,
+				Err(message) => return Ok(tool_result(message, true)),
+			};
+			if matches!(parsed, Sel::Image | Sel::Conflicts) {
+				return Ok(tool_result(
+					format!(
+						"Selector ':{sel}' is not supported for internal URL '{base}'.",
+						sel = sel_part.unwrap_or_default()
+					),
+					true,
+				));
+			}
+			let resource = match router
+				.resolve(base, &self.scope.resolve_context(&ctx.cwd, &ctx.cancellation_token))
+				.await
+			{
+				Ok(resource) => resource,
+				Err(message) => return Ok(tool_result(message, true)),
+			};
+			let source = TextSource::Memory { url: base, bytes: resource.content.as_bytes() };
+			let raw_selector = is_raw(&parsed);
+			let display_mode = self.display_mode(raw_selector, is_immutable_source(base));
+			let outcome = match &parsed {
+				Sel::Lines { ranges, raw } if ranges.len() > 1 => {
+					read_multi_range(&source, ranges, *raw, None, display_mode, ctx).await
+				},
+				Sel::Lines { ranges, raw } => {
+					read_single_range(&source, ranges[0], *raw, None, display_mode, ctx).await
+				},
+				Sel::Raw | Sel::None => {
+					read_single_range(
+						&source,
+						LineRange { start_line: 1, end_line: None },
+						raw_selector,
+						None,
+						display_mode,
+						ctx,
+					)
+					.await
+				},
+				Sel::Conflicts | Sel::Image => unreachable!("handled above"),
+			};
+			return match outcome {
+				Ok(mut result) => {
+					attach_internal_resource(&mut result.details, &resource);
+					Ok(result)
+				},
+				Err(message) => Ok(tool_result(message, true)),
+			};
+		}
+
 		// `~` expands before selector peeling, so `~/notes:12` reads the file.
 		let raw_path = expand_tilde(raw_path, ctx);
 
@@ -286,14 +380,6 @@ impl Tool for ReadTool {
 		let meta = match tokio::fs::metadata(&target).await {
 			Ok(meta) => meta,
 			Err(err) => {
-				if let Some(scheme) = internal_scheme(&raw_path) {
-					return Ok(unsupported(
-						format!(
-							"Internal resource reads are not supported in this build: '{scheme}://'. Use a local filesystem path."
-						),
-						&target,
-					));
-				}
 				let recovered = if is_not_found(&err) {
 					match find_unique_workspace_suffix(&path_part, ctx).await {
 						Some((candidate, display)) => match tokio::fs::metadata(&candidate).await {
@@ -418,18 +504,18 @@ impl Tool for ReadTool {
 				);
 			}
 		}
+		let source = TextSource::File { path: &target, size: meta.len() };
 		let outcome = match &parsed {
 			Sel::Lines { ranges, raw } if ranges.len() > 1 => {
-				read_multi_range(&target, meta.len(), ranges, *raw, sink, display_mode, ctx).await
+				read_multi_range(&source, ranges, *raw, sink, display_mode, ctx).await
 			},
 			Sel::Lines { ranges, raw } => {
 				let range = ranges[0];
-				read_single_range(&target, meta.len(), range, *raw, sink, display_mode, ctx).await
+				read_single_range(&source, range, *raw, sink, display_mode, ctx).await
 			},
 			Sel::Raw | Sel::None => {
 				read_single_range(
-					&target,
-					meta.len(),
+					&source,
 					LineRange { start_line: 1, end_line: None },
 					raw_selector,
 					sink,
@@ -899,18 +985,114 @@ fn is_immutable_source(raw: &str) -> bool {
 }
 
 fn internal_scheme(raw: &str) -> Option<String> {
-	let idx = raw.find("://")?;
-	let scheme = &raw[..idx];
-	if scheme.is_empty() || !scheme.as_bytes()[0].is_ascii_alphabetic() {
-		return None;
+	internal_urls::scheme_of(raw)
+}
+
+/// Text source for the read pipeline: an on-disk file, or an internal resource
+/// the router already resolved. Both run the same selector grammar, line model,
+/// caps and rendering, so an internal read can neither bypass the 3000-line /
+/// 50 KiB limits nor return a resource's unbounded `content` verbatim.
+enum TextSource<'a> {
+	File { path: &'a Path, size: u64 },
+	Memory { url: &'a str, bytes: &'a [u8] },
+}
+
+impl<'a> TextSource<'a> {
+	fn size(&self) -> u64 {
+		match self {
+			Self::File { size, .. } => *size,
+			Self::Memory { bytes, .. } => bytes.len() as u64,
+		}
 	}
-	if !scheme
-		.bytes()
-		.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
-	{
-		return None;
+
+	fn path(&self) -> Option<&Path> {
+		match self {
+			Self::File { path, .. } => Some(path),
+			Self::Memory { .. } => None,
+		}
 	}
-	Some(scheme.to_ascii_lowercase())
+
+	/// Label shown as `resolvedPath` / in errors.
+	fn label(&self) -> String {
+		match self {
+			Self::File { path, .. } => path.display().to_string(),
+			Self::Memory { url, .. } => (*url).to_string(),
+		}
+	}
+
+	/// `meta.source`: how the content was addressed, never a fake path.
+	fn meta_source(&self) -> Value {
+		match self {
+			Self::File { path, .. } => {
+				json!({ "type": "path", "value": path.display().to_string() })
+			},
+			Self::Memory { url, .. } => json!({ "type": "internal", "value": url }),
+		}
+	}
+}
+
+/// Schemes whose host grammar is identifier-shaped, so a trailing
+/// `:<selector-chunk>` is unambiguously a read-tool selector. Mirrors TS
+/// `INTERNAL_SCHEMES_WITH_SELECTORS` (`tools/path-utils.ts:43-57`): `mcp://` is
+/// opaque — server-defined URIs may end in selector-shaped tails.
+const SELECTOR_SCHEMES: [&str; 13] = [
+	"agent", "artifact", "issue", "history", "local", "memory", "omp", "pr", "rule", "security",
+	"skill", "ssh", "vault",
+];
+
+/// Split an internal URL from its read selector, mirroring TS
+/// `splitInternalUrlSel` (`tools/path-utils.ts:403-433`): peel selector chunks
+/// from the right while the read grammar accepts them, stop before the scheme
+/// separator, and keep `ssh://host:port` (no `/path`) whole so a port is never
+/// read as a selector. Opaque schemes are forwarded verbatim.
+fn split_internal_selector(raw: &str) -> (&str, Option<&str>) {
+	let Some(scheme) = internal_urls::scheme_of(raw) else {
+		return (raw, None);
+	};
+	if !SELECTOR_SCHEMES.contains(&scheme.as_str()) {
+		return (raw, None);
+	}
+	let scheme_end = scheme.len() + 3;
+	if scheme == "ssh" && !raw[scheme_end..].contains('/') {
+		return (raw, None);
+	}
+	let mut end = raw.len();
+	let mut start = end;
+	let mut chunks = 0;
+	let mut path = raw;
+	while let Some(colon) = path.rfind(':') {
+		if colon < scheme_end {
+			break;
+		}
+		let tail = &path[colon + 1..];
+		if !is_selector_tail(tail) {
+			break;
+		}
+		start = colon;
+		chunks += 1;
+		path = &path[..colon];
+	}
+	if chunks == 0 {
+		return (raw, None);
+	}
+	(&raw[..start], Some(&raw[start + 1..end]))
+}
+
+/// Attach the handler's resource metadata to a rendered result.
+fn attach_internal_resource(details: &mut Option<Value>, resource: &InternalResource) {
+	let map = details.get_or_insert_with(|| json!({})).as_object_mut().expect("details object");
+	map.insert(
+		"internalUrl".into(),
+		json!({
+			"url": resource.url,
+			"contentType": resource.content_type,
+			"size": resource.size,
+			"immutable": resource.immutable,
+			"isDirectory": resource.is_directory,
+			"sourcePath": resource.source_path.as_ref().map(|path| path.display().to_string()),
+			"notes": resource.notes,
+		}),
+	);
 }
 
 fn lower_path(path: &Path) -> String {
@@ -1200,14 +1382,14 @@ async fn scan_window(
 }
 
 async fn read_single_range(
-	path: &Path,
-	file_size: u64,
+	source: &TextSource<'_>,
 	range: LineRange,
 	raw: bool,
 	sink: Option<&dyn ReadSnapshotSink>,
 	display_mode: FileDisplayMode,
 	ctx: &AgentContext,
 ) -> Result<ToolResult, String> {
+	let file_size = source.size();
 	let requested_start = range.start_line - 1;
 	let limit = range.end_line.map(|end| end - range.start_line + 1);
 	let effective_limit = limit.unwrap_or(DEFAULT_READ_LIMIT);
@@ -1224,10 +1406,12 @@ async fn read_single_range(
 	let max_lines_to_collect = selected_line_limit.min(DEFAULT_MAX_LINES);
 	let max_bytes = DEFAULT_MAX_BYTES.max(max_lines_to_collect * 512);
 
-	let buffered = if file_size <= SNAPSHOT_MAX_BYTES {
-		read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await
-	} else {
-		None
+	let buffered = match source {
+		TextSource::File { path, size } if *size <= SNAPSHOT_MAX_BYTES => {
+			read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await
+		},
+		TextSource::Memory { bytes, .. } => Some(bytes.to_vec()),
+		TextSource::File { .. } => None,
 	};
 	let (window, snapshot_text) = match buffered {
 		Some(bytes) => {
@@ -1245,7 +1429,14 @@ async fn read_single_range(
 			);
 			(window, Some(text))
 		},
-		None => (
+		None => {
+			let TextSource::File { path, .. } = source else {
+				return Err(format!(
+					"Internal resource is too large to read ({}); use a line selector.",
+					format_bytes(file_size)
+				));
+			};
+			(
 			scan_window(
 				path,
 				file_size,
@@ -1258,7 +1449,8 @@ async fn read_single_range(
 			)
 			.await?,
 			None,
-		),
+			)
+		},
 	};
 
 	if window.reached_eof && requested_start >= window.total_lines {
@@ -1271,9 +1463,9 @@ async fn read_single_range(
 			)
 		};
 		let details = json!({
-			"resolvedPath": path.display().to_string(),
+			"resolvedPath": source.label(),
 			"fileSize": file_size,
-			"meta": { "source": { "type": "path", "value": path.display().to_string() } }
+			"meta": { "source": source.meta_source() }
 		});
 		return Ok(result_with_details(
 			format!(
@@ -1406,7 +1598,7 @@ async fn read_single_range(
 	}
 
 	if hash_lines {
-		if let (Some(sink), Some(text)) = (sink, snapshot_text.as_deref()) {
+		if let (Some(sink), Some(text), Some(path)) = (sink, snapshot_text.as_deref(), source.path()) {
 			if !first_line_exceeds && !window.lines.is_empty() {
 				let seen: Vec<u64> = (0..window.lines.len() as u64)
 					.map(|offset| display_start + offset)
@@ -1419,7 +1611,7 @@ async fn read_single_range(
 	}
 
 	let mut details = serde_json::Map::new();
-	details.insert("resolvedPath".into(), json!(path.display().to_string()));
+	details.insert("resolvedPath".into(), json!(source.label()));
 	details.insert("fileSize".into(), json!(file_size));
 	if window.reached_eof {
 		details.insert("totalLines".into(), json!(window.total_lines));
@@ -1437,10 +1629,7 @@ async fn read_single_range(
 		details.insert("truncation".into(), truncation);
 	}
 	let mut meta = serde_json::Map::new();
-	meta.insert(
-		"source".into(),
-		json!({ "type": "path", "value": path.display().to_string() }),
-	);
+	meta.insert("source".into(), source.meta_source());
 	if let Some(truncation) = meta_truncation {
 		meta.insert("truncation".into(), truncation);
 	}
@@ -1453,23 +1642,25 @@ async fn read_single_range(
 }
 
 async fn read_multi_range(
-	path: &Path,
-	file_size: u64,
+	source: &TextSource<'_>,
 	ranges: &[LineRange],
 	raw: bool,
 	sink: Option<&dyn ReadSnapshotSink>,
 	display_mode: FileDisplayMode,
 	ctx: &AgentContext,
 ) -> Result<ToolResult, String> {
+	let file_size = source.size();
 	let mut blocks: Vec<(LineRange, Vec<String>)> = Vec::new();
 	let mut skipped: Vec<LineRange> = Vec::new();
 	let mut byte_capped: Vec<LineRange> = Vec::new();
 	let mut total_lines: Option<u64> = None;
 
-	let buffered = if file_size <= SNAPSHOT_MAX_BYTES {
-		read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await
-	} else {
-		None
+	let buffered = match source {
+		TextSource::File { path, size } if *size <= SNAPSHOT_MAX_BYTES => {
+			read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await
+		},
+		TextSource::Memory { bytes, .. } => Some(bytes.to_vec()),
+		TextSource::File { .. } => None,
 	};
 	let snapshot_text = buffered.as_ref().map(|bytes| normalize_snapshot_text(bytes));
 
@@ -1492,6 +1683,12 @@ async fn read_multi_range(
 				scan_bytes(source, range.start_line - 1, max_lines, max_bytes, max_lines, raw)
 			},
 			_ => {
+				let TextSource::File { path, .. } = source else {
+					return Err(format!(
+						"Internal resource is too large to read ({}); use a line selector.",
+						format_bytes(file_size)
+					));
+				};
 				scan_window(
 					path,
 					file_size,
@@ -1594,7 +1791,7 @@ async fn read_multi_range(
 	}
 
 	if hash_lines {
-		if let (Some(sink), Some(text)) = (sink, snapshot_text.as_deref()) {
+		if let (Some(sink), Some(text), Some(path)) = (sink, snapshot_text.as_deref(), source.path()) {
 			if !seen_lines.is_empty() {
 				if let Some(header) = record_snapshot_text(sink, path, &ctx.cwd, text, &seen_lines) {
 					output = format!("{header}\n{output}");
@@ -1604,7 +1801,7 @@ async fn read_multi_range(
 	}
 
 	let mut details = serde_json::Map::new();
-	details.insert("resolvedPath".into(), json!(path.display().to_string()));
+	details.insert("resolvedPath".into(), json!(source.label()));
 	details.insert("fileSize".into(), json!(file_size));
 	if let Some(total) = total_lines {
 		details.insert("totalLines".into(), json!(total));
@@ -1620,10 +1817,7 @@ async fn read_multi_range(
 		);
 	}
 	let mut meta = serde_json::Map::new();
-	meta.insert(
-		"source".into(),
-		json!({ "type": "path", "value": path.display().to_string() }),
-	);
+	meta.insert("source".into(), source.meta_source());
 	if column_truncated {
 		meta.insert("limits".into(), json!({ "columnTruncated": { "maxColumn": MAX_COLUMNS } }));
 	}
@@ -2452,7 +2646,11 @@ mod display_tests {
 	use serde_json::json;
 
 	use super::*;
-	use crate::{state::ToolResult, tools::Tool as _};
+	use crate::{
+		state::ToolResult,
+		tools::Tool as _,
+		tools::internal_urls::{InternalUrl, ProtocolHandler, ResolveContext, UrlScope},
+	};
 
 	struct TempDir(PathBuf);
 
@@ -2591,6 +2789,146 @@ mod display_tests {
 		}
 		for path in ["file:///tmp/x", "https://example.com/x", "src/f.txt", "C:/x"] {
 			assert!(!is_immutable_source(path), "{path}");
+		}
+	}
+
+	#[tokio::test]
+	async fn scheme_reads_are_protocol_errors_not_filesystem_paths() {
+		let dir = TempDir::new("scheme");
+		// A file literally named `notes://missing` sits under the cwd: the read
+		// must stay a protocol error instead of resolving that file.
+		fs::create_dir_all(dir.0.join("notes:")).expect("scheme dir");
+		fs::write(dir.0.join("notes:/missing"), "local file").expect("fixture");
+
+		let (tool, _sink) = configured(EditMode::Hashline, true, false);
+		let result = read_with(&tool, &dir, "notes://missing").await;
+		assert!(result.is_error);
+		assert_eq!(result.content, "Unknown protocol: notes://\nSupported: none");
+
+		let router = Arc::new(InternalUrlRouter::new());
+		router.register(Arc::new(StaticHandler { immutable: false })).expect("register");
+		let tool = ReadTool::new()
+			.with_internal_urls(router, Arc::new(UrlScope::default()));
+		let result = read_with(&tool, &dir, "nope://x").await;
+		assert_eq!(result.content, "Unknown protocol: nope://\nSupported: local://, notes://");
+	}
+
+	#[tokio::test]
+	async fn scheme_reads_use_the_registered_handler() {
+		let dir = TempDir::new("handler");
+		let router = Arc::new(InternalUrlRouter::new());
+		router.register(Arc::new(StaticHandler { immutable: true })).expect("register");
+		let tool = ReadTool::new()
+			.with_internal_urls(router, Arc::new(UrlScope::default()));
+		let result = read_with(&tool, &dir, "notes://a").await;
+		assert!(!result.is_error, "{}", result.content);
+		// The resolved text goes through the normal read rendering (line
+		// numbers here), not straight to the model.
+		assert_eq!(result.content, "1|handler says notes://a");
+		let details = result.details.expect("details");
+		assert_eq!(details["internalUrl"]["immutable"], json!(true));
+		assert_eq!(details["internalUrl"]["contentType"], json!("text/plain"));
+		assert_eq!(details["internalUrl"]["url"], json!("notes://a"));
+	}
+
+	/// Selector handling is a consumer contract: what the model sees must obey
+	/// the same read grammar as a file read.
+	#[tokio::test]
+	async fn internal_url_selectors_use_the_read_selector_grammar() {
+		let dir = TempDir::new("internal-sel");
+		let tool = fixed_tool("l1\nl2\nl3\nl4\nl5\nl6".to_string());
+
+		let ranged = read_with(&tool, &dir, "artifact://doc:raw:2-3").await;
+		assert!(!ranged.is_error, "{}", ranged.content);
+		assert_eq!(ranged.content, "l2\nl3");
+
+		let raw = read_with(&tool, &dir, "artifact://doc:raw").await;
+		assert_eq!(raw.content, "l1\nl2\nl3\nl4\nl5\nl6");
+
+		let numbered = read_with(&tool, &dir, "artifact://doc:2-3").await;
+		assert!(numbered.content.contains("2|l2"), "{}", numbered.content);
+		assert!(numbered.content.contains("3|l3"), "{}", numbered.content);
+
+		let multi = read_with(&tool, &dir, "artifact://doc:raw:1,4-5").await;
+		assert!(multi.content.starts_with("l1"), "{}", multi.content);
+		assert!(multi.content.contains("\u{2026}"), "{}", multi.content);
+		assert!(multi.content.contains("l4\nl5"), "{}", multi.content);
+
+		let past_end = read_with(&tool, &dir, "artifact://doc:9").await;
+		assert!(!past_end.is_error);
+		assert!(past_end.content.contains("beyond end of file"), "{}", past_end.content);
+	}
+
+	/// The 3000-line / 50 KiB caps apply to internal resources exactly as to
+	/// files, so a large page cannot reach the model unbounded.
+	#[tokio::test]
+	async fn internal_url_content_is_capped_before_the_model() {
+		let dir = TempDir::new("internal-caps");
+
+		let many_lines = (0..4000).map(|index| format!("line{index}")).collect::<Vec<_>>().join("\n");
+		let tool = fixed_tool(many_lines);
+		let result = read_with(&tool, &dir, "artifact://doc").await;
+		assert!(!result.is_error, "{}", result.content);
+		let details = result.details.expect("details");
+		assert_eq!(details["truncation"]["truncated"], json!(true));
+		assert_eq!(details["truncation"]["truncatedBy"], json!("lines"));
+		assert_eq!(details["totalLines"], json!(4000));
+
+		let wide = "x".repeat(10_000);
+		let wide_lines = (0..300).map(|_| wide.clone()).collect::<Vec<_>>().join("\n");
+		let tool = fixed_tool(wide_lines);
+		let result = read_with(&tool, &dir, "artifact://doc").await;
+		assert!(!result.is_error, "{}", result.content);
+		let details = result.details.expect("details");
+		assert_eq!(details["truncation"]["truncated"], json!(true));
+		assert_eq!(details["truncation"]["truncatedBy"], json!("bytes"));
+	}
+
+	fn fixed_tool(content: String) -> ReadTool {
+		let router = Arc::new(InternalUrlRouter::new());
+		router.register(Arc::new(FixedHandler { content })).expect("register");
+		ReadTool::new().with_internal_urls(router, Arc::new(UrlScope::default()))
+	}
+
+	struct FixedHandler {
+		content: String,
+	}
+
+	#[async_trait::async_trait]
+	impl ProtocolHandler for FixedHandler {
+		fn scheme(&self) -> &str {
+			"artifact"
+		}
+
+		async fn resolve(
+			&self,
+			url: &InternalUrl,
+			_context: &ResolveContext,
+		) -> Result<InternalResource, String> {
+			Ok(InternalResource::text(&url.href, self.content.clone()))
+		}
+	}
+
+	struct StaticHandler {
+		immutable: bool,
+	}
+
+	#[async_trait::async_trait]
+	impl ProtocolHandler for StaticHandler {
+		fn scheme(&self) -> &str {
+			"notes"
+		}
+
+		fn immutable(&self) -> bool {
+			self.immutable
+		}
+
+		async fn resolve(
+			&self,
+			url: &InternalUrl,
+			_context: &ResolveContext,
+		) -> Result<InternalResource, String> {
+			Ok(InternalResource::text(&url.href, format!("handler says {}", url.href)))
 		}
 	}
 }

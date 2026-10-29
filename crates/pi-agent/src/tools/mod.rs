@@ -5,6 +5,7 @@ pub mod checkpoint;
 pub mod edit_variants;
 pub mod hashline;
 pub mod hub;
+pub mod internal_urls;
 pub mod pending;
 pub mod process;
 pub mod read;
@@ -24,6 +25,10 @@ pub use checkpoint::{
 	CheckpointController, CheckpointState, CheckpointTool, CompletedRewindState, RewindTool,
 };
 pub use hub::HubTool;
+pub use internal_urls::{
+	InternalResource, InternalUrl, InternalUrlRouter, ProtocolHandler, ResolveContext, UrlScope,
+	WriteContext,
+};
 pub use pending::{PendingAction, PendingStore, REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH};
 pub use read::{ReadSnapshotSink, ReadTool};
 pub use task::TaskTool;
@@ -101,6 +106,20 @@ pub trait Tool: Send + Sync {
 		false
 	}
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError>;
+	/// Execute with the model's tool-call id.
+	///
+	/// Host-bridged tools need the real id (`host_tool_call.toolCallId`), but
+	/// the scheduler's later result-id rewrite cannot repair a frame that was
+	/// already emitted. Defaults to [`Tool::execute`], so every existing
+	/// implementer is unchanged.
+	async fn execute_with_call_id(
+		&self,
+		_id: &str,
+		args: &Value,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, ToolError> {
+		self.execute(args, ctx).await
+	}
 }
 
 /// String buffer that stops growing past `cap` and counts what it dropped.
@@ -824,11 +843,20 @@ pub(crate) async fn write_atomic_with_mode(
 /// per registry — registries are rebuilt every prompt.
 pub struct WriteTool {
 	pending: Option<Arc<pending::PendingStore>>,
+	/// Internal URL router consulted before path resolution; absent in
+	/// embedders with no protocol handlers.
+	router:  Option<Arc<InternalUrlRouter>>,
+	/// Per-session scope handed to handlers; never mutated after construction.
+	scope:   Arc<UrlScope>,
 }
 
 impl Default for WriteTool {
 	fn default() -> Self {
-		Self { pending: None }
+		Self {
+			pending: None,
+			router:  None,
+			scope:   Arc::new(UrlScope::default()),
+		}
 	}
 }
 
@@ -839,7 +867,19 @@ impl WriteTool {
 
 	/// Mount the session's staging queue on this tool.
 	pub fn with_pending(pending: Arc<pending::PendingStore>) -> Self {
-		Self { pending: Some(pending) }
+		Self { pending: Some(pending), ..Self::default() }
+	}
+
+	/// Mount the session's internal URL router with its per-session scope.
+	#[must_use]
+	pub fn with_internal_urls(
+		mut self,
+		router: Arc<InternalUrlRouter>,
+		scope: Arc<UrlScope>,
+	) -> Self {
+		self.router = Some(router);
+		self.scope = scope;
+		self
 	}
 
 	/// Dispatch an `xd://resolve|reject` write. Never touches the filesystem.
@@ -937,6 +977,31 @@ impl Tool for WriteTool {
 				"content is {} bytes, the limit is {MAX_WRITE_BYTES}",
 				content.len()
 			)));
+		}
+
+		// Internal URLs never become files: a mounted handler owns the write,
+		// and a scheme with no handler is an explicit protocol error.
+		if let Some(scheme) = internal_urls::scheme_of(path) {
+			let Some(router) = &self.router else {
+				return Ok(tool_result(
+					internal_urls::unknown_protocol_error(&scheme, &[]),
+					true,
+				));
+			};
+			return match router
+				.write(
+					path,
+					content,
+					&self.scope.write_context(&ctx.cwd, &ctx.cancellation_token),
+				)
+				.await
+			{
+				Ok(()) => Ok(tool_result(
+					format!("Successfully wrote {} bytes to {path}", content.len()),
+					false,
+				)),
+				Err(message) => Ok(tool_result(message, true)),
+			};
 		}
 
 		let target = ctx.cwd.join(path);
@@ -2003,4 +2068,118 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
 		)),
 		Arc::new(TodoTool::new()),
 	]
+}
+
+#[cfg(test)]
+mod internal_url_write_tests {
+	use std::sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	};
+
+	use serde_json::json;
+
+	use super::*;
+	use crate::state::AgentContext;
+
+	struct CountingHandler {
+		writable: bool,
+		writes:   AtomicUsize,
+	}
+
+	#[async_trait::async_trait]
+	impl internal_urls::ProtocolHandler for CountingHandler {
+		fn scheme(&self) -> &str {
+			"notes"
+		}
+
+		fn writable(&self) -> bool {
+			self.writable
+		}
+
+		async fn resolve(
+			&self,
+			_url: &internal_urls::InternalUrl,
+			_context: &internal_urls::ResolveContext,
+		) -> Result<internal_urls::InternalResource, String> {
+			Err("read is served by the read tool in this test".to_string())
+		}
+
+		async fn write(
+			&self,
+			_url: &internal_urls::InternalUrl,
+			_content: &str,
+			_context: &internal_urls::WriteContext,
+		) -> Result<(), String> {
+			self.writes.fetch_add(1, Ordering::SeqCst);
+			Ok(())
+		}
+	}
+
+	fn temp_cwd(label: &str) -> std::path::PathBuf {
+		let path = std::env::temp_dir().join(format!(
+			"omp-write-uri-{label}-{}",
+			std::process::id()
+		));
+		std::fs::create_dir_all(&path).expect("temp cwd");
+		path
+	}
+
+	#[tokio::test]
+	async fn unknown_scheme_write_is_not_a_file() {
+		let cwd = temp_cwd("unknown");
+		let tool = WriteTool::new();
+		let result = tool
+			.execute(
+				&json!({ "path": "notes://a", "content": "x" }),
+				&AgentContext::new(cwd.clone()),
+			)
+			.await
+			.expect("write executes");
+		assert!(result.is_error);
+		assert_eq!(result.content, "Unknown protocol: notes://\nSupported: none");
+		assert!(!cwd.join("notes:").exists(), "no directory may be created");
+	}
+
+	#[tokio::test]
+	async fn read_only_scheme_rejects_without_reaching_the_handler() {
+		let cwd = temp_cwd("readonly");
+		let router = Arc::new(InternalUrlRouter::new());
+		let read_only = Arc::new(CountingHandler {
+			writable: false,
+			writes:   AtomicUsize::new(0),
+		});
+		router.register(read_only.clone()).expect("register");
+		let tool = WriteTool::new()
+			.with_internal_urls(Arc::clone(&router), Arc::new(UrlScope::default()));
+		let result = tool
+			.execute(
+				&json!({ "path": "notes://a", "content": "x" }),
+				&AgentContext::new(cwd.clone()),
+			)
+			.await
+			.expect("write executes");
+		assert!(result.is_error);
+		assert_eq!(
+			result.content,
+			"notes:// URLs are read-only for write; use the protocol-specific tool for mutations."
+		);
+		assert_eq!(read_only.writes.load(Ordering::SeqCst), 0);
+
+		let writable = Arc::new(CountingHandler {
+			writable: true,
+			writes:   AtomicUsize::new(0),
+		});
+		router.register(writable.clone()).expect("register");
+		let result = tool
+			.execute(
+				&json!({ "path": "notes://a", "content": "x" }),
+				&AgentContext::new(cwd.clone()),
+			)
+			.await
+			.expect("write executes");
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(result.content, "Successfully wrote 1 bytes to notes://a");
+		assert_eq!(writable.writes.load(Ordering::SeqCst), 1);
+	}
 }

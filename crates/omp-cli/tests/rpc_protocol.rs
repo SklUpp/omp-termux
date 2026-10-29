@@ -92,7 +92,7 @@ fn message_paging_cursor_continues_and_rejects_a_changed_snapshot() {
 #[test]
 fn reserved_host_uri_schemes_are_rejected_before_registration() {
 	let sink: Arc<dyn FrameSink> = Arc::new(RecordingSink::default());
-	let bridge = HostUriBridge::new(sink);
+	let bridge = Arc::new(HostUriBridge::new(sink));
 	let reserved = RpcHostUriSchemeDefinition {
 		scheme:      "security".to_string(),
 		description: None,
@@ -338,6 +338,24 @@ impl Drop for Harness {
 	}
 }
 
+/// Wait until the streamed turn is journaled as `aborted`.
+///
+/// `abort_and_prompt` retires the live turn's token inside the run lock and only
+/// then writes its response, so this frame proves the old turn can no longer
+/// complete with `stop`. Releasing a paused model script before it is a race the
+/// fixture — not the mode — decides, which is exactly what made the replacement
+/// test flaky.
+fn wait_aborted(harness: &Harness) {
+	harness.wait_for(
+		|frames| {
+			frames.iter().any(|frame| {
+				frame["type"] == "message_end" && frame["message"]["stopReason"] == "aborted"
+			})
+		},
+		timeout(),
+	);
+}
+
 struct StreamScript {
 	text:  String,
 	/// When present the server holds the response open until the test signals.
@@ -345,6 +363,17 @@ struct StreamScript {
 }
 
 fn spawn_model(scripts: Vec<StreamScript>) -> u16 {
+	spawn_model_recording(scripts).0
+}
+
+/// [`spawn_model`] plus the user prompt of every request the mock served.
+///
+/// The scripted answer text is positional, so it cannot identify the prompt that
+/// asked for it: a test asserting *which* prompt reached the provider has to read
+/// the request.
+fn spawn_model_recording(scripts: Vec<StreamScript>) -> (u16, Arc<Mutex<Vec<String>>>) {
+	let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+	let recorded = Arc::clone(&prompts);
 	let listener = TcpListener::bind("127.0.0.1:0").expect("bind model");
 	let port = listener.local_addr().expect("addr").port();
 	thread::spawn(move || {
@@ -358,8 +387,14 @@ fn spawn_model(scripts: Vec<StreamScript>) -> u16 {
 			stream
 				.set_read_timeout(Some(Duration::from_secs(5)))
 				.expect("read timeout");
-			if read_request(&mut stream).is_none() {
+			let Some(request) = read_request(&mut stream) else {
 				continue;
+			};
+			if let Some(prompt) = user_prompt(&request) {
+				recorded
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner)
+					.push(prompt);
 			}
 			let body = serde_json::to_string(&script.text).expect("json text");
 			let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
@@ -381,7 +416,30 @@ fn spawn_model(scripts: Vec<StreamScript>) -> u16 {
 			let _ = stream.flush();
 		}
 	});
-	port
+	(port, prompts)
+}
+
+/// Text of the last `user` message in an OpenAI-compatible request body.
+fn user_prompt(request: &[u8]) -> Option<String> {
+	let body_start = request.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
+	let value: Value = serde_json::from_slice(&request[body_start..]).ok()?;
+	let messages = value.get("messages")?.as_array()?;
+	let last = messages
+		.iter()
+		.rev()
+		.find(|message| message.get("role").and_then(Value::as_str) == Some("user"))?;
+	let content = last.get("content")?;
+	if let Some(text) = content.as_str() {
+		return Some(text.to_string());
+	}
+	Some(
+		content
+			.as_array()?
+			.iter()
+			.filter_map(|part| part.get("text").and_then(Value::as_str))
+			.collect::<Vec<_>>()
+			.join("\n"),
+	)
 }
 
 /// Read headers and body so the client never sees a reset mid-request.
@@ -455,6 +513,7 @@ fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
 			dir: None,
 			id: None,
 			continue_latest: false,
+			parent_session: None,
 			no_title: true,
 		},
 		steer: None,
@@ -581,6 +640,173 @@ fn follow_up_queued_while_streaming_runs_in_the_same_agent_run() {
 	);
 	let follow_up = frames.iter().find(|frame| frame["id"] == "f1").expect("follow_up response");
 	assert_eq!(follow_up["success"], true);
+}
+
+#[test]
+fn abort_and_prompt_while_streaming_runs_the_replacement_as_a_new_turn() {
+	let (pause_tx, pause_rx) = mpsc::channel();
+	let port = spawn_model(vec![
+		StreamScript { text: "old".to_string(), pause: Some(pause_rx) },
+		StreamScript { text: "replacement".to_string(), pause: None },
+	]);
+	let harness = Harness::start(launch(port, "local/mock-model", "local"));
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "one" }));
+	harness.wait_frame("message_update", timeout());
+	harness.send(json!({ "type": "abort_and_prompt", "id": "ap1", "message": "two" }));
+	// The abort is applied before the release, so the paused script cannot win
+	// the race by completing the old turn with `stop`.
+	wait_aborted(&harness);
+	pause_tx.send(()).expect("release first response");
+	let frames = harness.wait_frame("agent_end", timeout());
+
+	let response = frames
+		.iter()
+		.find(|frame| frame["id"] == "ap1")
+		.expect("abort_and_prompt response");
+	assert_eq!(response["success"], true);
+	assert_eq!(response["command"], "abort_and_prompt");
+
+	// The aborted turn is journaled as `aborted`, and the replacement runs as a
+	// real new turn: its text can only appear when a second provider request was
+	// actually made (the mock serves the scripts in order).
+	let message_ends: Vec<&Value> = frames
+		.iter()
+		.filter(|frame| frame["type"] == "message_end")
+		.collect();
+	assert_eq!(message_ends.len(), 2, "{frames:#?}");
+	assert_eq!(message_ends[0]["message"]["stopReason"], "aborted");
+	assert_eq!(message_ends[1]["message"]["stopReason"], "stop");
+	let deltas: Vec<String> = frames
+		.iter()
+		.filter(|frame| frame["type"] == "message_update")
+		.map(|frame| frame["assistantMessageEvent"]["delta"].as_str().unwrap_or("").to_string())
+		.collect();
+	assert!(deltas.iter().any(|delta| delta == "replacement"), "{deltas:?}");
+	// Same agent run: one start, one end, no extra run for the replacement.
+	assert_eq!(
+		frames.iter().filter(|frame| frame["type"] == "agent_start").count(),
+		1
+	);
+	assert_eq!(
+		frames.iter().filter(|frame| frame["type"] == "agent_end").count(),
+		1
+	);
+}
+
+#[test]
+fn abort_and_prompt_discards_the_queued_follow_ups_of_the_aborted_run() {
+	let (pause_tx, pause_rx) = mpsc::channel();
+	// The mock answers in request order, so a script named after the discarded
+	// follow-up could never distinguish the cases: with a correct run only two
+	// requests exist, and the second would answer with that script's text whatever
+	// prompt it carried. The scripts therefore name the expected run (aborted
+	// `old`, then the replacement) and the prompt itself is asserted below.
+	let (port, prompts) = spawn_model_recording(vec![
+		StreamScript { text: "old".to_string(), pause: Some(pause_rx) },
+		StreamScript { text: "replacement".to_string(), pause: None },
+	]);
+	let harness = Harness::start(launch(port, "local/mock-model", "local"));
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "one" }));
+	harness.wait_frame("message_update", timeout());
+	harness.send(json!({ "type": "follow_up", "id": "f1", "message": "stale" }));
+	harness.send(json!({ "type": "abort_and_prompt", "id": "ap1", "message": "two" }));
+	// Same barrier as the replacement test: the aborted turn must be journaled
+	// before the paused script is released, or `stops` below is a coin flip.
+	wait_aborted(&harness);
+	pause_tx.send(()).expect("release first response");
+	let frames = harness.wait_frame("agent_end", timeout());
+
+	let deltas: Vec<String> = frames
+		.iter()
+		.filter(|frame| frame["type"] == "message_update")
+		.map(|frame| frame["assistantMessageEvent"]["delta"].as_str().unwrap_or("").to_string())
+		.collect();
+	assert!(deltas.iter().any(|delta| delta == "replacement"), "{deltas:?}");
+	// The queued follow-up belonged to the aborted run, so the provider saw exactly
+	// two prompts and the second one is the replacement — the assertion the scripted
+	// answer text cannot make.
+	let prompts = prompts
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	assert_eq!(prompts.len(), 2, "{prompts:?}");
+	assert!(prompts[0].contains("one"), "{prompts:?}");
+	assert!(
+		prompts[1].contains("two"),
+		"the replacement prompt reached the provider: {prompts:?}"
+	);
+	assert!(
+		!prompts[1].contains("stale"),
+		"the aborted run's queued follow-up was sent to the provider: {prompts:?}"
+	);
+
+	let stops: Vec<String> = frames
+		.iter()
+		.filter(|frame| frame["type"] == "message_end")
+		.map(|frame| frame["message"]["stopReason"].as_str().unwrap_or("").to_string())
+		.collect();
+	assert_eq!(stops, vec!["aborted".to_string(), "stop".to_string()], "{frames:#?}");
+}
+
+#[test]
+fn plain_abort_at_the_boundary_discards_the_replacement() {
+	let (pause_tx, pause_rx) = mpsc::channel();
+	let port = spawn_model(vec![
+		StreamScript { text: "old".to_string(), pause: Some(pause_rx) },
+		StreamScript { text: "replacement".to_string(), pause: None },
+	]);
+	let harness = Harness::start(launch(port, "local/mock-model", "local"));
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "one" }));
+	harness.wait_frame("message_update", timeout());
+	harness.send(json!({ "type": "abort_and_prompt", "id": "ap1", "message": "two" }));
+	// A plain abort supersedes the replacement. Whether it lands before or after
+	// the worker takes it, the replacement must never complete: before the
+	// provider call the run state stops it, after it the abort cancels its token.
+	harness.send(json!({ "type": "abort", "id": "a1" }));
+	let frames = harness.wait_frame("agent_end", timeout());
+	drop(pause_tx);
+
+	let completed_replacement = frames.iter().any(|frame| {
+		frame["type"] == "message_end"
+			&& frame["message"]["stopReason"] == "stop"
+			&& frame["message"]["content"].to_string().contains("replacement")
+	});
+	assert!(!completed_replacement, "a plain abort let the replacement complete: {frames:#?}");
+}
+
+#[test]
+fn eof_after_abort_and_prompt_never_completes_the_replacement() {
+	let (pause_tx, pause_rx) = mpsc::channel();
+	let port = spawn_model(vec![
+		StreamScript { text: "old".to_string(), pause: Some(pause_rx) },
+		StreamScript { text: "replacement".to_string(), pause: None },
+	]);
+	let harness = Harness::start(launch(port, "local/mock-model", "local"));
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "one" }));
+	harness.wait_frame("message_update", timeout());
+	harness.send(json!({ "type": "abort_and_prompt", "id": "ap1", "message": "two" }));
+	// EOF while the aborted turn is still draining. Whether the worker reaches
+	// the replacement before EOF or after is a genuine race in both upstream and
+	// here; what must hold in every interleaving is that shutdown never lets the
+	// replacement finish.
+	harness.close_stdin();
+	let frames = harness.wait_frame("agent_end", timeout());
+	let result = harness.join();
+	assert!(result.is_ok(), "rpc run must exit cleanly: {result:?}");
+	drop(pause_tx);
+
+	let completed_replacement = frames.iter().any(|frame| {
+		frame["type"] == "message_end"
+			&& frame["message"]["stopReason"] == "stop"
+			&& frame["message"]["content"]
+				.to_string()
+				.contains("replacement")
+	});
+	assert!(!completed_replacement, "EOF let the replacement complete: {frames:#?}");
+	assert_eq!(
+		frames.iter().filter(|frame| frame["type"] == "agent_start").count(),
+		1
+	);
 }
 
 #[test]

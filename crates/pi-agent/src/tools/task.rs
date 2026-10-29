@@ -20,9 +20,9 @@ use super::{
 	},
 };
 use crate::{
-	loop_module::{AgentError, AgentLoop, SteeringEvent},
+	loop_module::{AgentError, AgentEvent, AgentLoop, SteeringEvent},
 	state::{AgentConfig, AgentContext, AgentState, Message, ToolResult, TurnResult},
-	supervisor::{ChildGuard, Supervisor, cap_result_text},
+	supervisor::{ChildGuard, ChildSpawn, Supervisor, cap_result_text},
 };
 
 #[derive(Clone)]
@@ -375,18 +375,22 @@ impl TaskTool {
 		item: TaskItemSpec,
 		ctx: &AgentContext,
 		child_ctx: &ChildContext,
+		parent_call_id: Option<&str>,
 	) -> SingleResult {
 		let start = Instant::now();
 		let child_name = item.name.clone();
 		let agent_name = item.agent.name.clone();
 		let agent_source = item.agent.source.as_str().to_string();
-		let Some((child_id, child_cancel)) = self.supervisor.reserve_child(
-			&child_name,
+		let Some((child_id, child_cancel)) = self.supervisor.reserve_child_full(ChildSpawn {
+			name:                &child_name,
 			index,
-			&agent_name,
-			&item.task,
-			self.parent_id.as_deref(),
-		) else {
+			agent:               &agent_name,
+			agent_source:        &agent_source,
+			task:                &item.task,
+			parent_id:           self.parent_id.as_deref(),
+			parent_tool_call_id: parent_call_id,
+			detached:            false,
+		}) else {
 			return SingleResult {
 				index,
 				id: child_name.clone(),
@@ -567,8 +571,13 @@ impl TaskTool {
 			item.task.clone()
 		};
 		let full_prompt = format!("Complete assignment thoroughly:\n\n{assignment}");
+		self
+			.supervisor
+			.append_child_transcript(&child_id, &[&Message::user(full_prompt.clone())]);
 
 		let child_cancel_for_loop = child_cancel.clone();
+		let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+		let events = forward_child_events(self.supervisor.clone(), child_id.clone(), event_rx);
 		let mut task_handle = tokio::spawn(async move {
 			let child_loop = match child_approver {
 				Some(approver) => AgentLoop::with_approver(
@@ -585,7 +594,7 @@ impl TaskTool {
 					Message::user(full_prompt),
 					&mut child_state,
 					Some(steering_rx),
-					None,
+					Some(event_tx),
 					child_cancel_for_loop,
 				)
 				.await
@@ -638,6 +647,10 @@ impl TaskTool {
 		// The running task is now owned by `ChildGuard`; no await occurred since
 		// `register_active_child`, so nothing can drop this future in the gap.
 		reservation.disarm();
+		// Real transition: the child passed admission and its loop is running.
+		self
+			.supervisor
+			.report_progress(&child_id, "running", Some(&item.task));
 
 		let outcome = tokio::select! {
 			_ = ctx.cancellation_token.cancelled() => {
@@ -660,6 +673,7 @@ impl TaskTool {
 			},
 		};
 
+		let _ = events.await;
 		guard.defuse();
 		self.supervisor.unregister_active_child(&child_id);
 
@@ -668,6 +682,9 @@ impl TaskTool {
 
 		let result = match outcome {
 			Ok(turn_results) => {
+				let messages: Vec<&Message> =
+					turn_results.iter().map(|turn| &turn.message).collect();
+				self.supervisor.append_child_transcript(&child_id, &messages);
 				let requests = turn_results.len();
 				let base_output = turn_results
 					.iter()
@@ -838,17 +855,23 @@ impl TaskTool {
 		item: TaskItemSpec,
 		ctx: &AgentContext,
 		child_ctx: ChildContext,
+		parent_call_id: Option<&str>,
 	) -> Result<String, String> {
 		let child_name = item.name.clone();
 		let agent_name = item.agent.name.clone();
+		let agent_source = item.agent.source.as_str().to_string();
+		let description = item.task.clone();
 		let item_for_settle = item.clone();
-		let Some((child_id, child_cancel)) = self.supervisor.reserve_child(
-			&child_name,
+		let Some((child_id, child_cancel)) = self.supervisor.reserve_child_full(ChildSpawn {
+			name:                &child_name,
 			index,
-			&agent_name,
-			&item.task,
-			self.parent_id.as_deref(),
-		) else {
+			agent:               &agent_name,
+			agent_source:        &agent_source,
+			task:                &item.task,
+			parent_id:           self.parent_id.as_deref(),
+			parent_tool_call_id: parent_call_id,
+			detached:            true,
+		}) else {
 			return Err(format!(
 				"{child_name}: result capacity exhausted ({} outstanding); wait for or consume finished jobs first",
 				crate::supervisor::MAX_OUTSTANDING_RESULTS
@@ -926,6 +949,9 @@ impl TaskTool {
 			return Err(format!("{child_name}: cancelled before start"));
 		}
 		let _ = start_tx.send(());
+		self
+			.supervisor
+			.report_progress(&child_id, "running", Some(&description));
 		Ok(child_id)
 	}
 
@@ -1006,7 +1032,7 @@ impl TaskTool {
 			.map_err(|error| error.to_string())?;
 		let expects_schema = item.output_schema.is_some()
 			|| (item.agent.output.is_some() && item.schema_error.is_none());
-		let single = self.run_single_task(0, item, ctx, &child_ctx).await;
+		let single = self.run_single_task(0, item, ctx, &child_ctx, None).await;
 		if single.aborted == Some(true) {
 			return Err(single
 				.abort_reason
@@ -1109,6 +1135,7 @@ async fn run_background_child(
 		item.task.clone()
 	};
 	let full_prompt = format!("Complete assignment thoroughly:\n\n{assignment}");
+	supervisor.append_child_transcript(&child_id, &[&Message::user(full_prompt.clone())]);
 	let child_loop = match child_approver {
 		Some(approver) => {
 			AgentLoop::with_approver(child_config, child_provider, child_registry, approver)
@@ -1118,16 +1145,38 @@ async fn run_background_child(
 	let child_loop = child_loop
 		.with_background_results(supervisor.owner_results_sink(Some(&child_id)))
 		.with_peer_inbox(supervisor.mailbox(), child_id.clone());
+	let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+	let events = forward_child_events(Arc::clone(&supervisor), child_id.clone(), event_rx);
 	let mut child_state = AgentState::default();
-	child_loop
+	let outcome = child_loop
 		.run_dialog_message_with_cancel(
 			Message::user(full_prompt),
 			&mut child_state,
 			Some(steering_rx),
-			None,
+			Some(event_tx),
 			cancel,
 		)
-		.await
+		.await;
+	// Drain the forwarder before the caller settles the record, so no event is
+	// emitted after the terminal lifecycle frame.
+	let _ = events.await;
+	outcome
+}
+
+/// Forward real child agent events to the supervisor's observer bus. Stops when
+/// the record stops being live, so a frame never outlives its child.
+fn forward_child_events(
+	supervisor: Arc<Supervisor>,
+	child_id: String,
+	mut events: tokio::sync::mpsc::Receiver<AgentEvent>,
+) -> tokio::task::JoinHandle<()> {
+	tokio::spawn(async move {
+		while let Some(event) = events.recv().await {
+			if !supervisor.report_event(&child_id, event) {
+				break;
+			}
+		}
+	})
 }
 
 /// Summarize a finished child: final assistant text, abort flag/reason, and a
@@ -1172,6 +1221,8 @@ fn settle_background_result(
 	let agent = item.agent.name.clone();
 	match outcome {
 		Ok(turns) => {
+			let messages: Vec<&Message> = turns.iter().map(|turn| &turn.message).collect();
+			supervisor.append_child_transcript(&id, &messages);
 			let (base, aborted, reason) = summarize_turns(&turns);
 			if aborted {
 				supervisor.mark_aborted(
@@ -1960,6 +2011,29 @@ impl Tool for TaskTool {
 	}
 
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+		self.run_call(None, args, ctx).await
+	}
+
+	async fn execute_with_call_id(
+		&self,
+		id: &str,
+		args: &Value,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, ToolError> {
+		self.run_call(Some(id), args, ctx).await
+	}
+}
+
+impl TaskTool {
+	/// Spawn body shared by [`Tool::execute`] and
+	/// [`Tool::execute_with_call_id`]; the latter supplies the real model call
+	/// id so every child carries `parentToolCallId`.
+	async fn run_call(
+		&self,
+		parent_call_id: Option<&str>,
+		args: &Value,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, ToolError> {
 		let limits = self.supervisor.limits();
 		let catalog = self.catalog();
 		let max_depth = catalog
@@ -2035,7 +2109,7 @@ impl Tool for TaskTool {
 			let mut started = Vec::new();
 			let mut failures = Vec::new();
 			for (index, item) in async_items {
-				match self.spawn_background_task(index, item, ctx, child_ctx.clone()) {
+				match self.spawn_background_task(index, item, ctx, child_ctx.clone(), parent_call_id) {
 					Ok(id) => started.push(id),
 					Err(error) => failures.push(error),
 				}
@@ -2126,9 +2200,9 @@ impl Tool for TaskTool {
 			// gates this call's return and lands inline in `results`. Both sets
 			// keep their receipts so post-return delivery never loses a spawn.
 			let start_total = Instant::now();
-			let futures = sync_items
-				.into_iter()
-				.map(|(index, item)| self.run_single_task(index, item, ctx, &child_ctx));
+			let futures = sync_items.into_iter().map(|(index, item)| {
+				self.run_single_task(index, item, ctx, &child_ctx, parent_call_id)
+			});
 			let results = join_all(futures).await;
 			let total_duration_ms = start_total.elapsed().as_millis() as u64;
 			let mut spawns = started
@@ -2191,10 +2265,9 @@ impl Tool for TaskTool {
 		}
 
 		let start_total = Instant::now();
-		let futures = items
-			.into_iter()
-			.enumerate()
-			.map(|(index, item)| self.run_single_task(index, item, ctx, &child_ctx));
+		let futures = items.into_iter().enumerate().map(|(index, item)| {
+			self.run_single_task(index, item, ctx, &child_ctx, parent_call_id)
+		});
 
 		let results = join_all(futures).await;
 		let total_duration_ms = start_total.elapsed().as_millis() as u64;

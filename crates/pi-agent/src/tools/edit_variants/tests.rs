@@ -28,6 +28,7 @@ fn context(cwd: &Path) -> AgentContext {
 		cancellation_token: CancellationToken::new(),
 		approver: None,
 		ask: None,
+		progress: None,
 	}
 }
 

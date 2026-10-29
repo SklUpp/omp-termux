@@ -132,6 +132,11 @@ struct RunnerSession {
 	lsp:             Mutex<LspSlot>,
 	/// `tools.maxTimeout` handed to the root `debug` tool each turn.
 	debug_timeout:   Mutex<Option<u64>>,
+	/// Session internal URL router for this run: the identical handle is handed
+	/// to the supervisor, so root and child `read`/`write` see one scheme set.
+	internal_urls:   Mutex<Option<Arc<pi_agent::tools::internal_urls::InternalUrlRouter>>>,
+	/// Immutable URL scope (session file + `local://` root) for this run.
+	url_scope:       Mutex<Arc<pi_agent::tools::internal_urls::UrlScope>>,
 }
 
 /// Shared LSP ownership scope plus the transport preference it was built with.
@@ -163,6 +168,8 @@ impl RunnerSession {
 			dap: Arc::new(DapSessionManager::new()),
 			lsp: Mutex::new(LspSlot::new(true)),
 			debug_timeout: Mutex::new(None),
+			internal_urls: Mutex::new(None),
+			url_scope: Mutex::new(Arc::new(pi_agent::tools::internal_urls::UrlScope::default())),
 		}
 	}
 
@@ -210,6 +217,45 @@ impl RunnerSession {
 		}
 		*self.session_file.lock().unwrap_or_else(|poison| poison.into_inner()) =
 			file.map(Path::to_path_buf);
+	}
+
+	/// Install this run's URL router; `None` leaves every `scheme://` source
+	/// unavailable to the root `read`/`write` tools.
+	fn set_internal_urls(
+		&self,
+		router: Option<Arc<pi_agent::tools::internal_urls::InternalUrlRouter>>,
+	) {
+		*self
+			.internal_urls
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = router;
+	}
+
+	/// Install this run's immutable URL scope; without one the empty scope
+	/// applies (no session file, no `local://` root).
+	fn set_url_scope(&self, scope: Option<Arc<pi_agent::tools::internal_urls::UrlScope>>) {
+		*self
+			.url_scope
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) =
+			scope.unwrap_or_else(|| Arc::new(pi_agent::tools::internal_urls::UrlScope::default()));
+	}
+
+	fn internal_urls(&self) -> Option<Arc<pi_agent::tools::internal_urls::InternalUrlRouter>> {
+		self
+			.internal_urls
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone()
+	}
+
+	fn url_scope(&self) -> Arc<pi_agent::tools::internal_urls::UrlScope> {
+		Arc::clone(
+			&self
+				.url_scope
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner()),
+		)
 	}
 
 	fn eval_session_id(&self) -> String {
@@ -325,6 +371,13 @@ impl PiAgentRunner {
 		})
 	}
 
+	/// Inject a steering message into the live turn, preserving its exact parts
+	/// (text and images). `false` when no turn is running or the loop closed its
+	/// steering channel — the caller reports that, never claims success.
+	pub fn steer(&self, parts: Vec<pi_agent::ContentPart>) -> bool {
+		self.dispatcher.inject(parts)
+	}
+
 	/// Process supervisor for exactly `project`, connected on first use and
 	/// reused by later turns of this runner. Always returns a scope-bound
 	/// backend: when the broker is unreachable, an in-process manager bound to
@@ -401,20 +454,72 @@ impl Drop for PiAgentRunner {
 	}
 }
 
+/// Every tool name the runner can mount itself, derived from the real
+/// constructors/constants so a rename cannot drift. Used to reject host tool
+/// definitions that would take a builtin, ask/checkpoint/rewind, or a
+/// bridge-owned (`eval`/`task`/`hub`) name. MCP names are per-turn (they exist
+/// only after discovery), so the mount-time conflict check covers those.
+#[must_use]
+pub fn reserved_tool_names() -> Vec<String> {
+	let mut names: Vec<String> = pi_agent::tools::builtin_tools()
+		.iter()
+		.map(|tool| tool.name().to_string())
+		.collect();
+	names.push(Tool::name(&AskTool::new()).to_string());
+	names.push(pi_agent::tools::checkpoint::CHECKPOINT_TOOL_NAME.to_string());
+	names.push(pi_agent::tools::checkpoint::REWIND_TOOL_NAME.to_string());
+	names.extend(crate::eval_host::OWNED_TOOL_NAMES.iter().map(|name| (*name).to_string()));
+	names
+}
+
+/// An `Arc<PiAgentRunner>` is itself a runner, so a caller that also needs the
+/// concrete type (live `steer`, `RpcLaunch`) can register one shared instance
+/// instead of building a second runtime.
+impl AgentRunner for Arc<PiAgentRunner> {
+	fn run(&self, request: &RunRequest) -> Result<EventStream> {
+		<PiAgentRunner as AgentRunner>::run(self, request)
+	}
+}
+
 struct SignalDispatcher {
 	active_turn: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SteeringEvent>>>>,
+	/// The dialog's own steering channel. Registered only by a real turn (never
+	/// by the MCP-discovery phase), so `steer` cannot report success for a
+	/// message the discovery watcher would drop.
+	steer_turn:  Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SteeringEvent>>>>,
 	_handle:     tokio::task::JoinHandle<()>,
 }
 
 struct TurnSignalRegistration {
 	active_turn: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SteeringEvent>>>>,
+	/// The channel this registration installed; a later registration for another
+	/// turn must not be wiped when this one drops.
+	own:         tokio::sync::mpsc::Sender<SteeringEvent>,
+	/// Present only for the dialog registration; cleared on drop.
+	steer_turn:  Option<Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SteeringEvent>>>>>,
 }
 
 impl Drop for TurnSignalRegistration {
 	fn drop(&mut self) {
-		if let Ok(mut guard) = self.active_turn.lock() {
-			*guard = None;
+		clear_if_owning(&self.active_turn, &self.own);
+		if let Some(steer_turn) = &self.steer_turn {
+			clear_if_owning(steer_turn, &self.own);
 		}
+	}
+}
+
+/// Clear a slot only when it still holds `own`. RPC can start a second turn
+/// while the first is finishing, so an unconditional clear would remove the
+/// live turn's interrupt and steering channels (and make Ctrl-C fall through to
+/// `exit(130)` mid-turn).
+fn clear_if_owning(
+	slot: &Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SteeringEvent>>>>,
+	own: &tokio::sync::mpsc::Sender<SteeringEvent>,
+) {
+	if let Ok(mut guard) = slot.lock()
+		&& guard.as_ref().is_some_and(|current| current.same_channel(own))
+	{
+		*guard = None;
 	}
 }
 
@@ -442,14 +547,55 @@ impl SignalDispatcher {
 				}
 			}
 		});
-		Self { active_turn, _handle }
+		Self {
+			active_turn,
+			steer_turn: Arc::new(std::sync::Mutex::new(None)),
+			_handle,
+		}
 	}
 
+	/// Register the interrupt destination for a phase that cannot be steered
+	/// (MCP discovery): Ctrl-C still cancels, injected messages are refused.
 	fn register(&self, tx: tokio::sync::mpsc::Sender<SteeringEvent>) -> TurnSignalRegistration {
 		if let Ok(mut guard) = self.active_turn.lock() {
-			*guard = Some(tx);
+			*guard = Some(tx.clone());
 		}
-		TurnSignalRegistration { active_turn: Arc::clone(&self.active_turn) }
+		TurnSignalRegistration {
+			active_turn: Arc::clone(&self.active_turn),
+			own: tx,
+			steer_turn: None,
+		}
+	}
+
+	/// Register the running dialog: Ctrl-C interrupts it and `steer` may inject
+	/// into it until the registration drops.
+	fn register_dialog(
+		&self,
+		tx: tokio::sync::mpsc::Sender<SteeringEvent>,
+	) -> TurnSignalRegistration {
+		if let Ok(mut guard) = self.active_turn.lock() {
+			*guard = Some(tx.clone());
+		}
+		if let Ok(mut guard) = self.steer_turn.lock() {
+			*guard = Some(tx.clone());
+		}
+		TurnSignalRegistration {
+			active_turn: Arc::clone(&self.active_turn),
+			own: tx,
+			steer_turn: Some(Arc::clone(&self.steer_turn)),
+		}
+	}
+
+	/// Hand one steering message to the live dialog. `false` when no dialog is
+	/// running or the channel is full: the caller reports "steering is
+	/// unavailable" instead of dropping the message silently.
+	fn inject(&self, parts: Vec<pi_agent::ContentPart>) -> bool {
+		match self.steer_turn.lock() {
+			Ok(guard) => guard.as_ref().is_some_and(|tx| {
+				tx.try_send(SteeringEvent::InjectMessage(parts)).is_ok()
+			}),
+			Err(_) => false,
+		}
 	}
 }
 struct TimerGuard(Option<tokio::task::JoinHandle<()>>);
@@ -543,6 +689,11 @@ impl AgentRunner for PiAgentRunner {
 			request.session_id.as_deref(),
 			request.session_file.as_deref(),
 		);
+		// Router and scope are installed before the registry is built: the root
+		// `read`/`write` instances below copy the scope at construction, and the
+		// supervisor shares the same router with every child registry.
+		session.set_internal_urls(request.internal_urls.clone());
+		session.set_url_scope(request.url_scope.clone());
 		// `lsp.shared`/`tools.maxTimeout` are applied before the registry is built
 		// so the root tool instances carry this turn's transport and cap.
 		session.set_lsp_shared(request.config.lsp.shared(), &self.runtime);
@@ -676,6 +827,16 @@ impl AgentRunner for PiAgentRunner {
 				debug_max_timeout: request.config.max_tool_timeout_secs,
 			});
 			supervisor.set_active_model(active_model.clone());
+			if let Some(observer) = &request.subagent_observer {
+				// Idempotent: a supervisor reused across turns keeps one
+				// subscription, and a replaced one is subscribed again.
+				supervisor.subscribe_once(&observer.0);
+			}
+			supervisor.set_internal_urls(request.internal_urls.clone());
+			if let Some(scope) = &request.url_scope {
+				supervisor.set_url_scope(Arc::clone(scope));
+			}
+			supervisor.set_child_session_root(request.child_session_root.clone());
 			if let Some(processes) = &process_backend {
 				supervisor.set_processes(Arc::clone(processes));
 			}
@@ -783,6 +944,23 @@ impl AgentRunner for PiAgentRunner {
 		if let Some(binder) = &eval_binder {
 			binder.bind(&mut registry, None);
 		}
+		// Host tools mount last, after every root-owned tool exists, so a host
+		// definition can never shadow `read`, `bash`, a checkpoint pair or a
+		// bridged eval tool. Registered one at a time: the second occurrence of
+		// a name fails the same way whether it repeats the batch or an existing
+		// tool. Children never see these — the supervisor cloned its template
+		// before this point — and a tool-disabled request mounts none: the
+		// compaction request sets `tools_enabled = false`, and advertising host
+		// adapters there would let the summarizer call out to the host mid-turn.
+		if request.tools_enabled {
+			for tool in &request.extra_tools {
+				let name = tool.0.name();
+				if registry.get(name).is_some() {
+					return Err(Error::new(format!("Duplicate tool name: {name}")));
+				}
+				registry.register(Arc::clone(&tool.0));
+			}
+		}
 		let mut agent = AgentLoop::with_approver(config, provider, registry, approvals);
 		if let Some(ack) = &request.turn_ack {
 			agent = agent.with_turn_ack(Arc::clone(ack));
@@ -810,7 +988,7 @@ impl AgentRunner for PiAgentRunner {
 			let _ = steering_tx_cancel.send(SteeringEvent::Interrupt).await;
 		});
 
-		let signal_reg = self.dispatcher.register(steering_tx.clone());
+		let signal_reg = self.dispatcher.register_dialog(steering_tx.clone());
 
 		let end_user_message = user_message.clone();
 		let dialog_message = user_message;
@@ -911,13 +1089,33 @@ impl AgentRunner for PiAgentRunner {
 							return;
 						}
 					},
-					AgentEvent::ToolEnd { id, name, result, is_error } => {
-						let error = is_error.then(|| result.clone());
+					AgentEvent::ToolUpdate { id, name, args, partial } => {
 						if event_tx_clone
-							.send(Ok(Event::ToolEnd { id, tool: name, result, error }))
+							.send(Ok(Event::ToolUpdate { id, tool: name, args, partial }))
 							.await
 							.is_err()
 						{
+							cancel_on_err.cancel();
+							let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
+							abort_after_grace(dialog_abort_clone);
+							return;
+						}
+					},
+					AgentEvent::ToolEnd { id, name, result, is_error, images, details } => {
+						let error = is_error.then(|| result.clone());
+						if event_tx_clone
+							.send(Ok(Event::ToolEnd { id, tool: name, result, error, images, details }))
+							.await
+							.is_err()
+						{
+							cancel_on_err.cancel();
+							let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
+							abort_after_grace(dialog_abort_clone);
+							return;
+						}
+					},
+					AgentEvent::UserSteer { parts } => {
+						if event_tx_clone.send(Ok(Event::UserSteer { parts })).await.is_err() {
 							cancel_on_err.cancel();
 							let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
 							abort_after_grace(dialog_abort_clone);
@@ -1830,12 +2028,23 @@ fn build_registry_with_display(
 	let pending = session
 		.map_or_else(|| Arc::new(PendingStore::new()), |session| Arc::clone(&session.pending));
 	let read_sink = Arc::new(NativeSnapshotSink::new(snapshots.clone()));
+	// Same router and scope the supervisor uses, so a child and the root resolve
+	// identical `scheme://` inputs. Without a router the tools stay filesystem-only.
+	let internal_urls = session.and_then(|session| session.internal_urls());
+	let url_scope = session.map_or_else(
+		|| Arc::new(pi_agent::tools::internal_urls::UrlScope::default()),
+		|session| session.url_scope(),
+	);
 	for name in tools {
 		let tool: Arc<dyn Tool> = match *name {
-			"read" => Arc::new(
-				ReadTool::with_snapshot_sink(read_sink.clone())
-					.with_display_inputs(resolved.display),
-			),
+			"read" => {
+				let read = ReadTool::with_snapshot_sink(read_sink.clone())
+					.with_display_inputs(resolved.display);
+				Arc::new(match &internal_urls {
+					Some(router) => read.with_internal_urls(Arc::clone(router), Arc::clone(&url_scope)),
+					None => read,
+				})
+			},
 			"glob" => Arc::new(GlobTool),
 			"grep" => Arc::new(GrepTool),
 			"ast_grep" => Arc::new(
@@ -1847,7 +2056,13 @@ fn build_registry_with_display(
 				Arc::clone(&pending),
 				resolved.display,
 			)),
-			"write" => Arc::new(WriteTool::with_pending(Arc::clone(&pending))),
+			"write" => {
+				let write = WriteTool::with_pending(Arc::clone(&pending));
+				Arc::new(match &internal_urls {
+					Some(router) => write.with_internal_urls(Arc::clone(router), Arc::clone(&url_scope)),
+					None => write,
+				})
+			},
 			"edit" => match session {
 				Some(session) => session.edit.clone(),
 				None => Arc::new(EditTool::with_mode(
@@ -3224,6 +3439,11 @@ mod tests {
 			session_file: None,
 			session_id: None,
 			cancellation_token: None,
+			extra_tools: Vec::new(),
+			internal_urls: None,
+			url_scope: None,
+			subagent_observer: None,
+			child_session_root: None,
 		}
 	}
 
@@ -4746,6 +4966,7 @@ mod tests {
 			dir: Some(dir.clone()),
 			id: Some("todo-runtime".to_string()),
 			continue_latest: false,
+			parent_session: None,
 			no_title: false,
 		};
 		let mut store = crate::session::SessionStore::open(&options);

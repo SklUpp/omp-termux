@@ -3,11 +3,11 @@ use std::path::PathBuf;
 
 use omp_cli::dirs;
 use omp_cli::session::{
-	SessionOptions, SessionStore, ToolCallRecord, TurnRecord, compute_default_session_dir,
-	continue_recent_with_breadcrumb, fork_session, import_legacy_v1, overlay_title_slot,
-	overwrite_title_slot_rolled_back, parse_title_slot, read_terminal_breadcrumb,
-	resolve_resumable_session, serialize_title_slot, session_matches_resume_arg,
-	write_terminal_breadcrumb,
+	MessageContent, MessageEntry, SessionMessage, SessionOptions, SessionStore, ToolCallRecord,
+	TurnRecord, compute_default_session_dir, continue_recent_with_breadcrumb, fork_session,
+	import_legacy_v1, overlay_title_slot, overwrite_title_slot_rolled_back, parse_title_slot,
+	read_terminal_breadcrumb, resolve_resumable_session, serialize_title_slot,
+	session_matches_resume_arg, write_terminal_breadcrumb,
 };
 
 static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -41,6 +41,7 @@ fn read_ts_v3_session_fixture() {
 		dir: Some(temp.clone()),
 		id: Some("session".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 
@@ -115,6 +116,7 @@ fn v1_legacy_log_is_read_only_and_never_overwritten() {
 		dir: Some(temp.clone()),
 		id: Some("v1-legacy-id".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 
@@ -182,6 +184,7 @@ fn explicit_import_legacy_v1_creates_valid_v3_copy_without_mutating_v1() {
 		dir: Some(target_dir.clone()),
 		id: None,
 		continue_latest: true,
+		parent_session: None,
 		no_title: false,
 	});
 	assert!(store.enabled(), "reopened imported store must be enabled");
@@ -208,6 +211,7 @@ fn malformed_header_fails_without_append() {
 		dir: Some(temp.clone()),
 		id: Some("bad".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 
@@ -252,6 +256,7 @@ fn malformed_entry_disables_persistence_and_refuses_append() {
 		dir: Some(temp.clone()),
 		id: Some("malformed".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 
@@ -393,6 +398,7 @@ fn fork_session_creates_new_session_with_parent_reference() {
 		dir: Some(target_dir.clone()),
 		id: None,
 		continue_latest: true,
+		parent_session: None,
 		no_title: false,
 	});
 	assert!(forked_store.enabled());
@@ -476,6 +482,7 @@ fn append_turn_titles_and_appends_entries_and_reopens_cleanly() {
 		dir: Some(temp.clone()),
 		id: Some("01a178ce-append-test".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 	assert!(store.enabled());
@@ -507,6 +514,7 @@ fn append_turn_titles_and_appends_entries_and_reopens_cleanly() {
 		dir: Some(temp.clone()),
 		id: Some("01a178ce-append-test".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 	assert!(reopened.enabled());
@@ -534,6 +542,7 @@ fn slotless_v3_append_never_overwrites_header_and_reopens_untitled() {
 		dir: Some(temp.clone()),
 		id: Some("01a178ce-slotless".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	};
 	let mut store = SessionStore::open(&options);
@@ -598,6 +607,7 @@ fn overwrite_title_slot_rolled_back_updates_slot_and_preserves_length() {
 		dir: Some(temp.clone()),
 		id: Some("01a178ce-test".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 	assert!(store.enabled());
@@ -622,6 +632,7 @@ fn overwrite_title_slot_rolled_back_updates_slot_and_preserves_length() {
 		dir: Some(temp.clone()),
 		id: Some("01a178ce-test".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 	assert!(reopened.enabled());
@@ -652,6 +663,7 @@ fn unsupported_session_version_rejected_without_append() {
 		dir: Some(temp.clone()),
 		id: Some("unsupported-v4".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 
@@ -701,6 +713,7 @@ fn missing_session_version_rejected_without_append() {
 		dir: Some(temp.clone()),
 		id: Some("missing-ver".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 
@@ -739,6 +752,7 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 		dir: Some(temp.clone()),
 		id: Some("canon-stop-test".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 	assert!(store.enabled());
@@ -801,6 +815,7 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 		dir: Some(temp.clone()),
 		id: Some("canon-stop-test".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 	assert!(reopened.enabled());
@@ -824,6 +839,7 @@ fn session_storage_preserves_and_replays_tool_result_images() {
 		dir: Some(temp.clone()),
 		id: Some("tool-img-test".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 	assert!(store.enabled());
@@ -864,6 +880,7 @@ fn session_storage_preserves_and_replays_tool_result_images() {
 		dir: Some(temp.clone()),
 		id: Some("tool-img-test".to_string()),
 		continue_latest: false,
+		parent_session: None,
 		no_title: false,
 	});
 	assert!(reopened.enabled());
@@ -900,4 +917,89 @@ fn session_storage_preserves_and_replays_tool_result_images() {
 	}
 
 	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn branch_to_and_parent_lineage_survive_reload() {
+	let dir = temp_dir("branch-to");
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(dir.clone()),
+		id: Some("branch-test".to_string()),
+		continue_latest: false,
+		parent_session: Some("parent-session".to_string()),
+		no_title: true,
+	});
+	assert!(store.enabled(), "store must be enabled: {:?}", store.take_warnings());
+	assert_eq!(
+		store.header().expect("header").parent_session.as_deref(),
+		Some("parent-session"),
+		"parent lineage must be persisted at creation"
+	);
+
+	store
+		.append_message(&MessageEntry::new(
+			"msg-1",
+			None,
+			"2026-10-29T10:00:00.000Z",
+			SessionMessage::user(MessageContent::Text("first".to_string()), 1),
+		))
+		.expect("append first");
+	store
+		.append_message(&MessageEntry::new(
+			"msg-2",
+			Some("msg-1".to_string()),
+			"2026-10-29T10:00:01.000Z",
+			SessionMessage::user(MessageContent::Text("second".to_string()), 2),
+		))
+		.expect("append second");
+
+	let marker = store.branch_to("msg-1").expect("branch to an existing entry");
+	assert!(store.has_entry(&marker), "branch marker must be persisted");
+	assert_eq!(store.leaf_id(), Some(marker.as_str()), "marker is the new leaf");
+	assert!(
+		store.has_branch_context(),
+		"a branched journal needs the exact branch context"
+	);
+	let branch: Vec<&str> = store.branch_messages().iter().map(|entry| entry.id.as_str()).collect();
+	assert_eq!(branch, ["msg-1"], "abandoned entries must leave the active branch");
+
+	// The loader derives the active branch from the last physical entry, so a
+	// reload must land on the same leaf and the same branch.
+	drop(store);
+	let mut reloaded = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(dir.clone()),
+		id: Some("branch-test".to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(reloaded.enabled(), "reload must open the log: {:?}", reloaded.take_warnings());
+	assert_eq!(
+		reloaded.header().expect("header").parent_session.as_deref(),
+		Some("parent-session"),
+		"parent lineage must survive a reload"
+	);
+	assert_eq!(reloaded.leaf_id(), Some(marker.as_str()), "leaf must survive a reload");
+	let branch: Vec<&str> = reloaded
+		.branch_messages()
+		.iter()
+		.map(|entry| entry.id.as_str())
+		.collect();
+	assert_eq!(branch, ["msg-1"], "active branch must survive a reload");
+
+	let unknown = reloaded.branch_to("msg-missing");
+	assert!(
+		unknown.as_ref().is_err_and(|error| error.contains("msg-missing")),
+		"branching to an entry outside the store must be rejected: {unknown:?}"
+	);
+
+	fs::remove_dir_all(dir).ok();
 }

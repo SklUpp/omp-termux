@@ -183,6 +183,11 @@ impl EvalToolBinder for CliEvalBinder {
 	}
 }
 
+/// Tools the host owns directly (`eval` re-enters this runtime; `task`/`hub`
+/// belong to the supervisor). One source for the bridge exclusion and for the
+/// reserved-name check that keeps host tool definitions from taking these.
+pub const OWNED_TOOL_NAMES: [&str; 3] = ["eval", "task", "hub"];
+
 /// Clone the session registry for bridged `tool.*` calls, dropping tools that
 /// would close an ownership cycle back to this host (`eval` itself would
 /// re-enter the same runtime/host from inside a running cell) or reach
@@ -191,7 +196,7 @@ impl EvalToolBinder for CliEvalBinder {
 /// upstream bridges every enabled tool, so this is a deliberate narrowing.
 fn bridge_tool_registry(registry: &ToolRegistry) -> ToolRegistry {
 	let mut tools = registry.clone();
-	for name in ["eval", "task", "hub"] {
+	for name in OWNED_TOOL_NAMES {
 		tools.remove(name);
 	}
 	tools
@@ -325,7 +330,7 @@ impl EvalHost for CliEvalHost {
 		args: Value,
 		ctx: &AgentContext,
 	) -> Result<ToolResult, ToolError> {
-		if matches!(name, "eval" | "task" | "hub") {
+		if OWNED_TOOL_NAMES.contains(&name) {
 			return Err(ToolError::InvalidArguments(format!(
 				"`{name}` is not callable from eval; use agent() for subagents"
 			)));

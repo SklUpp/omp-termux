@@ -1,8 +1,9 @@
 use std::{
-	collections::{HashMap, HashSet, VecDeque},
+	collections::{BTreeMap, HashMap, HashSet, VecDeque},
+	io::Write,
 	path::PathBuf,
 	sync::{
-		Arc, Mutex,
+		Arc, Mutex, MutexGuard, Weak,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::{SystemTime, UNIX_EPOCH},
@@ -15,16 +16,17 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	dap::DapTool,
 	eval::EvalToolBinder,
-	loop_module::SteeringEvent,
+	loop_module::{AgentEvent, SteeringEvent},
 	lsp::LspTool,
 	mailbox::Mailbox,
 	provider::ModelProvider,
-	state::{StagedPreviewPolicy, ToolApprover},
+	state::{Message, StagedPreviewPolicy, ToolApprover},
 	tools::{
 		AstGrepTool, BashTool, EditTool, HubTool, PendingStore, TaskTool, ThinkTool, WriteTool,
 		YieldTool,
 		edit_variants::{ResolvedSessionTools, SessionDisplayResolver, default_session_tools},
 		hashline::{self, NativeSnapshotSink, SnapshotStore},
+		internal_urls::{InternalUrlRouter, UrlScope},
 		process::{ProcessBackend, ProcessManager},
 		read::ReadTool,
 		registry::ToolRegistry,
@@ -188,6 +190,161 @@ pub struct ChildRecord {
 	pub aborted: Option<bool>,
 	#[serde(skip_serializing_if = "Option::is_none", alias = "abort_reason")]
 	pub abort_reason: Option<String>,
+	/// Real child transcript log (`<session artifacts>/<child_id>.jsonl`) the
+	/// task executor writes. `None` when no session root was installed.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub session_file: Option<PathBuf>,
+	/// Source the agent definition came from (`project`, `builtin`, ...).
+	pub agent_source: String,
+	/// Model tool-call id that spawned this child, when the caller has one.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub parent_tool_call_id: Option<String>,
+	/// True for background spawns (`task` with async), false for synchronous
+	/// ones. Mirrors the upstream `detached` flag on lifecycle/progress frames.
+	pub detached: bool,
+}
+
+/// One reserve request with every field observability needs. `reserve_child`
+/// keeps the historical five-argument shape for callers that only need
+/// identity.
+#[derive(Debug, Clone, Copy)]
+pub struct ChildSpawn<'a> {
+	pub name:                &'a str,
+	pub index:               usize,
+	pub agent:               &'a str,
+	pub agent_source:        &'a str,
+	pub task:                &'a str,
+	pub parent_id:           Option<&'a str>,
+	pub parent_tool_call_id: Option<&'a str>,
+	pub detached:            bool,
+}
+
+impl<'a> ChildSpawn<'a> {
+	#[must_use]
+	pub fn new(name: &'a str, index: usize, agent: &'a str, task: &'a str) -> Self {
+		Self {
+			name,
+			index,
+			agent,
+			agent_source: agent,
+			task,
+			parent_id: None,
+			parent_tool_call_id: None,
+			detached: false,
+		}
+	}
+}
+
+/// Terminal state carried by a lifecycle event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentLifecycleStatus {
+	Started,
+	Completed,
+	Failed,
+	Aborted,
+}
+
+impl SubagentLifecycleStatus {
+	#[must_use]
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Started => "started",
+			Self::Completed => "completed",
+			Self::Failed => "failed",
+			Self::Aborted => "aborted",
+		}
+	}
+}
+
+/// Spawn/terminal notification for one child (`subagent_lifecycle` upstream).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentLifecycle {
+	pub id:                  String,
+	pub index:               usize,
+	pub agent:               String,
+	pub agent_source:        String,
+	pub task:                String,
+	pub status:              SubagentLifecycleStatus,
+	pub session_file:        Option<String>,
+	pub parent_tool_call_id: Option<String>,
+	pub detached:            bool,
+	pub error:               Option<String>,
+	pub abort_reason:        Option<String>,
+	pub duration_ms:         Option<u64>,
+}
+
+/// Real progress for one running child (`subagent_progress` upstream). Emitted
+/// only at genuine transitions (a reserved child actually starting to run), not
+/// on a timer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentProgress {
+	pub id:                  String,
+	pub index:               usize,
+	pub agent:               String,
+	pub agent_source:        String,
+	pub task:                String,
+	pub parent_tool_call_id: Option<String>,
+	pub session_file:        Option<String>,
+	pub detached:            bool,
+	pub status:              String,
+	pub description:         Option<String>,
+}
+
+/// One observability notification. `Event` carries a real event emitted by the
+/// child agent's own loop (never synthesized): `task` forwards the loop's
+/// `AgentEvent` channel for every child it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubagentEvent {
+	Lifecycle(SubagentLifecycle),
+	Progress(SubagentProgress),
+	Event { id: String, event: AgentEvent },
+}
+
+/// Consumer of [`SubagentEvent`]s. The RPC mode installs one that feeds the
+/// `SubagentRegistry`; embedders may install any other.
+pub trait SubagentObserver: Send + Sync {
+	fn observe(&self, event: &SubagentEvent);
+}
+
+/// Removes its observer when dropped. Holding it for the session lifetime is
+/// what keeps a registry from leaking across sessions: drop the guard and no
+/// further event reaches the observer.
+pub struct ObserverGuard {
+	supervisor: Weak<Supervisor>,
+	id:         u64,
+}
+
+impl Drop for ObserverGuard {
+	fn drop(&mut self) {
+		if let Some(supervisor) = self.supervisor.upgrade() {
+			supervisor
+				.observers
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.retain(|(id, _)| *id != self.id);
+		}
+	}
+}
+
+/// Lifecycle payload for one record at one status.
+fn lifecycle_of(record: &ChildRecord, status: SubagentLifecycleStatus) -> SubagentLifecycle {
+	SubagentLifecycle {
+		id:                  record.id.clone(),
+		index:               record.index,
+		agent:               record.agent.clone(),
+		agent_source:        record.agent_source.clone(),
+		task:                record.task.clone(),
+		status,
+		session_file:        record
+			.session_file
+			.as_ref()
+			.map(|path| path.display().to_string()),
+		parent_tool_call_id: record.parent_tool_call_id.clone(),
+		detached:            record.detached,
+		error:               record.error.clone(),
+		abort_reason:        record.abort_reason.clone(),
+		duration_ms:         record.duration_ms,
+	}
 }
 
 #[derive(Clone)]
@@ -273,6 +430,23 @@ pub struct Supervisor {
 	/// Wakes `cancel_child`, `hub jobs`, and `hub wait` waiters whenever a child
 	/// reaches a terminal status or a delivery is consumed.
 	settle: Notify,
+	/// Installed observability consumers, keyed by subscription id so a guard
+	/// can remove exactly its own entry.
+	observers: Mutex<Vec<(u64, Arc<dyn SubagentObserver>)>>,
+	observer_seq: AtomicU64,
+	/// Serializes a child's state decision with the frames it produces, so a
+	/// settled child can never emit after its terminal lifecycle frame. Always
+	/// taken before `state`; observer callbacks run under this gate but never
+	/// under `state`, and must not re-enter an emitting method.
+	emission: Mutex<()>,
+	/// Directory child transcripts are written to (`<artifacts>/<id>.jsonl`).
+	child_session_root: Mutex<Option<PathBuf>>,
+	/// Session internal URL router. Children rebuild `read`/`write` with their
+	/// own snapshot/pending stores, so the router must be re-applied there.
+	internal_urls: Mutex<Option<Arc<InternalUrlRouter>>>,
+	/// Root session scope paired with the router. Each tool call builds its own
+	/// context from it, so concurrent turns never share mutable scope.
+	url_scope: Mutex<Arc<UrlScope>>,
 }
 
 /// Result of a scoped `hub` cancellation attempt.
@@ -365,6 +539,12 @@ impl Supervisor {
 			}),
 			seq: AtomicU64::new(0),
 			settle: Notify::new(),
+			observers: Mutex::new(Vec::new()),
+			observer_seq: AtomicU64::new(0),
+			emission: Mutex::new(()),
+			child_session_root: Mutex::new(None),
+			internal_urls: Mutex::new(None),
+			url_scope: Mutex::new(Arc::new(UrlScope::default())),
 		})
 	}
 
@@ -397,6 +577,49 @@ impl Supervisor {
 			.agent_catalog
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner()) = Some(catalog);
+	}
+
+	/// Install the session's internal URL router so child `read`/`write`
+	/// instances resolve the same schemes as the root registry.
+	pub fn set_internal_urls(&self, router: Option<Arc<InternalUrlRouter>>) {
+		*self
+			.internal_urls
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = router;
+	}
+
+	/// Install the root session scope (session file + artifacts dir) that every
+	/// tool call copies into its own context.
+	pub fn set_url_scope(&self, scope: Arc<UrlScope>) {
+		*self.url_scope.lock().unwrap_or_else(|poison| poison.into_inner()) = scope;
+	}
+
+	/// Session internal URL router, when one is installed.
+	#[must_use]
+	pub fn internal_urls(&self) -> Option<Arc<InternalUrlRouter>> {
+		self
+			.internal_urls
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone()
+	}
+
+	/// Scope for one registry rebuild. A child gets its own transcript file and
+	/// artifacts directory; roots get the session scope installed above.
+	fn url_scope_for(&self, owner: Option<&str>) -> Arc<UrlScope> {
+		if let Some(id) = owner
+			&& let Some(path) = self.child_session_file(id)
+		{
+			let local_root = path
+				.parent()
+				.map(std::path::Path::to_path_buf)
+				.unwrap_or_else(|| PathBuf::from("."));
+			return Arc::new(UrlScope {
+				session_file: Some(path),
+				local_roots:  BTreeMap::from([("local".to_string(), local_root)]),
+			});
+		}
+		Arc::clone(&self.url_scope.lock().unwrap_or_else(|poison| poison.into_inner()))
 	}
 
 	/// Record the settings isolated child `lsp`/`debug` instances inherit.
@@ -534,12 +757,16 @@ impl Supervisor {
 		let snapshots = Arc::new(SnapshotStore::new());
 		let pending = Arc::new(PendingStore::new());
 		let sink = Arc::new(NativeSnapshotSink::new(snapshots.clone()));
+		let router = self.internal_urls();
+		let url_scope = self.url_scope_for(owner);
 
 		if registry.get("read").is_some() {
 			registry.remove("read");
-			registry.register(Arc::new(
-				ReadTool::with_snapshot_sink(sink.clone()).with_display_inputs(resolved.display),
-			));
+			let read = ReadTool::with_snapshot_sink(sink.clone()).with_display_inputs(resolved.display);
+			registry.register(Arc::new(match &router {
+				Some(router) => read.with_internal_urls(Arc::clone(router), Arc::clone(&url_scope)),
+				None => read,
+			}));
 		}
 		if registry.get("ast_grep").is_some() {
 			registry.remove("ast_grep");
@@ -566,7 +793,11 @@ impl Supervisor {
 		}
 		if registry.get("write").is_some() {
 			registry.remove("write");
-			registry.register(Arc::new(WriteTool::with_pending(Arc::clone(&pending))));
+			let write = WriteTool::with_pending(Arc::clone(&pending));
+			registry.register(Arc::new(match &router {
+				Some(router) => write.with_internal_urls(Arc::clone(router), Arc::clone(&url_scope)),
+				None => write,
+			}));
 		}
 		registry.set_policy(Arc::new(StagedPreviewPolicy::new(pending)));
 		if registry.get("eval").is_some()
@@ -916,7 +1147,9 @@ impl Supervisor {
 		match state.active.get(id) {
 			Some(active) => active
 				.steering_tx
-				.try_send(SteeringEvent::InjectMessage(text))
+				.try_send(SteeringEvent::InjectMessage(vec![
+					crate::state::ContentPart::text(text),
+				]))
 				.map_err(|_| format!("Agent \"{id}\" has no live session.")),
 			None => Err(format!("Agent \"{id}\" has no live session.")),
 		}
@@ -1151,39 +1384,241 @@ impl Supervisor {
 		task: &str,
 		parent_id: Option<&str>,
 	) -> Option<(String, CancellationToken)> {
-		let mut state = self.state.lock().unwrap();
-		Self::prune_state(&mut state);
-		if state.outstanding.len() >= MAX_OUTSTANDING_RESULTS {
-			return None;
-		}
-		let id = format!("task-{}", self.next_seq());
-		let cancellation_token = CancellationToken::new();
-		let started_at = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.map(|d| d.as_millis() as u64)
-			.ok();
-		let record = ChildRecord {
-			id: id.clone(),
-			name: name.to_string(),
-			index,
-			agent: agent.to_string(),
-			task: task.to_string(),
-			status: ChildStatus::Running,
-			parent_id: parent_id.map(str::to_string),
-			started_at,
-			duration_ms: None,
-			output: None,
-			error: None,
-			aborted: None,
-			abort_reason: None,
+		let mut spawn = ChildSpawn::new(name, index, agent, task);
+		spawn.parent_id = parent_id;
+		self.reserve_child_full(spawn)
+	}
+
+	/// Reserve with the fields observability needs beyond identity. The child
+	/// transcript is created here so `sessionFile` on the `started` event is a
+	/// real path the moment it is announced.
+	pub fn reserve_child_full(&self, spawn: ChildSpawn<'_>) -> Option<(String, CancellationToken)> {
+		let _emission = self.emission_gate();
+		let (id, cancellation_token, record) = {
+			let mut state = self.state.lock().unwrap();
+			Self::prune_state(&mut state);
+			if state.outstanding.len() >= MAX_OUTSTANDING_RESULTS {
+				return None;
+			}
+			let id = format!("task-{}", self.next_seq());
+			let cancellation_token = CancellationToken::new();
+			let started_at = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.map(|d| d.as_millis() as u64)
+				.ok();
+			let session_file = self.allocate_child_session(&id);
+			let record = ChildRecord {
+				id: id.clone(),
+				name: spawn.name.to_string(),
+				index: spawn.index,
+				agent: spawn.agent.to_string(),
+				task: spawn.task.to_string(),
+				status: ChildStatus::Running,
+				parent_id: spawn.parent_id.map(str::to_string),
+				started_at,
+				duration_ms: None,
+				output: None,
+				error: None,
+				aborted: None,
+				abort_reason: None,
+				session_file,
+				agent_source: spawn.agent_source.to_string(),
+				parent_tool_call_id: spawn.parent_tool_call_id.map(str::to_string),
+				detached: spawn.detached,
+			};
+			state.order.push(id.clone());
+			state.records.insert(id.clone(), record.clone());
+			state
+				.reservations
+				.insert(id.clone(), cancellation_token.clone());
+			state.outstanding.insert(id.clone());
+			(id, cancellation_token, record)
 		};
-		state.order.push(id.clone());
-		state.records.insert(id.clone(), record);
-		state
-			.reservations
-			.insert(id.clone(), cancellation_token.clone());
-		state.outstanding.insert(id.clone());
+		self.emit(SubagentEvent::Lifecycle(lifecycle_of(
+			&record,
+			SubagentLifecycleStatus::Started,
+		)));
 		Some((id, cancellation_token))
+	}
+
+	/// Directory child transcripts are created in; `None` disables them.
+	pub fn set_child_session_root(&self, root: Option<PathBuf>) {
+		*self
+			.child_session_root
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = root;
+	}
+
+	/// Real transcript log for one child, when a session root was installed.
+	#[must_use]
+	pub fn child_session_file(&self, id: &str) -> Option<PathBuf> {
+		let state = self.state.lock().unwrap();
+		state.records.get(id).and_then(|record| record.session_file.clone())
+	}
+
+	/// Append real child messages to that child's transcript log.
+	///
+	/// The path comes from the child's record — never a guess — and a write
+	/// failure is reported on stderr rather than replacing the child result.
+	pub fn append_child_transcript(&self, id: &str, messages: &[&Message]) {
+		let Some(path) = self.child_session_file(id) else {
+			return;
+		};
+		let mut file = match std::fs::OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open(&path)
+		{
+			Ok(file) => file,
+			Err(error) => {
+				eprintln!(
+					"warning: cannot open child transcript {}: {error}",
+					path.display()
+				);
+				return;
+			},
+		};
+		for message in messages {
+			let Ok(message) = serde_json::to_value(message) else {
+				continue;
+			};
+			let line = serde_json::json!({ "type": "message", "message": message });
+			if let Err(error) = writeln!(file, "{line}") {
+				eprintln!(
+					"warning: cannot append child transcript {}: {error}",
+					path.display()
+				);
+				return;
+			}
+		}
+	}
+
+	fn allocate_child_session(&self, id: &str) -> Option<PathBuf> {
+		let root = self
+			.child_session_root
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone()?;
+		let path = root.join(format!("{id}.jsonl"));
+		if let Some(parent) = path.parent() {
+			let _ = std::fs::create_dir_all(parent);
+		}
+		// An empty log is a real, readable transcript: paging returns no
+		// entries until the executor appends the child's actual messages.
+		let _ = std::fs::OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open(&path);
+		Some(path)
+	}
+
+	/// Subscribe an observability consumer for the supervisor's lifetime (or
+	/// until the returned guard drops).
+	pub fn subscribe(self: &Arc<Self>, observer: Arc<dyn SubagentObserver>) -> ObserverGuard {
+		let id = self.observer_seq.fetch_add(1, Ordering::SeqCst) + 1;
+		self
+			.observers
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.push((id, observer));
+		ObserverGuard { supervisor: Arc::downgrade(self), id }
+	}
+
+	/// Idempotent subscription for callers that see the supervisor once per
+	/// turn: a second call with the same observer is a no-op. Returns `true`
+	/// when this call installed it.
+	pub fn subscribe_once(self: &Arc<Self>, observer: &Arc<dyn SubagentObserver>) -> bool {
+		{
+			let observers = self
+				.observers
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner());
+			if observers
+				.iter()
+				.any(|(_, installed)| Arc::ptr_eq(installed, observer))
+			{
+				return false;
+			}
+		}
+		let id = self.observer_seq.fetch_add(1, Ordering::SeqCst) + 1;
+		self
+			.observers
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.push((id, Arc::clone(observer)));
+		true
+	}
+
+	/// Report real progress for one running child. Callers pass an observed
+	/// transition (the child actually started running); settled or unknown ids
+	/// are ignored so no event outlives its record.
+	pub fn report_progress(&self, id: &str, status: &str, description: Option<&str>) -> bool {
+		let _emission = self.emission_gate();
+		let record = {
+			let state = self.state.lock().unwrap();
+			state.records.get(id).cloned()
+		};
+		let Some(record) = record else {
+			return false;
+		};
+		if record.status != ChildStatus::Running {
+			return false;
+		}
+		self.emit(SubagentEvent::Progress(SubagentProgress {
+			id:                  record.id.clone(),
+			index:               record.index,
+			agent:               record.agent.clone(),
+			agent_source:        record.agent_source.clone(),
+			task:                record.task.clone(),
+			parent_tool_call_id: record.parent_tool_call_id.clone(),
+			session_file:        record
+				.session_file
+				.as_ref()
+				.map(|path| path.display().to_string()),
+			detached:            record.detached,
+			status:              status.to_string(),
+			description:         description.map(str::to_string),
+		}));
+		true
+	}
+
+	/// Forward one real event from a running child's loop to observers. Events
+	/// for settled or unknown ids are dropped, so no frame outlives its record.
+	pub fn report_event(&self, id: &str, event: AgentEvent) -> bool {
+		let _emission = self.emission_gate();
+		let live = {
+			let state = self.state.lock().unwrap();
+			state
+				.records
+				.get(id)
+				.is_some_and(|record| record.status == ChildStatus::Running)
+		};
+		if !live {
+			return false;
+		}
+		self.emit(SubagentEvent::Event { id: id.to_string(), event });
+		true
+	}
+
+	/// Emission gate. Taken before `state` and held until the frames are handed
+	/// to observers, so a state decision and its frames cannot interleave with
+	/// another child transition. Observers run under this gate (never under
+	/// `state`), so they must not call back into an emitting method.
+	fn emission_gate(&self) -> MutexGuard<'_, ()> {
+		self.emission.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	fn emit(&self, event: SubagentEvent) {
+		let observers: Vec<Arc<dyn SubagentObserver>> = self
+			.observers
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.iter()
+			.map(|(_, observer)| Arc::clone(observer))
+			.collect();
+		for observer in observers {
+			observer.observe(&event);
+		}
 	}
 
 	/// Free result slots for jobs whose inline/sync result was returned or
@@ -1257,7 +1692,8 @@ impl Supervisor {
 	}
 
 	pub fn mark_aborted(&self, id: &str, reason: &str) -> bool {
-		let changed = {
+		let _emission = self.emission_gate();
+		let (changed, record) = {
 			let mut state = self.state.lock().unwrap();
 			let changed = match state.records.get_mut(id) {
 				Some(record) if record.status == ChildStatus::Running => {
@@ -1272,9 +1708,16 @@ impl Supervisor {
 				state.settled_at.insert(id.to_string(), now_ms());
 				state.outstanding.remove(id);
 			}
-			changed
+			let record = state.records.get(id).cloned();
+			(changed, record)
 		};
 		if changed {
+			if let Some(record) = record {
+				self.emit(SubagentEvent::Lifecycle(lifecycle_of(
+					&record,
+					SubagentLifecycleStatus::Aborted,
+				)));
+			}
 			self.sweep_owner_deliveries(id);
 			self.settle.notify_waiters();
 		}
@@ -1282,7 +1725,8 @@ impl Supervisor {
 	}
 
 	fn settle_child(&self, id: &str, duration_ms: u64, output: Option<&str>, error: Option<&str>) {
-		let changed = {
+		let _emission = self.emission_gate();
+		let (changed, record) = {
 			let mut state = self.state.lock().unwrap();
 			let changed = match state.records.get_mut(id) {
 				Some(record) if record.status == ChildStatus::Running => {
@@ -1305,9 +1749,19 @@ impl Supervisor {
 			if changed {
 				state.settled_at.insert(id.to_string(), now_ms());
 			}
-			changed
+			let record = state.records.get(id).cloned();
+			(changed, record)
 		};
 		if changed {
+			if let Some(record) = record {
+				let status = match record.status {
+					ChildStatus::Completed => SubagentLifecycleStatus::Completed,
+					ChildStatus::Failed => SubagentLifecycleStatus::Failed,
+					ChildStatus::Aborted => SubagentLifecycleStatus::Aborted,
+					ChildStatus::Running => SubagentLifecycleStatus::Started,
+				};
+				self.emit(SubagentEvent::Lifecycle(lifecycle_of(&record, status)));
+			}
 			self.sweep_owner_deliveries(id);
 			self.settle.notify_waiters();
 		}

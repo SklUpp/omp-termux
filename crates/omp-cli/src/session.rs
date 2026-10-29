@@ -951,6 +951,10 @@ pub struct SessionOptions {
 	/// Suppress automatic first-prompt titles for this invocation only.
 	/// Runtime-only: never read back from or written to the session log.
 	pub no_title: bool,
+	/// Lineage of a freshly created log: the parent session id (or file), copied
+	/// verbatim into `SessionHeader.parent_session`. Ignored when an existing log
+	/// is opened — its own header is the source of truth.
+	pub parent_session: Option<String>,
 }
 
 impl SessionOptions {
@@ -1140,7 +1144,7 @@ impl SessionStore {
 			title: None,
 			title_source: Some("auto".to_string()),
 			additional_directories: Vec::new(),
-			parent_session: None,
+			parent_session: options.parent_session.clone(),
 			previous_session_files: Vec::new(),
 			provider_prompt_cache_key: None,
 		};
@@ -1525,6 +1529,35 @@ impl SessionStore {
 			.cloned()
 			.collect();
 		derive_turn_history(&messages)
+	}
+
+	/// Move the active leaf to an existing entry so the next append forms a new
+	/// branch (TS `SessionManager.branch`), durably.
+	///
+	/// Upstream only mutates the in-memory leaf, which the loader cannot see: our
+	/// loader derives the active branch from the last physical entry, so a bare
+	/// leaf change is lost on reload. This appends the same metadata-only marker
+	/// upstream writes for a durable path change — a `branch_summary` with an
+	/// empty summary whose `parentId` is `entry_id` — so root..`entry_id` is the
+	/// active branch after reload. No entry is modified or deleted, and the
+	/// marker carries no message content, so it never reaches the model chat.
+	///
+	/// Returns the marker entry id (the new physical leaf). A non-persisted store
+	/// reports instead of pretending: there is no journal to move a leaf in.
+	pub fn branch_to(&mut self, entry_id: &str) -> Result<String, String> {
+		if !self.has_entry(entry_id) {
+			return Err(format!("Entry {entry_id} not found"));
+		}
+		if !self.enabled {
+			return Err(
+				"session persistence is disabled: cannot move the active branch".to_string()
+			);
+		}
+		self.branch_with_summary(
+			Some(entry_id),
+			"",
+			serde_json::json!({ "kind": "branch-point" }),
+		)
 	}
 
 	/// TS `SessionManager.branchWithSummary`: append a `branch_summary` whose
@@ -3831,6 +3864,7 @@ mod tests {
 			dir: Some(dir),
 			id: id.map(str::to_string),
 			continue_latest: false,
+			parent_session: None,
 			no_title: false,
 		}
 	}
@@ -4198,6 +4232,7 @@ mod tests {
 
 		let mut resumed = SessionStore::open(&SessionOptions {
 			continue_latest: true,
+			parent_session: None,
 			..options(dir.clone(), None)
 		});
 		assert!(resumed.enabled());
@@ -4251,6 +4286,8 @@ mod tests {
 			tool: "read".to_string(),
 			result: "contents".to_string(),
 			error: None,
+			images: Vec::new(),
+			details: None,
 		});
 		builder.observe(&Event::message_end(pi_agent::Message::assistant("done")));
 		builder.observe(&Event::turn_end(
@@ -4282,6 +4319,8 @@ mod tests {
 			tool: "write".to_string(),
 			result: String::new(),
 			error: None,
+			images: Vec::new(),
+			details: None,
 		});
 		// Call 2: started but never received ToolEnd (interrupted).
 		builder.observe(&Event::ToolStart {
@@ -4963,6 +5002,8 @@ mod tests {
 			tool: "todo".to_string(),
 			result: "plan written".to_string(),
 			error: None,
+			images: Vec::new(),
+			details: None,
 		});
 		builder.observe(&Event::turn_end(
 			asst,

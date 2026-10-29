@@ -5,9 +5,10 @@
 //! and resolved by `host_uri_result`. Scheme validation, reserved namespaces,
 //! writable/immutable semantics and error text are identical to upstream.
 //!
-//! This build's native `read`/`write` tools reject every scheme URI (no
-//! `InternalUrlRouter` exists yet), so installing the handlers is reported as a
-//! precise prerequisite instead of pretending the schemes are live.
+//! Once [`HostUriBridge::bind`] hands the bridge a router, every registered
+//! scheme becomes a real [`ProtocolHandler`]: `read`/`write` on that scheme is
+//! an RPC round-trip, and a non-writable scheme rejects before any frame is
+//! sent.
 
 use std::{
 	collections::BTreeMap,
@@ -17,17 +18,19 @@ use std::{
 	},
 };
 
+use async_trait::async_trait;
 use pi_agent::CancellationToken;
+use pi_agent::tools::internal_urls::{
+	self, InternalUrl, InternalUrlRouter, ProtocolHandler, ResolveContext, WriteContext,
+	InternalResource as RouterResource,
+};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::{
-	session::{FrameSink, Prerequisite},
+	session::FrameSink,
 	types::{RpcHostUriResult, RpcHostUriSchemeDefinition},
 };
-
-/// OMP-owned namespaces that RPC hosts may not replace.
-const RESERVED_SCHEMES: [&str; 1] = ["security"];
 
 enum UriReply {
 	Result(RpcHostUriResult),
@@ -56,6 +59,9 @@ pub struct HostUriBridge {
 	pending:     Mutex<BTreeMap<String, PendingUriCall>>,
 	closed:      Mutex<Option<String>>,
 	next_id:     AtomicU64,
+	/// Router the registered schemes are mounted on. Absent until the session
+	/// owner binds one; then `set_schemes` keeps the router in sync.
+	router:      Mutex<Option<Arc<InternalUrlRouter>>>,
 }
 
 impl std::fmt::Debug for HostUriBridge {
@@ -66,15 +72,60 @@ impl std::fmt::Debug for HostUriBridge {
 	}
 }
 
-fn valid_scheme(scheme: &str) -> bool {
-	let mut chars = scheme.chars();
-	let Some(first) = chars.next() else {
-		return false;
-	};
-	if !first.is_ascii_lowercase() {
-		return false;
+/// One registered host scheme, mounted on the internal URL router.
+struct BridgeHandler {
+	bridge:    Arc<HostUriBridge>,
+	scheme:    String,
+	immutable: bool,
+	writable:  bool,
+}
+
+#[async_trait]
+impl ProtocolHandler for BridgeHandler {
+	fn scheme(&self) -> &str {
+		&self.scheme
 	}
-	chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '.' | '-'))
+
+	fn immutable(&self) -> bool {
+		self.immutable
+	}
+
+	fn writable(&self) -> bool {
+		self.writable
+	}
+
+	async fn resolve(
+		&self,
+		url: &InternalUrl,
+		context: &ResolveContext,
+	) -> Result<RouterResource, String> {
+		let resource = self
+			.bridge
+			.request_read(&self.scheme, &url.href, &context.signal)
+			.await?;
+		Ok(RouterResource {
+			url:          resource.url,
+			content:      resource.content,
+			content_type: resource.content_type,
+			size:         resource.size,
+			source_path:  None,
+			notes:        resource.notes,
+			immutable:    resource.immutable,
+			is_directory: false,
+		})
+	}
+
+	async fn write(
+		&self,
+		url: &InternalUrl,
+		content: &str,
+		context: &WriteContext,
+	) -> Result<(), String> {
+		self
+			.bridge
+			.request_write(&url.href, content, &context.signal)
+			.await
+	}
 }
 
 impl HostUriBridge {
@@ -86,12 +137,24 @@ impl HostUriBridge {
 			pending: Mutex::new(BTreeMap::new()),
 			closed: Mutex::new(None),
 			next_id: AtomicU64::new(1),
+			router: Mutex::new(None),
 		}
+	}
+
+	/// Mount this bridge on the session's router and install the schemes that
+	/// were validated before the router existed.
+	pub fn bind(self: &Arc<Self>, router: Arc<InternalUrlRouter>) {
+		*self.lock_router() = Some(router);
+		let definitions = self.lock_definitions().clone();
+		// Definitions only reach the map through `set_schemes`, which already
+		// rejected reserved schemes: a residual `Err` here is an invariant break.
+		self.mount(&[], &definitions)
+			.expect("mount: definitions validated by set_schemes");
 	}
 
 	/// Replace the registered scheme set, validating exactly like upstream.
 	pub fn set_schemes(
-		&self,
+		self: &Arc<Self>,
 		schemes: &[RpcHostUriSchemeDefinition],
 	) -> Result<Vec<String>, String> {
 		let mut normalized = BTreeMap::new();
@@ -100,10 +163,10 @@ impl HostUriBridge {
 			if scheme.is_empty() {
 				return Err("Host URI scheme must be a non-empty string".to_string());
 			}
-			if !valid_scheme(&scheme) {
+			if !internal_urls::is_valid_scheme(&scheme) {
 				return Err(format!("Host URI scheme contains invalid characters: {}", raw.scheme));
 			}
-			if RESERVED_SCHEMES.contains(&scheme.as_str()) {
+			if internal_urls::is_reserved_scheme(&scheme) {
 				return Err(format!("Host URI scheme is reserved by OMP: {scheme}://"));
 			}
 			normalized.insert(
@@ -116,9 +179,61 @@ impl HostUriBridge {
 				},
 			);
 		}
-		let mut store = self.lock_definitions();
-		*store = normalized;
-		Ok(store.keys().cloned().collect())
+		let previous: Vec<String> = self.lock_definitions().keys().cloned().collect();
+		let registered: Vec<String> = normalized.keys().cloned().collect();
+		*self.lock_definitions() = normalized.clone();
+		self.mount(&previous, &normalized)?;
+		Ok(registered)
+	}
+
+	/// Unregister every host scheme (session switch/shutdown).
+	pub fn clear_schemes(&self) {
+		let previous: Vec<String> = self.lock_definitions().keys().cloned().collect();
+		self.lock_definitions().clear();
+		let Some(router) = self.lock_router().clone() else {
+			return;
+		};
+		for scheme in previous {
+			router.unregister(&scheme);
+		}
+	}
+
+	/// Keep the router's handler set equal to the validated definitions.
+	///
+	/// `Err` only for a reserved scheme; `set_schemes` rejects those before
+	/// storing a definition, so it surfaces only a real invariant break.
+	fn mount(
+		self: &Arc<Self>,
+		previous: &[String],
+		definitions: &BTreeMap<String, RpcHostUriSchemeDefinition>,
+	) -> Result<(), String> {
+		if let Some(scheme) = definitions
+			.keys()
+			.find(|scheme| internal_urls::is_reserved_scheme(scheme.as_str()))
+		{
+			return Err(format!("Host URI scheme is reserved by OMP: {scheme}://"));
+		}
+		let Some(router) = self.lock_router().clone() else {
+			return Ok(());
+		};
+		for scheme in previous {
+			router.unregister(scheme);
+		}
+		for definition in definitions.values() {
+			// Every scheme passed the reservation check above, so registering
+			// cannot fail; `?` keeps the contract honest if that changes.
+			router.register(Arc::new(BridgeHandler {
+				bridge:    Arc::clone(self),
+				scheme:    definition.scheme.clone(),
+				immutable: definition.immutable,
+				writable:  definition.writable,
+			}))?;
+		}
+		Ok(())
+	}
+
+	fn lock_router(&self) -> MutexGuard<'_, Option<Arc<InternalUrlRouter>>> {
+		self.router.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 	}
 
 	/// Currently registered schemes, sorted.
@@ -271,24 +386,6 @@ fn non_empty(preferred: Option<&str>, fallback: &str) -> String {
 		.map_or_else(|| fallback.to_string(), str::to_string)
 }
 
-/// The native seam host URI schemes still need: no internal URL router exists.
-#[must_use]
-pub fn mount_prerequisite(schemes: &[String]) -> Prerequisite {
-	Prerequisite::new(
-		"host_uri_schemes_not_mounted",
-		format!(
-			"host URI schemes {} were validated and stored, but this build's read/write tools reject \
-			 scheme URIs: no InternalUrlRouter exists (native seam: pi_agent internal-URL router with \
-			 ProtocolHandler registration, consulted by read and write)",
-			schemes
-				.iter()
-				.map(|scheme| format!("{scheme}://"))
-				.collect::<Vec<_>>()
-				.join(", ")
-		),
-	)
-}
-
 /// Result payload for `set_host_uri_schemes`.
 #[must_use]
 pub fn schemes_payload(schemes: &[String]) -> Value {
@@ -335,7 +432,7 @@ mod tests {
 
 	#[test]
 	fn scheme_validation_matches_upstream() {
-		let bridge = HostUriBridge::new(Arc::new(TestSink::default()));
+		let bridge = Arc::new(HostUriBridge::new(Arc::new(TestSink::default())));
 		assert_eq!(
 			bridge.set_schemes(&[definition("  ")]).expect_err("empty"),
 			"Host URI scheme must be a non-empty string"
@@ -351,6 +448,10 @@ mod tests {
 		assert_eq!(
 			bridge.set_schemes(&[definition("security")]).expect_err("reserved"),
 			"Host URI scheme is reserved by OMP: security://"
+		);
+		assert_eq!(
+			bridge.set_schemes(&[definition("local")]).expect_err("built-in root handler"),
+			"Host URI scheme is reserved by OMP: local://"
 		);
 		assert_eq!(
 			bridge.set_schemes(&[definition("Docs")]).expect("normalized"),
@@ -458,5 +559,125 @@ mod tests {
 		assert_eq!(error, "Host URI read for docs://a was aborted");
 		let cancel_frame = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("cancel");
 		assert_eq!(cancel_frame["type"], json!("host_uri_cancel"));
+	}
+
+	/// Registering a scheme on a bound bridge makes `read` a real RPC
+	/// round-trip, rejects a reserved override, refuses writes on a read-only
+	/// scheme without emitting a frame, and unregisters on clear.
+	#[test]
+	fn router_read_roundtrip_reserved_and_read_only() {
+		let (tx, rx) = mpsc::channel();
+		let sink = Arc::new(TestSink { tx: Mutex::new(Some(tx)) });
+		let bridge = Arc::new(HostUriBridge::new(sink));
+		bridge.set_schemes(&[definition("notes")]).expect("schemes");
+		let router = Arc::new(InternalUrlRouter::new());
+		bridge.bind(Arc::clone(&router));
+		assert!(router.can_handle("notes://a"));
+
+		assert_eq!(
+			bridge.set_schemes(&[definition("security")]).expect_err("reserved"),
+			"Host URI scheme is reserved by OMP: security://"
+		);
+		assert_eq!(
+			bridge.set_schemes(&[definition("local")]).expect_err("built-in root handler"),
+			"Host URI scheme is reserved by OMP: local://"
+		);
+		assert!(router.can_handle("notes://a"), "rejected set must not unregister");
+
+		let runtime = runtime();
+		let signal = CancellationToken::new();
+		let scope = internal_urls::UrlScope::default();
+		let task = {
+			let router = Arc::clone(&router);
+			let context = scope.resolve_context(std::path::Path::new("/w"), &signal);
+			runtime.spawn(async move { router.resolve("notes://a", &context).await })
+		};
+		let request = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("request");
+		assert_eq!(request["type"], json!("host_uri_request"));
+		assert_eq!(request["operation"], json!("read"));
+		assert_eq!(request["url"], json!("notes://a"));
+		let id = request["id"].as_str().expect("id").to_string();
+		assert!(bridge.handle_result(RpcHostUriResult {
+			id,
+			content: Some("hi".into()),
+			content_type: Some("text/markdown".into()),
+			notes: None,
+			immutable: None,
+			is_error: false,
+			error: None,
+		}));
+		let resource = runtime.block_on(task).expect("join").expect("resource");
+		assert_eq!(resource.url, "notes://a");
+		assert_eq!(resource.content, "hi");
+		assert_eq!(resource.content_type, "text/markdown");
+
+		let error = runtime
+			.block_on(router.write(
+				"notes://a",
+				"x",
+				&scope.write_context(std::path::Path::new("/w"), &signal),
+			))
+			.expect_err("read-only");
+		assert_eq!(
+			error,
+			"notes:// URLs are read-only for write; use the protocol-specific tool for mutations."
+		);
+		assert!(
+			rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+			"read-only write must not emit a host frame"
+		);
+
+		// Unknown schemes name the supported set instead of falling through.
+		let error = runtime
+			.block_on(router.resolve(
+				"nope://x",
+				&scope.resolve_context(std::path::Path::new("/w"), &signal),
+			))
+			.expect_err("unknown");
+		assert_eq!(error, "Unknown protocol: nope://\nSupported: local://, notes://");
+
+		bridge.clear_schemes();
+		assert!(!router.can_handle("notes://a"));
+		assert_eq!(bridge.schemes(), Vec::<String>::new());
+	}
+
+	/// A writable definition installs a write handler that dispatches the real
+	/// `host_uri_request` write operation.
+	#[test]
+	fn writable_scheme_roundtrips_a_write() {
+		let (tx, rx) = mpsc::channel();
+		let sink = Arc::new(TestSink { tx: Mutex::new(Some(tx)) });
+		let bridge = Arc::new(HostUriBridge::new(sink));
+		let router = Arc::new(InternalUrlRouter::new());
+		bridge.bind(Arc::clone(&router));
+		bridge
+			.set_schemes(&[RpcHostUriSchemeDefinition {
+				scheme: "docs".into(),
+				description: None,
+				writable: true,
+				immutable: true,
+			}])
+			.expect("schemes");
+		let runtime = runtime();
+		let task = {
+			let router = Arc::clone(&router);
+			let context = internal_urls::UrlScope::default()
+				.write_context(std::path::Path::new("/w"), &CancellationToken::new());
+			runtime.spawn(async move { router.write("docs://a", "body", &context).await })
+		};
+		let request = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("request");
+		assert_eq!(request["operation"], json!("write"));
+		assert_eq!(request["content"], json!("body"));
+		let id = request["id"].as_str().expect("id").to_string();
+		assert!(bridge.handle_result(RpcHostUriResult {
+			id,
+			content: None,
+			content_type: None,
+			notes: None,
+			immutable: None,
+			is_error: false,
+			error: None,
+		}));
+		runtime.block_on(task).expect("join").expect("write ok");
 	}
 }

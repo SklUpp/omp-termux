@@ -9,6 +9,7 @@
 //! | `types`     | `rpc-types.ts`            | commands, responses, frames, state     |
 //! | `frame`     | `rpc-frame.ts`            | v1/v2 chunking + reassembly            |
 //! | `input`     | `rpc-input.ts`            | stdin reader, writer, extension UI, EOF |
+//! | `event_wire`| `agent-loop` emit helpers | native event -> TS frame conversion     |
 //! | `messages`  | `rpc-messages.ts`         | snapshot paging                        |
 //! | `host_tools`| `host-tools.ts`           | host tool bridge + native adapters     |
 //! | `host_uris` | `host-uris.ts`            | host URI bridge + scheme validation    |
@@ -16,6 +17,8 @@
 //! | `session`   | `agent-session` + `rpc-mode` state | long-lived session state       |
 //! | `mode`      | `rpc-mode.ts`             | command loop, turn pump, frames        |
 
+pub mod auth;
+pub mod event_wire;
 pub mod frame;
 pub mod host_tools;
 pub mod host_uris;

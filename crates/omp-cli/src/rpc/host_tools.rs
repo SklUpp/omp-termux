@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::{
-	session::{FrameSink, Prerequisite},
+	session::FrameSink,
 	types::{RpcHostToolDefinition, RpcHostToolResult, RpcHostToolUpdate},
 };
 
@@ -103,15 +103,32 @@ impl HostToolBridge {
 	}
 
 	/// Replace the host tool set and return the adapters to mount.
+	///
+	/// Reserved names are rejected here, synchronously, before the stored set
+	/// changes: upstream rejects a host tool that conflicts with an existing one
+	/// (`session-tools.ts:1826`), and the mount-time check alone would only fail
+	/// after `prepare_turn` already recorded the user entry. The reserved set is
+	/// independent of the current turn's registry, so `--no-tools` or an
+	/// allowlist cannot let a host definition take a builtin name and inherit its
+	/// name-based approval tier. MCP tool names are per-turn (they only exist
+	/// after discovery), so the mount-time check stays as that backstop.
 	pub fn set_tools(
 		self: &Arc<Self>,
 		definitions: Vec<RpcHostToolDefinition>,
 	) -> Result<Vec<Arc<dyn Tool>>, String> {
 		let normalized = normalize_definitions(definitions)?;
+		let reserved: std::collections::BTreeSet<String> =
+			crate::runtime::reserved_tool_names().into_iter().collect();
 		let mut unique = std::collections::BTreeSet::new();
 		for definition in &normalized {
 			if !unique.insert(definition.name.clone()) {
 				return Err(format!("Duplicate host tool name: {}", definition.name));
+			}
+			if reserved.contains(&definition.name) {
+				return Err(format!(
+					"Host tool \"{}\" conflicts with an existing tool",
+					definition.name
+				));
 			}
 		}
 		let mut store = self.lock_definitions();
@@ -123,6 +140,21 @@ impl HostToolBridge {
 				Arc::new(HostToolAdapter { definition, bridge: Arc::clone(self) }) as Arc<dyn Tool>
 			})
 			.collect())
+	}
+
+	/// Adapters for the definitions last accepted by [`Self::set_tools`], in
+	/// registration order, so a turn can mount the live host tool set without
+	/// re-registering it. Empty before the first `set_host_tools`.
+	#[must_use]
+	pub fn adapters(self: &Arc<Self>) -> Vec<Arc<dyn Tool>> {
+		self
+			.lock_definitions()
+			.iter()
+			.cloned()
+			.map(|definition| {
+				Arc::new(HostToolAdapter { definition, bridge: Arc::clone(self) }) as Arc<dyn Tool>
+			})
+			.collect()
 	}
 
 	/// Names currently registered, in registration order.
@@ -239,6 +271,17 @@ impl Tool for HostToolAdapter {
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
 		self.execute_with_id("", args, ctx).await
 	}
+
+	async fn execute_with_call_id(
+		&self,
+		tool_call_id: &str,
+		args: &Value,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, ToolError> {
+		// The host correlates on the model's real call id; the scheduler's later
+		// result-id rewrite cannot repair an already emitted frame.
+		self.execute_with_id(tool_call_id, args, ctx).await
+	}
 }
 
 impl HostToolAdapter {
@@ -295,17 +338,57 @@ impl HostToolAdapter {
 			};
 
 			match outcome {
-				// Native `Tool::execute` has no progress callback, so an update is
-				// acknowledged and dropped instead of ending the wait early.
-				Some(HostReply::Update(_)) => continue,
+				Some(HostReply::Update(partial)) => {
+					// The host streams partial output; surface it natively instead
+					// of acknowledging and dropping it.
+					ctx.report_progress(tool_call_id, &definition.name, args, partial).await;
+					continue;
+				},
 				Some(HostReply::Result(result)) => {
 					let text = text_content(&result);
+					// `AgentToolResult` blocks: images the host returned must reach
+					// the provider request, so mirror them into the `details.images`
+					// shape the loop validates (`tool_image_parts`), instead of
+					// leaving them buried in the raw payload.
+					let images: Vec<Value> = result
+						.get("content")
+						.and_then(Value::as_array)
+						.map(|items| {
+							items
+								.iter()
+								.filter(|item| {
+									item.get("type").and_then(Value::as_str) == Some("image")
+								})
+								.filter_map(|item| {
+									let data = item.get("data").and_then(Value::as_str)?;
+									let mime = item
+										.get("mimeType")
+										.or_else(|| item.get("mime_type"))
+										.and_then(Value::as_str)?;
+									Some(json!({ "data": data, "mimeType": mime }))
+								})
+								.collect()
+						})
+						.unwrap_or_default();
+					let mut details = result;
+					if !images.is_empty() {
+						let has_existing = details.get("images").and_then(Value::as_array).is_some();
+						if let Some(map) = details.as_object_mut() {
+							if has_existing {
+								if let Some(Value::Array(existing)) = map.get_mut("images") {
+									existing.extend(images);
+								}
+							} else {
+								map.insert("images".to_string(), Value::Array(images));
+							}
+						}
+					}
 					return Ok(ToolResult {
 						tool_call_id: tool_call_id.to_string(),
 						content: text,
 						is_error: false,
 						terminate: false,
-						details: Some(result),
+						details: Some(details),
 					});
 				},
 				Some(HostReply::Failed(message)) => return Err(ToolError::ExecutionFailed(message)),
@@ -320,16 +403,6 @@ impl HostToolAdapter {
 			}
 		}
 	}
-}
-
-/// The native seam host tools still need: `RunRequest` carries no extra tools.
-pub fn mount_prerequisite() -> Prerequisite {
-	Prerequisite::new(
-		"host_tools_not_mounted",
-		"host tools were validated and stored, but this build cannot mount them into the per-turn \
-		 registry: RunRequest exposes no extra-tools field (native seam: RunRequest { extra_tools: \
-		 Vec<Arc<dyn Tool>> } registered after build_registry in runtime::PiAgentRunner::run)",
-	)
 }
 
 #[cfg(test)]

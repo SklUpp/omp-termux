@@ -11,10 +11,10 @@ use futures::StreamExt;
 use pi_agent::provider::OpenAiChatRequest;
 use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
-	CancellationToken, ChunkStream, DelegationLimits, EditTool, GlobTool, GrepTool, ImagePart,
-	Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, ReadTool, Role, SteeringEvent,
-	StreamAssembler, StreamChunk, Supervisor, Tool, ToolCall, ToolCallDelta, ToolChoice,
-	ToolRegistry, TurnStatus, WriteTool, parse_sse_line, sse_stream,
+	CancellationToken, ChunkStream, ContentPart, DelegationLimits, EditTool, GlobTool, GrepTool,
+	ImagePart, Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, ReadTool, Role,
+	SteeringEvent, StreamAssembler, StreamChunk, Supervisor, Tool, ToolCall, ToolCallDelta,
+	ToolChoice, ToolRegistry, TurnStatus, WriteTool, parse_sse_line, sse_stream,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde_json::json;
@@ -3810,4 +3810,108 @@ async fn apply_failure_leaves_preview_pending_for_a_later_reject() {
 	assert!(turns[0].tool_results[0].is_error, "{}", turns[0].tool_results[0].content);
 	assert_eq!(provider.choices(), vec![ToolChoice::Auto; 3]);
 	assert!(pending.is_empty());
+}
+
+/// Records each request and answers with one streamed turn, so a live dialog can
+/// be inspected from the provider side.
+struct SteerCaptureProvider {
+	requests: Mutex<Vec<(ToolChoice, Vec<Message>)>>,
+}
+
+impl SteerCaptureProvider {
+	fn new() -> Self {
+		Self { requests: Mutex::new(Vec::new()) }
+	}
+
+	fn requests(&self) -> Vec<(ToolChoice, Vec<Message>)> {
+		self.requests.lock().expect("requests").clone()
+	}
+}
+
+#[async_trait]
+impl ModelProvider for SteerCaptureProvider {
+	async fn complete(
+		&self,
+		messages: &[Message],
+		_tools: &[serde_json::Value],
+		tool_choice: &ToolChoice,
+	) -> Result<Message, ProviderError> {
+		self.requests
+			.lock()
+			.expect("requests")
+			.push((tool_choice.clone(), messages.to_vec()));
+		Ok(Message::assistant("done"))
+	}
+
+	async fn stream(
+		&self,
+		messages: &[Message],
+		_tools: &[serde_json::Value],
+		tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		self.requests
+			.lock()
+			.expect("requests")
+			.push((tool_choice.clone(), messages.to_vec()));
+		let items: Vec<Result<StreamChunk, ProviderError>> =
+			vec![Ok(text_chunk("done")), Ok(done_chunk())];
+		Ok(Box::pin(futures::stream::iter(items)))
+	}
+
+	fn supports_images(&self) -> bool {
+		true
+	}
+}
+
+/// Steering carries parts, not just text: an injected message reaches the
+/// history and the very next provider request with its image intact, and the
+/// host is told about it exactly once, at acceptance.
+#[tokio::test]
+async fn steering_injection_preserves_text_and_image_parts() {
+	let dir = TempDir::new("steer-parts");
+	let provider = Arc::new(SteerCaptureProvider::new());
+	let agent = AgentLoop::new(
+		config(&dir.path, 3),
+		provider.clone(),
+		ToolRegistry::with_builtins(),
+	);
+	let mut state = AgentState::default();
+	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
+	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
+	let image_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+	let image = ContentPart::image(image_b64, "image/png").expect("valid image part");
+	let parts = vec![ContentPart::text("look"), image];
+	steering_tx
+		.send(SteeringEvent::InjectMessage(parts.clone()))
+		.await
+		.expect("queue steering");
+
+	agent
+		.run_dialog_with("hi", &mut state, Some(steering_rx), Some(events_tx))
+		.await
+		.expect("dialog");
+
+	let injected = state
+		.messages
+		.iter()
+		.find(|message| message.role == Role::User && message.content == "look")
+		.expect("steering message in history");
+	assert_eq!(injected.parts, parts, "history keeps text and image parts");
+	let request = provider.requests().pop().expect("one provider request");
+	assert!(
+		request
+			.1
+			.iter()
+			.any(|message| message.content == "look" && message.parts == parts),
+		"the next request carries the injected parts: {:?}",
+		request.1
+	);
+
+	let mut announced = Vec::new();
+	while let Ok(event) = events_rx.try_recv() {
+		if let AgentEvent::UserSteer { parts } = event {
+			announced.push(parts);
+		}
+	}
+	assert_eq!(announced, vec![parts], "accepted steering is announced once");
 }

@@ -619,6 +619,7 @@ mod tests {
 			dir: Some(dir),
 			id: Some(id.to_string()),
 			continue_latest: false,
+			parent_session: None,
 			no_title: true,
 		}
 	}

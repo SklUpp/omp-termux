@@ -51,11 +51,24 @@ pub enum Event {
 		tool: String,
 		args: serde_json::Value,
 	},
+	/// Partial tool output while it still runs (TS `tool_execution_update`).
+	ToolUpdate {
+		id: String,
+		tool: String,
+		args: serde_json::Value,
+		partial: serde_json::Value,
+	},
 	ToolEnd {
 		id: String,
 		tool: String,
 		result: String,
 		error: Option<String>,
+		/// Validated image parts the provider request carries for this result.
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		images: Vec<pi_agent::ContentPart>,
+		/// Structured result details (TS `AgentToolResult.details`).
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		details: Option<serde_json::Value>,
 	},
 	TurnEnd {
 		message: pi_agent::Message,
@@ -76,6 +89,12 @@ pub enum Event {
 		provider: Option<String>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		model: Option<String>,
+	},
+	/// A user message accepted from the steering channel, exactly as it entered
+	/// the loop's history. Emitted after acceptance, so the session can persist
+	/// it at that position and mirror it on the wire.
+	UserSteer {
+		parts: Vec<pi_agent::ContentPart>,
 	},
 }
 
@@ -167,6 +186,57 @@ pub struct RunRequest {
 	pub tools_enabled: bool,
 	/// Optional cancellation trigger from the consumer.
 	pub cancellation_token: Option<pi_agent::CancellationToken>,
+	/// Host-provided tools mounted into the per-turn registry after every
+	/// builtin/MCP/ask/checkpoint/eval tool is in place. A name that is already
+	/// registered — or repeated in this batch — is a hard error, never a silent
+	/// replacement of a builtin.
+	pub extra_tools: Vec<ExtraTool>,
+	/// Session internal URL router: the RPC host `scheme://` handlers plus any
+	/// scheme the runner installs. Shared with child agents so a child resolves
+	/// exactly what the root does; `None` disables every non-filesystem source.
+	pub internal_urls: Option<std::sync::Arc<pi_agent::tools::internal_urls::InternalUrlRouter>>,
+	/// Immutable URL scope for this run (session file + `local://` root). The
+	/// runner copies it into each tool call, so concurrent turns and children
+	/// never share or overwrite one.
+	pub url_scope: Option<std::sync::Arc<pi_agent::tools::internal_urls::UrlScope>>,
+	/// Subagent event observer the runner subscribes once on its lazily built
+	/// supervisor; a replaced supervisor reuses the same handle.
+	pub subagent_observer: Option<ObserverHandle>,
+	/// Directory child transcripts are written to; `None` leaves
+	/// `get_subagent_messages` without a file to page.
+	pub child_session_root: Option<std::path::PathBuf>,
+}
+
+/// Observer handle that keeps [`RunRequest`]'s derived `Debug` intact: the
+/// trait object itself is not printable, the handle names only that one was
+/// installed.
+#[derive(Clone)]
+pub struct ObserverHandle(pub std::sync::Arc<dyn pi_agent::supervisor::SubagentObserver>);
+
+impl std::fmt::Debug for ObserverHandle {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("ObserverHandle")
+	}
+}
+
+/// One host tool handed to the runner.
+///
+/// `Arc<dyn Tool>` is neither `Debug` nor name-aware at the field level, so the
+/// wrapper supplies both: `RunRequest` stays `Debug` and a conflict message can
+/// name the tool.
+#[derive(Clone)]
+pub struct ExtraTool(pub std::sync::Arc<dyn pi_agent::tools::Tool>);
+
+impl std::fmt::Debug for ExtraTool {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("ExtraTool").field(&self.0.name()).finish()
+	}
+}
+
+impl From<std::sync::Arc<dyn pi_agent::tools::Tool>> for ExtraTool {
+	fn from(tool: std::sync::Arc<dyn pi_agent::tools::Tool>) -> Self {
+		Self(tool)
+	}
 }
 
 impl RunRequest {

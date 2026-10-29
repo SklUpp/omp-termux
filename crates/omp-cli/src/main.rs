@@ -27,6 +27,7 @@ use omp_cli::{
 	profile,
 	prompts::{self, Prompts},
 	repl,
+	rpc::{RpcMode, session::{RpcLaunch, SteerFn, SteeringMessage}},
 	runtime::{self, PiAgentRunner},
 	session::{
 		self, ContentPart, MessageContent, MessageEntry, SessionHeader, SessionMessage,
@@ -344,7 +345,11 @@ fn run() -> std::result::Result<(), CliError> {
 		},
 		_ => {},
 	}
-	if agent::install(Box::new(PiAgentRunner::new()?)).is_err() {
+	// One shared runner instance: it is the installed `AgentRunner` and the
+	// concrete type behind the live steering channel (`RpcLaunch.steer`), so a
+	// turn and a steering hook never drive two runtimes.
+	let native_runner = Arc::new(PiAgentRunner::new()?);
+	if agent::install(Box::new(Arc::clone(&native_runner))).is_err() {
 		return Err(CliError::fail("agent runtime already registered"));
 	}
 	let Some(runner) = agent::runner() else {
@@ -486,6 +491,7 @@ fn run() -> std::result::Result<(), CliError> {
 			dir: session_dir.clone(),
 			id: None,
 			continue_latest: false,
+			parent_session: None,
 			no_title: false,
 		});
 		let prov = loaded.provenance_entry(selected_info);
@@ -633,6 +639,7 @@ fn run() -> std::result::Result<(), CliError> {
 			dir,
 			id,
 			continue_latest: false,
+			parent_session: None,
 			no_title,
 		}
 	} else {
@@ -653,9 +660,99 @@ fn run() -> std::result::Result<(), CliError> {
 			dir: session_dir,
 			id: cli.session_id.clone(),
 			continue_latest: cli.continue_session,
+			parent_session: None,
 			no_title,
 		}
 	};
+
+	// `--mode rpc`: the process speaks NDJSON command/event frames on stdout.
+	// `RpcMode` owns that single writer and its `ready` frame, so this path
+	// never builds a `Reporter`, never reads the terminal (approval and `ask`
+	// go over `extension_ui_*` frames) and never drains piped stdin as prompt
+	// text: a positional prompt is not required and is not consumed here.
+	if cli.mode == OutputMode::Rpc {
+		let steer_runner = Arc::clone(&native_runner);
+		let steer: Option<SteerFn> = Some(Arc::new(move |message: &SteeringMessage| {
+			// Exact user parts travel with the steering message; an image is
+			// never dropped or flattened to text.
+			let mut parts = Vec::with_capacity(message.images.len() + 1);
+			if !message.text.is_empty() {
+				parts.push(pi_agent::ContentPart::text(message.text.clone()));
+			}
+			for image in &message.images {
+				match pi_agent::ContentPart::image(image.data.clone(), image.mime_type.clone()) {
+					Ok(part) => parts.push(part),
+					Err(error) => {
+						eprintln!("warning: cannot steer with image: {error}");
+						return false;
+					},
+				}
+			}
+			steer_runner.steer(parts)
+		}));
+		// Preflight the log the RPC session will own: a resume whose log cannot
+		// be persisted must fail here (nothing has been written to stdout yet)
+		// instead of running in memory, and an inherited cache key has to come
+		// from the header this process resumes. `RpcSession::open` opens the
+		// store again from the same options; ponytail: double read at startup,
+		// pass the store once `RpcLaunch` accepts a pre-opened one.
+		let mut rpc_store = SessionStore::open(&open_opts);
+		for warning in rpc_store.take_warnings() {
+			eprintln!("warning: {warning}");
+		}
+		if !cli.no_session && explicitly_existing && !rpc_store.enabled() {
+			return Err(CliError::usage(
+				"cannot open session log: persistence disabled due to format error",
+			));
+		}
+		let rpc_cache_key = cli
+			.prompt_cache_key
+			.clone()
+			.filter(|key| !key.is_empty())
+			.or_else(|| {
+				let shape_changed = cli.model.is_some()
+					|| session.thinking.is_some()
+					|| session.config.system_prompt.is_some()
+					|| session.config.append_system_prompt.is_some()
+					|| cli.tools.is_some()
+					|| cli.no_tools;
+				if shape_changed {
+					return None;
+				}
+				rpc_store
+					.header()
+					.and_then(|header| header.provider_prompt_cache_key.clone())
+			});
+		// Typed local so the `Arc<PiAgentRunner>` unsizes once here; method
+		// receiver keeps `T = PiAgentRunner` concrete before the coercion.
+		let rpc_runner: Arc<dyn AgentRunner> = native_runner.clone();
+		let launch = RpcLaunch {
+			runner: rpc_runner,
+			config: session.config.clone(),
+			cwd: session.cwd.clone(),
+			prompts: session.prompts.clone(),
+			skills: session.skills.clone(),
+			catalog: Arc::clone(&session.catalog),
+			approval_mode: session.config.approval_mode.unwrap_or_default(),
+			allow: session.config.allow.clone(),
+			model: session.model.clone(),
+			provider: session.provider.clone(),
+			api_key: session.api_key.clone(),
+			thinking: session.thinking,
+			max_time: session.max_time,
+			max_turns: session.max_turns,
+			tools_enabled: session.tools_enabled,
+			// Same rule as the `--print` path below; resolved above.
+			prompt_cache_key: rpc_cache_key,
+			provider_session_id: cli
+				.provider_session_id
+				.clone()
+				.filter(|id| !id.is_empty()),
+			store_options: open_opts,
+			steer,
+		};
+		return RpcMode::run(launch, io::stdin().lock(), io::stdout()).map_err(CliError::from);
+	}
 
 	let mut store = SessionStore::open(&open_opts);
 	for warning in store.take_warnings() {
@@ -1013,6 +1110,11 @@ impl Session<'_> {
 			max_turns: self.max_turns,
 			tools_enabled: self.tools_enabled,
 			cancellation_token: None,
+			extra_tools: Vec::new(),
+			internal_urls: None,
+			url_scope: None,
+			subagent_observer: None,
+			child_session_root: None,
 		}
 	}
 

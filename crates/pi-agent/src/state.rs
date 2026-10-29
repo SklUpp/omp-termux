@@ -670,6 +670,10 @@ pub struct AgentContext {
 	pub approver: Option<Arc<dyn ToolApprover>>,
 	/// Interactive `ask` surface; `None` in headless runs and child agents.
 	pub ask: Option<Arc<dyn crate::tools::ask::AskChannel>>,
+	/// Live agent-event sink. A tool reports progress by enqueueing a
+	/// `ToolUpdate` on this same channel the loop uses for `ToolStart`/`ToolEnd`,
+	/// so delivery is ordered and backpressured by one bounded queue.
+	pub progress: Option<tokio::sync::mpsc::Sender<crate::AgentEvent>>,
 }
 
 impl std::fmt::Debug for AgentContext {
@@ -680,6 +684,7 @@ impl std::fmt::Debug for AgentContext {
 			.field("cancellation_token", &self.cancellation_token)
 			.field("has_approver", &self.approver.is_some())
 			.field("has_ask", &self.ask.is_some())
+			.field("has_progress", &self.progress.is_some())
 			.finish()
 	}
 }
@@ -692,6 +697,7 @@ impl AgentContext {
 			cancellation_token: CancellationToken::new(),
 			approver: None,
 			ask: None,
+			progress: None,
 		}
 	}
 
@@ -702,6 +708,7 @@ impl AgentContext {
 			cancellation_token,
 			approver: None,
 			ask: None,
+			progress: None,
 		}
 	}
 
@@ -717,6 +724,7 @@ impl AgentContext {
 			cancellation_token,
 			approver,
 			ask,
+			progress: None,
 		}
 	}
 
@@ -725,6 +733,45 @@ impl AgentContext {
 	pub fn with_ask(mut self, ask: Option<Arc<dyn crate::tools::ask::AskChannel>>) -> Self {
 		self.ask = ask;
 		self
+	}
+
+	/// Attach the live agent-event sink a tool reports progress through.
+	#[must_use]
+	pub fn with_progress(
+		mut self,
+		progress: Option<tokio::sync::mpsc::Sender<crate::AgentEvent>>,
+	) -> Self {
+		self.progress = progress;
+		self
+	}
+
+	/// Report partial tool output as a `ToolUpdate` on the loop's own event
+	/// channel.
+	///
+	/// The send awaits capacity: no update is dropped, and because the same
+	/// bounded queue carries `ToolStart`/`ToolEnd`, a tool that reports before
+	/// returning is ordered before its `ToolEnd`. The wait races cancellation so
+	/// a stopping run never blocks on a host that stopped reading.
+	pub async fn report_progress(
+		&self,
+		tool_call_id: &str,
+		name: &str,
+		args: &serde_json::Value,
+		partial: serde_json::Value,
+	) {
+		let Some(sink) = &self.progress else {
+			return;
+		};
+		let event = crate::AgentEvent::ToolUpdate {
+			id: tool_call_id.to_string(),
+			name: name.to_string(),
+			args: args.clone(),
+			partial,
+		};
+		tokio::select! {
+			_ = self.cancellation_token.cancelled() => {},
+			_ = sink.send(event) => {},
+		}
 	}
 }
 

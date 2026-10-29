@@ -5720,6 +5720,7 @@ name = "omp-cli"
 version = "18.0.9"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "clap",
  "globset",
  "grep-searcher",
@@ -5727,9 +5728,11 @@ dependencies = [
  "pi-agent",
  "pi-grep-pattern",
  "pi-walker",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-util",
  "xxhash-rust",

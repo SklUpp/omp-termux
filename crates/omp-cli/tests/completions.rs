@@ -256,7 +256,7 @@ fn bash_script_parses_and_completes_real_arguments() {
 
 	let mut modes = groups[5].clone();
 	modes.sort();
-	assert_eq!(modes, ["json", "text"], "--mode completion");
+	assert_eq!(modes, ["json", "rpc", "text"], "--mode completion");
 
 	let mut shells = groups[6].clone();
 	shells.sort();

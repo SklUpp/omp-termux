@@ -162,6 +162,11 @@ fn make_run_request(
 		max_turns: 1,
 		tools_enabled: true,
 		cancellation_token: None,
+		extra_tools: Vec::new(),
+		internal_urls: None,
+		url_scope: None,
+		subagent_observer: None,
+		child_session_root: None,
 	}
 }
 
@@ -191,7 +196,7 @@ fn test_closed_stdin_denies_write_and_file_unchanged() {
 
 	let mut tool_results = Vec::new();
 	for ev in stream {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results.push((id, tool, result, error));
 		}
 	}
@@ -242,7 +247,7 @@ fn test_allow_permits_write() {
 
 	let mut tool_results = Vec::new();
 	for ev in stream {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results.push((id, tool, result, error));
 		}
 	}
@@ -285,7 +290,7 @@ fn test_allow_edit_authorizes_apply_patch_wire_name() {
 	let stream = runner.run(&req).expect("run");
 	let mut tool_results = Vec::new();
 	for ev in stream {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results.push((id, tool, result, error));
 		}
 	}
@@ -315,7 +320,7 @@ fn test_allow_edit_authorizes_apply_patch_wire_name() {
 	let stream2 = runner.run(&req2).expect("run denied");
 	let mut denied_results = Vec::new();
 	for ev in stream2 {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			denied_results.push((id, tool, result, error));
 		}
 	}
@@ -352,7 +357,7 @@ fn test_always_ask_auto_permits_read_tier() {
 	let stream = runner.run(&req).expect("run");
 	let mut tool_results = Vec::new();
 	for ev in stream {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results.push((id, tool, result, error));
 		}
 	}
@@ -388,7 +393,7 @@ fn test_approval_mode_write_read_only_permits() {
 	let stream1 = runner.run(&req1).expect("run read");
 	let mut tool_results1 = Vec::new();
 	for ev in stream1 {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results1.push((id, tool, result, error));
 		}
 	}
@@ -417,7 +422,7 @@ fn test_approval_mode_write_read_only_permits() {
 	let stream2 = runner.run(&req2).expect("run bash");
 	let mut tool_results2 = Vec::new();
 	for ev in stream2 {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results2.push((id, tool, result, error));
 		}
 	}
@@ -509,7 +514,7 @@ while True:
 	let stream = runner.run(&req).expect("run mcp");
 	let mut tool_results = Vec::new();
 	for ev in stream {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results.push((id, tool, result, error));
 		}
 	}
@@ -545,7 +550,7 @@ while True:
 	let stream_unknown = runner.run(&req_unknown).expect("run unknown mcp");
 	let mut tool_results_unknown = Vec::new();
 	for ev in stream_unknown {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results_unknown.push((id, tool, result, error));
 		}
 	}
@@ -577,7 +582,7 @@ while True:
 	let stream_prefix_unknown = runner.run(&req_prefix_unknown).expect("run prefix unknown mcp");
 	let mut tool_results_prefix_unknown = Vec::new();
 	for ev in stream_prefix_unknown {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results_prefix_unknown.push((id, tool, result, error));
 		}
 	}
@@ -608,7 +613,7 @@ while True:
 	let stream2 = runner.run(&req2).expect("run mcp allowed");
 	let mut tool_results2 = Vec::new();
 	for ev in stream2 {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results2.push((id, tool, result, error));
 		}
 	}
@@ -641,7 +646,7 @@ while True:
 	let stream2_unknown = runner.run(&req2_unknown).expect("run running mcp nonexistent tool");
 	let mut tool_results2_unknown = Vec::new();
 	for ev in stream2_unknown {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results2_unknown.push((id, tool, result, error));
 		}
 	}
@@ -670,7 +675,7 @@ while True:
 	let stream3 = runner.run(&req3).expect("run mcp allowed via colon syntax");
 	let mut tool_results3 = Vec::new();
 	for ev in stream3 {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results3.push((id, tool, result, error));
 		}
 	}
@@ -697,7 +702,7 @@ while True:
 	let stream4 = runner.run(&req4).expect("run server level allow");
 	let mut tool_results4 = Vec::new();
 	for ev in stream4 {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results4.push((id, tool, result, error));
 		}
 	}
@@ -804,7 +809,7 @@ fn test_mcp_tool_ambiguous_prefix_names_no_server() {
 	let stream = runner.run(&req).expect("run ambiguous mcp");
 	let mut tool_results = Vec::new();
 	for ev in stream {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results.push((id, tool, result, error));
 		}
 	}
@@ -896,7 +901,7 @@ fn test_mcp_tool_error_redacts_http_body_secrets() {
 	let stream = runner.run(&req).expect("run");
 	let mut tool_results = Vec::new();
 	for ev in stream {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results.push((id, tool, result, error));
 		}
 	}
@@ -1085,7 +1090,7 @@ fn test_mcp_tool_call_error_redacts_http_body_secrets() {
 	let stream = runner.run(&req).expect("run");
 	let mut tool_results = Vec::new();
 	for ev in stream {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results.push((id, tool, result, error));
 		}
 	}
@@ -1321,7 +1326,7 @@ fn test_mcp_tool_call_json_rpc_error_redacts_message_secrets() {
 	let stream = runner.run(&req).expect("run");
 	let mut tool_results = Vec::new();
 	for ev in stream {
-		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
 			tool_results.push((id, tool, result, error));
 		}
 	}

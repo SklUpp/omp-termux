@@ -107,7 +107,7 @@ impl ToolScheduler {
 			}
 		}
 
-		let result = match tool.execute(&call.arguments, ctx).await {
+		let result = match tool.execute_with_call_id(&call.id, &call.arguments, ctx).await {
 			Ok(result) => result,
 			Err(err) => tool_error_result(&call.id, err),
 		};
