@@ -210,12 +210,6 @@ impl LspTool {
 	pub fn with_session(session: Arc<LspSession>) -> Self {
 		Self { session }
 	}
-
-	/// Ownership scope this tool claims clients under.
-	#[must_use]
-	pub fn session(&self) -> &Arc<LspSession> {
-		&self.session
-	}
 }
 
 #[async_trait]

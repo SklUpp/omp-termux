@@ -396,7 +396,7 @@ impl LspClient {
 			"method": "$/cancelRequest",
 			"params": { "id": id }
 		});
-		if let Some(arc) = registry().clients.lock().unwrap_or_else(|e| e.into_inner()).get(&client_name).cloned() {
+		if let Some(arc) = registered_client(&client_name) {
 			tokio::spawn(async move {
 				let _ = arc.write_message(message, &token).await;
 			});
@@ -462,22 +462,39 @@ struct ClientCell {
 	lock: tokio::sync::Mutex<()>,
 }
 
+/// Live client plus the [`LspSession`] ids that keep it open.
+///
+/// Both move under one `links` critical section, so "no owner remains" and
+/// "unregister the client" are a single atomic step: no acquire can claim a
+/// client the last release is tearing down, and no claim can outlive the
+/// registration it was made against.
+struct ClientLink {
+	client: Arc<LspClient>,
+	owners: HashSet<u64>,
+}
+
+impl ClientLink {
+	fn last_owner(&mut self, owner: u64) -> bool {
+		self.owners.remove(&owner);
+		self.owners.is_empty()
+	}
+}
+
 struct Registry {
-	clients: Mutex<HashMap<String, Arc<LspClient>>>,
+	/// Client key -> live instance + owners.
+	links: Mutex<HashMap<String, ClientLink>>,
+	/// Spawn serialization per key. Held only to resolve/spawn, never while
+	/// mutating `links`.
 	cells: Mutex<HashMap<String, Arc<ClientCell>>>,
 	file_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 	failures: Mutex<HashMap<String, (Instant, String)>>,
-	/// Live [`LspSession`] ids per client key. A shared client stays open while
-	/// any owner remains; the last owner to release closes the connection.
-	owners: Mutex<HashMap<String, HashSet<u64>>>,
 }
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| Registry {
-	clients: Mutex::new(HashMap::new()),
+	links: Mutex::new(HashMap::new()),
 	cells: Mutex::new(HashMap::new()),
 	file_locks: Mutex::new(HashMap::new()),
 	failures: Mutex::new(HashMap::new()),
-	owners: Mutex::new(HashMap::new()),
 });
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
@@ -510,21 +527,40 @@ fn normalize_cwd(cwd: &Path) -> String {
 	cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()).to_string_lossy().into_owned()
 }
 
+/// Unregister a dead or superseded instance.
+///
+/// Only the registered instance and its claims die: a newer client may already
+/// own the same key, and a claim racing this removal is refused by
+/// [`LspSession::claim`] instead of resurrecting the instance.
 fn remove_client(client: &Arc<LspClient>) {
-	let removed = {
-		let mut clients = lock(&registry().clients);
-		if clients.get(&client.name).is_some_and(|candidate| Arc::ptr_eq(candidate, client)) {
-			clients.remove(&client.name);
-			true
-		} else {
-			false
-		}
-	};
-	// Only the removed instance's claims die: a newer client may already own
-	// the same key.
-	if removed {
-		lock(&registry().owners).remove(&client.name);
+	let mut links = lock(&registry().links);
+	if links.get(&client.name).is_some_and(|link| Arc::ptr_eq(&link.client, client)) {
+		links.remove(&client.name);
 	}
+}
+
+/// Currently registered instance for `key`, if any.
+fn registered_client(key: &str) -> Option<Arc<LspClient>> {
+	lock(&registry().links).get(key).map(|link| link.client.clone())
+}
+
+/// Spawn-serialization cell for `key`.
+fn client_cell(key: &str) -> Arc<ClientCell> {
+	let mut cells = lock(&registry().cells);
+	cells
+		.entry(key.to_string())
+		.or_insert_with(|| Arc::new(ClientCell { lock: tokio::sync::Mutex::new(()) }))
+		.clone()
+}
+
+/// Outcome of recording an owner on a client.
+enum Claim {
+	/// Owner recorded; the client stays open until every owner releases.
+	Claimed,
+	/// The session released during acquire; nothing was recorded.
+	Released,
+	/// The client is no longer the registered instance; resolve again.
+	Stale,
 }
 
 /// Per-owner claim set over the process-wide client registry.
@@ -535,11 +571,20 @@ fn remove_client(client: &Arc<LspClient>) {
 /// ownership-scoped: the last owner to release closes the connection, and a
 /// shared mux server is never killed — the broker answers `shutdown` itself and
 /// `exit` closes only this session's link.
+///
+/// Lock order: `state` -> registry `links`. Both are plain mutexes held for map
+/// edits only and never across an await. The per-key spawn cell is the only
+/// lock held across an await, and no claim/release path waits on it, so acquire
+/// and release cannot deadlock.
 pub struct LspSession {
 	id:         u64,
 	shared_mux: bool,
-	held:       Mutex<HashSet<String>>,
-	released:   AtomicBool,
+	state:      Mutex<SessionState>,
+}
+
+struct SessionState {
+	released: bool,
+	held:     HashSet<String>,
 }
 
 impl LspSession {
@@ -548,8 +593,7 @@ impl LspSession {
 		Arc::new(Self {
 			id: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
 			shared_mux,
-			held: Mutex::new(HashSet::new()),
-			released: AtomicBool::new(false),
+			state: Mutex::new(SessionState { released: false, held: HashSet::new() }),
 		})
 	}
 
@@ -558,98 +602,94 @@ impl LspSession {
 		self.shared_mux
 	}
 
-	/// Record this owner on `client`, unless the owner already released.
-	fn claim(&self, client: &Arc<LspClient>) {
-		let key = client.name.clone();
-		if self.released.load(Ordering::SeqCst) {
-			// A tool call raced session teardown. Close the connection when this
-			// would have been its only owner instead of leaking it.
-			if last_owner_of(&key) {
-				shutdown_detached(vec![key]);
-			}
-			return;
-		}
-		lock(&registry().owners).entry(key.clone()).or_default().insert(self.id);
-		lock(&self.held).insert(key);
+	#[must_use]
+	fn is_released(&self) -> bool {
+		lock(&self.state).released
 	}
 
-	/// Remove this owner from `key`; true when no owner remains.
-	fn drop_owner(&self, key: &str) -> bool {
-		let mut owners = lock(&registry().owners);
-		let Some(entry) = owners.get_mut(key) else {
-			return false;
-		};
-		entry.remove(&self.id);
-		if entry.is_empty() {
-			owners.remove(key);
+	/// Record this owner on `client` atomically with the registration check.
+	///
+	/// `fresh` registers a client this acquire just spawned; otherwise `client`
+	/// must still be the instance registered for `key`. A released session
+	/// records nothing, so it can neither leak a stale owner id nor keep a
+	/// client another owner has already claimed.
+	fn claim(&self, key: &str, client: &Arc<LspClient>, fresh: bool) -> Claim {
+		let mut state = lock(&self.state);
+		if state.released {
+			return Claim::Released;
+		}
+		let mut links = lock(&registry().links);
+		let recorded = if links.contains_key(key) {
+			let link = links.get_mut(key).expect("contains_key checked");
+			if Arc::ptr_eq(&link.client, client) {
+				link.owners.insert(self.id);
+				true
+			} else {
+				false
+			}
+		} else if fresh {
+			links.insert(
+				key.to_string(),
+				ClientLink { client: Arc::clone(client), owners: HashSet::from([self.id]) },
+			);
 			true
 		} else {
 			false
+		};
+		drop(links);
+		if !recorded {
+			return Claim::Stale;
 		}
+		state.held.insert(key.to_string());
+		Claim::Claimed
+	}
+
+	/// Mark the session released and take the keys it still holds.
+	fn begin_release(&self) -> Vec<String> {
+		let mut state = lock(&self.state);
+		if state.released {
+			return Vec::new();
+		}
+		state.released = true;
+		state.held.drain().collect()
 	}
 
 	/// Close every client this owner kept open and no other owner still uses.
 	///
-	/// The shared-mux path stays broker-safe: `shutdown_client_instance` sends
+	/// The shared-mux path stays broker-safe: [`teardown_client`] sends
 	/// `shutdown` (answered by the broker, the shared server keeps running) and
 	/// `exit` (closes this session's link only).
 	pub async fn release(&self) {
-		if self.released.swap(true, Ordering::SeqCst) {
-			return;
-		}
-		let keys: Vec<String> = lock(&self.held).drain().collect();
-		for key in keys {
-			if !self.drop_owner(&key) {
+		for key in self.begin_release() {
+			let Some(client) = release_owner(self.id, &key) else {
 				continue;
-			}
-			let client = lock(&registry().clients).get(&key).cloned();
-			if let Some(client) = client {
-				let _ = shutdown_client_instance(&client).await;
-			}
+			};
+			let _ = teardown_client(&client).await;
 		}
 	}
 }
 
 impl Drop for LspSession {
 	fn drop(&mut self) {
-		if self.released.swap(true, Ordering::SeqCst) {
+		let removed: Vec<Arc<LspClient>> = self
+			.begin_release()
+			.iter()
+			.filter_map(|key| release_owner(self.id, key))
+			.collect();
+		if removed.is_empty() {
 			return;
 		}
-		let keys: Vec<String> = lock(&self.held).drain().collect();
-		let mut stop = Vec::new();
-		for key in keys {
-			if self.drop_owner(&key) {
-				stop.push(key);
-			}
-		}
-		if stop.is_empty() {
-			return;
-		}
-		// `Drop` cannot await. Prefer the graceful detached path; outside a
-		// runtime, at least kill private servers instead of orphaning them.
-		shutdown_detached(stop);
-	}
-}
-
-/// True when no live owner claims `key` any more.
-fn last_owner_of(key: &str) -> bool {
-	lock(&registry().owners).get(key).is_none_or(HashSet::is_empty)
-}
-
-fn shutdown_detached(keys: Vec<String>) {
-	if let Ok(handle) = tokio::runtime::Handle::try_current() {
-		handle.spawn(async move {
-			for key in keys {
-				let client = lock(&registry().clients).get(&key).cloned();
-				if let Some(client) = client {
-					let _ = shutdown_client_instance(&client).await;
+		// `Drop` cannot await. Hand the graceful shutdown to the runtime, or
+		// outside one at least kill private servers instead of orphaning them.
+		if let Ok(handle) = tokio::runtime::Handle::try_current() {
+			handle.spawn(async move {
+				for client in removed {
+					let _ = teardown_client(&client).await;
 				}
-			}
-		});
-		return;
-	}
-	for key in keys {
-		if let Some(client) = lock(&registry().clients).remove(&key) {
+			});
+			return;
+		}
+		for client in removed {
 			client.reject_pending("LSP owner released");
 			if !client.shared_mux {
 				client.kill_process();
@@ -658,25 +698,27 @@ fn shutdown_detached(keys: Vec<String>) {
 	}
 }
 
+/// Drop `owner` from `key`; when it was the last owner, unregister the client
+/// and hand it back for teardown outside the lock.
+fn release_owner(owner: u64, key: &str) -> Option<Arc<LspClient>> {
+	let mut links = lock(&registry().links);
+	if !links.get_mut(key).is_some_and(|link| link.last_owner(owner)) {
+		return None;
+	}
+	links.remove(key).map(|link| link.client)
+}
+
 // =============================================================================
 // Spawn and initialize
 // =============================================================================
-
-/// Resolve (or spawn) a client without ownership tracking.
-pub async fn get_or_create_client(
-	config: &ServerConfig,
-	cwd: &Path,
-	init_timeout: Option<Duration>,
-	cancel: &CancellationToken,
-	shared_mux: bool,
-) -> Result<Arc<LspClient>, LspError> {
-	get_or_create_client_inner(config, cwd, init_timeout, cancel, shared_mux).await
-}
 
 /// Resolve (or spawn) a client and claim it for `session`.
 ///
 /// Session-scoped callers (the `lsp` tool and its diagnostics/format helpers)
 /// use this so runner/child teardown closes only clients the owner introduced.
+/// A session that releases while this runs gets no client: a fresh spawn is
+/// torn down instead of leaking unowned, and a client other owners still hold
+/// is left untouched.
 pub async fn get_or_create_client_for(
 	session: &Arc<LspSession>,
 	config: &ServerConfig,
@@ -684,29 +726,20 @@ pub async fn get_or_create_client_for(
 	init_timeout: Option<Duration>,
 	cancel: &CancellationToken,
 ) -> Result<Arc<LspClient>, LspError> {
-	let client = get_or_create_client_inner(
-		config,
-		cwd,
-		init_timeout,
-		cancel,
-		session.shared_mux(),
-	)
-	.await?;
-	session.claim(&client);
-	Ok(client)
-}
-
-async fn get_or_create_client_inner(
-	config: &ServerConfig,
-	cwd: &Path,
-	init_timeout: Option<Duration>,
-	cancel: &CancellationToken,
-	shared_mux: bool,
-) -> Result<Arc<LspClient>, LspError> {
-	let key = client_key(config, cwd, shared_mux);
-	if let Some(client) = lock(&registry().clients).get(&key).cloned() {
+	let key = client_key(config, cwd, session.shared_mux());
+	if session.is_released() {
+		return Err(LspError::Cancelled);
+	}
+	// Fast path: a ready client some owner keeps alive. `claim` re-checks the
+	// registration, so a concurrent last-owner release cannot hand us a client
+	// that is already shutting down.
+	if let Some(client) = registered_client(&key).filter(|client| client.status() == ClientStatus::Ready) {
 		client.touch();
-		return Ok(client);
+		match session.claim(&key, &client, false) {
+			Claim::Claimed => return Ok(client),
+			Claim::Released => return Err(LspError::Cancelled),
+			Claim::Stale => {},
+		}
 	}
 	let previous_failure = lock(&registry().failures).get(&key).cloned();
 	if let Some((at, message)) = previous_failure {
@@ -719,32 +752,48 @@ async fn get_or_create_client_inner(
 		lock(&registry().failures).remove(&key);
 	}
 
-	let cell = {
-		let mut cells = lock(&registry().cells);
-		cells
-			.entry(key.clone())
-			.or_insert_with(|| Arc::new(ClientCell { lock: tokio::sync::Mutex::new(()) }))
-			.clone()
-	};
+	let cell = client_cell(&key);
 	let _guard = cell.lock.lock().await;
-	let existing_client = lock(&registry().clients).get(&key).cloned();
-	if let Some(client) = existing_client {
+	if let Some(client) = registered_client(&key) {
 		if client.status() == ClientStatus::Ready {
 			client.touch();
-			return Ok(client);
+			match session.claim(&key, &client, false) {
+				Claim::Claimed => return Ok(client),
+				Claim::Released => return Err(LspError::Cancelled),
+				Claim::Stale => {},
+			}
+		} else {
+			remove_client(&client);
 		}
-		remove_client(&client);
 	}
-	if cancel.is_cancelled() {
+	if cancel.is_cancelled() || session.is_released() {
 		return Err(LspError::Cancelled);
 	}
 
-	match spawn_and_initialize(config, cwd, init_timeout, cancel, &key, shared_mux).await {
+	match spawn_and_initialize(config, cwd, init_timeout, cancel, &key, session.shared_mux()).await {
 		Ok(client) => {
 			lock(&registry().failures).remove(&key);
-			lock(&registry().clients).insert(key, client.clone());
-			Ok(client)
-		}
+			let claim = session.claim(&key, &client, true);
+			// Resolve is finished: release the spawn cell before a teardown that
+			// can wait on the server's shutdown handshake.
+			drop(_guard);
+			match claim {
+				Claim::Claimed => Ok(client),
+				Claim::Released => {
+					// The owner vanished mid-spawn: never leave a server running
+					// that no session can release.
+					let _ = teardown_client(&client).await;
+					Err(LspError::Cancelled)
+				},
+				Claim::Stale => {
+					let _ = teardown_client(&client).await;
+					Err(LspError::Message(format!(
+						"LSP server {} was replaced during initialization",
+						config.command
+					)))
+				},
+			}
+		},
 		Err(error) => {
 			// Negative-cache deterministic failures only. Caller aborts are
 			// transient, and a timeout under a caller-shortened init deadline
@@ -1528,12 +1577,12 @@ pub async fn notify_workspace_watched_files(
 		return;
 	}
 	let workspace = normalize_cwd(cwd);
-	let active: Vec<Arc<LspClient>> = lock(&registry().clients)
+	let active: Vec<Arc<LspClient>> = lock(&registry().links)
 		.values()
+		.map(|link| Arc::clone(&link.client))
 		.filter(|client| {
 			client.status() == ClientStatus::Ready && normalize_cwd(&client.cwd) == workspace
 		})
-		.cloned()
 		.collect();
 	if active.is_empty() {
 		return;
@@ -1644,12 +1693,12 @@ async fn reconcile_executed_changes(
 		}
 	}
 	let workspace = normalize_cwd(cwd);
-	let active: Vec<Arc<LspClient>> = lock(&registry().clients)
+	let active: Vec<Arc<LspClient>> = lock(&registry().links)
 		.values()
+		.map(|link| Arc::clone(&link.client))
 		.filter(|client| {
 			client.status() == ClientStatus::Ready && normalize_cwd(&client.cwd) == workspace
 		})
-		.cloned()
 		.collect();
 	for client in active {
 		let open_keys: Vec<String> = lock(&client.state).open_files.keys().cloned().collect();
@@ -1918,6 +1967,15 @@ pub async fn wait_for_diagnostics(
 
 pub async fn shutdown_client_instance(client: &Arc<LspClient>) -> bool {
 	remove_client(client);
+	teardown_client(client).await
+}
+
+/// Graceful shutdown of an instance that is already unregistered.
+///
+/// A shared-mux link sends `shutdown` (answered by the broker) and `exit`
+/// (closes this session's link only), so the broker-owned server keeps serving
+/// other sessions.
+async fn teardown_client(client: &Arc<LspClient>) -> bool {
 	client.reject_pending("LSP client shutdown");
 	let shutdown_token = CancellationToken::new();
 	let shutdown_ok = client
@@ -1947,10 +2005,10 @@ pub async fn shutdown_stale_clients(
 ) -> Result<Vec<String>, LspError> {
 	let fresh: HashSet<String> = configs.iter().map(|config| client_key(config, cwd, shared_mux)).collect();
 	let workspace = normalize_cwd(cwd);
-	let stale: Vec<Arc<LspClient>> = lock(&registry().clients)
+	let stale: Vec<Arc<LspClient>> = lock(&registry().links)
 		.values()
+		.map(|link| Arc::clone(&link.client))
 		.filter(|client| normalize_cwd(&client.cwd) == workspace && !fresh.contains(&client.name))
-		.cloned()
 		.collect();
 	let mut stopped = Vec::new();
 	for client in stale {
@@ -1969,28 +2027,18 @@ pub async fn shutdown_stale_clients(
 	Ok(stopped)
 }
 
-pub async fn shutdown_all() {
-	let clients: Vec<Arc<LspClient>> = lock(&registry().clients).values().cloned().collect();
-	lock(&registry().clients).clear();
-	// Owners die with the registry: a later claim must not keep a dead client.
-	lock(&registry().owners).clear();
-	for client in clients {
-		let _ = shutdown_client_instance(&client).await;
-	}
-}
-
 pub fn clear_initialization_failure(config: &ServerConfig, cwd: &Path, shared_mux: bool) {
 	lock(&registry().failures).remove(&client_key(config, cwd, shared_mux));
 }
 
 #[must_use]
 pub fn get_active_clients() -> Vec<ServerStatus> {
-	lock(&registry().clients)
+	lock(&registry().links)
 		.values()
-		.map(|client| ServerStatus {
-			name: client.config.command.clone(),
-			status: client.status(),
-			file_types: client.config.file_types.clone(),
+		.map(|link| ServerStatus {
+			name: link.client.config.command.clone(),
+			status: link.client.status(),
+			file_types: link.client.config.file_types.clone(),
 		})
 		.collect()
 }
@@ -2067,7 +2115,8 @@ pub fn set_idle_timeout(timeout_ms: Option<u64>) {
 				if timeout == 0 {
 					continue;
 				}
-				let candidates: Vec<Arc<LspClient>> = lock(&registry().clients).values().cloned().collect();
+				let candidates: Vec<Arc<LspClient>> =
+					lock(&registry().links).values().map(|link| Arc::clone(&link.client)).collect();
 				for client in candidates {
 					if client.pending_count() > 0 {
 						continue;

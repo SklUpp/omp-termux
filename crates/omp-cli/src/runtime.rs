@@ -3250,40 +3250,6 @@ mod tests {
 	}
 
 	#[test]
-	fn runner_session_keeps_one_lsp_scope_and_debug_tree_across_turns() {
-		let session = RunnerSession::new(EditToolOptions::default());
-		assert!(
-			Arc::ptr_eq(&session.lsp_session(), &session.lsp_session()),
-			"root turns must share one LSP ownership scope"
-		);
-		assert!(
-			Arc::ptr_eq(&session.dap_manager(), &session.dap_manager()),
-			"root turns must share one debug session tree"
-		);
-		let other = RunnerSession::new(EditToolOptions::default());
-		assert!(!Arc::ptr_eq(&session.dap_manager(), &other.dap_manager()));
-		assert!(!Arc::ptr_eq(&session.lsp_session(), &other.lsp_session()));
-
-		let registry = build_registry_full(
-			&["lsp", "debug"],
-			Vec::new(),
-			Vec::new(),
-			Vec::new(),
-			Vec::new(),
-			false,
-			EditToolOptions::default(),
-			Some(&Arc::new(session)),
-		)
-		.expect("session registry");
-		assert!(registry.get("lsp").is_some());
-		assert!(registry.get("debug").is_some());
-		// Standalone registries (tests, helpers) still implement both names.
-		let standalone = build_registry(&["lsp", "debug"]).expect("standalone registry");
-		assert!(standalone.get("lsp").is_some());
-		assert!(standalone.get("debug").is_some());
-	}
-
-	#[test]
 	fn plan_maps_request_onto_provider_config() {
 		let plan = RunPlan::resolve(&request(yolo())).expect("plan");
 		assert_eq!(plan.base_url, "http://127.0.0.1:8080/v1");

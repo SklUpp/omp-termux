@@ -29,8 +29,7 @@ pub mod workspace_diagnostics;
 pub mod yaml;
 
 pub use client::{
-	get_active_clients, get_config, get_or_create_client, get_or_create_client_for, shutdown_all,
-	LspClient, LspError, LspSession,
+	get_active_clients, get_config, get_or_create_client_for, LspClient, LspError, LspSession,
 };
 pub use config::load_config;
 pub use mux::worker::{run_mux_worker, run_mux_worker_blocking};

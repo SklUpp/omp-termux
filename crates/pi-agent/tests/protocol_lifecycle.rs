@@ -28,7 +28,7 @@ use pi_agent::{
 	lsp::{
 		LspError, LspSession, LspTool,
 		client::{
-			ClientStatus, ensure_file_open, get_active_clients, get_or_create_client, notify_saved,
+			ClientStatus, ensure_file_open, get_active_clients, get_or_create_client_for, notify_saved,
 			shutdown_client_instance, sync_content,
 		},
 		mux::{endpoint_for_project, server::LspMuxServer},
@@ -199,8 +199,9 @@ async fn lsp_lifecycle_initializes_configures_and_syncs_documents() {
 		let expected_argv = json!(&config.args);
 		let cwd = dir.path().to_path_buf();
 		let cancel = CancellationToken::new();
+		let session = LspSession::new(false);
 
-		let client = get_or_create_client(&config, &cwd, Some(Duration::from_secs(10)), &cancel, false)
+		let client = get_or_create_client_for(&session, &config, &cwd, Some(Duration::from_secs(10)), &cancel)
 			.await
 			.expect("initialize fixture language server");
 		assert_eq!(client.status(), ClientStatus::Ready);
@@ -292,7 +293,8 @@ async fn lsp_request_correlation_keeps_out_of_order_responses_paired() {
 		let script = fixture("fake_lsp.py");
 		let config = lsp_config(&python, &script, &log);
 		let cancel = CancellationToken::new();
-		let client = get_or_create_client(&config, dir.path(), Some(Duration::from_secs(10)), &cancel, false)
+		let session = LspSession::new(false);
+		let client = get_or_create_client_for(&session, &config, dir.path(), Some(Duration::from_secs(10)), &cancel)
 			.await
 			.expect("initialize fixture language server");
 
@@ -371,7 +373,8 @@ async fn lsp_cancellation_and_deadline_emit_cancel_request_and_release_pending()
 		let script = fixture("fake_lsp.py");
 		let config = lsp_config(&python, &script, &log);
 		let cancel = CancellationToken::new();
-		let client = get_or_create_client(&config, dir.path(), Some(Duration::from_secs(10)), &cancel, false)
+		let session = LspSession::new(false);
+		let client = get_or_create_client_for(&session, &config, dir.path(), Some(Duration::from_secs(10)), &cancel)
 			.await
 			.expect("initialize fixture language server");
 
@@ -468,7 +471,8 @@ async fn lsp_process_exit_rejects_pending_request_and_unregisters_client() {
 		let registry_name = format!("fake-lsp-exit-{}", std::process::id());
 		config.command = registry_name.clone();
 		let cancel = CancellationToken::new();
-		let client = get_or_create_client(&config, dir.path(), Some(Duration::from_secs(10)), &cancel, false)
+		let session = LspSession::new(false);
+		let client = get_or_create_client_for(&session, &config, dir.path(), Some(Duration::from_secs(10)), &cancel)
 			.await
 			.expect("initialize fixture language server");
 
@@ -504,11 +508,12 @@ async fn lsp_private_clients_are_isolated_per_workspace_and_restart_replaces_pro
 		let script = fixture("fake_lsp.py");
 		let config = lsp_config(&python, &script, &log);
 		let cancel = CancellationToken::new();
+		let session = LspSession::new(false);
 
-		let client_a = get_or_create_client(&config, dir_a.path(), Some(Duration::from_secs(10)), &cancel, false)
+		let client_a = get_or_create_client_for(&session, &config, dir_a.path(), Some(Duration::from_secs(10)), &cancel)
 			.await
 			.expect("client A");
-		let client_b = get_or_create_client(&config, dir_b.path(), Some(Duration::from_secs(10)), &cancel, false)
+		let client_b = get_or_create_client_for(&session, &config, dir_b.path(), Some(Duration::from_secs(10)), &cancel)
 			.await
 			.expect("client B");
 		assert!(!Arc::ptr_eq(&client_a, &client_b));
@@ -524,7 +529,7 @@ async fn lsp_private_clients_are_isolated_per_workspace_and_restart_replaces_pro
 
 		let old_pid = client_a.pid;
 		assert!(shutdown_client_instance(&client_a).await);
-		let restarted = get_or_create_client(&config, dir_a.path(), Some(Duration::from_secs(10)), &cancel, false)
+		let restarted = get_or_create_client_for(&session, &config, dir_a.path(), Some(Duration::from_secs(10)), &cancel)
 			.await
 			.expect("restarted client A");
 		assert_ne!(restarted.pid, old_pid, "restart must spawn a fresh process");
@@ -557,13 +562,16 @@ async fn lsp_shared_mux_keeps_a_separate_transport_from_private() {
 		let script = fixture("fake_lsp.py");
 		let config = lsp_config(&python, &script, &log);
 		let cancel = CancellationToken::new();
+		let private_session = LspSession::new(false);
 
-		let private = get_or_create_client(&config, dir.path(), Some(Duration::from_secs(10)), &cancel, false)
-			.await
-			.expect("private client");
-		let private_again = get_or_create_client(&config, dir.path(), Some(Duration::from_secs(10)), &cancel, false)
-			.await
-			.expect("private client reuse");
+		let private =
+			get_or_create_client_for(&private_session, &config, dir.path(), Some(Duration::from_secs(10)), &cancel)
+				.await
+				.expect("private client");
+		let private_again =
+			get_or_create_client_for(&private_session, &config, dir.path(), Some(Duration::from_secs(10)), &cancel)
+				.await
+				.expect("private client reuse");
 		assert!(
 			Arc::ptr_eq(&private, &private_again),
 			"private preference must reuse the same process for one workspace"
@@ -575,9 +583,11 @@ async fn lsp_shared_mux_keeps_a_separate_transport_from_private() {
 		let endpoint = endpoint_for_project(dir.path()).expect("mux endpoint");
 		let server = Arc::new(LspMuxServer::new());
 		server.listen(&endpoint).await.expect("bind in-process mux");
-		let shared = get_or_create_client(&config, dir.path(), Some(Duration::from_secs(10)), &cancel, true)
-			.await
-			.expect("shared client");
+		let shared_session = LspSession::new(true);
+		let shared =
+			get_or_create_client_for(&shared_session, &config, dir.path(), Some(Duration::from_secs(10)), &cancel)
+				.await
+				.expect("shared client");
 		assert!(shared.shared_mux, "shared preference must connect through the mux transport");
 		assert!(!Arc::ptr_eq(&private, &shared));
 		assert_ne!(private.name, shared.name, "shared and private preferences must not alias");
@@ -929,13 +939,13 @@ async fn dap_fresh_manager_cannot_see_or_terminate_another_managers_session() {
 // Tool-level mounting: the CLI's `lsp` / `debug` tools over the same fixtures
 // =============================================================================
 
-fn write_lsp_project(dir: &Path, python: &Path, script: &Path, log: &Path) {
+fn write_lsp_project(dir: &Path, python: &Path, script: &Path, log: &Path, extension: &str) {
 	let config = json!({
 		"servers": {
 			"fixture": {
 				"command": python.to_string_lossy(),
 				"args": [script.to_string_lossy(), log.to_string_lossy()],
-				"fileTypes": [".ltool"],
+				"fileTypes": [extension],
 				"rootMarkers": ["fixture-root"],
 				"languageId": "testlang",
 			}
@@ -972,9 +982,14 @@ async fn lsp_tool_hover_rename_and_owned_release() {
 	bounded("lsp tool", 40, async move {
 		let dir = TestDir::new("lsp-tool");
 		let log = dir.path().join("lsp.log");
-		write_lsp_project(dir.path(), &python, &fixture("fake_lsp.py"), &log);
-		let source = dir.path().join("sample.ltool");
+		// `get_active_clients` is process-global and tests share the interpreter
+		// command, so each LSP test claims a private extension and asserts on it
+		// instead of on every client another parallel test may be running.
+		let extension = ".ltoola";
+		write_lsp_project(dir.path(), &python, &fixture("fake_lsp.py"), &log, extension);
+		let source = dir.path().join(format!("sample{extension}"));
 		std::fs::write(&source, "value = 1\n").expect("source file");
+		let file = format!("sample{extension}");
 
 		let session = LspSession::new(false);
 		let tool = LspTool::with_session(Arc::clone(&session));
@@ -982,7 +997,7 @@ async fn lsp_tool_hover_rename_and_owned_release() {
 
 		let hover = tool
 			.execute(
-				&json!({"action": "hover", "file": "sample.ltool", "line": 1, "symbol": "value"}),
+				&json!({"action": "hover", "file": &file, "line": 1, "symbol": "value"}),
 				&ctx,
 			)
 			.await
@@ -994,7 +1009,7 @@ async fn lsp_tool_hover_rename_and_owned_release() {
 			.execute(
 				&json!({
 					"action": "rename",
-					"file": "sample.ltool",
+					"file": &file,
 					"line": 1,
 					"symbol": "value",
 					"new_name": "renamed",
@@ -1022,30 +1037,22 @@ async fn lsp_tool_hover_rename_and_owned_release() {
 
 		// Runner teardown: this session owns the private fixture server, so
 		// release sends shutdown + exit and the client leaves the registry.
+		// `release` awaits the process exit, so the wire log and registry are
+		// final here: no sleep-based polling.
 		session.release().await;
+		let entries = read_log(&log);
 		assert!(
-			wait_until(Duration::from_secs(5), || {
-				read_log(&log)
-					.iter()
-					.any(|entry| entry["dir"] == "in" && entry["msg"]["method"] == "shutdown")
-			})
-			.await,
+			entries.iter().any(|entry| entry["dir"] == "in" && entry["msg"]["method"] == "shutdown"),
 			"release must send shutdown"
 		);
 		assert!(
-			wait_until(Duration::from_secs(5), || {
-				read_log(&log).iter().any(|entry| entry["dir"] == "in" && entry["msg"]["method"] == "exit")
-			})
-			.await,
+			entries.iter().any(|entry| entry["dir"] == "in" && entry["msg"]["method"] == "exit"),
 			"release must send exit"
 		);
 		assert!(
-			wait_until(Duration::from_secs(5), || {
-				get_active_clients()
-					.iter()
-					.all(|client| !client.file_types.iter().any(|kind| kind == ".ltool"))
-			})
-			.await,
+			get_active_clients()
+				.iter()
+				.all(|client| !client.file_types.iter().any(|kind| kind.as_str() == extension)),
 			"released client must leave the registry"
 		);
 	})
@@ -1058,29 +1065,48 @@ async fn lsp_scope_keeps_a_client_another_owner_still_uses() {
 	bounded("lsp scope refcount", 40, async move {
 		let dir = TestDir::new("lsp-scope");
 		let log = dir.path().join("lsp.log");
-		write_lsp_project(dir.path(), &python, &fixture("fake_lsp.py"), &log);
-		std::fs::write(dir.path().join("sample.ltool"), "value = 1\n").expect("source file");
+		let extension = ".ltoolb";
+		write_lsp_project(dir.path(), &python, &fixture("fake_lsp.py"), &log, extension);
+		let file = format!("sample{extension}");
+		std::fs::write(dir.path().join(&file), "value = 1\n").expect("source file");
 
 		let root = LspSession::new(false);
 		let child = LspSession::new(false);
 		let root_tool = LspTool::with_session(Arc::clone(&root));
 		let child_tool = LspTool::with_session(Arc::clone(&child));
 		let ctx = AgentContext::new(dir.path().to_path_buf());
-		let hover = json!({"action": "hover", "file": "sample.ltool", "line": 1, "symbol": "value"});
+		let hover = json!({"action": "hover", "file": &file, "line": 1, "symbol": "value"});
 
-		root_tool.execute(&hover, &ctx).await.expect("root hover");
-		child_tool.execute(&hover, &ctx).await.expect("child hover");
+		// Both owners resolve the same command+cwd identity concurrently: the
+		// per-key spawn cell must register exactly one client and both calls
+		// must claim it, with no second spawn and no stale owner entry.
+		let (root_hover, child_hover) =
+			tokio::join!(root_tool.execute(&hover, &ctx), child_tool.execute(&hover, &ctx));
+		let root_hover = root_hover.expect("root hover");
+		assert!(!root_hover.is_error, "{}", root_hover.content);
+		let child_hover = child_hover.expect("child hover");
+		assert!(!child_hover.is_error, "{}", child_hover.content);
 		assert_eq!(
 			get_active_clients()
 				.iter()
-				.filter(|client| client.file_types.iter().any(|kind| kind == ".ltool"))
+				.filter(|client| client.file_types.iter().any(|kind| kind.as_str() == extension))
 				.count(),
 			1,
 			"same command+cwd identity must reuse one client"
 		);
 
-		// The child finishes first: the root still owns the client.
+		// The child finishes first: the root still owns the client. `release`
+		// only awaits teardown for the last owner, so the registration and wire
+		// log are already final for a non-last release.
 		child.release().await;
+		assert_eq!(
+			get_active_clients()
+				.iter()
+				.filter(|client| client.file_types.iter().any(|kind| kind.as_str() == extension))
+				.count(),
+			1,
+			"a sibling release must keep the shared client registered"
+		);
 		let still_there = root_tool
 			.execute(&hover, &ctx)
 			.await
@@ -1093,12 +1119,7 @@ async fn lsp_scope_keeps_a_client_another_owner_still_uses() {
 
 		root.release().await;
 		assert!(
-			wait_until(Duration::from_secs(5), || {
-				read_log(&log)
-					.iter()
-					.any(|entry| entry["dir"] == "in" && entry["msg"]["method"] == "shutdown")
-			})
-			.await,
+			read_log(&log).iter().any(|entry| entry["dir"] == "in" && entry["msg"]["method"] == "shutdown"),
 			"the last owner releases the client"
 		);
 	})
@@ -1114,7 +1135,7 @@ async fn debug_tool_shares_root_session_and_isolates_children() {
 		write_dap_project(dir.path(), &python, &fixture("fake_dap.py"), &log);
 		std::fs::write(dir.path().join("main.py"), "print(1)\n").expect("program");
 
-		let manager = DapSessionManager::new();
+		let manager = Arc::new(DapSessionManager::new());
 		let tool = DapTool::shared(manager.clone());
 		let ctx = AgentContext::new(dir.path().to_path_buf());
 		let launch = tool
