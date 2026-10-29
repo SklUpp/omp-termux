@@ -294,14 +294,18 @@ async fn invalid_run_modes_are_rejected_not_silently_ignored() {
 	assert!(matches!(&pty, ToolError::InvalidArguments(_)));
 	assert!(pty.to_string().contains("pty"));
 
+	let async_marker = dir.path.join("async_ran");
 	let background = BashTool::new()
-		.execute(&json!({"command": "true", "async": true}), &ctx)
+		.execute(
+			&json!({"command": format!("touch {}", async_marker.display()), "async": true}),
+			&ctx,
+		)
 		.await
 		.expect_err("async needs a supervisor");
 	assert!(matches!(&background, ToolError::InvalidArguments(_)));
-	assert_eq!(
-		background.to_string(),
-		"Background bash ('async') requires the session process supervisor; use hub start for a supervised process"
+	assert!(
+		!async_marker.exists(),
+		"rejected async command must not start"
 	);
 
 	let legacy = BashTool::new()
@@ -314,14 +318,22 @@ async fn invalid_run_modes_are_rejected_not_silently_ignored() {
 	// The legacy spelling is rejected before the async branch can start a job.
 	let backend: std::sync::Arc<dyn pi_agent::tools::process::ProcessBackend> =
 		std::sync::Arc::new(pi_agent::tools::process::ProcessManager::new(dir.join("processes")));
+	let legacy_async_marker = dir.path.join("legacy_async_ran");
 	let legacy_async = BashTool::with_processes(backend, None)
-		.execute(&json!({"command": "true", "async": true, "timeout_ms": 1}), &ctx)
+		.execute(
+			&json!({
+				"command": format!("touch {}", legacy_async_marker.display()),
+				"async": true,
+				"timeout_ms": 1
+			}),
+			&ctx,
+		)
 		.await
 		.expect_err("async with timeout_ms was removed");
 	assert!(matches!(&legacy_async, ToolError::InvalidArguments(_)));
-	assert_eq!(
-		legacy_async.to_string(),
-		"'timeout_ms' was removed; pass 'timeout' in seconds"
+	assert!(
+		!legacy_async_marker.exists(),
+		"legacy timeout_ms must not start a supervised job"
 	);
 
 	let explicit_off = BashTool::new()
