@@ -295,7 +295,7 @@ fn uri_file(uri: &str) -> Result<PathBuf, String> {
 
 fn record_change(
 	result: &mut WorkspaceEditResult,
-	on_executed: &mut dyn FnMut(&ExecutedWorkspaceChange),
+	on_executed: &mut (dyn FnMut(&ExecutedWorkspaceChange) + Send),
 	change: ExecutedWorkspaceChange,
 ) {
 	on_executed(&change);
@@ -307,7 +307,7 @@ fn record_change(
 pub async fn apply_workspace_edit(
 	edit: &WorkspaceEdit,
 	cwd: &Path,
-	mut on_executed: impl FnMut(&ExecutedWorkspaceChange),
+	mut on_executed: impl FnMut(&ExecutedWorkspaceChange) + Send,
 ) -> Result<WorkspaceEditResult, String> {
 	let mut result = WorkspaceEditResult::default();
 
@@ -457,7 +457,7 @@ async fn rename_resource(
 	options: &RenameFileOptions,
 	cwd: &Path,
 	result: &mut WorkspaceEditResult,
-	on_executed: &mut dyn FnMut(&ExecutedWorkspaceChange),
+	on_executed: &mut (dyn FnMut(&ExecutedWorkspaceChange) + Send),
 	old_uri: &str,
 	new_uri: &str,
 ) -> Result<bool, String> {
