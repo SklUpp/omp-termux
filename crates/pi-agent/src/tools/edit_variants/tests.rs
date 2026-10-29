@@ -328,6 +328,23 @@ async fn sloppy_aligns_explicit_rewrite_that_echoes_surrounding_boundaries() {
 }
 
 #[tokio::test]
+async fn sloppy_expands_echoed_bare_selection_rewrite_to_whole_line() {
+	let dir = temp_dir("sloppy-echoed-line");
+	let file = dir.join("demo.txt");
+	std::fs::write(&file, "const x = 1;\n").unwrap();
+	let ctx = context(&dir);
+	// Upstream expandEchoedLineSelection: a one-line REWRITE starting with the
+	// selection's prefix restates the whole line, so the authored text replaces
+	// it verbatim, delimiter included (or omitted).
+	let payload = "§demo.txt\n«\nconst x = ⟪1⟫;\n»\nconst x = 2";
+	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+		.await
+		.unwrap();
+	assert_eq!(read(&file), "const x = 2\n");
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn sloppy_merges_overlapping_consistent_edits() {
 	let dir = temp_dir("sloppy-overlap-merge");
 	let file = dir.join("demo.txt");
