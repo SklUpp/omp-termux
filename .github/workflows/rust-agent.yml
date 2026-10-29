@@ -39,6 +39,180 @@ jobs:
         run: cargo check --locked -p pi-agent -p omp-cli
       - name: Test agent core and CLI
         run: cargo test --locked -p pi-agent -p omp-cli
+      # Read-only evidence capture after a real suite failure. This step never
+      # installs, warms caches, retries the suite or changes its verdict; it only
+      # records Julia provenance, host load and one bounded probe measurement so
+      # the timeout root cause can be diagnosed from the same failing run.
+      - name: Julia probe diagnostics (read-only, bounded)
+        if: failure()
+        timeout-minutes: 5
+        run: |
+          python3 - <<'PY'
+          import os
+          import selectors
+          import shutil
+          import signal
+          import subprocess
+          import time
+          import traceback
+
+          # Each command gets at most CMD_TIMEOUT of runtime; a timed-out command
+          # then gets at most REAP_GRACE more to die after its process group is
+          # SIGKILLed. Worst case is four such commands, well inside the
+          # five-minute step cap.
+          CMD_TIMEOUT = 20
+          REAP_GRACE = 2
+          OUT_LIMIT = 1200
+
+
+          def child_cpu():
+              t = os.times()
+              return t.children_user + t.children_system
+
+
+          def store(heads, totals, stream, chunk):
+              totals[stream] += len(chunk)
+              room = OUT_LIMIT - len(heads[stream])
+              if room > 0:
+                  heads[stream] += chunk[:room]
+
+
+          def residual(stream, heads, totals):
+              # One non-blocking read only: a survivor still writing after
+              # SIGKILL can neither spin this nor cost more than one pipe buffer.
+              try:
+                  os.set_blocking(stream.fileno(), False)
+                  chunk = os.read(stream.fileno(), 65536)
+              except (OSError, ValueError):
+                  chunk = b""
+              if chunk:
+                  store(heads, totals, stream, chunk)
+              try:
+                  stream.close()
+              except OSError:
+                  pass
+
+
+          def run(label, cmd, timeout=CMD_TIMEOUT):
+              print(f"=== {label}: {' '.join(cmd)}", flush=True)
+              cpu_before = child_cpu()
+              start = time.perf_counter()
+              try:
+                  proc = subprocess.Popen(
+                      cmd,
+                      stdin=subprocess.DEVNULL,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      start_new_session=True,
+                  )
+              except OSError as exc:
+                  print(f"spawn-failed: {type(exc).__name__}: {exc}", flush=True)
+                  return
+              # Drain both pipes without buffering them whole: only the first
+              # OUT_LIMIT bytes per stream are kept, the rest is counted and
+              # discarded, so a runaway writer cannot exhaust runner memory.
+              heads = {proc.stdout: bytearray(), proc.stderr: bytearray()}
+              totals = {proc.stdout: 0, proc.stderr: 0}
+              live = set(heads)
+              deadline = start + timeout
+              timed_out = False
+              sel = selectors.DefaultSelector()
+              try:
+                  for stream in live:
+                      os.set_blocking(stream.fileno(), False)
+                      sel.register(stream, selectors.EVENT_READ)
+                  while live and not timed_out:
+                      remaining = deadline - time.perf_counter()
+                      if remaining <= 0:
+                          timed_out = True
+                          break
+                      for key, _ in sel.select(min(remaining, 0.5)):
+                          stream = key.fileobj
+                          try:
+                              chunk = os.read(stream.fileno(), 65536)
+                          except BlockingIOError:
+                              continue
+                          if chunk:
+                              store(heads, totals, stream, chunk)
+                          else:
+                              sel.unregister(stream)
+                              live.discard(stream)
+                  if not timed_out:
+                      try:
+                          proc.wait(timeout=max(0.0, deadline - time.perf_counter()))
+                      except subprocess.TimeoutExpired:
+                          timed_out = True
+              finally:
+                  sel.close()
+                  # Timeout or any failure above must still kill, reap and close.
+                  # Never killpg a reaped pid: its id may already be reused.
+                  if timed_out or proc.poll() is None:
+                      # start_new_session makes proc the session leader, so its pid
+                      # is the process-group id: kill the group, no orphan bootstrap.
+                      try:
+                          os.killpg(proc.pid, signal.SIGKILL)
+                      except ProcessLookupError:
+                          pass
+                      try:
+                          proc.wait(timeout=REAP_GRACE)
+                      except subprocess.TimeoutExpired:
+                          print("reap-timeout: still alive after SIGKILL", flush=True)
+                  for stream in (proc.stdout, proc.stderr):
+                      residual(stream, heads, totals)
+              wall = time.perf_counter() - start
+              cpu = child_cpu() - cpu_before
+              print(
+                  f"exit={proc.returncode} timeout={timed_out} wall={wall:.2f}s child_cpu={cpu:.2f}s",
+                  flush=True,
+              )
+              for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+                  head = heads.get(stream, b"").decode("utf-8", "replace")
+                  print(f"{name}[{totals[stream]}]: {head!r}", flush=True)
+
+
+          def safe(label, cmd, timeout=CMD_TIMEOUT):
+              # One broken command must not cancel the remaining measurements.
+              try:
+                  run(label, cmd, timeout)
+              except Exception:
+                  print(f"run-error: {label}", flush=True)
+                  traceback.print_exc()
+
+
+          try:
+              loadavg = os.getloadavg() if hasattr(os, "getloadavg") else "unavailable"
+              print(f"cpu_count={os.cpu_count()} loadavg={loadavg}", flush=True)
+
+              found = shutil.which("julia")
+              if found is None:
+                  print("julia: not on PATH", flush=True)
+              else:
+                  real = os.path.realpath(found)
+                  st = os.stat(real)
+                  print(
+                      f"julia_path={found} realpath={real} size={st.st_size} mtime={int(st.st_mtime)}",
+                      flush=True,
+                  )
+                  safe("provenance", ["dpkg-query", "-S", real], 10)
+
+              julia = found or "julia"
+              safe("control", ["/bin/sh", "-c", "exit 0"])
+              safe(
+                  "version",
+                  [julia, "--startup-file=no", "--history-file=no", "--color=no", "--version"],
+              )
+              # Same argv as the Rust availability probe
+              # (crates/pi-agent/src/eval/languages.rs probe_command), measured once.
+              # Fidelity caveat: that probe spawns with a filtered env and its own cwd,
+              # while this step inherits the workflow env, so the timing here is
+              # indicative provenance evidence, not a byte-exact reproduction.
+              safe(
+                  "probe",
+                  [julia, "--startup-file=no", "--history-file=no", "--color=no", "-e", "exit(0)"],
+              )
+          except Exception:  # script bug: print traceback, keep the suite's verdict
+              traceback.print_exc()
+          PY
 
   test-native-grep:
     name: Native grep and matcher tests (linux x86_64)
