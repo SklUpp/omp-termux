@@ -4933,6 +4933,10 @@ mod process_scope_tests {
 
 	#[test]
 	fn fallback_scope_root_is_stable_and_per_project() {
+		// Scope roots derive from `agent_dir()`, which other tests relocate via
+		// `PI_CODING_AGENT_DIR`/`PI_CONFIG_DIR` while deleting their temp roots.
+		// Holding the env lock keeps this fixture's root out of their cleanup.
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
 		let one = PathBuf::from("/tmp/project-one");
 		let two = PathBuf::from("/tmp/project-two");
 		let (a, b) = ("runner-a", "runner-b");
