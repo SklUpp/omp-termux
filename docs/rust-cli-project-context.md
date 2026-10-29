@@ -225,6 +225,9 @@ Latest user authorization supersedes the earlier push pause: try normal push, in
 
 Final pending-block verification after review fixes: auth tests passed 140/140; RPC protocol passed 19/19, including interactive-login compact/handoff rejection and EOF cleanup (serial command exit 0, 95.99 s including compilation). Independent review accepted the scoped changes. The one-test count reduction removes redundant credential-literal copying, not behavior coverage. Manual compact/handoff now reject during login; automatic compaction skips that boundary before emitting a start frame. Detailed retained-directory evidence is in `docs/worktree-audit-2026-10-30.md`. No directory or snapshot ref has been removed.
 
+Pending main-tree changes committed as `077bac1709` (`feat(auth): connect RPC credentials and prevent login compaction deadlocks`, 13 files). Normal push of this new HEAD exited 1: GH013 still flags Google OAuth material in ancestor `faad6b5355`. No remote update, no bypass, no rewrite. Worktree snapshots remain preserved; integration audit distinguishes content already ported from actual ancestry.
+
+
 
 
 
