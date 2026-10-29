@@ -999,16 +999,23 @@ fn test_mcp_tool_call_error_redacts_http_body_secrets() {
 						});
 						let resp_bytes = serde_json::to_vec(&resp).unwrap();
 						let http_resp = format!(
-							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
 							resp_bytes.len()
 						);
 						let _ = socket.write_all(http_resp.as_bytes());
 						let _ = socket.write_all(&resp_bytes);
 						let _ = socket.flush();
+						// One request per connection: the single-threaded accept
+						// loop must never wait behind an idle keep-alive socket,
+						// or the client's next request is never accepted.
+						let _ = socket.shutdown(std::net::Shutdown::Both);
+						break;
 					} else if method == "notifications/initialized" {
-						let http_resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+						let http_resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 						let _ = socket.write_all(http_resp.as_bytes());
 						let _ = socket.flush();
+						let _ = socket.shutdown(std::net::Shutdown::Both);
+						break;
 					} else if method == "tools/list" {
 						let resp = json!({
 							"jsonrpc": "2.0",
@@ -1023,12 +1030,14 @@ fn test_mcp_tool_call_error_redacts_http_body_secrets() {
 						});
 						let resp_bytes = serde_json::to_vec(&resp).unwrap();
 						let http_resp = format!(
-							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
 							resp_bytes.len()
 						);
 						let _ = socket.write_all(http_resp.as_bytes());
 						let _ = socket.write_all(&resp_bytes);
 						let _ = socket.flush();
+						let _ = socket.shutdown(std::net::Shutdown::Both);
+						break;
 					} else if method == "tools/call" {
 						let body = r#"{"error":"internal_failure","secret_token":"CALL_TIME_SUPER_SECRET_TOKEN"}"#;
 						let http_resp = format!(
