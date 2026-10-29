@@ -377,3 +377,15 @@ GDB example for an OpenOCD remote target:
 - `addDirectoryToArchive()` reads artifact files as text with `Bun.file(...).text()`. Binary artifact contents are not preserved byte-for-byte in the report bundle.
 - The tool renderer truncates displayed output for the TUI preview, but the underlying text result still contains the full returned string.
 - The UI-only JavaScriptCore remote debugger is idempotent after startup and cannot be stopped because `bun:jsc` returns no handle. It binds only to `127.0.0.1`; a loopback readiness probe determines success because Bun may throw a spurious bind error on macOS even when the socket came up.
+
+## Rust runtime
+
+The native agent ports the DAP lane to `crates/pi-agent/src/dap/`; the TypeScript tree remains the behavioral reference.
+
+- Entry: `crates/pi-agent/src/dap/tool.rs` (the 28 actions from `debug.ts`, schema, read-only classification, text/details rendering).
+- Transport: `client.rs` — stdio, Unix socket, TCP dial-back and TCP client modes; writes `Content-Length:` frames and decodes with the shared `crate::lsp::framing::MessageFramer` seam (no second framer).
+- Sessions: `session.rs` — single-root session tree, `configurationDone` handshake, breakpoint synchronization to children, stop-outcome waits, 128 KiB output ring, 10-minute idle cleanup, reverse `runInTerminal`/`startDebugging`, cancellation per request.
+- Adapters: `config.rs` + embedded defaults for the same 14 adapters, `dap.json`/`.dap.yaml` overlays, auto-selection, and `adapter_unavailable_message()` prereq errors. No adapter is auto-installed.
+- Integration seams (parent): add `pub mod dap;` to `lib.rs`; `RunnerSession` owns one `Arc<DapSessionManager>` and per-prompt registries register `DapTool::shared(manager.clone()).with_max_timeout(tools.maxTimeout)` behind `debug.enabled`; subagents use `DapTool::new()` for an isolated tree; use `is_readonly_action()` for the `read`/`exec` approval split.
+- Timeouts: `timeout` seconds clamp to 5–300, optionally capped by `tools.maxTimeout`; aborting a call cancels only the in-flight request, never the session.
+- Tests: `tool.rs` drives the real handshake through an in-process fake adapter (launch, breakpoint, continue/stop, output, terminate, cancellation) and checks the shared framing decoder; no local adapter binaries are required.

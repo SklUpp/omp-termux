@@ -296,7 +296,9 @@ fn complete_sessions(prefix: &str) {
 	sessions.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 	// A partially migrated legacy directory can still hold a log that also
 	// exists in the current directory; keep the newest copy per session id.
-	sessions.dedup_by(|a, b| a.1 == b.1);
+	// Sorted newest first, so the first row seen for an id is the copy to keep.
+	let mut seen = std::collections::BTreeSet::new();
+	sessions.retain(|(_, id, _)| seen.insert(id.clone()));
 	for (_, id, title) in sessions {
 		println!("{id}\t{title}");
 	}

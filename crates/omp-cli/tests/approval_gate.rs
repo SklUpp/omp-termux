@@ -17,10 +17,11 @@ use omp_cli::{
 	agent::{AgentRunner, Event, RunRequest},
 	approve::{ApprovalMode, Approvals},
 	catalog::Catalog,
-	config::{Config, ProviderConfig},
+	config::{Config, EditMode, ProviderConfig},
 	output::OutputMode,
 	runtime::PiAgentRunner,
 };
+use pi_agent::CancellationToken;
 use serde_json::json;
 
 /// Mock listeners must outlive the runner's own `max_time` (10s) and full-suite
@@ -107,6 +108,16 @@ fn spawn_mock_model_server(
 	(addr, handle)
 }
 
+/// Approvals whose prompt boundary reads an injected, already-closed stdin, so
+/// the suite never waits on the process terminal even under a developer TTY.
+fn closed_approvals(mode: ApprovalMode, allow: Vec<String>) -> Approvals {
+	let closed: Box<dyn std::io::BufRead + Send> =
+		Box::new(std::io::Cursor::new(Vec::<u8>::new()));
+	let input: omp_cli::approve::ApprovalInput =
+		Arc::new(std::sync::Mutex::new(closed));
+	Approvals::new(mode, allow).with_input(Some(input))
+}
+
 fn make_run_request(
 	addr: SocketAddr,
 	work_dir: &Path,
@@ -137,6 +148,9 @@ fn make_run_request(
 		context_files: Vec::new(),
 		skills: Vec::new(),
 		history: Vec::new(),
+		history_messages: None,
+		checkpoint_controller: None,
+		turn_ack: None,
 		todo_phases: Vec::new(),
 		session_persisted: false,
 		config,
@@ -163,11 +177,11 @@ fn test_closed_stdin_denies_write_and_file_unchanged() {
 		}),
 	);
 
-	// Default always-ask with empty allow list; stdin is not interactive
+	// Default always-ask with empty allow list; the injected stdin is closed.
 	let req = make_run_request(
 		addr,
 		&temp.path,
-		Approvals::new(ApprovalMode::AlwaysAsk, Vec::new()),
+		closed_approvals(ApprovalMode::AlwaysAsk, Vec::new()),
 	);
 
 	let runner = PiAgentRunner::new().expect("runner");
@@ -244,6 +258,111 @@ fn test_allow_permits_write() {
 }
 
 #[test]
+fn test_allow_edit_authorizes_apply_patch_wire_name() {
+	let temp = TempDir::new("apply-patch-allowed");
+	let created = temp.path.join("allowed.txt");
+	assert!(!created.exists());
+
+	let (addr, handle) = spawn_mock_model_server(
+		"apply_patch",
+		json!({
+			"input": "*** Begin Patch\n*** Add File: allowed.txt\n+hello\n*** End Patch"
+		}),
+	);
+
+	// `--allow edit` must authorize the advertised `apply_patch` wire name;
+	// stdin is closed, so any prompt would deny and no file would appear.
+	let mut req = make_run_request(
+		addr,
+		&temp.path,
+		closed_approvals(ApprovalMode::AlwaysAsk, vec!["edit".to_string()]),
+	);
+	req.config.edit.mode = Some(EditMode::ApplyPatch);
+
+	let runner = PiAgentRunner::new().expect("runner");
+	let stream = runner.run(&req).expect("run");
+	let mut tool_results = Vec::new();
+	for ev in stream {
+		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+			tool_results.push((id, tool, result, error));
+		}
+	}
+	handle.join().unwrap();
+
+	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results[0].1, "apply_patch");
+	assert!(
+		tool_results[0].3.is_none(),
+		"--allow edit must authorize apply_patch: {} {:?}",
+		tool_results[0].2,
+		tool_results[0].3
+	);
+	assert_eq!(fs::read_to_string(&created).expect("mutation landed"), "hello\n");
+
+	// The alias must not widen the allowlist: `write` is still denied.
+	let denied = temp.path.join("denied.txt");
+	let (addr2, handle2) = spawn_mock_model_server(
+		"write",
+		json!({ "path": denied.to_str().unwrap(), "content": "must not be written" }),
+	);
+	let req2 = make_run_request(
+		addr2,
+		&temp.path,
+		closed_approvals(ApprovalMode::AlwaysAsk, vec!["edit".to_string()]),
+	);
+	let stream2 = runner.run(&req2).expect("run denied");
+	let mut denied_results = Vec::new();
+	for ev in stream2 {
+		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+			denied_results.push((id, tool, result, error));
+		}
+	}
+	handle2.join().unwrap();
+
+	assert_eq!(denied_results.len(), 1);
+	assert_eq!(denied_results[0].1, "write");
+	assert!(denied_results[0].3.is_some(), "write must stay denied");
+	assert!(!denied.exists(), "denied mutation must not land");
+}
+
+#[test]
+fn test_always_ask_auto_permits_read_tier() {
+	let temp = TempDir::new("always-ask-read");
+	let read_target = temp.path.join("readable.txt");
+	fs::write(&read_target, "readable data").unwrap();
+
+	let (addr, handle) = spawn_mock_model_server(
+		"read",
+		json!({
+			"path": read_target.to_str().unwrap()
+		}),
+	);
+
+	// Always-ask still auto-approves the read tier; the prompt input is closed,
+	// so any prompt would deny and fail this assertion.
+	let req = make_run_request(
+		addr,
+		&temp.path,
+		closed_approvals(ApprovalMode::AlwaysAsk, Vec::new()),
+	);
+
+	let runner = PiAgentRunner::new().expect("runner");
+	let stream = runner.run(&req).expect("run");
+	let mut tool_results = Vec::new();
+	for ev in stream {
+		if let Ok(Event::ToolEnd { id, tool, result, error }) = ev {
+			tool_results.push((id, tool, result, error));
+		}
+	}
+	handle.join().unwrap();
+
+	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results[0].1, "read");
+	assert!(tool_results[0].3.is_none(), "read must not prompt under always-ask");
+	assert!(tool_results[0].2.contains("readable data"));
+}
+
+#[test]
 fn test_approval_mode_write_read_only_permits() {
 	let temp = TempDir::new("mode-write");
 	let read_target = temp.path.join("readonly.txt");
@@ -290,7 +409,7 @@ fn test_approval_mode_write_read_only_permits() {
 	let req2 = make_run_request(
 		addr2,
 		&temp.path,
-		Approvals::new(ApprovalMode::Write, Vec::new()),
+		closed_approvals(ApprovalMode::Write, Vec::new()),
 	);
 
 	let stream2 = runner.run(&req2).expect("run bash");
@@ -593,10 +712,16 @@ while True:
 #[test]
 fn test_canceled_execution_aborts_cleanly() {
 	let temp = TempDir::new("cancel");
+	let started = temp.path.join("started.txt");
+	let finished = temp.path.join("finished.txt");
 	let (addr, handle) = spawn_mock_model_server(
 		"bash",
 		json!({
-			"command": "sleep 5"
+			"command": format!(
+				"touch {}; sleep 5; touch {}",
+				started.display(),
+				finished.display()
+			)
 		}),
 	);
 
@@ -605,7 +730,8 @@ fn test_canceled_execution_aborts_cleanly() {
 		&temp.path,
 		Approvals::new(ApprovalMode::Yolo, Vec::new()),
 	);
-	req.max_time = Some(Duration::from_millis(150));
+	let token = CancellationToken::new();
+	req.cancellation_token = Some(token.clone());
 
 	let runner = PiAgentRunner::new().expect("runner");
 	let stream = runner.run(&req).expect("run");
@@ -614,6 +740,16 @@ fn test_canceled_execution_aborts_cleanly() {
 	let mut tool_results = Vec::new();
 	for ev in stream {
 		match ev {
+			Ok(Event::ToolStart { tool, .. }) if tool == "bash" => {
+				// ToolStart precedes execution; wait for the command's own first
+				// side effect so cancellation lands in flight, not during streaming.
+				let deadline = std::time::Instant::now() + Duration::from_secs(5);
+				while !started.exists() && std::time::Instant::now() < deadline {
+					std::thread::sleep(Duration::from_millis(20));
+				}
+				assert!(started.exists(), "bash must start before cancellation");
+				token.cancel();
+			},
 			Ok(Event::TurnEnd { stop_reason, .. }) => turn_ends.push(stop_reason),
 			Ok(Event::ToolEnd { result, error, .. }) => tool_results.push((result, error)),
 			_ => {},
@@ -627,6 +763,7 @@ fn test_canceled_execution_aborts_cleanly() {
 		tool_results[0].1.is_some(),
 		"canceled execution must report error on tool"
 	);
+	assert!(!finished.exists(), "cancelled command must not run to completion");
 }
 
 #[test]

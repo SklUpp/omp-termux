@@ -19,7 +19,7 @@
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `pat` | `string` | Yes | Single AST pattern. The wrapper trims it and rejects empty strings. |
-| `path` | `string` | No | File, directory, glob, internal URL, or fetched web URL to search. Separate multiple roots with `;`. Omitted or empty defaults to `.` (the workspace root). Internal-URL globs are rejected. |
+| `path` | `string` | No | File, directory, glob, internal URL, or fetched web URL to search (TypeScript wrapper). Separate multiple roots with `;`. Omitted or empty defaults to `.` (the workspace root). Internal-URL globs are rejected. The Rust CLI port is local-only: `file://` URLs are accepted, every other scheme fails explicitly (see Rust wiring below). |
 | `skip` | `number` | No | Match offset. Defaults to `0`, then `Math.floor(...)`; negatives and non-finite values fail. |
 
 Pattern grammar and language support exposed to the model:
@@ -74,6 +74,7 @@ Pattern grammar and language support exposed to the model:
 - Internal URL inputs: supported when the router resolves them to a backing file path. Readable external URLs are materialized to immutable temporary files.
 - Hashline output mode vs plain line-number mode: controlled by `resolveFileDisplayMode()`; hashline mode requires the edit tool and hashline edit mode, and per-file anchors additionally require a successful whole-file snapshot (`recordFileSnapshot()`) — over-cap or unreadable files fall back to plain output.
 - Rust wiring (`crates/pi-agent/src/tools/ast_grep.rs`): `AstGrepTool::with_snapshot_sink(sink).with_display_inputs(FileDisplayInputs)` feeds the shared resolver; matches render as `*LINE:TEXT` under a `[PATH#TAG]` header when hashline is selected, otherwise `*LINE|TEXT`. Grouped directory/multi-path runs use the shared `formatGroupedFiles` tree with `#TAG` header suffixes, and `details.displayContent` carries the `*LINE│TEXT` code-frame view. `AstGrepTool::new()` keeps the plain output for existing consumers.
+- Rust paths are local-only: entries are split on top-level `;`, `file://` URLs are converted to paths, and every other URI scheme (`ssh://`, `xd://`, `agent://`, …) fails the whole call with `Unsupported target: … (only local filesystem paths are supported)` before any filesystem probe. There is no internal/remote URL resolver in this port.
 
 ## Side Effects
 - Filesystem

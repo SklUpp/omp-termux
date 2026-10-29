@@ -7,6 +7,8 @@
 //! Multi-entry calls apply in order and are not atomic across entries, which
 //! matches upstream `apply_patch` semantics.
 
+use std::path::Path;
+
 use regex::Regex;
 use serde_json::Value;
 
@@ -537,13 +539,13 @@ fn parse_one_hunk(lines: &[String], line_number: usize, allow_missing_context: b
 		let context_value = &header_trimmed[CHANGE_CONTEXT_MARKER.len()..];
 		let trimmed_context = context_value.trim();
 		let normalized_context = strip_leading_context_marker(trimmed_context);
-		if let Some(hint) = parse_line_hint(normalized_context) {
+		if let Some(hint) = parse_line_hint(&normalized_context) {
 			old_start_line = Some(hint);
 			new_start_line = Some(hint);
 			if hint < 1 {
 				return Err(parse_error("Line hint must be >= 1", line_number));
 			}
-		} else if is_top_of_file(normalized_context) {
+		} else if is_top_of_file(&normalized_context) {
 			old_start_line = Some(1);
 			new_start_line = Some(1);
 		} else if !trimmed_context.is_empty() {
@@ -804,13 +806,13 @@ fn fuzzy_score_at(
 		let max_len = line_norm.chars().count().max(pattern_norm.chars().count()).max(1);
 		let length_delta = line_norm.chars().count().abs_diff(pattern_norm.chars().count());
 		let upper = 1.0 - length_delta as f64 / max_len as f64;
-		if (total + upper + remaining) / count as f64 < min_score {
+		if (total + upper + remaining) / (count as f64) < min_score {
 			return total / count as f64;
 		}
 		if upper > 0.0 {
 			total += text::similarity(line_norm, pattern_norm);
 		}
-		if (total + remaining) / count as f64 < min_score {
+		if (total + remaining) / (count as f64) < min_score {
 			return total / count as f64;
 		}
 	}

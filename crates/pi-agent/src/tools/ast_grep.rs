@@ -1426,14 +1426,14 @@ mod tests {
 			.expect("ast_grep executes");
 		assert!(!result.is_error, "{}", result.content);
 		assert!(result.content.starts_with("[one.rs#0A1B]\n"), "{}", result.content);
-		assert!(result.content.contains("*2:    foo(a0);"), "{}", result.content);
+		assert!(result.content.contains("*2:foo(a0)"), "{}", result.content);
 		assert!(!result.content.contains("*2|"), "{}", result.content);
 		assert_eq!(sink.files.lock().expect("files").len(), 1);
 		let details = result.details.as_ref().expect("details");
 		assert!(
 			details["displayContent"]
 				.as_str()
-				.is_some_and(|display| display.contains("*2│    foo(a0);")),
+				.is_some_and(|display| display.contains("*2│foo(a0)")),
 			"{}",
 			result.content
 		);
@@ -1444,7 +1444,7 @@ mod tests {
 			.execute(&json!({ "pat": "foo($A)", "path": "one.rs" }), &ctx)
 			.await
 			.expect("ast_grep executes");
-		assert!(result.content.contains("*2|    foo(a0);"), "{}", result.content);
+		assert!(result.content.contains("*2|foo(a0)"), "{}", result.content);
 		assert!(!result.content.contains("[one.rs#"), "{}", result.content);
 	}
 }

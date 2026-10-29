@@ -15,7 +15,8 @@ pub mod sloppy;
 pub mod text;
 
 pub use mode::{
-	DEFAULT_EDIT_MODE, EDIT_MODES, EditMode, EditModeSettings, FileDisplayMode, match_model_variant,
+	DEFAULT_EDIT_MODE, EDIT_MODES, EditMode, EditModeSettings, FileDisplayMode,
+	ResolvedSessionTools, SessionDisplayResolver, default_session_tools, match_model_variant,
 	normalize_edit_mode, resolve_edit_mode, resolve_file_display_mode, supports_hashline_edits,
 };
 

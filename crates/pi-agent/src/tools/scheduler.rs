@@ -67,10 +67,27 @@ impl ToolScheduler {
 
 		let approver = self.approver.as_ref().or(ctx.approver.as_ref());
 		if let Some(approver) = approver {
-			if let Err(denial) = approver.approve(&call.name, &call.arguments).await {
+			// A pending prompt must not outlive the turn: dropping this future
+			// aborts the approver's blocking read, and no approved-but-cancelled
+			// call reaches `execute`.
+			let decision = tokio::select! {
+				biased;
+				decision = approver.approve(&call.name, &call.arguments) => decision,
+				_ = ctx.cancellation_token.cancelled() => Err("approval cancelled".to_string()),
+			};
+			if let Err(denial) = decision {
 				return ToolResult {
 					tool_call_id: call.id.clone(),
 					content: format!("Tool execution denied: {denial}"),
+					is_error: true,
+					terminate: false,
+					details: None,
+				};
+			}
+			if ctx.cancellation_token.is_cancelled() {
+				return ToolResult {
+					tool_call_id: call.id.clone(),
+					content: "Tool execution aborted before start".to_string(),
 					is_error: true,
 					terminate: false,
 					details: None,
@@ -97,5 +114,108 @@ fn tool_error_result(tool_call_id: &str, err: ToolError) -> ToolResult {
 		is_error: true,
 		terminate: false,
 		details: None,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::path::PathBuf;
+	use std::sync::Arc;
+	use std::time::Duration;
+
+	use async_trait::async_trait;
+	use serde_json::json;
+
+	use super::*;
+	use crate::CancellationToken;
+	use crate::tools::{BashTool, registry::ToolRegistry};
+
+	struct PendingApprover {
+		started: tokio::sync::mpsc::Sender<()>,
+	}
+
+	#[async_trait]
+	impl ToolApprover for PendingApprover {
+		async fn approve(&self, _name: &str, _args: &serde_json::Value) -> Result<(), String> {
+			let _ = self.started.send(()).await;
+			std::future::pending::<()>().await;
+			Ok(())
+		}
+	}
+
+	struct AllowApprover;
+
+	#[async_trait]
+	impl ToolApprover for AllowApprover {
+		async fn approve(&self, _name: &str, _args: &serde_json::Value) -> Result<(), String> {
+			Ok(())
+		}
+	}
+
+	fn temp_dir(label: &str) -> PathBuf {
+		static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+		let path = std::env::temp_dir().join(format!(
+			"pi-agent-scheduler-{label}-{}-{}",
+			std::process::id(),
+			NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+		));
+		std::fs::create_dir_all(&path).expect("create temp dir");
+		path
+	}
+
+	fn bash_call(marker: &std::path::Path) -> Vec<ToolCall> {
+		vec![ToolCall {
+			id: "call_1".to_string(),
+			name: "bash".to_string(),
+			arguments: json!({"command": format!("touch {}", marker.display())}),
+		}]
+	}
+
+	fn bash_scheduler(approver: Arc<dyn ToolApprover>) -> ToolScheduler {
+		let mut registry = ToolRegistry::new();
+		registry.register(Arc::new(BashTool::new()));
+		ToolScheduler::with_approver(registry, approver)
+	}
+
+	#[tokio::test]
+	async fn cancelled_approval_never_executes_the_tool() {
+		let dir = temp_dir("approval-cancel");
+		let marker = dir.join("ran");
+		let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+		let scheduler = bash_scheduler(Arc::new(PendingApprover { started: started_tx }));
+		let token = CancellationToken::new();
+		let ctx = AgentContext::with_cancellation(dir.clone(), token.clone());
+		let calls = bash_call(&marker);
+
+		let batch = tokio::spawn(async move { scheduler.execute_batch(&calls, &ctx).await });
+		started_rx
+			.recv()
+			.await
+			.expect("approval prompt must be pending");
+		token.cancel();
+
+		let results = tokio::time::timeout(Duration::from_secs(5), batch)
+			.await
+			.expect("cancelled approval must settle")
+			.expect("join");
+		assert_eq!(results.len(), 1);
+		assert!(results[0].is_error, "cancelled approval must not succeed");
+		assert!(!marker.exists(), "cancelled approval still ran the command");
+	}
+
+	#[tokio::test]
+	async fn approval_after_cancellation_does_not_execute_the_tool() {
+		let dir = temp_dir("approval-late");
+		let marker = dir.join("ran");
+		let scheduler = bash_scheduler(Arc::new(AllowApprover));
+		let token = CancellationToken::new();
+		token.cancel();
+		let ctx = AgentContext::with_cancellation(dir.clone(), token);
+		let calls = bash_call(&marker);
+
+		let results = scheduler.execute_batch(&calls, &ctx).await;
+		assert_eq!(results.len(), 1);
+		assert!(results[0].is_error, "cancelled turn must not execute the tool");
+		assert!(!marker.exists(), "approved call ran after cancellation");
 	}
 }

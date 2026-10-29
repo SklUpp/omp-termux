@@ -18,7 +18,9 @@ use crate::{
 	provider::ModelProvider,
 	state::{StagedPreviewPolicy, ToolApprover},
 	tools::{
-		BashTool, EditTool, HubTool, PendingStore, TaskTool, ThinkTool, WriteTool, YieldTool,
+		AstGrepTool, BashTool, EditTool, HubTool, PendingStore, TaskTool, ThinkTool, WriteTool,
+		YieldTool,
+		edit_variants::{ResolvedSessionTools, SessionDisplayResolver, default_session_tools},
 		hashline::{self, NativeSnapshotSink, SnapshotStore},
 		process::{ProcessBackend, ProcessManager},
 		read::ReadTool,
@@ -218,6 +220,12 @@ pub struct Supervisor {
 	/// Options copied into each child's fresh `EditTool` (same knobs as the
 	/// parent run, but a fresh store/registers/guard).
 	edit_options: Mutex<hashline::edit::EditToolOptions>,
+	/// Host-injected `edit.mode`/display resolution. Children resolve again with
+	/// their own selected model; unset keeps the config-free default.
+	display_resolver: Mutex<Option<Arc<dyn SessionDisplayResolver>>>,
+	/// Root session's actual `provider/id`, so a child that inherits the parent
+	/// provider still resolves model-specific variants instead of dropping them.
+	active_model: Mutex<Option<String>>,
 	/// Agent catalog installed by the host (CLI) runtime. Definitions and policy
 	/// are stable; the catalog's model resolver is refreshed per root turn.
 	agent_catalog: Mutex<Option<Arc<AgentCatalog>>>,
@@ -302,6 +310,8 @@ impl Supervisor {
 			root_permits: Arc::new(Semaphore::new(permits)),
 			mailbox: Arc::new(Mailbox::default()),
 			edit_options: Mutex::new(hashline::edit::EditToolOptions::default()),
+			display_resolver: Mutex::new(None),
+			active_model: Mutex::new(None),
 			agent_catalog: Mutex::new(None),
 			processes: Mutex::new(None),
 			process_root: {
@@ -427,6 +437,82 @@ impl Supervisor {
 	/// Mirror the parent run's `edit` options onto child `EditTool`s.
 	pub fn set_edit_options(&self, options: hashline::edit::EditToolOptions) {
 		*self.edit_options.lock().unwrap() = options;
+	}
+
+	/// Install the host's display/`edit.mode` resolver (CLI settings + env).
+	pub fn set_display_resolver(&self, resolver: Arc<dyn SessionDisplayResolver>) {
+		*self.display_resolver.lock().unwrap() = Some(resolver);
+	}
+
+	/// Root session model (`provider/id`), used when a child inherits the parent
+	/// provider so model-variant resolution never falls back to defaults.
+	pub fn set_active_model(&self, active_model: impl Into<String>) {
+		*self.active_model.lock().unwrap() = Some(active_model.into());
+	}
+
+	fn resolve_session_tools(
+		&self,
+		active_model: Option<&str>,
+		has_edit_tool: bool,
+	) -> ResolvedSessionTools {
+		let model = active_model
+			.map(str::to_string)
+			.or_else(|| self.active_model.lock().unwrap().clone());
+		let resolver = self.display_resolver.lock().unwrap().clone();
+		match resolver {
+			Some(resolver) => resolver.resolve(model.as_deref(), has_edit_tool),
+			None => default_session_tools(has_edit_tool),
+		}
+	}
+
+	/// Rebuild the display-bearing tools of `registry` for one session model.
+	///
+	/// Idempotent and allocation-free for absent tools: one snapshot store and
+	/// one pending store are created, then `read`, `ast_grep`, `edit`,
+	/// `ast_edit`, and `write` are replaced only when mounted. Callers must do
+	/// this after any allowlist filtering so `has_edit_tool` reflects the final
+	/// set (no anchors for agents without `edit`).
+	pub fn rebind_session_tools(&self, registry: &mut ToolRegistry, active_model: Option<&str>) {
+		let has_edit_tool = registry.get("edit").is_some();
+		let resolved = self.resolve_session_tools(active_model, has_edit_tool);
+		let snapshots = Arc::new(SnapshotStore::new());
+		let pending = Arc::new(PendingStore::new());
+		let sink = Arc::new(NativeSnapshotSink::new(snapshots.clone()));
+
+		if registry.get("read").is_some() {
+			registry.remove("read");
+			registry.register(Arc::new(
+				ReadTool::with_snapshot_sink(sink.clone()).with_display_inputs(resolved.display),
+			));
+		}
+		if registry.get("ast_grep").is_some() {
+			registry.remove("ast_grep");
+			registry.register(Arc::new(
+				AstGrepTool::with_snapshot_sink(sink).with_display_inputs(resolved.display),
+			));
+		}
+		if has_edit_tool {
+			let options = *self.edit_options.lock().unwrap();
+			registry.remove("edit");
+			registry.register(Arc::new(EditTool::with_mode(
+				Arc::clone(&snapshots),
+				options,
+				resolved.edit_tool,
+			)));
+		}
+		if registry.get("ast_edit").is_some() {
+			registry.remove("ast_edit");
+			registry.register(Arc::new(crate::tools::AstEditTool::with_display_inputs(
+				snapshots,
+				Arc::clone(&pending),
+				resolved.display,
+			)));
+		}
+		if registry.get("write").is_some() {
+			registry.remove("write");
+			registry.register(Arc::new(WriteTool::with_pending(Arc::clone(&pending))));
+		}
+		registry.set_policy(Arc::new(StagedPreviewPolicy::new(pending)));
 	}
 
 	pub fn task_enabled(&self) -> bool {
@@ -682,42 +768,24 @@ impl Supervisor {
 	}
 
 	pub fn child_registry(self: &Arc<Self>, depth: i32, owner: Option<&str>) -> ToolRegistry {
+		let mut reg = self.child_registry_unbound(depth, owner);
+		// Direct callers (tests, host convenience) get a fully bound child.
+		// `task` instead filters its allowlist first and rebinds exactly once
+		// with the child's effective model, so no store is allocated twice.
+		self.rebind_session_tools(&mut reg, None);
+		reg
+	}
+
+	/// Child registry with parent display-bearing tools still attached: callers
+	/// MUST finish with [`Supervisor::rebind_session_tools`] after allowlist
+	/// filtering.
+	pub(crate) fn child_registry_unbound(self: &Arc<Self>, depth: i32, owner: Option<&str>) -> ToolRegistry {
 		let mut reg = self.template.lock().unwrap().clone();
-		// `read`/`edit` are session-scoped: a child gets its own snapshot store,
-		// `CUT` registers, and no-op guard. Rebinding keeps the parent's tool
-		// whitelist and edit options, but never its read provenance.
-		let snapshots = Arc::new(SnapshotStore::new());
-		if reg.get("read").is_some() {
-			let sink = Arc::new(NativeSnapshotSink::new(snapshots.clone()));
-			reg.remove("read");
-			reg.register(Arc::new(ReadTool::with_snapshot_sink(sink)));
-		}
-		if reg.get("edit").is_some() {
-			let options = *self.edit_options.lock().unwrap();
-			reg.remove("edit");
-			reg.register(Arc::new(EditTool::with_options(Arc::clone(&snapshots), options)));
-		}
-		// Staged previews are session-scoped like snapshots: a child gets its
-		// own queue for the life of its registry, never the parent's pending
-		// action (which only the root may resolve). The soft requirement policy
-		// must point at that same child queue, or a child preview would remind
-		// against the root's head.
-		let child_pending = Arc::new(PendingStore::new());
-		if reg.get("ast_edit").is_some() {
-			reg.remove("ast_edit");
-			reg.register(Arc::new(crate::tools::AstEditTool::with_display(
-				Arc::clone(&snapshots),
-				Arc::clone(&child_pending),
-				// The child `read` above also mounts a snapshot sink, so its
-				// preview headers must be hashline tags.
-				crate::tools::PreviewDisplay::Hashline,
-			)));
-		}
-		if reg.get("write").is_some() {
-			reg.remove("write");
-			reg.register(Arc::new(WriteTool::with_pending(Arc::clone(&child_pending))));
-		}
-		reg.set_policy(Arc::new(StagedPreviewPolicy::new(child_pending)));
+		// `read`/`edit`/`ast_grep`/`ast_edit`/`write` are session-scoped: a
+		// child gets its own snapshot store, `CUT` registers, no-op guard,
+		// pending queue, and read provenance. `rebind_session_tools` replaces
+		// them after the whitelist so the child model and final tool set are
+		// known; until then the template's copies are placeholders.
 		// `todo` is parent-owned: the template shares one live `Arc<TodoTool>`
 		// instance, and child events/session details are not persisted. Dropping
 		// it here prevents descendants from mutating the parent list.

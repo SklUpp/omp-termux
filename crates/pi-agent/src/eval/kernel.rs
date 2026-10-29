@@ -2,7 +2,8 @@
 //!
 //! One kernel owns one interpreter process. Runners dup their original stdout
 //! for the protocol channel and repoint fd 1/2 at capture pipes, so user output
-//! cannot spoof a frame; malformed lines are dropped here as well.
+//! cannot spoof a frame; unparseable lines on the protocol channel are surfaced
+//! as cell output instead of being dropped.
 
 use std::{
 	collections::HashMap,
@@ -49,6 +50,9 @@ const KILL_SIGNAL: i32 = 9;
 
 enum KernelEvent {
 	Frame(KernelFrame),
+	/// Non-protocol line written to the protocol fd by a child. Surfaced as
+	/// cell output instead of being silently dropped.
+	Raw(String),
 	Closed,
 }
 
@@ -316,6 +320,13 @@ impl Kernel {
 						kernel_killed: true,
 					});
 				},
+				Some(KernelEvent::Raw(text)) => {
+					if let Some(on_chunk) = options.on_chunk.as_mut()
+						&& !text.is_empty()
+					{
+						on_chunk(&text);
+					}
+				},
 				Some(KernelEvent::Frame(frame)) => {
 					if frame.id.as_deref() != Some(options.run_id.as_str()) {
 						continue;
@@ -554,15 +565,20 @@ async fn read_frames(stdout: tokio::process::ChildStdout, sender: mpsc::Unbounde
 			continue;
 		}
 		let text = String::from_utf8_lossy(&line);
-		let trimmed = text.trim();
-		if trimmed.is_empty() {
+		if text.trim().is_empty() {
 			continue;
 		}
-		let Ok(frame) = serde_json::from_str::<KernelFrame>(trimmed) else {
-			continue;
-		};
-		if sender.send(KernelEvent::Frame(frame)).is_err() {
-			break;
+		match serde_json::from_str::<KernelFrame>(text.trim()) {
+			Ok(frame) => {
+				if sender.send(KernelEvent::Frame(frame)).is_err() {
+					break;
+				}
+			},
+			Err(_) => {
+				if sender.send(KernelEvent::Raw(text.into_owned())).is_err() {
+					break;
+				}
+			},
 		}
 	}
 	let _ = sender.send(KernelEvent::Closed);
@@ -611,6 +627,54 @@ while IFS= read -r line; do
       ;;
   esac
 done"#;
+
+	const FAKE_WIRE_RAW: &str = r#"trap '' INT
+while IFS= read -r line; do
+  case "$line" in
+    *'"id":"'*)
+      id=$(printf '%s' "$line" | sed -E 's/.*"id":"([^"]+)".*/\1/')
+      printf 'garbage-line\n'
+      printf '{"type":"done","id":"%s","status":"ok"}\n' "$id"
+      ;;
+  esac
+done"#;
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn non_protocol_lines_surface_as_cell_output() {
+		let env = std::env::vars().collect::<HashMap<_, _>>();
+		let mut kernel = Kernel::spawn_process(
+			EvalLanguage::Py,
+			&["sh".to_string(), "-c".to_string(), FAKE_WIRE_RAW.to_string()],
+			Path::new("."),
+			env,
+		)
+		.expect("fake kernel spawn");
+		let mut sink = String::new();
+		let env = HashMap::new();
+		let result = {
+			let on_chunk = |chunk: &str| sink.push_str(chunk);
+			kernel
+				.execute(
+					"ignored",
+					KernelExecuteOptions {
+						run_id: "run-raw".to_string(),
+						cwd: Path::new("."),
+						env: &env,
+						silent: false,
+						store_history: false,
+						cancellation: CancellationToken::new(),
+						on_chunk: Some(Box::new(on_chunk)),
+						on_display: None,
+					},
+				)
+				.await
+				.expect("execute")
+		};
+		assert_eq!(result.status, KernelStatus::Ok, "done frame was recognized: {result:?}");
+		assert!(sink.contains("garbage-line"), "raw line was dropped: {sink:?}");
+		kernel.shutdown().await;
+	}
 
 	#[cfg(unix)]
 	#[tokio::test]

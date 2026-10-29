@@ -5,7 +5,7 @@
 //! fallback language.
 
 use std::{
-	collections::HashMap,
+	collections::{BTreeMap, HashMap},
 	path::PathBuf,
 	sync::{Arc, Mutex},
 	time::{Duration, Instant},
@@ -23,13 +23,12 @@ use crate::{
 use super::{
 	bridge::EVAL_TIMEOUT_PAUSE_OP,
 	host::{ArtifactRef, EvalHost},
-	idle::{IdleTimeout, combine_with},
-	kernel::Kernel,
-	output::{OutputSink, dimension_note, format_display_outputs_for_text},
-	runtime::{EvalRuntime, background_wait, session_cwd},
+	idle::{CellControl, IdleTimeout},
+	output::{LIVE_TAIL_BYTES, OutputSink, dimension_note, format_display_outputs_for_text},
+	runtime::{EvalRuntime, KernelMode, background_wait, session_cwd},
 	types::{
-		AsyncJob, AsyncState, CellStatus, EvalCellResult, EvalDisplayOutput, EvalError, EvalImage,
-		EvalLanguage, EvalStatusEvent, EvalToolDetails,
+		AsyncJob, AsyncState, CellStatus, EvalBackendId, EvalCellResult, EvalDisplayOutput, EvalError,
+		EvalImage, EvalLanguage, EvalStatusEvent, EvalToolDetails,
 	},
 	util,
 };
@@ -42,7 +41,10 @@ pub struct EvalSessionInfo {
 	pub owner_id: Option<String>,
 	pub session_file: Option<PathBuf>,
 	pub artifacts_dir: Option<PathBuf>,
-	pub local_roots: Vec<PathBuf>,
+	/// Scheme (without `://`) to on-disk root, e.g. `{"local": "/path"}`. Sent to
+	/// subprocess preludes as JSON so `read("local://x")`/`write("local://x")`
+	/// resolve under the same root.
+	pub local_roots: BTreeMap<String, PathBuf>,
 }
 
 impl EvalSessionInfo {
@@ -52,7 +54,7 @@ impl EvalSessionInfo {
 			owner_id: None,
 			session_file: None,
 			artifacts_dir: None,
-			local_roots: Vec::new(),
+			local_roots: BTreeMap::new(),
 		}
 	}
 
@@ -75,8 +77,14 @@ impl EvalSessionInfo {
 	}
 
 	#[must_use]
-	pub fn with_local_roots(mut self, roots: Vec<PathBuf>) -> Self {
-		self.local_roots = roots;
+	pub fn with_local_roots(mut self, roots: impl IntoIterator<Item = (String, PathBuf)>) -> Self {
+		self.local_roots = roots.into_iter().collect();
+		self
+	}
+
+	#[must_use]
+	pub fn with_local_root(mut self, scheme: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+		self.local_roots.insert(scheme.into(), path.into());
 		self
 	}
 }
@@ -164,25 +172,29 @@ fn tool_error(error: EvalError) -> ToolError {
 	}
 }
 
-fn apply_status(
-	events: &Arc<Mutex<Vec<EvalStatusEvent>>>,
-	idle: Option<&IdleTimeout>,
-	event: EvalStatusEvent,
-) {
-	if event.op == EVAL_TIMEOUT_PAUSE_OP {
-		if let Some(idle) = idle {
-			idle.pause();
-		}
-		return;
-	}
-	if event.op == super::bridge::EVAL_TIMEOUT_RESUME_OP {
-		if let Some(idle) = idle {
-			idle.resume();
-		}
+fn apply_status(events: &Arc<Mutex<Vec<EvalStatusEvent>>>, event: EvalStatusEvent) {
+	// Watchdog control is executed bridge-side before the host await; these
+	// synthetic ops never render or persist.
+	if event.op == EVAL_TIMEOUT_PAUSE_OP || event.op == super::bridge::EVAL_TIMEOUT_RESUME_OP {
 		return;
 	}
 	let mut events = events.lock().unwrap_or_else(|poison| poison.into_inner());
 	EvalStatusEvent::upsert(&mut events, event);
+}
+
+/// Append streamed output to the bounded live preview shared with the
+/// auto-background snapshot.
+fn push_preview(preview: &Arc<Mutex<String>>, chunk: &str) {
+	let mut preview = preview.lock().unwrap_or_else(|poison| poison.into_inner());
+	if preview.len() >= LIVE_TAIL_BYTES {
+		return;
+	}
+	let room = LIVE_TAIL_BYTES - preview.len();
+	let mut end = chunk.len().min(room);
+	while end > 0 && !chunk.is_char_boundary(end) {
+		end -= 1;
+	}
+	preview.push_str(&chunk[..end]);
 }
 
 fn managed_env(
@@ -202,13 +214,14 @@ fn managed_env(
 		env.insert("PI_ARTIFACTS_DIR".to_string(), path.display().to_string());
 	}
 	if !session.local_roots.is_empty() {
-		let joined = session
+		let roots: BTreeMap<&str, String> = session
 			.local_roots
 			.iter()
-			.map(|root| root.display().to_string())
-			.collect::<Vec<_>>()
-			.join(local_roots_delimiter());
-		env.insert("PI_EVAL_LOCAL_ROOTS".to_string(), joined);
+			.map(|(scheme, root)| (scheme.as_str(), root.display().to_string()))
+			.collect();
+		if let Ok(encoded) = serde_json::to_string(&roots) {
+			env.insert("PI_EVAL_LOCAL_ROOTS".to_string(), encoded);
+		}
 	}
 	env
 }
@@ -223,13 +236,49 @@ struct CellJob {
 	timeout_secs: Option<u64>,
 	reset: bool,
 	ctx: AgentContext,
+	/// Bounded live tail shared with the auto-background start snapshot.
+	preview: Arc<Mutex<String>>,
 }
 
 impl CellJob {
+	/// Cancellation that lands before the kernel accepts code is still a
+	/// cancelled cell result (upstream `createCancelledPythonResult`), not a
+	/// tool error: foreground and background deliveries agree on the
+	/// `Command aborted` annotation.
+	fn aborted_result(&self, started: Instant) -> ToolResult {
+		let output = "Command aborted".to_string();
+		let cell = EvalCellResult {
+			index: 0,
+			title: self.title.clone(),
+			code: self.code.clone(),
+			language: Some(EvalBackendId::of(self.language)),
+			output: output.clone(),
+			status: CellStatus::Error,
+			duration_ms: Some(started.elapsed().as_millis() as u64),
+			exit_code: Some(1),
+			status_events: None,
+			has_markdown: None,
+		};
+		let details = EvalToolDetails {
+			cells: Some(vec![cell]),
+			is_error: Some(true),
+			language: Some(EvalBackendId::of(self.language)),
+			languages: Some(vec![EvalBackendId::of(self.language)]),
+			..EvalToolDetails::default()
+		};
+		ToolResult {
+			tool_call_id: String::new(),
+			content: output,
+			is_error: true,
+			terminate: false,
+			details: Some(serde_json::to_value(details).unwrap_or(Value::Null)),
+		}
+	}
+
 	async fn run(self) -> Result<ToolResult, ToolError> {
 		let started = Instant::now();
 		if self.ctx.cancellation_token.is_cancelled() {
-			return Err(ToolError::Aborted("eval call cancelled".to_string()));
+			return Ok(self.aborted_result(started));
 		}
 		let settings = self.runtime.settings();
 		if !settings.allowance().enabled(self.language) {
@@ -243,37 +292,17 @@ impl CellJob {
 			Some(requested) => settings.resolve_timeout_secs(Some(requested)),
 			None => settings.resolve_timeout_secs(None),
 		});
-		let idle = idle_secs
-			.filter(|seconds| *seconds > 0)
-			.map(|seconds| IdleTimeout::new(Duration::from_secs(seconds)));
-		let combined = match &idle {
-			Some(idle) => {
-				let (token, handle) = combine_with(self.ctx.cancellation_token.clone(), idle.token());
-				Some((token, handle))
-			},
-			None => None,
+		// Discovery is bounded by the cell budget and the caller's real token; the
+		// cell watchdog is armed only after the runtime is resolved and the kernel
+		// is up, so probe/startup time is never charged to the cell.
+		let cell_timeout_ms = idle_secs.filter(|seconds| *seconds > 0).map(|seconds| seconds * 1000);
+		let probe_timeout_ms = settings.probe_timeout_ms();
+		let probe_bound_ms = match (cell_timeout_ms, probe_timeout_ms) {
+			(Some(cell), 0) => Some(cell),
+			(Some(cell), probe) => Some(cell.min(probe)),
+			(None, 0) => None,
+			(None, probe) => Some(probe),
 		};
-		let cancellation = combined
-			.as_ref()
-			.map_or_else(|| self.ctx.cancellation_token.clone(), |(token, _)| token.clone());
-		let run_id = format!("eval-{}-{}", self.language.token(), &util::random_token()[..8]);
-		let managed = managed_env(
-			&self.session,
-			&self.runtime.bridge().endpoint().url,
-			&self.runtime.bridge().endpoint().token,
-			self.runtime.bridge_session_id(),
-		);
-		let status_rx = self.runtime.bridge().register(
-			self.runtime.bridge_session_id(),
-			&run_id,
-			Arc::clone(&self.host),
-			self.ctx.clone(),
-			format!("{} prelude", self.language.runtime_name()),
-			cancellation.clone(),
-		);
-		let status_events = Arc::new(Mutex::new(Vec::new()));
-		let drain = spawn_status_drain(status_rx, Arc::clone(&status_events), idle.clone());
-
 		let acquired = self
 			.runtime
 			.kernel_for_session(
@@ -283,21 +312,41 @@ impl CellJob {
 				&cwd,
 				&self.ctx.env,
 				self.reset,
-				cancellation.clone(),
+				probe_bound_ms,
+				self.ctx.cancellation_token.clone(),
 			)
 			.await;
-		let kernel: Arc<Kernel> = match acquired {
-			Ok(kernel) => kernel,
-			Err(error) => {
-				self.runtime.bridge().unregister(self.runtime.bridge_session_id(), &run_id);
-				drain.abort();
-				if let Some((_, handle)) = combined {
-					handle.abort();
-				}
-				idle.as_ref().inspect(|idle| idle.dispose());
-				return Err(tool_error(error));
-			},
+		let acquired = match acquired {
+			Ok(acquired) => acquired,
+			Err(EvalError::Aborted(_)) => return Ok(self.aborted_result(started)),
+			Err(error) => return Err(tool_error(error)),
 		};
+		let mut kernel = acquired;
+		let per_call = matches!(settings.kernel_mode(), KernelMode::PerCall);
+
+		let idle = idle_secs
+			.filter(|seconds| *seconds > 0)
+			.map(|seconds| IdleTimeout::new(Duration::from_secs(seconds)));
+		let control = CellControl::new(self.ctx.cancellation_token.clone(), idle);
+		let cancellation = control.kernel_token();
+		let run_id = format!("eval-{}-{}", self.language.token(), &util::random_token()[..8]);
+		let managed = managed_env(
+			&self.session,
+			&self.runtime.bridge().endpoint().url,
+			&self.runtime.bridge().endpoint().token,
+			self.runtime.bridge_session_id(),
+		);
+		let status_events = Arc::new(Mutex::new(Vec::new()));
+		let status_rx = self.runtime.bridge().register(
+			self.runtime.bridge_session_id(),
+			&run_id,
+			Arc::clone(&self.host),
+			self.ctx.clone(),
+			format!("{} prelude", self.language.runtime_name()),
+			self.ctx.cancellation_token.clone(),
+			Some(control.clone()),
+		);
+		let mut drain = spawn_status_drain(status_rx, Arc::clone(&status_events));
 
 		let mut sink = OutputSink::new(settings.spill_bytes(), settings.keep_artifacts());
 		let mut display_outputs: Vec<EvalDisplayOutput> = Vec::new();
@@ -307,54 +356,113 @@ impl CellJob {
 		let mut has_markdown = false;
 
 		let events_for_display = Arc::clone(&status_events);
-		let idle_for_display = idle.clone();
-		let result = {
-			let on_chunk = |chunk: &str| sink.push(chunk);
-			let on_display = |output: EvalDisplayOutput| match output {
-				EvalDisplayOutput::Json(value) => {
-					json_outputs.push(value.clone());
-					display_outputs.push(EvalDisplayOutput::Json(value));
-				},
-				EvalDisplayOutput::Image { data, mime_type } => {
-					let index = images.len() + 1;
-					if let Some(note) = dimension_note(index, &mime_type, &data) {
-						image_notes.push(note);
-					}
-					images.push(EvalImage::new(data.clone(), mime_type.clone()));
-					display_outputs.push(EvalDisplayOutput::Image { data, mime_type });
-				},
-				EvalDisplayOutput::Markdown { text } => {
-					has_markdown = true;
-					display_outputs.push(EvalDisplayOutput::Markdown { text });
-				},
-				EvalDisplayOutput::Status(event) => {
-					apply_status(&events_for_display, idle_for_display.as_ref(), event);
-				},
-			};
-			kernel
-				.execute(
-					&self.code,
-					super::types::KernelExecuteOptions {
-						run_id: run_id.clone(),
-						cwd: &cwd,
-						env: &managed,
-						silent: false,
-						store_history: true,
-						cancellation: cancellation.clone(),
-						on_chunk: Some(Box::new(on_chunk)),
-						on_display: Some(Box::new(on_display)),
+		let cancelled_by_us =
+			|| self.ctx.cancellation_token.is_cancelled() || control.timed_out();
+		// One bounded recovery attempt, and only when the kernel died on its own:
+		// never replay after a turn/timeout cancellation (the first run may have
+		// produced side effects before its delivery became uncertain).
+		let mut retried = false;
+		let mut original_cancelled: Option<super::types::KernelExecuteResult> = None;
+		let mut result = loop {
+			let attempt_result = {
+				let on_chunk = |chunk: &str| {
+					sink.push(chunk);
+					push_preview(&self.preview, chunk);
+				};
+				let on_display = |output: EvalDisplayOutput| match output {
+					EvalDisplayOutput::Json(value) => {
+						json_outputs.push(value.clone());
+						display_outputs.push(EvalDisplayOutput::Json(value));
 					},
+					EvalDisplayOutput::Image { data, mime_type } => {
+						let index = images.len() + 1;
+						if let Some(note) = dimension_note(index, &mime_type, &data) {
+							image_notes.push(note);
+						}
+						images.push(EvalImage::new(data.clone(), mime_type.clone()));
+						display_outputs.push(EvalDisplayOutput::Image { data, mime_type });
+					},
+					EvalDisplayOutput::Markdown { text } => {
+						has_markdown = true;
+						display_outputs.push(EvalDisplayOutput::Markdown { text });
+					},
+					EvalDisplayOutput::Status(event) => {
+						apply_status(&events_for_display, event);
+					},
+				};
+				kernel
+					.execute(
+						&self.code,
+						super::types::KernelExecuteOptions {
+							run_id: run_id.clone(),
+							cwd: &cwd,
+							env: &managed,
+							silent: false,
+							store_history: true,
+							cancellation: cancellation.clone(),
+							on_chunk: Some(Box::new(on_chunk)),
+							on_display: Some(Box::new(on_display)),
+						},
+					)
+					.await
+			};
+			let retryable = !retried
+				&& !kernel.is_alive()
+				&& !cancelled_by_us()
+				&& match &attempt_result {
+					Ok(result) => result.cancelled,
+					Err(_) => true,
+				};
+			if !retryable {
+				break attempt_result;
+			}
+			retried = true;
+			original_cancelled = attempt_result.as_ref().ok().filter(|result| result.cancelled).cloned();
+			match self
+				.runtime
+				.kernel_for_session(
+					self.language,
+					self.session.owner_id.as_deref(),
+					&self.session.session_id,
+					&cwd,
+					&self.ctx.env,
+					true,
+					probe_bound_ms,
+					self.ctx.cancellation_token.clone(),
 				)
 				.await
+			{
+				Ok(replacement) => {
+					kernel = replacement;
+					if self.ctx.cancellation_token.is_cancelled() {
+						break attempt_result;
+					}
+				},
+				Err(error) => {
+					if cancelled_by_us() {
+						break attempt_result;
+					}
+					break Err(error);
+				},
+			}
 		};
 
-		self.runtime.bridge().unregister(self.runtime.bridge_session_id(), &run_id);
-		drain.abort();
-		if let Some((_, handle)) = combined {
-			handle.abort();
+		let timed_out = control.timed_out();
+		if timed_out
+			&& let Ok(retry) = &result
+			&& retry.cancelled
+			&& let Some(original) = original_cancelled
+		{
+			result = Ok(original);
 		}
-		let timed_out = idle.as_ref().is_some_and(IdleTimeout::timed_out);
-		idle.as_ref().inspect(|idle| idle.dispose());
+		control.dispose();
+		self.runtime.bridge().unregister(self.runtime.bridge_session_id(), &run_id);
+		if tokio::time::timeout(Duration::from_millis(250), &mut drain).await.is_err() {
+			drain.abort();
+		}
+		if per_call {
+			kernel.shutdown().await;
+		}
 
 		let mut is_error = true;
 		let stdout = match &result {
@@ -445,7 +553,7 @@ impl CellJob {
 			index: 0,
 			title: self.title.clone(),
 			code: self.code.clone(),
-			language: Some(self.language),
+			language: Some(EvalBackendId::of(self.language)),
 			output: cell_output.clone(),
 			status: cell_status,
 			duration_ms: Some(started.elapsed().as_millis() as u64),
@@ -460,8 +568,8 @@ impl CellJob {
 			status_events: (!events.is_empty()).then_some(events),
 			is_error: is_error.then_some(true),
 			meta: Some(meta),
-			language: Some(self.language),
-			languages: Some(vec![self.language]),
+			language: Some(EvalBackendId::of(self.language)),
+			languages: Some(vec![EvalBackendId::of(self.language)]),
 			notice: None,
 			r#async: None,
 		};
@@ -478,11 +586,10 @@ impl CellJob {
 fn spawn_status_drain(
 	mut receiver: mpsc::UnboundedReceiver<EvalStatusEvent>,
 	events: Arc<Mutex<Vec<EvalStatusEvent>>>,
-	idle: Option<IdleTimeout>,
 ) -> tokio::task::JoinHandle<()> {
 	tokio::spawn(async move {
 		while let Some(event) = receiver.recv().await {
-			apply_status(&events, idle.as_ref(), event);
+			apply_status(&events, event);
 		}
 	})
 }
@@ -548,16 +655,18 @@ impl Tool for EvalTool {
 
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
 		let params = parse_params(args)?;
+		let preview = Arc::new(Mutex::new(String::new()));
 		let job = CellJob {
 			runtime: Arc::clone(&self.runtime),
 			host: Arc::clone(&self.host),
 			session: self.session.clone(),
 			language: params.language,
-			code: params.code,
-			title: params.title,
+			code: params.code.clone(),
+			title: params.title.clone(),
 			timeout_secs: params.timeout_secs,
 			reset: params.reset,
 			ctx: ctx.clone(),
+			preview: Arc::clone(&preview),
 		};
 		let settings = self.runtime.settings();
 		let cell_timeout_ms = match params.timeout_secs {
@@ -569,9 +678,7 @@ impl Tool for EvalTool {
 			.auto_background()
 			.map(|config| background_wait(config.threshold_ms, cell_timeout_ms));
 
-		if let Some(wait_ms) = wait_ms
-			&& cell_timeout_ms.is_none_or(|timeout| wait_ms < timeout)
-		{
+		if let Some(wait_ms) = wait_ms {
 			let job_id = format!("eval-bg-{}", &util::random_token()[..10]);
 			let mut handle = tokio::spawn(job.run());
 			match tokio::time::timeout(Duration::from_millis(wait_ms), &mut handle).await {
@@ -601,23 +708,46 @@ impl Tool for EvalTool {
 								.push(format!("Eval background job `{delivery_id}` finished:\n{text}"));
 						}
 					});
-					let notice = format!(
-						"Eval cell exceeded the {wait_ms}ms foreground window and continues in the background (job `{job_id}`)."
-					);
+					let preview_text = preview
+						.lock()
+						.unwrap_or_else(|poison| poison.into_inner())
+						.clone();
+					let backend = EvalBackendId::of(params.language);
 					let details = EvalToolDetails {
-						language: Some(params.language),
-						languages: Some(vec![params.language]),
-						notice: Some(notice.clone()),
+						cells: Some(vec![EvalCellResult {
+							index: 0,
+							title: params.title.clone(),
+							code: params.code.clone(),
+							language: Some(backend),
+							output: preview_text.clone(),
+							status: CellStatus::Running,
+							duration_ms: None,
+							exit_code: None,
+							status_events: None,
+							has_markdown: None,
+						}]),
+						language: Some(backend),
+						languages: Some(vec![backend]),
+						notice: None,
 						r#async: Some(AsyncJob {
 							state: AsyncState::Running,
 							job_id: job_id.clone(),
-							kind: "eval-cell".to_string(),
+							kind: "eval".to_string(),
 						}),
 						..EvalToolDetails::default()
 					};
+					let mut lines = Vec::new();
+					let trimmed = preview_text.trim_end();
+					if !trimmed.is_empty() {
+						lines.push(trimmed.to_string());
+						lines.push(String::new());
+					}
+					lines.push(format!(
+						"Backgrounded as job {job_id}; result will be delivered automatically."
+					));
 					return Ok(ToolResult {
 						tool_call_id: String::new(),
-						content: notice,
+						content: lines.join("\n"),
 						is_error: false,
 						terminate: false,
 						details: Some(serde_json::to_value(details).unwrap_or(Value::Null)),
@@ -642,11 +772,6 @@ impl Tool for EvalTool {
 		}
 		Ok(result)
 	}
-}
-
-/// Path delimiter used for `PI_EVAL_LOCAL_ROOTS`.
-pub fn local_roots_delimiter() -> &'static str {
-	":"
 }
 
 #[cfg(test)]
@@ -675,6 +800,19 @@ mod tests {
 			Some(0)
 		);
 		assert!(parse_params(&json!({"language": "py", "code": "", "timeout": -1})).is_err());
+	}
+
+	#[test]
+	fn local_roots_serialize_as_scheme_map() {
+		let session = EvalSessionInfo::new("s").with_local_roots([
+			("local".to_string(), PathBuf::from("/tmp/a")),
+			("work".to_string(), PathBuf::from("/tmp/b")),
+		]);
+		let env = managed_env(&session, "http://127.0.0.1:1", "t", "bs");
+		let encoded = env.get("PI_EVAL_LOCAL_ROOTS").expect("local roots env");
+		let value: Value = serde_json::from_str(encoded).expect("json map");
+		assert_eq!(value["local"], "/tmp/a");
+		assert_eq!(value["work"], "/tmp/b");
 	}
 
 	#[test]

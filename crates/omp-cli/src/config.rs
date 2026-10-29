@@ -70,27 +70,161 @@ pub enum DisabledProviderEntry {
 	Scoped { prefixes: Vec<String>, providers: Vec<String> },
 }
 
+/// Edit tool variants: the settings schema's `edit.mode` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum EditMode {
+	Replace,
+	Patch,
+	#[default]
+	Hashline,
+	ApplyPatch,
+	Sloppy,
+}
+
+impl EditMode {
+	#[must_use]
+	pub fn parse(raw: &str) -> Option<Self> {
+		match raw {
+			"replace" => Some(Self::Replace),
+			"patch" => Some(Self::Patch),
+			"hashline" => Some(Self::Hashline),
+			"apply_patch" => Some(Self::ApplyPatch),
+			"sloppy" => Some(Self::Sloppy),
+			_ => None,
+		}
+	}
+
+	#[must_use]
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Replace => "replace",
+			Self::Patch => "patch",
+			Self::Hashline => "hashline",
+			Self::ApplyPatch => "apply_patch",
+			Self::Sloppy => "sloppy",
+		}
+	}
+}
+
+/// Raw `edit.modelVariants` layer value. Type filtering and the `atom`/`vim`
+/// migration happen after the layers merge (upstream `#getEditVariantEntries`),
+/// so an entry that is invalid in one layer but fixed by a later one keeps its
+/// insertion position, and a non-object group replaces the lower layer instead
+/// of being ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ModelVariants {
+	/// Key absent from this layer: merging keeps the lower layer.
+	#[default]
+	Absent,
+	/// Present but not a mapping: the merged group is no longer a mapping and
+	/// yields no variants (the upstream `isRecord` guard).
+	NotAMap,
+	/// Present mapping in file order (the order is the precedence). `None`
+	/// holds a non-string value, which can never match but still occupies its
+	/// merge position.
+	Entries(Vec<(String, Option<String>)>),
+}
+
 /// `edit` settings group consumed by the headless runtime.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EditConfig {
 	/// `edit.enforceSeenLines`; absent means [`Self::DEFAULT_ENFORCE_SEEN_LINES`]
 	/// (the upstream settings-schema default).
 	pub enforce_seen_lines: Option<bool>,
+	/// `edit.mode` after the `atom`/`vim` → `hashline` migration; absent means
+	/// [`Self::mode`]'s `hashline` default.
+	pub mode:               Option<EditMode>,
+	/// `edit.modelVariants`, raw and in file insertion order; typed variants
+	/// are derived in [`Self::variant_for_model`]. Merging is case-sensitive
+	/// like the upstream deep merge; only matching folds case.
+	pub model_variants:     ModelVariants,
+}
+
+impl pi_agent::tools::edit_variants::EditModeSettings for Config {
+	fn get_edit_mode(&self) -> Option<&str> {
+		self.edit.mode.map(pi_agent::tools::edit_variants::EditMode::as_str)
+	}
+
+	fn get_edit_variant_for_model(
+		&self,
+		model: Option<&str>,
+	) -> Option<pi_agent::tools::edit_variants::EditMode> {
+		model.and_then(|model| self.edit.variant_for_model(model))
+	}
+
+	fn get_read_line_numbers(&self) -> bool {
+		self.read_line_numbers()
+	}
 }
 
 impl EditConfig {
 	/// Seen-line guard default, matching the upstream settings schema. The
 	/// runtime maps this onto `EditToolOptions { enforce_seen_lines, .. }`.
 	pub const DEFAULT_ENFORCE_SEEN_LINES: bool = false;
+	/// `edit.mode` default (`DEFAULT_EDIT_MODE` upstream).
+	pub const DEFAULT_MODE: EditMode = EditMode::Hashline;
 
 	#[must_use]
 	pub fn enforce_seen_lines(&self) -> bool {
 		self.enforce_seen_lines.unwrap_or(Self::DEFAULT_ENFORCE_SEEN_LINES)
 	}
 
+	/// Configured `edit.mode`, or the `hashline` default.
+	#[must_use]
+	pub fn mode(&self) -> EditMode {
+		self.mode.unwrap_or(Self::DEFAULT_MODE)
+	}
+
+	/// First valid `edit.modelVariants` pattern contained in `model`
+	/// (case-insensitive), like upstream `getEditVariantForModel`. Raw keys stay
+	/// distinct for merging and invalid values are skipped here rather than at
+	/// parse time, so a value fixed by a later layer keeps its position; only
+	/// matching folds case.
+	#[must_use]
+	pub fn variant_for_model(&self, model: &str) -> Option<EditMode> {
+		let ModelVariants::Entries(entries) = &self.model_variants else {
+			return None;
+		};
+		let model = model.to_lowercase();
+		entries.iter().find_map(|(pattern, raw)| {
+			let raw = raw.as_deref()?;
+			if !model.contains(&pattern.to_lowercase()) {
+				return None;
+			}
+			let normalized = match raw {
+				"atom" | "vim" => "hashline",
+				other => other,
+			};
+			EditMode::parse(normalized)
+		})
+	}
+
 	fn merge(&mut self, overlay: Self) {
 		if overlay.enforce_seen_lines.is_some() {
 			self.enforce_seen_lines = overlay.enforce_seen_lines;
+		}
+		if overlay.mode.is_some() {
+			self.mode = overlay.mode;
+		}
+		// Upstream deep-merges mappings and replaces the group whenever either
+		// side is not a mapping: an overlay pattern overrides the raw value in
+		// place (keeping the lower layer's position), new patterns append in
+		// overlay order, and a non-object overlay drops the inherited group.
+		match overlay.model_variants {
+			ModelVariants::Absent => {},
+			ModelVariants::NotAMap => self.model_variants = ModelVariants::NotAMap,
+			ModelVariants::Entries(entries) => {
+				if let ModelVariants::Entries(existing) = &mut self.model_variants {
+					for (pattern, raw) in entries {
+						match existing.iter().position(|(key, _)| *key == pattern) {
+							Some(index) => existing[index].1 = raw,
+							None => existing.push((pattern, raw)),
+						}
+					}
+				} else {
+					self.model_variants = ModelVariants::Entries(entries);
+				}
+			},
 		}
 	}
 }
@@ -254,6 +388,9 @@ pub struct Config {
 	pub lsp:                  LspConfig,
 	pub debug:                DebugConfig,
 	pub checkpoint:           CheckpointConfig,
+	/// `readLineNumbers` (root schema key, not a `read` group leaf); absent
+	/// means `false`. Drives plain line numbers in read output.
+	pub read_line_numbers:    Option<bool>,
 	/// `modelRoles` aliases (`task`, `smol`, `slow`, ...). `default` also feeds
 	/// `default_model`.
 	pub model_roles:          BTreeMap<String, String>,
@@ -302,6 +439,9 @@ impl Config {
 		self.lsp.merge(overlay.lsp);
 		self.debug.merge(overlay.debug);
 		self.checkpoint.merge(overlay.checkpoint);
+		if overlay.read_line_numbers.is_some() {
+			self.read_line_numbers = overlay.read_line_numbers;
+		}
 		self.model_roles.extend(overlay.model_roles);
 		if overlay.extensions.is_some() {
 			self.extensions = overlay.extensions;
@@ -514,6 +654,13 @@ impl Config {
 		Ok(config)
 	}
 
+	/// `readLineNumbers` with its `false` default. The runtime combines this
+	/// with the hashline display resolver (hashline anchors imply line numbers).
+	#[must_use]
+	pub fn read_line_numbers(&self) -> bool {
+		self.read_line_numbers.unwrap_or(false)
+	}
+
 	/// Resolve a provider API key through its `config.yml` connection block.
 	#[must_use]
 	pub fn resolve_api_key(&self, provider: &str) -> Option<String> {
@@ -657,6 +804,20 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	{
 		config.edit.enforce_seen_lines = expect_bool(enforce, "edit.enforceSeenLines", path)?;
 	}
+	if let Some(mode) = settings_leaf(value, "edit", "mode", "edit.mode") {
+		config.edit.mode = parse_edit_mode(mode, "edit.mode", path)?;
+	}
+	// `edit.modelVariants` is an untyped object in the upstream schema: raw
+	// entries are kept for the merge and filtered when matching, and a
+	// non-object group replaces the merged group (upstream `isRecord` guard).
+	if let Some(variants) = value.get("edit").and_then(|edit| edit.get("modelVariants")) {
+		config.edit.model_variants = parse_model_variants(variants);
+	}
+	// Root schema leaf (not `read.lineNumbers`); legacy `readHashLines` stays an
+	// ignored unknown root key, matching the upstream migration that deletes it.
+	if let Some(enabled) = value.get("readLineNumbers") {
+		config.read_line_numbers = expect_bool(enabled, "readLineNumbers", path)?;
+	}
 	if let Some(enabled) = value.get("async").and_then(|async_settings| async_settings.get("enabled"))
 	{
 		config.async_config.enabled = expect_bool(enabled, "async.enabled", path)?;
@@ -697,6 +858,41 @@ fn settings_leaf<'a>(value: &'a Value, group: &str, leaf: &str, dotted: &str) ->
 		Value::Map(_) => group_value.get(leaf),
 		_ => None,
 	}
+}
+
+/// `edit.mode`: legacy `atom`/`vim` values migrate to `hashline`, then the
+/// remaining value must be a known variant. Unlike the untyped
+/// `modelVariants` group this is a schema enum, so a bad value fails the load
+/// at the trust boundary instead of silently defaulting.
+fn parse_edit_mode(value: &Value, key: &str, path: &Path) -> Result<Option<EditMode>> {
+	let Some(raw) = expect_text(value, key, path)? else {
+		return Ok(None);
+	};
+	let normalized = match raw.as_str() {
+		"atom" | "vim" => "hashline",
+		other => other,
+	};
+	EditMode::parse(normalized).map(Some).ok_or_else(|| {
+		invalid(path, key, "expected one of replace, patch, hashline, apply_patch, sloppy")
+	})
+}
+
+/// Raw `edit.modelVariants` layer value in file insertion order. Mirrors
+/// upstream `#getEditVariantEntries`: every key is kept so the deep merge stays
+/// case-sensitive (`GPT` and `gpt` are distinct entries) and insertion position
+/// survives until [`EditConfig::variant_for_model`] filters; the untyped group
+/// may hold non-strings, kept as `None` (they never match), and a non-mapping
+/// value becomes [`ModelVariants::NotAMap`] so it replaces inherited entries.
+fn parse_model_variants(value: &Value) -> ModelVariants {
+	let Some(entries) = value.as_map() else {
+		return ModelVariants::NotAMap;
+	};
+	ModelVariants::Entries(
+		entries
+			.iter()
+			.map(|(pattern, item)| (pattern.clone(), item.as_str().map(str::to_string)))
+			.collect(),
+	)
 }
 
 /// `disabledProviders` entries: bare strings, plus path-scoped maps whose
@@ -1783,6 +1979,162 @@ mod tests {
 		layered_on.merge(parse_config("edit:\n  enforceSeenLines: true\n").expect("overlay"));
 		assert!(layered_on.edit.enforce_seen_lines());
 		assert!(parse_config("edit:\n  enforceSeenLines: nope\n").is_err());
+	}
+
+	#[test]
+	fn edit_mode_variants_and_read_line_numbers_parse_and_overlay() {
+		let default = parse_config("").expect("default");
+		assert_eq!(default.edit.mode, None);
+		assert_eq!(default.edit.mode(), EditMode::Hashline);
+		assert_eq!(default.edit.model_variants, ModelVariants::Absent);
+		assert_eq!(default.edit.variant_for_model("openai/gpt-5"), None);
+		assert_eq!(default.read_line_numbers, None);
+		assert!(!default.read_line_numbers());
+
+		let explicit = parse_config(
+			"edit:\n  mode: apply_patch\n  modelVariants:\n    GPT: replace\n    claude: \
+			 patch\nreadLineNumbers: true\n",
+		)
+		.expect("explicit");
+		assert_eq!(explicit.edit.mode(), EditMode::ApplyPatch);
+		assert!(explicit.read_line_numbers());
+		// Patterns match case-insensitively by substring, first entry wins.
+		assert_eq!(explicit.edit.variant_for_model("openai/GPT-5"), Some(EditMode::Replace));
+		assert_eq!(explicit.edit.variant_for_model("anthropic/claude-x"), Some(EditMode::Patch));
+		assert_eq!(explicit.edit.variant_for_model("xai/grok"), None);
+
+		// `atom`/`vim` migrate to `hashline` in the mode and each variant value;
+		// quoted dotted `"edit.mode"` is the same leaf.
+		let legacy = parse_config(
+			"edit:\n  mode: vim\n  modelVariants:\n    atom-model: atom\n",
+		)
+		.expect("legacy");
+		assert_eq!(legacy.edit.mode(), EditMode::Hashline);
+		assert_eq!(legacy.edit.variant_for_model("atom-model-1"), Some(EditMode::Hashline));
+		let dotted_mode = parse_config("\"edit.mode\": atom\n").expect("dotted mode");
+		assert_eq!(dotted_mode.edit.mode(), EditMode::Hashline);
+
+		// Overlay merge: same pattern overrides in place, new ones append, and an
+		// absent field keeps the lower layer (explicit false still wins).
+		let mut layered = parse_config(
+			"edit:\n  mode: patch\n  modelVariants:\n    claude: replace\n    gpt: \
+			 hashline\n",
+		)
+		.expect("base");
+		layered.merge(
+			parse_config("edit:\n  modelVariants:\n    gpt: sloppy\n    gemini: apply_patch\n")
+				.expect("overlay"),
+		);
+		assert_eq!(layered.edit.mode(), EditMode::Patch, "absent mode keeps the lower layer");
+		let ModelVariants::Entries(layered_entries) = &layered.edit.model_variants else {
+			panic!("layered variants: {:?}", layered.edit.model_variants);
+		};
+		let patterns: Vec<&str> =
+			layered_entries.iter().map(|(pattern, _)| pattern.as_str()).collect();
+		assert_eq!(patterns, ["claude", "gpt", "gemini"]);
+		assert_eq!(layered.edit.variant_for_model("claude-3"), Some(EditMode::Replace));
+		assert_eq!(layered.edit.variant_for_model("gpt-4"), Some(EditMode::Sloppy));
+		assert_eq!(layered.edit.variant_for_model("gemini-pro"), Some(EditMode::ApplyPatch));
+
+		let mut lines = parse_config("readLineNumbers: true\n").expect("base lines");
+		lines.merge(parse_config("readLineNumbers: false\n").expect("false overlay"));
+		assert!(!lines.read_line_numbers(), "explicit false must override a lower layer");
+
+		// Raw pattern keys merge case-sensitively (`GPT` and `gpt` stay distinct
+		// entries) and case folds only at match time, so the lower layer's entry
+		// keeps the first-match position like upstream `#deepMerge`.
+		let mut cased =
+			parse_config("edit:\n  modelVariants:\n    GPT: patch\n").expect("cased base");
+		cased.merge(
+			parse_config("edit:\n  modelVariants:\n    gpt: replace\n").expect("cased overlay"),
+		);
+		assert_eq!(
+			cased.edit.model_variants,
+			ModelVariants::Entries(vec![
+				("GPT".to_string(), Some("patch".to_string())),
+				("gpt".to_string(), Some("replace".to_string())),
+			])
+		);
+		assert_eq!(cased.edit.variant_for_model("gpt-4"), Some(EditMode::Patch));
+
+		// Untyped `modelVariants` values stay raw until matching (upstream
+		// `#getEditVariantEntries`), so a value repaired by a later layer keeps
+		// its position and the first matching pattern still wins.
+		let mut repaired =
+			parse_config("edit:\n  modelVariants:\n    m: bogus\n    gpt: patch\n")
+				.expect("repaired base");
+		repaired.merge(
+			parse_config("edit:\n  modelVariants:\n    m: replace\n").expect("repaired overlay"),
+		);
+		assert_eq!(repaired.edit.variant_for_model("m-gpt-4"), Some(EditMode::Replace));
+		let mut non_string =
+			parse_config("edit:\n  modelVariants:\n    m: 1\n    gpt: patch\n").expect("raw base");
+		non_string.merge(
+			parse_config("edit:\n  modelVariants:\n    m: replace\n").expect("raw overlay"),
+		);
+		assert_eq!(non_string.edit.variant_for_model("m-gpt-4"), Some(EditMode::Replace));
+
+		// Untyped entries and non-object groups yield no variant; a non-object
+		// overlay replaces the inherited group, while an empty mapping keeps it
+		// (upstream deep merge).
+		let skipped = parse_config(
+			"edit:\n  modelVariants:\n    prose: text\n    gpt: 1\n    claude-model: \
+			 replace\n",
+		)
+		.expect("skipped");
+		assert_eq!(
+			skipped.edit.model_variants,
+			ModelVariants::Entries(vec![
+				("prose".to_string(), Some("text".to_string())),
+				("gpt".to_string(), None),
+				("claude-model".to_string(), Some("replace".to_string())),
+			])
+		);
+		assert_eq!(skipped.edit.variant_for_model("claude-model-1"), Some(EditMode::Replace));
+		let non_map = parse_config("edit:\n  modelVariants: true\n").expect("non map");
+		assert_eq!(non_map.edit.model_variants, ModelVariants::NotAMap);
+		assert_eq!(non_map.edit.variant_for_model("gpt-4"), None);
+
+		let mut cleared =
+			parse_config("edit:\n  modelVariants:\n    gpt: patch\n").expect("cleared base");
+		cleared.merge(parse_config("edit:\n  modelVariants: null\n").expect("null overlay"));
+		assert_eq!(cleared.edit.model_variants, ModelVariants::NotAMap);
+		assert_eq!(cleared.edit.variant_for_model("gpt-4"), None);
+
+		let mut kept =
+			parse_config("edit:\n  modelVariants:\n    gpt: patch\n").expect("kept base");
+		kept.merge(
+			Config::from_settings_value(
+				&json_to_value(&serde_json::json!({ "edit": { "modelVariants": {} } })),
+				Path::new("overlay.json"),
+			)
+			.expect("empty overlay"),
+		);
+		assert_eq!(kept.edit.variant_for_model("gpt-4"), Some(EditMode::Patch));
+		for text in [
+			"edit:\n  mode: plain\n",
+			"edit:\n  mode: 1\n",
+			"\"edit.mode\": fast\n",
+			"readLineNumbers: yes\n",
+		] {
+			let err = parse_config(text).expect_err(text);
+			assert!(err.to_string().contains("test.yml"), "{err}");
+		}
+
+		// settings.json keeps JSON insertion order (serde_json `preserve_order`),
+		// so the first declared pattern still wins.
+		let json = serde_json::json!({
+			"edit": {
+				"mode": "sloppy",
+				"modelVariants": { "gpt": "patch", "claude": "replace" },
+			},
+			"readLineNumbers": true,
+		});
+		let settings = Config::from_settings_value(&json_to_value(&json), Path::new("settings.json"))
+			.expect("settings json");
+		assert_eq!(settings.edit.mode(), EditMode::Sloppy);
+		assert_eq!(settings.edit.variant_for_model("gpt-claude-mini"), Some(EditMode::Patch));
+		assert!(settings.read_line_numbers());
 	}
 
 	#[test]

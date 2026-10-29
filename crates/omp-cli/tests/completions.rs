@@ -376,6 +376,62 @@ fn complete_sessions_reports_ids_titles_and_honors_the_prefix() {
 }
 
 #[test]
+fn session_completion_dedupes_non_adjacent_ids_keeping_the_newest_copy() {
+	let sandbox = Sandbox::new("sessions-dedupe");
+	let current = sandbox.agent().join("sessions/-project");
+	let legacy = legacy_session_dir(&sandbox);
+	fs::create_dir_all(&current).expect("current sessions dir");
+	fs::create_dir_all(&legacy).expect("legacy sessions dir");
+	let newest = current.join("dup-new.jsonl");
+	let other = current.join("other222.jsonl");
+	let oldest = legacy.join("dup-old.jsonl");
+	fs::write(
+		&newest,
+		"{\"type\":\"session\",\"version\":3,\"id\":\"dup111\",\
+		 \"timestamp\":\"2026-10-28T00:00:00Z\",\"cwd\":\"/work\",\"title\":\"Newest copy\"}\n",
+	)
+	.expect("newest duplicate");
+	fs::write(
+		&other,
+		"{\"type\":\"session\",\"version\":3,\"id\":\"other222\",\
+		 \"timestamp\":\"2026-10-28T00:00:00Z\",\"cwd\":\"/work\",\"title\":\"Other\"}\n",
+	)
+	.expect("other session");
+	fs::write(
+		&oldest,
+		"{\"type\":\"session\",\"version\":3,\"id\":\"dup111\",\
+		 \"timestamp\":\"2026-10-28T00:00:00Z\",\"cwd\":\"/work\",\"title\":\"Legacy copy\"}\n",
+	)
+	.expect("legacy duplicate");
+	let age = |path: &Path, seconds: u64| {
+		fs::File::options()
+			.write(true)
+			.open(path)
+			.expect("open session")
+			.set_modified(SystemTime::now() - Duration::from_secs(seconds))
+			.expect("age session");
+	};
+	// The second copy of `dup111` sits below `other222` in mtime order, so only
+	// a global dedupe keeps one row.
+	age(&newest, 10);
+	age(&other, 20);
+	age(&oldest, 30);
+
+	let mut command = omp();
+	command.args(["__complete", "sessions"]);
+	isolate(&mut command, &sandbox);
+	let output = run(command);
+	assert_eq!(output.status.code(), Some(i32::from(EXIT_SUCCESS)), "{}", stderr(&output));
+	assert_eq!(
+		stdout(&output).lines().collect::<Vec<_>>(),
+		["dup111\tNewest copy", "other222\tOther"],
+		"duplicate ids collapse to the newest copy even when rows interleave"
+	);
+	assert!(legacy.is_dir(), "completion must not remove the legacy directory");
+	assert!(oldest.is_file(), "completion must not move the legacy session file");
+}
+
+#[test]
 fn session_completion_is_read_only_and_lists_legacy_dirs() {
 	let sandbox = Sandbox::new("legacy-readonly");
 	let legacy_dir = legacy_session_dir(&sandbox);

@@ -86,8 +86,11 @@ impl ChildContext {
 		&self,
 		child_id: &str,
 		agent: &AgentDefinition,
+		active_model: Option<&str>,
 	) -> Result<(ToolRegistry, Option<BTreeSet<String>>), String> {
-		let mut registry = self.supervisor.child_registry(self.depth + 1, Some(child_id));
+		let mut registry = self
+			.supervisor
+			.child_registry_unbound(self.depth + 1, Some(child_id));
 
 		if let Some(tools) = &agent.tools {
 			for name in tools {
@@ -128,17 +131,10 @@ impl ChildContext {
 		};
 
 		if let Some(allowed) = &effective {
-			let names: Vec<String> = registry
-				.schemas()
-				.iter()
-				.filter_map(|schema| {
-					schema
-						.pointer("/function/name")
-						.and_then(Value::as_str)
-						.map(str::to_string)
-				})
-				.collect();
-			for name in names {
+			// Filter by registry keys (internal tool names), never by advertised
+			// wire names: `edit` may advertise `apply_patch` while its allowlist
+			// entry stays `edit`.
+			for name in registry.names() {
 				if !allowed.contains(&name) {
 					registry.remove(&name);
 				}
@@ -159,6 +155,9 @@ impl ChildContext {
 			nested.model_factory = self.model_factory.clone();
 			registry.register(Arc::new(nested));
 		}
+
+		self.supervisor
+			.rebind_session_tools(&mut registry, active_model);
 
 		Ok((registry, effective))
 	}
@@ -515,7 +514,7 @@ impl TaskTool {
 			|model| model.provider,
 		);
 		let (child_registry, _effective_tools) =
-			match child_ctx.prepare_registry(&child_id, &item.agent) {
+			match child_ctx.prepare_registry(&child_id, &item.agent, resolved_model.as_deref()) {
 				Ok(prepared) => prepared,
 				Err(message) => {
 					reservation.disarm();
@@ -932,12 +931,13 @@ async fn run_background_child(
 	let child_model = child_ctx
 		.resolve_model(&item.agent, item.effort.as_deref())
 		.map_err(AgentError::Internal)?;
+	let child_active_model = child_model.as_ref().map(|model| model.model.clone());
 	let child_provider = child_model.map_or_else(
 		|| supervisor.provider(),
 		|model| model.provider,
 	);
 	let (child_registry, _effective_tools) = child_ctx
-		.prepare_registry(&child_id, &item.agent)
+		.prepare_registry(&child_id, &item.agent, child_active_model.as_deref())
 		.map_err(AgentError::Internal)?;
 	let prompt_schema = item.output_schema.clone().or_else(|| {
 		if item.schema_error.is_none() {
@@ -2289,7 +2289,7 @@ mod tests {
 			"yield".to_string(),
 		]);
 		let error = context
-			.prepare_registry("scout-1", &scout)
+			.prepare_registry("scout-1", &scout, None)
 			.err()
 			.expect("missing web_search");
 		assert!(error.contains("web_search"));
@@ -2298,13 +2298,13 @@ mod tests {
 		let mut supported = scout.clone();
 		supported.tools = Some(vec!["read".to_string(), "grep".to_string(), "yield".to_string()]);
 		let (registry, _tools) = context
-			.prepare_registry("scout-2", &supported)
+			.prepare_registry("scout-2", &supported, None)
 			.expect("supported tools");
 		assert!(registry.get("read").is_some());
 
 		let mut typo = scout;
 		typo.tools = Some(vec!["read".to_string(), "fill".to_string(), "yield".to_string()]);
-		let error = context.prepare_registry("typo-1", &typo).err().expect("unknown");
+		let error = context.prepare_registry("typo-1", &typo, None).err().expect("unknown");
 		assert!(error.contains("requests tool 'fill'"));
 	}
 
@@ -2382,7 +2382,7 @@ mod tests {
 		let mut agent = model_agent();
 		agent.tools = None;
 		let (_registry, effective) = context
-			.prepare_registry("task-1", &agent)
+			.prepare_registry("task-1", &agent, None)
 			.expect("registry");
 		assert!(effective.is_none(), "None ceiling must not expand to a set");
 	}

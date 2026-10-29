@@ -2,7 +2,10 @@
 //
 // Protocol: one JSON request per stdin line ({id,code,cwd,env,silent,storeHistory}
 // or {type:"exit"}); JSON frames on stdout. Cell stdout/stderr go through a
-// context facade, so user code cannot forge protocol frames.
+// context facade, and the real `process.stdout`/`process.stderr`/`fs` fd 1-2
+// write paths are patched after the protocol writer is captured, so output from
+// `require("node:process")`/`require("node:fs")` is captured instead of dropping
+// into (or forging) the frame stream.
 //
 // Contract port notes:
 // - static imports are rewritten to `__omp_import__` resolved against the cell cwd;
@@ -19,6 +22,11 @@ const { createRequire } = require("node:module");
 
 const emitRaw = process.stdout.write.bind(process.stdout);
 const emitErrRaw = process.stderr.write.bind(process.stderr);
+const fs = require("node:fs");
+const webCrypto =
+	typeof crypto !== "undefined" && crypto && typeof crypto.getRandomValues === "function"
+		? crypto
+		: require("node:crypto").webcrypto;
 let CURRENT_RUN = null;
 let executionCount = 0;
 let displayCount = 0;
@@ -35,6 +43,90 @@ function chunk(text, channel = "stdout") {
 	if (!CURRENT_RUN || typeof text !== "string" || text.length === 0) return;
 	frame({ type: channel, id: CURRENT_RUN, data: text });
 }
+
+function textOf(data, encoding) {
+	if (typeof data === "string") return data;
+	if (data instanceof Uint8Array) {
+		return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString(encoding || "utf8");
+	}
+	return String(data);
+}
+
+// `require("node:process")` and `require("node:fs")` expose the real objects, so
+// a facade alone cannot keep user writes off the protocol pipe. Patch the real
+// write entry points (the protocol's own `emitRaw` was bound first) and surface
+// unparseable protocol lines as cell output in the kernel.
+const realWriteSync = fs.writeSync.bind(fs);
+const realWrite = fs.write.bind(fs);
+const realWriteFileSync = fs.writeFileSync.bind(fs);
+
+function fdText(fd, data, offset, length) {
+	if (typeof data === "string") return { text: data, bytes: Buffer.byteLength(data) };
+	if (data instanceof Uint8Array || data instanceof ArrayBuffer) {
+		const view = data instanceof ArrayBuffer
+			? Buffer.from(data)
+			: Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+		const start = typeof offset === "number" ? offset : 0;
+		const len = typeof length === "number" ? length : view.length - start;
+		return { text: view.toString("utf8", start, start + len), bytes: len };
+	}
+	return null;
+}
+
+function patchStreamWrite(stream, channel) {
+	const write = (data, encoding, callback) => {
+		chunk(textOf(data, typeof encoding === "string" ? encoding : undefined), channel);
+		if (typeof encoding === "function") encoding();
+		if (typeof callback === "function") callback();
+		return true;
+	};
+	try {
+		Object.defineProperty(stream, "write", { value: write, configurable: true, writable: true });
+	} catch {
+		try {
+			stream.write = write;
+		} catch {
+			// Native stream without a writable `write`: kernel raw-line fallback still
+			// surfaces the bytes as cell output instead of a forged frame.
+		}
+	}
+}
+
+patchStreamWrite(process.stdout, "stdout");
+patchStreamWrite(process.stderr, "stderr");
+fs.writeSync = (fd, data, offset, length, position) => {
+	if (fd === 1 || fd === 2) {
+		const parsed = fdText(fd, data, offset, length);
+		if (parsed) {
+			chunk(parsed.text, fd === 2 ? "stderr" : "stdout");
+			return parsed.bytes;
+		}
+	}
+	return realWriteSync(fd, data, offset, length, position);
+};
+fs.write = (...args) => {
+	const fd = args[0];
+	if (fd === 1 || fd === 2) {
+		const callback = typeof args.at(-1) === "function" ? args.pop() : undefined;
+		const parsed = fdText(fd, args[1], typeof args[2] === "number" ? args[2] : undefined, typeof args[3] === "number" ? args[3] : undefined);
+		if (parsed) {
+			chunk(parsed.text, fd === 2 ? "stderr" : "stdout");
+			if (callback) process.nextTick(callback, null, parsed.bytes, args[1]);
+			return;
+		}
+	}
+	return realWrite(...args);
+};
+fs.writeFileSync = (target, data, options) => {
+	if (target === 1 || target === 2) {
+		const parsed = fdText(target, data);
+		if (parsed) {
+			chunk(parsed.text, target === 2 ? "stderr" : "stdout");
+			return;
+		}
+	}
+	return realWriteFileSync(target, data, options);
+};
 
 function status(op, extra = {}) {
 	if (!CURRENT_RUN) return;
@@ -385,6 +477,12 @@ Object.assign(context, {
 	structuredClone,
 	atob: value => Buffer.from(value, "base64").toString("binary"),
 	btoa: value => Buffer.from(value, "binary").toString("base64"),
+	Buffer,
+	Bun: typeof Bun !== "undefined" ? Bun : undefined,
+	fs,
+	crypto: webCrypto,
+	webcrypto: webCrypto,
+	createRequire,
 	require: createRequire(path.join(cwd, "cell.js")),
 	__omp_import__: importModule,
 	...helpers,
@@ -403,7 +501,13 @@ async function execute(request) {
 	executionCount += 1;
 
 	let source = String(request.code ?? "");
-	if (/(?:\bimport\s+type\b|\binterface\s+\w|\btype\s+\w+\s*=|\b(?:as|satisfies)\s+(?:const\b|[A-Z]\w*)|:\s*(?:string|number|boolean|any|unknown|void|never)\b)/.test(source)) {
+	if (
+		typeof Bun !== "undefined" &&
+		typeof Bun.Transpiler === "function" &&
+		/(?:\bimport\s+type\b|\binterface\s+\w|\btype\s+\w+\s*=|\b(?:as|satisfies)\s+(?:const\b|[A-Z]\w*)|:\s*(?:string|number|boolean|any|unknown|void|never)\b)/.test(
+			source,
+		)
+	) {
 		try {
 			source = new Bun.Transpiler({ loader: "ts" }).transformSync(source);
 		} catch {

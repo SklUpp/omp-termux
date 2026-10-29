@@ -1,6 +1,7 @@
 //! Consumer-visible contract for `BashTool`: per-call `env`/`cwd`/`timeout`,
-//! rejection of run modes the Rust tool does not implement, the output cap, and
-//! timeout/cancellation error results.
+//! foreground-PTY and legacy `timeout_ms` rejection, background delegation to
+//! the session process supervisor, the output cap, and timeout/cancellation
+//! error results.
 
 use std::{
 	path::PathBuf,
@@ -282,7 +283,7 @@ async fn cancellation_aborts_the_run_before_its_deadline() {
 }
 
 #[tokio::test]
-async fn unsupported_run_modes_are_rejected_not_silently_ignored() {
+async fn invalid_run_modes_are_rejected_not_silently_ignored() {
 	let dir = TempDir::new("bash-modes");
 	let ctx = AgentContext::new(dir.path.clone());
 
@@ -296,8 +297,12 @@ async fn unsupported_run_modes_are_rejected_not_silently_ignored() {
 	let background = BashTool::new()
 		.execute(&json!({"command": "true", "async": true}), &ctx)
 		.await
-		.expect_err("async must be rejected");
-	assert!(background.to_string().contains("async"));
+		.expect_err("async needs a supervisor");
+	assert!(matches!(&background, ToolError::InvalidArguments(_)));
+	assert_eq!(
+		background.to_string(),
+		"Background bash ('async') requires the session process supervisor; use hub start for a supervised process"
+	);
 
 	let legacy = BashTool::new()
 		.execute(&json!({"command": "true", "timeout_ms": 1000}), &ctx)
@@ -305,6 +310,19 @@ async fn unsupported_run_modes_are_rejected_not_silently_ignored() {
 		.expect_err("timeout_ms was removed");
 	assert!(matches!(&legacy, ToolError::InvalidArguments(_)));
 	assert!(legacy.to_string().contains("timeout"), "got: {legacy}");
+
+	// The legacy spelling is rejected before the async branch can start a job.
+	let backend: std::sync::Arc<dyn pi_agent::tools::process::ProcessBackend> =
+		std::sync::Arc::new(pi_agent::tools::process::ProcessManager::new(dir.join("processes")));
+	let legacy_async = BashTool::with_processes(backend, None)
+		.execute(&json!({"command": "true", "async": true, "timeout_ms": 1}), &ctx)
+		.await
+		.expect_err("async with timeout_ms was removed");
+	assert!(matches!(&legacy_async, ToolError::InvalidArguments(_)));
+	assert_eq!(
+		legacy_async.to_string(),
+		"'timeout_ms' was removed; pass 'timeout' in seconds"
+	);
 
 	let explicit_off = BashTool::new()
 		.execute(&json!({"command": "echo off", "pty": false, "async": false}), &ctx)

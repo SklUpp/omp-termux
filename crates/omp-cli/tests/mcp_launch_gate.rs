@@ -961,3 +961,40 @@ fn test_bare_server_name_mcp_prefixed_does_not_launch_server() {
 	assert!(tools.tools.is_empty(), "server named mcp__foo_bar must NOT spawn from bare allow mcp__foo_bar");
 	assert!(!marker_file.exists(), "marker must NOT exist when bare mcp__foo_bar allow is denied");
 }
+
+#[test]
+fn checkpoint_tools_are_known_tools_selection_names() {
+	let temp_dir = TempDir::new();
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+
+	let approvals = Approvals::new(ApprovalMode::Yolo, Vec::new());
+	let cancel_token = pi_agent::CancellationToken::new();
+
+	let mut config = Config::default();
+	config.tools = Some(vec!["checkpoint".to_string(), "rewind".to_string()]);
+	let tools = rt
+		.block_on(filter_and_spawn_mcp_servers(
+			Vec::new(),
+			temp_dir.path(),
+			&config,
+			&approvals,
+			&cancel_token,
+		))
+		.expect("checkpoint/rewind are selectable builtin names");
+	assert!(tools.is_empty(), "no MCP server was discovered");
+
+	config.tools = Some(vec!["checkpoint".to_string(), "bogus_tool".to_string()]);
+	let err = rt
+		.block_on(filter_and_spawn_mcp_servers(
+			Vec::new(),
+			temp_dir.path(),
+			&config,
+			&approvals,
+			&cancel_token,
+		))
+		.expect_err("unknown tool names must still fail");
+	assert!(err.to_string().contains("Unknown tool in --tools: bogus_tool"));
+}

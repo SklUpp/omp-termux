@@ -46,8 +46,19 @@ const STRING_VALUE_FLAGS: [&str; 17] = [
 const OPTIONAL_VALUE_FLAGS: [&str; 3] = ["--resume", "-r", "--session"];
 
 /// First residual token naming a subcommand stops global extraction, matching
-/// `isSubcommand` in `profile-bootstrap.ts`.
-const SUBCOMMANDS: [&str; 4] = ["repl", "completions", "__complete", "agents"];
+/// `isSubcommand` in `profile-bootstrap.ts`. Must list every `args::Command`
+/// variant; `subcommand_gate_stops_extraction_for_every_clap_subcommand`
+/// enforces that through the extraction boundary.
+const SUBCOMMANDS: [&str; 8] = [
+	"repl",
+	"completions",
+	"__complete",
+	"agents",
+	"models",
+	"read",
+	"grep",
+	"ps",
+];
 
 /// Internal marker inserted when stripping `--profile`/`--alias` would let the
 /// following value-like token become an optional flag's value. `args.rs`
@@ -641,6 +652,29 @@ mod tests {
 		assert_eq!(argv(&unknown), ["omp", "--some-ext", "val"]);
 		let unknown_flag = extract(&["omp", "--some-ext", "--profile", "work"]).expect("unknown flag");
 		assert_eq!(unknown_flag.profile.as_deref(), Some("work"));
+	}
+
+	#[test]
+	fn subcommand_gate_stops_extraction_for_every_clap_subcommand() {
+		use clap::CommandFactory as _;
+		let subcommands: Vec<String> = crate::args::Cli::command()
+			.get_subcommands()
+			.map(|command| command.get_name().to_string())
+			.collect();
+		assert!(!subcommands.is_empty());
+		for name in subcommands {
+			for flag in [&["--alias", "wk"][..], &["--profile", "work"]] {
+				let args = ["omp", name.as_str(), flag[0], flag[1]];
+				let result =
+					extract_cli_flags(args.iter().map(std::ffi::OsString::from).collect())
+						.expect("passthrough");
+				assert_eq!(result.profile, None, "{args:?}");
+				assert_eq!(result.alias, None, "{args:?}");
+				let argv: Vec<String> =
+					result.argv.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
+				assert_eq!(argv, args, "{args:?}");
+			}
+		}
 	}
 
 	#[test]

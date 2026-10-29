@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -24,6 +24,105 @@ const MIN_RECENT_MESSAGES: usize = 4;
 /// OpenAI history requires every `tool_call` to be answered, so an interrupted
 /// batch is closed with this marker instead of leaving orphan calls behind.
 pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution interrupted by user]";
+
+/// Metadata the loop hands the turn-end consumer with each ack request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnAckRequest {
+	/// Message count before the finished assistant message was appended.
+	pub turn_start: usize,
+	/// Message count after the finished turn (assistant + tool results) was appended.
+	pub message_count: usize,
+}
+
+/// In-memory branch cut for sessions without persistence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InMemoryRewind {
+	/// Live-loop messages to keep (checkpoint position, inclusive). Only the
+	/// loop applies this count; the session mirror may be uncompacted.
+	pub keep: usize,
+	/// Provider tool-call id of the checkpoint result. Session mirrors locate
+	/// the cut by this id so compaction/steering cannot shift it.
+	pub checkpoint_tool_call_id: Option<String>,
+	/// Rendered `branch_summary` context (user role).
+	pub summary: String,
+	/// Rendered retained rewind report (developer/system role).
+	pub report: String,
+}
+
+/// Conversation rewrite requested by the turn-end consumer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnRewrite {
+	/// Replace the whole live conversation (persisted branch rebuild).
+	Replace(Vec<Message>),
+	/// Truncate at `keep` and append the summary/report (no-session mode).
+	InMemory(InMemoryRewind),
+}
+
+/// Result of the async turn-end handshake. `Default` means unchanged.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnAckDecision {
+	pub rewrite: Option<TurnRewrite>,
+	/// Run another provider request instead of ending the dialog.
+	pub continue_turn: bool,
+	/// Warning to append for the continuation turn.
+	pub warning: Option<String>,
+}
+
+#[derive(Debug)]
+struct PendingTurnAck {
+	request: TurnAckRequest,
+	reply: oneshot::Sender<TurnAckDecision>,
+}
+
+/// One-shot per-turn rendezvous between the agent loop and the session owner.
+///
+/// The loop registers a request before emitting `TurnEnd`, then awaits the
+/// decision while still inside its async task; the session consumer (on its own
+/// thread) persists the batch and replies before the next provider request.
+/// Dropping/never replying unblocks the loop via stream cancellation.
+#[derive(Debug, Default)]
+pub struct TurnAck {
+	pending: Mutex<Option<PendingTurnAck>>,
+}
+
+impl TurnAck {
+	#[must_use]
+	pub fn new() -> Arc<Self> {
+		Arc::new(Self::default())
+	}
+
+	/// Register the turn about to end and return the decision receiver.
+	pub fn begin(&self, request: TurnAckRequest) -> oneshot::Receiver<TurnAckDecision> {
+		let (reply, rx) = oneshot::channel();
+		*self.pending.lock().unwrap_or_else(|poison| poison.into_inner()) =
+			Some(PendingTurnAck { request, reply });
+		rx
+	}
+
+	/// Take the pending request (consumer side) and its metadata.
+	#[must_use]
+	pub fn take(&self) -> Option<(TurnAckRequest, oneshot::Sender<TurnAckDecision>)> {
+		self
+			.pending
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.take()
+			.map(|pending| (pending.request, pending.reply))
+	}
+
+	/// Reply to the pending turn. Returns `false` when there is none.
+	#[must_use]
+	pub fn finish(&self, decision: TurnAckDecision) -> bool {
+		self
+			.take()
+			.is_some_and(|(_, reply)| reply.send(decision).is_ok())
+	}
+
+	/// Drop a pending reply so the loop stops waiting (cancellation/error path).
+	pub fn cancel(&self) {
+		drop(self.pending.lock().unwrap_or_else(|poison| poison.into_inner()).take());
+	}
+}
 
 /// Live event emitted while a dialog runs.
 ///
@@ -157,6 +256,122 @@ impl Drop for PresenceGuard {
 	}
 }
 
+/// Cut the live conversation after the checkpoint tool batch (all sibling
+/// results of that assistant message). The anchor is located in the *current*
+/// live messages, so it only works while compaction retained that result;
+/// once pruned, the stale `keep` fallback runs (it may
+/// clamp to a no-op or land inside the retained region). The fallback never
+/// splits an assistant tool call from its results or leaves a dangling trailing
+/// call, so the degraded live context is still structurally valid; the mirror
+/// cut remains anchored and the next prompt self-heals.
+fn apply_in_memory_cut(messages: &mut Vec<Message>, rewind: &InMemoryRewind) {
+	let keep = rewind
+		.checkpoint_tool_call_id
+		.as_deref()
+		.and_then(|id| tool_batch_end(messages, id))
+		.unwrap_or_else(|| repair_tool_batch_boundary(messages, rewind.keep))
+		.min(messages.len());
+	messages.truncate(keep);
+	if !rewind.summary.is_empty() {
+		messages.push(Message::user(rewind.summary.clone()));
+	}
+	if !rewind.report.is_empty() {
+		messages.push(Message::system(rewind.report.clone()));
+	}
+}
+
+/// End (exclusive) of the tool-result group owned by the assistant message
+/// that issued `tool_call_id`, or `None` when either side is absent.
+#[must_use]
+pub fn tool_batch_end(messages: &[Message], tool_call_id: &str) -> Option<usize> {
+	let result_position = messages
+		.iter()
+		.rposition(|message| message.tool_call_id.as_deref() == Some(tool_call_id))?;
+	let assistant_position = messages[..result_position].iter().rposition(|message| {
+		message.role == Role::Assistant
+			&& message.tool_calls.iter().any(|call| call.id == tool_call_id)
+	})?;
+	let call_ids: std::collections::HashSet<&str> = messages[assistant_position]
+		.tool_calls
+		.iter()
+		.map(|call| call.id.as_str())
+		.collect();
+	let mut end = assistant_position + 1;
+	while end < messages.len()
+		&& messages[end].role == Role::Tool
+		&& messages[end]
+			.tool_call_id
+			.as_deref()
+			.is_some_and(|id| call_ids.contains(id))
+	{
+		end += 1;
+	}
+	Some(end)
+}
+
+/// Pair-safe fallback cut: finish a partially kept tool-result run and drop a
+/// dangling trailing assistant tool call.
+#[must_use]
+pub fn repair_tool_batch_boundary(messages: &[Message], keep: usize) -> usize {
+	let mut keep = keep.min(messages.len());
+	// Cutting inside a tool-result run would strand the assistant tool call;
+	// finish the whole batch instead.
+	if keep > 0 && keep < messages.len() && messages[keep].role == Role::Tool {
+		while keep < messages.len() && messages[keep].role == Role::Tool {
+			keep += 1;
+		}
+	}
+	// A kept assistant tool call whose results were cut away is also invalid.
+	if keep > 0 {
+		let last = &messages[keep - 1];
+		let next = messages.get(keep);
+		if last.role == Role::Assistant
+			&& !last.tool_calls.is_empty()
+			&& next.is_none_or(|next| next.role != Role::Tool)
+		{
+			keep -= 1;
+		}
+	}
+	keep
+}
+
+/// Apply a session-owner reply to the live conversation. `Replace` restores
+/// the owner's retained context wholesale (no dependency on a pruned anchor);
+/// `InMemory` cuts at the checkpoint result when still present.
+fn apply_turn_decision(messages: &mut Vec<Message>, decision: TurnAckDecision) -> bool {
+	let mut continue_turn = decision.continue_turn;
+	match decision.rewrite {
+		Some(TurnRewrite::Replace(mut replacement)) => {
+			if let Some(system) = messages
+				.first()
+				.filter(|message| message.role == Role::System)
+				.cloned()
+			{
+				if replacement
+					.first()
+					.is_none_or(|message| message.role != Role::System)
+				{
+					replacement.insert(0, system);
+				}
+			}
+			*messages = replacement;
+			continue_turn = true;
+		},
+		Some(TurnRewrite::InMemory(rewind)) => {
+			apply_in_memory_cut(messages, &rewind);
+			continue_turn = true;
+		},
+		None => {},
+	}
+	if let Some(warning) = decision.warning
+		&& !warning.is_empty()
+	{
+		messages.push(Message::system(warning));
+		continue_turn = true;
+	}
+	continue_turn
+}
+
 /// Agent execution engine: provider turn, tool batch, repeat.
 pub struct AgentLoop {
 	config: AgentConfig,
@@ -169,6 +384,8 @@ pub struct AgentLoop {
 	peer_inbox: Option<(Arc<Mailbox>, String)>,
 	/// Session-owned staged-preview policy (peeked from the registry).
 	policy: Option<Arc<dyn ToolPolicy>>,
+	/// Turn-end persistence/rewind handshake with the session owner.
+	turn_ack: Option<Arc<TurnAck>>,
 }
 
 impl AgentLoop {
@@ -187,6 +404,7 @@ impl AgentLoop {
 			background_results: None,
 			peer_inbox: None,
 			policy,
+			turn_ack: None,
 		}
 	}
 
@@ -206,7 +424,16 @@ impl AgentLoop {
 			background_results: None,
 			peer_inbox: None,
 			policy,
+			turn_ack: None,
 		}
+	}
+
+	/// Attach the per-turn ack channel used by the session owner for
+	/// persistence and checkpoint/rewind context replacement.
+	#[must_use]
+	pub fn with_turn_ack(mut self, ack: Arc<TurnAck>) -> Self {
+		self.turn_ack = Some(ack);
+		self
 	}
 
 	/// Register the supervisor's exactly-once background result sink. Without
@@ -240,6 +467,40 @@ impl AgentLoop {
 			}
 		}
 	}
+	fn begin_turn_ack(
+		&self,
+		turn_start: usize,
+		message_count: usize,
+	) -> Option<oneshot::Receiver<TurnAckDecision>> {
+		self
+			.turn_ack
+			.as_ref()
+			.map(|ack| ack.begin(TurnAckRequest { turn_start, message_count }))
+	}
+
+	/// Await the session owner's reply. Cancellation or a dropped stream unblocks
+	/// with the default (unchanged) decision so the loop can fail safely.
+	async fn await_turn_ack(
+		&self,
+		receiver: Option<oneshot::Receiver<TurnAckDecision>>,
+		cancellation_token: &CancellationToken,
+	) -> TurnAckDecision {
+		let Some(receiver) = receiver else {
+			return TurnAckDecision::default();
+		};
+		tokio::select! {
+			decision = receiver => decision.unwrap_or_default(),
+			() = cancellation_token.cancelled() => TurnAckDecision::default(),
+		}
+	}
+
+	/// Apply a session-owner rewrite to the live conversation. A replacement
+	/// keeps the leading system message; an in-memory cut prefers the
+	/// checkpoint tool-call anchor and falls back to a pair-safe `keep`.
+	fn apply_turn_rewrite(&self, messages: &mut Vec<Message>, decision: TurnAckDecision) -> bool {
+		apply_turn_decision(messages, decision)
+	}
+
 	/// Run turns without emitting live events.
 	pub async fn run_dialog(
 		&self,
@@ -385,6 +646,7 @@ impl AgentLoop {
 					&mut pending_injections,
 				)
 				.await?;
+			let turn_start = state.messages.len();
 			state.messages.push(assistant.clone());
 			state.total_turns += 1;
 
@@ -466,6 +728,7 @@ impl AgentLoop {
 				}
 				soft.force_next = true;
 				soft.escalations += 1;
+				let ack_rx = self.begin_turn_ack(turn_start, state.messages.len());
 				if let Some(events_sink) = events.as_ref() {
 					let _ = events_sink
 						.send(AgentEvent::TurnEnd {
@@ -475,6 +738,8 @@ impl AgentLoop {
 						})
 						.await;
 				}
+				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
+				self.apply_turn_rewrite(&mut state.messages, decision);
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: results,
@@ -487,6 +752,7 @@ impl AgentLoop {
 				for message in pending_injections {
 					state.messages.push(Message::user(message));
 				}
+				let ack_rx = self.begin_turn_ack(turn_start, state.messages.len());
 				if let Some(events_sink) = events.as_ref() {
 					let _ = events_sink
 						.send(AgentEvent::TurnEnd {
@@ -496,11 +762,16 @@ impl AgentLoop {
 						})
 						.await;
 				}
+				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
+				let continue_turn = self.apply_turn_rewrite(&mut state.messages, decision);
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: Vec::new(),
-					is_completed: true,
+					is_completed: !continue_turn,
 				});
+				if continue_turn && !cancellation_token.is_cancelled() {
+					continue;
+				}
 				return Ok(turn_results);
 			}
 
@@ -568,6 +839,7 @@ impl AgentLoop {
 				TurnStatus::ToolUse
 			};
 
+			let ack_rx = self.begin_turn_ack(turn_start, state.messages.len());
 			if let Some(events_sink) = events.as_ref() {
 				let _ = events_sink
 					.send(AgentEvent::TurnEnd {
@@ -577,6 +849,8 @@ impl AgentLoop {
 					})
 					.await;
 			}
+			let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
+			let _ = self.apply_turn_rewrite(&mut state.messages, decision);
 
 			let should_terminate = outcome.results.iter().any(|r| r.terminate);
 
@@ -898,5 +1172,161 @@ impl AgentLoop {
 			}
 		};
 		Ok(message)
+	}
+}
+
+#[cfg(test)]
+mod live_cut_tests {
+	use super::*;
+	use crate::state::ToolCall;
+
+	fn call(id: &str, name: &str) -> ToolCall {
+		ToolCall {
+			id: id.to_string(),
+			name: name.to_string(),
+			arguments: serde_json::json!({}),
+		}
+	}
+
+	#[test]
+	fn anchor_cuts_after_checkpoint_ignoring_stale_keep() {
+		let mut messages = vec![
+			Message::system("sys"),
+			Message::user("investigate"),
+			Message::assistant_with_tools("", vec![call("cp", "checkpoint")]),
+			Message::tool_with_status("cp", "checkpoint", "Checkpoint: map it", false),
+			Message::user("injected boundary"),
+			Message::assistant("steering answer"),
+			Message::user("wrap up"),
+			Message::assistant_with_tools("", vec![call("rw", "rewind")]),
+			Message::tool_with_status("rw", "rewind", "Rewind requested.", false),
+		];
+		let rewind = InMemoryRewind {
+			keep: 7,
+			checkpoint_tool_call_id: Some("cp".to_string()),
+			summary: "Summary".to_string(),
+			report: "Report".to_string(),
+		};
+		apply_in_memory_cut(&mut messages, &rewind);
+		let text = messages
+			.iter()
+			.map(|message| message.content.as_str())
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(text.contains("Checkpoint: map it"));
+		assert!(text.contains("Report"));
+		assert!(!text.contains("injected"));
+		assert!(!text.contains("steering"));
+		assert_eq!(messages.last().expect("report").role, Role::System);
+	}
+
+	#[test]
+	fn missing_anchor_fallback_does_not_split_tool_batch() {
+		let mut messages = vec![
+			Message::system("sys"),
+			Message::user("investigate"),
+			Message::assistant_with_tools("", vec![call("a", "read")]),
+			Message::tool_with_status("a", "read", "first", false),
+			Message::tool_with_status("a", "read", "second", false),
+		];
+		let rewind = InMemoryRewind {
+			keep: 3,
+			checkpoint_tool_call_id: Some("compacted-away".to_string()),
+			summary: String::new(),
+			report: String::new(),
+		};
+		apply_in_memory_cut(&mut messages, &rewind);
+		assert_eq!(messages.len(), 5, "whole tool batch retained");
+		assert_eq!(messages[2].tool_calls[0].id, "a");
+		assert_eq!(messages[3].tool_call_id.as_deref(), Some("a"));
+		assert_eq!(messages[4].tool_call_id.as_deref(), Some("a"));
+	}
+
+	#[test]
+	fn missing_anchor_fallback_drops_dangling_trailing_call() {
+		let mut messages = vec![
+			Message::system("sys"),
+			Message::user("investigate"),
+			Message::assistant_with_tools("", vec![call("x", "read")]),
+		];
+		let rewind = InMemoryRewind {
+			keep: 3,
+			checkpoint_tool_call_id: Some("compacted-away".to_string()),
+			summary: String::new(),
+			report: String::new(),
+		};
+		apply_in_memory_cut(&mut messages, &rewind);
+		assert_eq!(messages.len(), 2);
+		assert_eq!(messages.last().expect("user").role, Role::User);
+	}
+
+	#[test]
+	fn anchored_cut_keeps_sibling_results_of_checkpoint_batch() {
+		let mut messages = vec![
+			Message::system("sys"),
+			Message::user("investigate"),
+			Message::assistant_with_tools(
+				"",
+				vec![call("cp", "checkpoint"), call("read", "read")],
+			),
+			Message::tool_with_status("cp", "checkpoint", "Checkpoint: map it", false),
+			Message::tool_with_status("read", "read", "sibling contents", false),
+			Message::assistant("secret exploration"),
+		];
+		let rewind = InMemoryRewind {
+			keep: 3,
+			checkpoint_tool_call_id: Some("cp".to_string()),
+			summary: "Retained summary".to_string(),
+			report: "Retained report".to_string(),
+		};
+		apply_in_memory_cut(&mut messages, &rewind);
+		let text = messages
+			.iter()
+			.map(|message| message.content.as_str())
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(text.contains("sibling contents"), "sibling result kept");
+		assert!(text.contains("Checkpoint: map it"));
+		assert!(!text.contains("secret"), "later exploration cut");
+		assert_eq!(messages.last().expect("report").content, "Retained report");
+	}
+
+	#[test]
+	fn compacted_away_anchor_replaced_from_mirror_in_current_run() {
+		// The owner's uncompacted retained branch (mirror after its cut).
+		let retained = vec![
+			Message::user("investigate"),
+			Message::assistant_with_tools("", vec![call("cp", "checkpoint")]),
+			Message::tool_with_status("cp", "checkpoint", "Checkpoint: map it", false),
+			Message::user("Retained summary"),
+			Message::system("Retained report"),
+		];
+		// Compaction pruned the checkpoint result: no live anchor remains.
+		let mut live = vec![
+			Message::system("sys"),
+			Message::system("[System notice: earlier turns pruned]"),
+			Message::user("exploration"),
+			Message::assistant("secret exploration"),
+		];
+		assert!(
+			live.iter()
+				.all(|message| message.tool_call_id.as_deref() != Some("cp"))
+		);
+		let decision = TurnAckDecision {
+			rewrite: Some(TurnRewrite::Replace(retained.clone())),
+			continue_turn: false,
+			warning: None,
+		};
+		assert!(apply_turn_decision(&mut live, decision));
+		assert_eq!(live.first().expect("system").content, "sys");
+		let text = live
+			.iter()
+			.map(|message| message.content.as_str())
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(text.contains("Checkpoint: map it"));
+		assert!(text.contains("Retained report"));
+		assert!(!text.contains("exploration"));
+		assert!(!text.contains("secret"));
 	}
 }

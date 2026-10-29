@@ -172,6 +172,35 @@ pub fn resolve_file_display_mode(
 	}
 }
 
+/// Independent display and wire-contract selection for one session/model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedSessionTools {
+	/// Display inputs for `read`/`ast_grep`/`ast_edit` (model-variant precedence).
+	pub display:    crate::tools::read::FileDisplayInputs,
+	/// `edit` wire contract; a valid `PI_EDIT_VARIANT` pins it over model variants
+	/// (upstream constructor semantics), otherwise it equals `display.edit_mode`.
+	pub edit_tool:  EditMode,
+}
+
+/// Host-injected settings resolution. `pi-agent` has no config/env access, so
+/// the CLI supplies one implementation per registry build; children resolve
+/// again with their own selected model.
+pub trait SessionDisplayResolver: Send + Sync {
+	fn resolve(&self, active_model: Option<&str>, has_edit_tool: bool) -> ResolvedSessionTools;
+}
+
+/// Config-free fallback used by builtin registries and tests.
+pub fn default_session_tools(has_edit_tool: bool) -> ResolvedSessionTools {
+	ResolvedSessionTools {
+		display:   crate::tools::read::FileDisplayInputs::new(
+			DEFAULT_EDIT_MODE,
+			has_edit_tool,
+			false,
+		),
+		edit_tool: DEFAULT_EDIT_MODE,
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

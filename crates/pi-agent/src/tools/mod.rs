@@ -1,6 +1,8 @@
 pub mod ask;
 pub mod ast_edit;
 pub mod ast_grep;
+pub mod checkpoint;
+pub mod edit_variants;
 pub mod hashline;
 pub mod hub;
 pub mod pending;
@@ -17,6 +19,9 @@ pub mod yield_tool;
 pub use ask::AskTool;
 pub use ast_edit::{AstEditTool, PreviewDisplay};
 pub use ast_grep::AstGrepTool;
+pub use checkpoint::{
+	CheckpointController, CheckpointState, CheckpointTool, CompletedRewindState, RewindTool,
+};
 pub use hub::HubTool;
 pub use pending::{PendingAction, PendingStore, REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH};
 pub use read::{ReadSnapshotSink, ReadTool};
@@ -75,12 +80,20 @@ pub enum ToolError {
 	ExecutionFailed(String),
 	#[error("Operation aborted: {0}")]
 	Aborted(String),
+	/// Upstream `ToolError.render()` text, surfaced verbatim (no prefix).
+	#[error("{0}")]
+	Rejected(String),
 }
 
 /// Dynamic trait implemented by all agent tools.
 #[async_trait]
 pub trait Tool: Send + Sync {
 	fn name(&self) -> &str;
+	/// Model-facing name when it differs from the registry key (upstream
+	/// `customWireName`); `None` advertises [`Tool::name`].
+	fn wire_name(&self) -> Option<&str> {
+		None
+	}
 	fn description(&self) -> &str;
 	fn schema(&self) -> Value;
 	fn is_exclusive(&self) -> bool {
@@ -246,12 +259,21 @@ fn bash_timeout_ms(raw: Option<&Value>) -> Result<Option<u32>, ToolError> {
 	Ok(Some((clamped * 1000.0).round() as u32))
 }
 
-/// Reject foreground arguments whose TypeScript semantics live in a separate
-/// subsystem. Background (`async`) is routed to the shared process manager
-/// before this check; a *foreground* PTY needs the interactive terminal bridge
-/// this headless tool does not own (supervised PTYs run via `hub start` or
-/// `bash async` with `pty:true`). `timeout_ms` is the removed legacy spelling.
-fn reject_unsupported_bash_args(args: &Value) -> Result<(), ToolError> {
+/// Reject arguments whose TypeScript semantics live in a separate subsystem.
+/// `timeout_ms` is the removed legacy spelling and is rejected in both run
+/// modes; a *foreground* PTY needs the interactive terminal bridge this
+/// headless tool does not own (supervised PTYs run via `hub start` or `bash
+/// async` with `pty:true`). Background PTYs are validated by
+/// `execute_background` before the supervisor starts the process.
+fn reject_unsupported_bash_args(args: &Value, run_async: bool) -> Result<(), ToolError> {
+	if args.get("timeout_ms").is_some() {
+		return Err(ToolError::InvalidArguments(
+			"'timeout_ms' was removed; pass 'timeout' in seconds".to_string(),
+		));
+	}
+	if run_async {
+		return Ok(());
+	}
 	match args.get("pty") {
 		None | Some(Value::Null) => {},
 		Some(value) if value.as_bool() == Some(false) => {},
@@ -260,11 +282,6 @@ fn reject_unsupported_bash_args(args: &Value) -> Result<(), ToolError> {
 				"Foreground 'pty' needs an interactive terminal UI; use hub start with pty:true (or async bash with pty:true) for a PTY-backed process".to_string(),
 			));
 		},
-	}
-	if args.get("timeout_ms").is_some() {
-		return Err(ToolError::InvalidArguments(
-			"'timeout_ms' was removed; pass 'timeout' in seconds".to_string(),
-		));
 	}
 	Ok(())
 }
@@ -451,11 +468,11 @@ impl Tool for BashTool {
 				.as_bool()
 				.ok_or_else(|| ToolError::InvalidArguments("'async' must be a boolean".to_string()))?,
 		};
+		reject_unsupported_bash_args(args, run_async)?;
 		if run_async {
 			return self.execute_background(command, args, ctx).await;
 		}
 
-		reject_unsupported_bash_args(args)?;
 		let timeout_ms = bash_timeout_ms(args.get("timeout"))?;
 		let env = bash_env(args.get("env"), &ctx.env)?;
 		let cwd_arg = match args.get("cwd") {
@@ -957,6 +974,10 @@ pub struct EditTool {
 	registers: Mutex<BTreeMap<String, Vec<String>>>,
 	noop_guard: hashline::edit::NoopGuard,
 	options: Mutex<hashline::edit::EditToolOptions>,
+	/// Active wire contract. Mutable because a root turn keeps one instance
+	/// (CUT registers, no-op guard, store identity) across REPL turns while the
+	/// selector may follow the active model; upstream resolves lazily too.
+	mode: Mutex<edit_variants::EditMode>,
 }
 
 impl EditTool {
@@ -966,11 +987,21 @@ impl EditTool {
 
 	/// Construct with explicit knobs (e.g. `enforce_seen_lines = false`).
 	pub fn with_options(store: Arc<hashline::SnapshotStore>, options: hashline::edit::EditToolOptions) -> Self {
+		Self::with_mode(store, options, edit_variants::DEFAULT_EDIT_MODE)
+	}
+
+	/// Construct with a pinned mode (env-pinned or resolved per session).
+	pub fn with_mode(
+		store: Arc<hashline::SnapshotStore>,
+		options: hashline::edit::EditToolOptions,
+		mode: edit_variants::EditMode,
+	) -> Self {
 		Self {
 			store,
 			registers: Mutex::new(BTreeMap::new()),
 			noop_guard: Mutex::new(BTreeMap::new()),
 			options: Mutex::new(options),
+			mode: Mutex::new(mode),
 		}
 	}
 
@@ -978,6 +1009,15 @@ impl EditTool {
 	/// registers or the no-op guard this instance carries.
 	pub fn set_options(&self, options: hashline::edit::EditToolOptions) {
 		*self.options.lock().unwrap_or_else(|poison| poison.into_inner()) = options;
+	}
+
+	pub fn mode(&self) -> edit_variants::EditMode {
+		*self.mode.lock().unwrap_or_else(|poison| poison.into_inner())
+	}
+
+	/// Refresh the wire contract for a later turn without dropping state.
+	pub fn set_mode(&self, mode: edit_variants::EditMode) {
+		*self.mode.lock().unwrap_or_else(|poison| poison.into_inner()) = mode;
 	}
 }
 
@@ -987,21 +1027,35 @@ impl Tool for EditTool {
 		"edit"
 	}
 
+	fn wire_name(&self) -> Option<&str> {
+		match self.mode() {
+			edit_variants::EditMode::ApplyPatch => Some("apply_patch"),
+			_ => None,
+		}
+	}
+
 	fn description(&self) -> &str {
-		"Apply hashline sections to existing files; anchors must carry the 4-hex snapshot tag from the latest read"
+		edit_variants::contract(self.mode()).map_or(
+			"Apply hashline sections to existing files; anchors must carry the 4-hex snapshot tag from the latest read",
+			|contract| contract.description,
+		)
 	}
 
 	fn schema(&self) -> Value {
-		serde_json::json!({
-			"type": "object",
-			"properties": {
-				"input": {
-					"type": "string",
-					"description": "One or more hashline sections: `[PATH#TAG]` headers followed by PUT/CUT/REM/MV ops. TAG is the 4-hex content-hash tag printed by the latest read/search/edit of that file. Line numbers index that tagged snapshot."
-				}
-			},
-			"required": ["input"]
-		})
+		edit_variants::contract(self.mode())
+			.map(|contract| contract.schema())
+			.unwrap_or_else(|| {
+				serde_json::json!({
+					"type": "object",
+					"properties": {
+						"input": {
+							"type": "string",
+							"description": "One or more hashline sections: `[PATH#TAG]` headers followed by PUT/CUT/REM/MV ops. TAG is the 4-hex content-hash tag printed by the latest read/search/edit of that file. Line numbers index that tagged snapshot."
+						}
+					},
+					"required": ["input"]
+				})
+			})
 	}
 
 	fn is_exclusive(&self) -> bool {
@@ -1009,6 +1063,10 @@ impl Tool for EditTool {
 	}
 
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+		let mode = self.mode();
+		if mode != edit_variants::EditMode::Hashline {
+			return edit_variants::execute(mode, args, ctx).await;
+		}
 		let options = *self.options.lock().unwrap_or_else(|poison| poison.into_inner());
 		hashline::execute(self.store.as_ref(), &self.registers, &self.noop_guard, &options, args, ctx).await
 	}
@@ -1927,20 +1985,20 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
 	let snapshots = Arc::new(hashline::SnapshotStore::new());
 	let sink = Arc::new(hashline::NativeSnapshotSink::new(snapshots.clone()));
 	let pending = Arc::new(pending::PendingStore::new());
+	// Config-free default: hashline, `edit` mounted, no plain line numbers.
+	let display = edit_variants::default_session_tools(true).display;
 	vec![
 		Arc::new(BashTool::new()),
-		Arc::new(ReadTool::with_snapshot_sink(sink)),
+		Arc::new(ReadTool::with_snapshot_sink(sink.clone()).with_display_inputs(display)),
 		Arc::new(WriteTool::with_pending(Arc::clone(&pending))),
 		Arc::new(EditTool::new(Arc::clone(&snapshots))),
 		Arc::new(GlobTool),
 		Arc::new(GrepTool),
-		Arc::new(AstGrepTool),
-		// Upstream's default `edit.mode` is `hashline`, and `read` here always
-		// displays hashline headers, so the builtin preview matches it.
-		Arc::new(AstEditTool::with_display(
+		Arc::new(AstGrepTool::with_snapshot_sink(sink).with_display_inputs(display)),
+		Arc::new(AstEditTool::with_display_inputs(
 			snapshots,
 			pending,
-			PreviewDisplay::Hashline,
+			display,
 		)),
 		Arc::new(TodoTool::new()),
 	]

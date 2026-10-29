@@ -287,6 +287,41 @@ fn bootstrap_rejects_bad_profile_values_before_clap() {
 }
 
 #[test]
+fn registered_subcommands_pass_profile_flags_to_clap_validation() {
+	let root = temp_dir("subcommand-flags");
+	let home = root.join("home");
+	let work = root.join("work");
+	fs::create_dir_all(&home).expect("home");
+	fs::create_dir_all(&work).expect("work");
+	fs::write(work.join("file.txt"), "hello").expect("file");
+
+	let run = |args: &[&str], profile: Option<&str>| {
+		let mut cmd = omp();
+		isolated(&mut cmd, &root, &home);
+		cmd.current_dir(&work).env("SHELL", "/bin/bash");
+		if let Some(profile) = profile {
+			cmd.env("OMP_PROFILE", profile);
+		}
+		cmd.args(args).output().expect("run")
+	};
+
+	// `read` is a registered subcommand, so `--alias` reaches clap and is
+	// rejected: it must never install a shell shortcut into the user's rc file.
+	let before = snapshot(&home);
+	let alias = run(&["read", "--alias", "wk", "file.txt"], Some("work"));
+	assert_ne!(alias.status.code(), Some(0), "stdout: {}", stdout(&alias));
+	assert!(stderr(&alias).contains("--alias"), "stderr: {}", stderr(&alias));
+	assert_eq!(snapshot(&home), before, "`read --alias` must not write rc files");
+
+	// Likewise `--profile` stays with the command instead of being cracked out
+	// and activated globally.
+	let profile = run(&["read", "--profile", "work", "file.txt"], None);
+	assert_ne!(profile.status.code(), Some(0), "stdout: {}", stdout(&profile));
+	assert!(stderr(&profile).contains("--profile"), "stderr: {}", stderr(&profile));
+	fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn profile_flag_selects_the_profiled_agent_dir() {
 	let root = temp_dir("profile-path");
 	let home = root.join("home");

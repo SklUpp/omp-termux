@@ -1,11 +1,13 @@
 //! Tool approval matrix (`--approval-mode`, `--allow`).
 //!
-//! `always-ask` prompts on stdin, `write` auto-approves read-only tools,
-//! `yolo` approves everything; an explicit `--allow <tool>` always approves
-//! that tool. Mirrors `packages/coding-agent` approval semantics.
+//! `always-ask` auto-approves the read tier and prompts on stdin for writes and
+//! execs, `write` auto-approves read-only tools, and `yolo` approves everything;
+//! an explicit `--allow <tool>` always approves that tool. Mirrors
+//! `packages/coding-agent` approval semantics.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use clap::ValueEnum;
@@ -14,11 +16,11 @@ use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum ApprovalMode {
-	/// Ask before every tool call.
+	/// Auto-approve read-tier tools; ask before write/exec calls.
 	#[default]
 	#[value(name = "always-ask")]
 	AlwaysAsk,
-	/// Auto-approve read-only tools, ask for writes/execs.
+	/// Auto-approve read-tier tools; ask before write/exec calls.
 	/// Note: In TS `approval.ts`, `write` mode approves up to `write` tier.
 	/// The Android headless parity plan explicitly defines `write` mode as
 	/// read-only auto-permitted, requiring explicit approval for writes and execs.
@@ -123,7 +125,7 @@ pub fn classify_tool(name: &str, args: &serde_json::Value) -> ToolTier {
 				ToolTier::Write
 			}
 		},
-		"edit" => {
+		"edit" | "apply_patch" => {
 			if has_ssh_target(args) {
 				ToolTier::Exec
 			} else {
@@ -159,12 +161,17 @@ pub fn extract_tool_detail(name: &str, args: &serde_json::Value) -> Option<Strin
 	}
 }
 
+pub type ApprovalInput = std::sync::Arc<std::sync::Mutex<Box<dyn BufRead + Send>>>;
+
 #[derive(Clone, Default)]
 pub struct Approvals {
 	pub mode: ApprovalMode,
 	pub allow: BTreeSet<String>,
 	/// Interactive `ask` surface; absent in headless runs and child agents.
 	pub ask: Option<std::sync::Arc<dyn pi_agent::tools::ask::AskChannel>>,
+	/// Injected approval input (tests, embedders). `None` reads the process
+	/// terminal, which stays interactive-only.
+	input: Option<ApprovalInput>,
 }
 
 impl std::fmt::Debug for Approvals {
@@ -173,6 +180,7 @@ impl std::fmt::Debug for Approvals {
 			.field("mode", &self.mode)
 			.field("allow", &self.allow)
 			.field("has_ask", &self.ask.is_some())
+			.field("has_input", &self.input.is_some())
 			.finish()
 	}
 }
@@ -180,7 +188,19 @@ impl std::fmt::Debug for Approvals {
 impl Approvals {
 	#[must_use]
 	pub fn new(mode: ApprovalMode, allow: impl IntoIterator<Item = String>) -> Self {
-		Self { mode, allow: allow.into_iter().collect(), ask: None }
+		Self { mode, allow: allow.into_iter().collect(), ask: None, input: None }
+	}
+
+	/// Install or clear an injected approval input. Injected input never consults
+	/// the process terminal, so tests and embedders control the answer.
+	pub fn set_input(&mut self, input: Option<ApprovalInput>) {
+		self.input = input;
+	}
+
+	#[must_use]
+	pub fn with_input(mut self, input: Option<ApprovalInput>) -> Self {
+		self.set_input(input);
+		self
 	}
 
 	/// Install or clear the interactive `ask` surface.
@@ -211,18 +231,29 @@ impl Approvals {
 	}
 
 	/// Resolve approval decision given explicit tool tier.
+	///
+	/// Both non-yolo modes auto-approve the `read` tier, matching
+	/// `APPROVAL_MODE_MAX_TIER` upstream: `always-ask` permits reads and prompts
+	/// for writes/execs; this port's `write` mode deliberately stays
+	/// read-only-auto and prompts for writes/execs.
+	///
+	/// The `apply_patch` wire name also matches an explicit allow for its
+	/// internal tool name `edit`; the raw name is checked first so an explicit
+	/// `--allow apply_patch` keeps working.
 	#[must_use]
 	pub fn decide_tier(&self, tool: &str, tier: ToolTier) -> Decision {
-		if self.allow.contains(tool) || self.mode == ApprovalMode::Yolo {
+		let allowed =
+			self.allow.contains(tool) || (tool == "apply_patch" && self.allow.contains("edit"));
+		if allowed || self.mode == ApprovalMode::Yolo {
 			return Decision::Auto;
 		}
-		if tier == ToolTier::Read && self.mode == ApprovalMode::Write {
+		if tier == ToolTier::Read {
 			return Decision::Auto;
 		}
 		Decision::Ask
 	}
 
-	/// Pure matrix: explicit allow, then `yolo`, then read-only under `write`.
+	/// Pure matrix: explicit allow, then `yolo`, then the `read` tier.
 	#[must_use]
 	pub fn decide(&self, tool: &str, read_only: bool) -> Decision {
 		let tier = if read_only { ToolTier::Read } else { ToolTier::Write };
@@ -241,10 +272,7 @@ impl Approvals {
 		if self.decide(tool, read_only) == Decision::Auto {
 			return Ok(true);
 		}
-		match detail {
-			Some(detail) => write!(prompt, "Approve {tool} ({detail})? [y/N] ")?,
-			None => write!(prompt, "Approve {tool}? [y/N] ")?,
-		}
+		write!(prompt, "{}", approval_prompt(tool, detail))?;
 		prompt.flush()?;
 		let mut line = String::new();
 		if input.read_line(&mut line)? == 0 {
@@ -263,10 +291,28 @@ impl pi_agent::ToolApprover for Approvals {
 
 	async fn approve(&self, name: &str, args: &serde_json::Value) -> std::result::Result<(), String> {
 		let tier = classify_tool(name, args);
-		let decision = self.decide_tier(name, tier);
-		match decision {
+		match self.decide_tier(name, tier) {
 			Decision::Auto => Ok(()),
 			Decision::Ask => {
+				let detail = extract_tool_detail(name, args);
+				if let Some(input) = self.input.clone() {
+					// Injected input: never consults the process terminal and never
+					// blocks a runtime worker waiting on a real operator.
+					let mut input =
+						input.lock().map_err(|_| "approval input poisoned".to_string())?;
+					let mut prompt = std::io::stderr().lock();
+					return match self.confirm(
+						name,
+						tier == ToolTier::Read,
+						detail.as_deref(),
+						&mut *input,
+						&mut prompt,
+					) {
+						Ok(true) => Ok(()),
+						Ok(false) => Err(format!("approval denied for {name}")),
+						Err(err) => Err(err.to_string()),
+					};
+				}
 				use std::io::IsTerminal;
 				// In non-interactive environments (pipes, /dev/null, daemons, background),
 				// closed stdin cannot prompt the operator; deny immediately before side effects.
@@ -275,18 +321,71 @@ impl pi_agent::ToolApprover for Approvals {
 				if !std::io::stdin().is_terminal() {
 					return Err("approval required but stdin closed".to_string());
 				}
-				let detail = extract_tool_detail(name, args);
-				let mut stdin = std::io::stdin().lock();
-				let mut stderr = std::io::stderr().lock();
-				let read_only = tier == ToolTier::Read;
-				match self.confirm(name, read_only, detail.as_deref(), &mut stdin, &mut stderr) {
-					Ok(true) => Ok(()),
-					Ok(false) => Err(format!("approval denied for {name}")),
-					Err(err) => Err(err.to_string()),
+				eprint!("{}", approval_prompt(name, detail.as_deref()));
+				let _ = std::io::stderr().flush();
+				let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+				// Dropping the approval future (turn cancellation) flips this flag;
+				// the reader stops polling stdin instead of eating the next prompt.
+				let _abort = PromptAbort(std::sync::Arc::clone(&cancelled));
+				let answer = tokio::task::spawn_blocking(move || read_prompt_answer(cancelled)).await;
+				match answer {
+					Ok(Ok(true)) => Ok(()),
+					Ok(Ok(false)) => Err(format!("approval denied for {name}")),
+					Ok(Err(err)) => Err(err),
+					Err(err) => Err(format!("approval prompt failed: {err}")),
 				}
 			},
 		}
 	}
+}
+
+fn approval_prompt(tool: &str, detail: Option<&str>) -> String {
+	match detail {
+		Some(detail) => format!("Approve {tool} ({detail})? [y/N] "),
+		None => format!("Approve {tool}? [y/N] "),
+	}
+}
+
+/// Flags a dropped approval future so its blocking stdin reader stops polling.
+struct PromptAbort(std::sync::Arc<AtomicBool>);
+
+impl Drop for PromptAbort {
+	fn drop(&mut self) {
+		self.0.store(true, Ordering::SeqCst);
+	}
+}
+
+/// Read one approval line without blocking cancellation for the whole line.
+/// Returns `Err` only when stdin is closed before an answer; an empty line is a
+/// denial. The cancellation flag is checked before every read so a cancelled
+/// prompt never consumes input intended for the next prompt.
+fn read_prompt_answer(cancelled: std::sync::Arc<AtomicBool>) -> std::result::Result<bool, String> {
+	let mut buf: Vec<u8> = Vec::new();
+	loop {
+		if cancelled.load(Ordering::SeqCst) {
+			return Ok(false);
+		}
+		#[cfg(unix)]
+		{
+			if crate::runtime::poll_stdin_readable(100) {
+				if cancelled.load(Ordering::SeqCst) {
+					return Ok(false);
+				}
+				match crate::runtime::read_stdin_byte() {
+					Some(b'\n') => break,
+					Some(b'\r') => {},
+					Some(byte) => buf.push(byte),
+					None => return Err("approval required but stdin closed".to_string()),
+				}
+			}
+		}
+		#[cfg(not(unix))]
+		{
+			return Err("approval prompt requires a POSIX terminal".to_string());
+		}
+	}
+	let answer = String::from_utf8_lossy(&buf).trim().to_ascii_lowercase();
+	Ok(matches!(answer.as_str(), "y" | "yes"))
 }
 #[cfg(test)]
 mod tests {
@@ -299,9 +398,9 @@ mod tests {
 	}
 
 	#[test]
-	fn matrix_matches_typescript_semantics() {
+	fn matrix_auto_approves_read_and_prompts_side_effects() {
 		let ask = approvals(ApprovalMode::AlwaysAsk, &[]);
-		assert_eq!(ask.decide("read", true), Decision::Ask);
+		assert_eq!(ask.decide("read", true), Decision::Auto);
 		assert_eq!(ask.decide("bash", false), Decision::Ask);
 
 		let auto = approvals(ApprovalMode::AlwaysAsk, &["bash"]);

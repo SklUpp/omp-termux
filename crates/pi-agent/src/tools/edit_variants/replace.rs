@@ -249,6 +249,7 @@ pub(crate) fn find_match(
 				matched: Some(best.clone()),
 				closest: Some(best),
 				occurrences: 1,
+				occurrence_previews: Vec::new(),
 				fuzzy_matches: above_threshold,
 				dominant: true,
 			};

@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
 	bridge::Bridge,
-	kernel::Kernel,
+	kernel::{Kernel, KernelSpawn},
 	languages,
 	output::DEFAULT_MAX_BYTES,
 	session::{KernelKey, SessionRegistry, normalize_cwd},
@@ -310,7 +310,16 @@ impl EvalRuntime {
 	}
 
 	/// Resolve the interpreter (bounded probe, cached) and acquire/replace the
-	/// retained kernel for one owner/session key.
+	/// kernel for one owner/session key.
+	///
+	/// In `per-call` mode a fresh unregistered kernel is started for this
+	/// invocation (upstream `executePerCall`); otherwise the retained registry
+	/// slot is reused/replaced.
+	///
+	/// Probe/startup run under `cancellation` (the caller's real token) with
+	/// `probe_timeout_ms` bounding discovery only. The cell watchdog is armed by
+	/// the caller *after* this returns, so probe/startup time is not charged to
+	/// the cell and an external abort during startup is reported as aborted.
 	pub async fn kernel_for_session(
 		&self,
 		language: EvalLanguage,
@@ -319,6 +328,7 @@ impl EvalRuntime {
 		cwd: &Path,
 		ambient_env: &HashMap<String, String>,
 		reset: bool,
+		probe_timeout_ms: Option<u64>,
 		cancellation: CancellationToken,
 	) -> Result<std::sync::Arc<Kernel>, EvalError> {
 		let interpreter = self.settings.interpreters.for_language(language);
@@ -329,27 +339,48 @@ impl EvalRuntime {
 			ambient_env,
 			interpreter,
 			&cancellation,
-			Some(self.settings.probe_timeout_ms),
+			probe_timeout_ms,
 		)
 		.await?;
-		let key = KernelKey {
-			language,
-			owner: owner.map(str::to_string),
-			session_id: session_id.to_string(),
-			cwd: cwd.clone(),
-			interpreter: Some(runtime.program.display().to_string()),
-		};
 		let endpoint = self.bridge.endpoint();
 		let extra_env = HashMap::from([
 			("PI_TOOL_BRIDGE_URL".to_string(), endpoint.url.clone()),
 			("PI_TOOL_BRIDGE_TOKEN".to_string(), endpoint.token.clone()),
 			("PI_TOOL_BRIDGE_SESSION".to_string(), self.bridge_session_id.clone()),
 		]);
-		let effective_reset = reset || matches!(self.settings.kernel_mode, KernelMode::PerCall);
-		self
+		// Upstream `executePerCall` never touches the session registry: each call
+		// owns a fresh kernel and shuts it down in `finally`. Sharing a registry
+		// slot made concurrent cells reset/dispose each other's kernels.
+		if matches!(self.settings.kernel_mode, KernelMode::PerCall) {
+			let spawn = KernelSpawn { language, runtime, cwd, extra_env };
+			return match Kernel::start(spawn, cancellation.clone()).await {
+				Ok(kernel) => Ok(std::sync::Arc::new(kernel)),
+				Err(EvalError::Kernel(_)) if cancellation.is_cancelled() => Err(EvalError::Aborted(format!(
+					"{} kernel startup was cancelled",
+					language.display_name()
+				))),
+				Err(error) => Err(error),
+			};
+		}
+		let key = KernelKey {
+			language,
+			owner: owner.map(str::to_string),
+			session_id: session_id.to_string(),
+			cwd,
+			interpreter: Some(runtime.program.display().to_string()),
+		};
+		match self
 			.registry
-			.acquire(key, runtime, extra_env, effective_reset, cancellation)
+			.acquire(key, runtime, extra_env, reset, cancellation.clone())
 			.await
+		{
+			Ok(kernel) => Ok(kernel),
+			Err(EvalError::Kernel(_)) if cancellation.is_cancelled() => Err(EvalError::Aborted(format!(
+				"{} kernel startup was cancelled",
+				language.display_name()
+			))),
+			Err(error) => Err(error),
+		}
 	}
 
 	pub async fn dispose_owner(&self, owner: Option<&str>) {
@@ -381,10 +412,18 @@ pub fn session_cwd(ctx_cwd: &Path, env: &HashMap<String, String>) -> PathBuf {
 }
 
 /// Delay used by the auto-background wait race.
+///
+/// Mirrors `resolveAutoBackgroundWaitMs`: the cell is backgrounded one second
+/// before its own timeout so a deadline expiry resolves inline, never just
+/// after the watchdog killed the cell. `0` means background immediately.
 pub fn background_wait(threshold_ms: u64, cell_timeout_ms: Option<u64>) -> u64 {
+	const TIMEOUT_BUFFER_MS: u64 = 1_000;
+	if threshold_ms == 0 {
+		return 0;
+	}
 	match cell_timeout_ms {
 		Some(0) | None => threshold_ms,
-		Some(timeout) => threshold_ms.min(timeout),
+		Some(timeout) => threshold_ms.min(timeout.saturating_sub(TIMEOUT_BUFFER_MS)),
 	}
 }
 
@@ -426,9 +465,12 @@ mod tests {
 	}
 
 	#[test]
-	fn background_wait_never_outlives_the_cell() {
-		assert_eq!(background_wait(60_000, Some(10_000)), 10_000);
+	fn background_wait_keeps_one_second_of_cell_budget() {
+		assert_eq!(background_wait(60_000, Some(10_000)), 9_000);
+		assert_eq!(background_wait(60_000, Some(30_000)), 29_000);
 		assert_eq!(background_wait(60_000, None), 60_000);
 		assert_eq!(background_wait(60_000, Some(0)), 60_000);
+		assert_eq!(background_wait(60_000, Some(500)), 0);
+		assert_eq!(background_wait(0, None), 0);
 	}
 }

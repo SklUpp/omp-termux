@@ -1,88 +1,70 @@
 # checkpoint
 
-> Mark the current top-level conversation state so later `rewind` can collapse exploratory context into a report.
+> Mark the current top-level conversation position so a later `rewind` can collapse exploratory context into a report.
 
 ## Source
-- Entry: `packages/coding-agent/src/tools/checkpoint.ts`
-- Model-facing prompt: `packages/coding-agent/src/prompts/tools/checkpoint.md`
-- Key collaborators:
-  - `packages/coding-agent/src/session/agent-session.ts` — captures the active checkpoint after tool success.
-  - `packages/coding-agent/src/session/session-manager.ts` — persists the normal session entry stream; not the active checkpoint marker.
-  - `packages/coding-agent/src/tools/index.ts` — registers the tool and gates it behind `checkpoint.enabled`.
-  - `packages/coding-agent/src/config/settings-schema.ts` — defines the disabled-by-default feature flag.
+- Tool: `crates/pi-agent/src/tools/checkpoint.rs` (`CheckpointTool`, `CheckpointController`).
+- Session host: `crates/omp-cli/src/session_checkpoint.rs` (`CheckpointHost`).
+- Branch persistence: `crates/omp-cli/src/session.rs` (`SessionStore::branch_with_summary`, `append_custom_message`).
+- Upstream anchors: `packages/coding-agent/src/tools/checkpoint.ts`, `packages/coding-agent/src/session/agent-session.ts`, `packages/coding-agent/src/session/checkpoint-entries.ts`.
 
 ## Registration / Visibility
-- Tool metadata: `approval = "read"`, `strict = true`, `loadMode = "discoverable"`. Execution is single-shot; the tool does not stream progress updates.
-- Registration requires `checkpoint.enabled = true` (default `false`).
-- Top-level sessions receive the tool when enabled. Subagents do not discover it by default, but may receive it through an explicit `tools:`/requested-tools list.
-- `checkpoint` and `rewind` are a safety pair: when either name is explicitly requested while the feature is enabled, registration automatically includes the other.
-- In an ordinary `tools.xdev` session, discoverable built-ins may be presented as `xd://checkpoint`; an explicitly requested tool remains top-level.
+- `approval = read`, strict arguments, discoverable built-in. Execution is single-shot; no progress updates, no job handle.
+- Gated by the shared `checkpoint.enabled` setting, default `false`.
+- `checkpoint` and `rewind` are a sister pair registered together whenever `checkpoint.enabled` is on; `--tools` selection does not split them.
+- Both tools are `is_exclusive`, so two `checkpoint` calls in one tool batch cannot both observe an empty state.
+- The controller is per session: construct one `CheckpointHost`, register `host.checkpoint_tool()` and `host.rewind_tool()`, and hand `Arc::clone(host.controller())` to the run request. Children never get these tools, so they cannot capture the root store.
 
 ## Inputs
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
-| `goal` | `string` | Yes | Investigation goal. Required by the schema and echoed unchanged in the tool result; the implementation does not trim it or reject an empty string. |
+| `goal` | `string` | Yes | Investigation goal. Echoed unchanged; not trimmed and not rejected when empty. |
+
+Unknown parameters and non-object arguments are rejected as invalid arguments.
 
 ## Outputs
-The tool returns a single text result plus structured details:
+Text body:
 
-- text body:
-  - `Checkpoint created.`
-  - `Goal: <goal>`
-  - `Run your investigation, then call rewind with a concise report.`
-- `details`:
-  - `goal: string`
-  - `startedAt: string` — ISO timestamp created inside `CheckpointTool.execute()`
+```text
+Checkpoint: <goal>
+Finish exploration and formulate findings.
+```
+
+`details`:
+
+- `goal: string`
+- `startedAt: string` — RFC 3339 UTC timestamp with milliseconds, generated inside `execute()`
 
 No checkpoint ID, artifact URI, job handle, file path, or restore token is returned.
 
 ## Flow
-1. Tool registration in `packages/coding-agent/src/tools/index.ts` enforces `checkpoint.enabled` and the top-level/explicit-subagent visibility rules. `CheckpointTool.createIf()` itself always constructs the tool.
-2. `CheckpointTool.execute()` rejects nested checkpoints with `ToolError("Checkpoint already active.")` when `session.getCheckpointState?.()` is already set.
-3. It creates `startedAt = new Date().toISOString()` and returns a normal `toolResult()` payload. The tool method itself does not mutate checkpoint state.
-4. On the later successful checkpoint tool-result event, `AgentSession` captures three runtime fields:
-   - `checkpointMessageCount` — current `agent.state.messages.length`, after the checkpoint tool result has already been appended
-   - `checkpointEntryId` — `sessionManager.getEntries().at(-1)?.id ?? null`, i.e. the last persisted session entry ID at checkpoint time
-   - `startedAt` — copied from tool details or regenerated
-5. `AgentSession` stores that object in `#checkpointState`, clears `#pendingRewindReport`, and clears the prior `#lastCompletedRewind`.
-6. On resume, session switch, or tree navigation, `#rehydrateCheckpointRewindState()` scans the current persisted branch. A most-recent successful checkpoint without a later retained rewind report reconstructs the active checkpoint boundary and guard.
+1. `CheckpointTool::execute()` rejects an open checkpoint with `Checkpoint already active.`.
+2. On success it records the live checkpoint synchronously (`note_checkpoint` with a placeholder message count and no entry id), so a `rewind` in the very next step already sees `checkpoint_state()`. If the request is abandoned before persistence, rehydration from the branch clears the phantom state on resume.
+3. The session persists the tool-call and tool-result message entries as usual.
+4. After `SessionStore::append_messages`, the host method `CheckpointHost::note_persisted_tool_results(store, &entries)` records:
+   - `goal` and `startedAt` from result details (falling back to the entry timestamp),
+   - the persisted checkpoint tool-result entry id,
+   - `checkpoint_message_count` = that entry's 1-based position in the log (the in-memory cut point; not the end of a multi-result batch).
+   It clears any pending rewind report and retained completed rewind. A replayed checkpoint result already followed by a retained rewind report on the branch is ignored.
+5. In no-session mode the same capture runs from the turn-end tool results (`note_unpersisted_tool_results`) using `turn_start`.
+6. `CheckpointHost::needs_rewind_before_yield()` reports an open checkpoint without a captured report. The turn-end ack reply sets `continue_turn` and `warning` from `yield_warning()`, so the loop runs another turn instead of finishing.
+7. On resume, session switch, or tree navigation, `CheckpointHost::rehydrate(&store)` scans the active branch (`SessionStore::branch_entries`) for the latest successful checkpoint result. A later retained `rewind-report` entry turns it into the completed-rewind guard instead.
 
 ## Side Effects
-- Session state (transcript, memory, jobs, checkpoints, registries)
-  - Sets `AgentSession.#checkpointState` in memory.
-  - Records the checkpoint boundary as a message count plus the persisted checkpoint tool-result entry ID.
-  - The ordinary successful tool-result entry is enough to reconstruct an unfinished checkpoint after resume; there is no separate checkpoint-marker entry.
-  - Enables the later settle guard: if a checkpoint is active and no rewind report is pending, `#enforceRewindBeforeYield()` injects a developer-role warning and schedules another turn.
-- User-visible prompts / interactive UI
-  - The tool result tells the model to call `rewind` after the investigation.
-  - If the agent tries to `yield` first, `AgentSession` injects:
-
-```text
-<system-warning>
-You are in an active checkpoint. You MUST call rewind with your investigation findings before yielding. Do NOT yield without completing the checkpoint.
-</system-warning>
-```
+- Runtime state: goal, message count, persisted entry id, timestamp (never written as its own entry).
+- A non-displayed `checkpoint-active-reminder` custom entry follows the checkpoint result so branch rebuilds replay the notice to the model; the rewind cut abandons it.
+- Nothing about the filesystem, git, artifacts, blobs, processes, or auth is captured or restored.
 
 ## Limits & Caps
-- Availability is gated by `checkpoint.enabled`, default `false`.
-- Only one active checkpoint is allowed per session or subagent.
-- Subagents require an explicit requested-tools entry; requesting either checkpoint tool auto-includes its sister.
-- Checkpoint state is not persisted as a dedicated entry. It is reconstructed from the successful checkpoint tool-result entry on the active branch, including after process resume.
-- Session persistence applies to the ordinary checkpoint tool-call/result messages. Global session persistence truncation is `MAX_PERSIST_CHARS = 500_000` in `packages/coding-agent/src/session/session-persistence.ts`.
+- Availability: `checkpoint.enabled`, default `false`.
+- One active checkpoint per session; there is no checkpoint list, label, or ID parameter.
+- Report/summary/report entries are subject to the normal session persistence rules.
 
 ## Errors
-- `ToolError("Checkpoint already active.")` — thrown when a prior checkpoint has not been rewound or cleared.
-- The tool body has no local `try/catch`; unexpected exceptions propagate.
+- `Checkpoint already active.` — an earlier checkpoint has not been rewound (or rehydrated as open).
+- Invalid arguments — non-object arguments, unknown keys, or a non-string `goal`.
 
 ## Notes
-- Despite the summary string `Create a git-based checkpoint to save and restore session state`, the implementation does not call git and does not snapshot filesystem state.
-- Captured state is conversation/session metadata only:
-  - in-memory message count
-  - persisted checkpoint tool-result entry ID in the session tree
-  - timestamp
-- Not captured:
-  - working tree contents or staged changes
-  - artifacts or blob-store contents
-  - SQLite prompt-history rows from `packages/coding-agent/src/session/history-storage.ts`
-  - auth or agent records from `packages/coding-agent/src/session/agent-storage.ts`
+- Checkpoint state is conversation metadata only. No git operation exists anywhere in this lane.
+- Persisted session history is append-only; branching never rewrites or deletes earlier `.jsonl` lines.

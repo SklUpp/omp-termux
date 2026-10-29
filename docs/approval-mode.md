@@ -17,9 +17,12 @@ Configure with `tools.approvalMode`:
 
 | Mode             | Auto-approves           | Prompts for     |
 | ---------------- | ----------------------- | --------------- |
-| `always-ask`     | `read`                  | `write`, `exec` |
-| `write`          | `read`, `write`         | `exec`          |
-| `yolo` (default) | `read`, `write`, `exec` | none            |
+| `always-ask` (default) | `read`                  | `write`, `exec` |
+| `write`                | `read`                  | `write`, `exec` |
+| `yolo`                 | `read`, `write`, `exec` | none            |
+
+This Android port deliberately keeps `write` mode read-only-auto: unlike the
+upstream `APPROVAL_MODE_MAX_TIER` (`write`), a `write`-tier call still prompts.
 
 `--auto-approve` and `--yolo` force `tools.approvalMode: yolo` for the session.
 
@@ -147,7 +150,7 @@ omp acp --config ./acp-yolo.yml   # file contains tools.approvalMode: yolo
 
 Precedence is the normal settings precedence: runtime flags (`--approval-mode`, `--auto-approve`, `--yolo`) override `--config` overlays, which override project config, which overrides global config. ACP does not currently define a `session/new`, `session/load`, or `session/resume` approval-policy field, so ACP clients that need per-session yolo should launch a separate `omp acp` process with one of the flags above or with a session-specific `--config` overlay.
 
-`tools.approvalMode: yolo` fully applies to ACP when it is explicitly configured or supplied by a runtime flag. It skips OMP's approval prompts and also skips the ACP client permission gate for `bash`, `edit`, `delete`, and `move` unless `tools.approval.<tool>` is `prompt` or `deny`. The schema default is `yolo`, but default-config ACP sessions still keep the client permission gate; set `tools.approvalMode: yolo` explicitly when the client wants unattended execution.
+`tools.approvalMode: yolo` fully applies to ACP when it is explicitly configured or supplied by a runtime flag. It skips OMP's approval prompts and also skips the ACP client permission gate for `bash`, `edit`, `delete`, and `move` unless `tools.approval.<tool>` is `prompt` or `deny`. The schema default is `always-ask`; default-config ACP sessions keep the client permission gate. Set `tools.approvalMode: yolo` explicitly when the client wants unattended execution.
 
 When ACP approval is required, OMP routes it through the ACP client instead of the terminal TUI. Client-gated `bash`, `edit`, `delete`, and `move` calls use ACP `session/request_permission`; generic approval prompts use form elicitation when the client advertises `elicitation.form`. A rejected, cancelled, or unsupported prompt rejects/cancels the tool call; OMP does not silently allow it.
 

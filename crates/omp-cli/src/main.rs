@@ -31,6 +31,7 @@ use omp_cli::{
 		self, ContentPart, MessageContent, MessageEntry, SessionHeader, SessionMessage,
 		SessionOptions, SessionStore, TurnBuilder, TurnRecord,
 	},
+	session_checkpoint::CheckpointHost,
 	skills::{self, Skill},
 	tool_commands,
 };
@@ -69,6 +70,16 @@ impl From<Error> for CliError {
 	}
 }
 
+/// Releases a loop waiting on a turn-end ack when the consumer returns early,
+/// errors, or drops the stream.
+struct TurnAckGuard(Arc<pi_agent::TurnAck>);
+
+impl Drop for TurnAckGuard {
+	fn drop(&mut self) {
+		self.0.cancel();
+	}
+}
+
 impl From<std::io::Error> for CliError {
 	fn from(err: std::io::Error) -> Self {
 		Self::fail(err.to_string())
@@ -98,6 +109,14 @@ fn run() -> std::result::Result<(), CliError> {
 	// user CLI invocation.
 	if daemon_broker::is_worker_invocation() {
 		daemon_broker::run_worker().map_err(CliError::fail)?;
+		return Ok(());
+	}
+	// The shared LSP mux is the same kind of hidden worker: broker-spawned with
+	// its endpoint and project scope in the environment. Dispatch before clap,
+	// config, and session boot so a worker never looks like a user command.
+	if pi_agent::lsp::mux::worker::is_worker_invocation() {
+		let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
+		pi_agent::lsp::mux::worker::run_mux_worker_blocking(&args).map_err(CliError::fail)?;
 		return Ok(());
 	}
 	// Share this profile's exact runtime scope with `pi-agent` broker clients.
@@ -499,6 +518,8 @@ fn run() -> std::result::Result<(), CliError> {
 		skills_filter,
 		store: SessionStore::default(),
 		history: Vec::new(),
+		checkpoint_host: CheckpointHost::new(),
+		in_memory_messages: None,
 		session_dir: session_dir.clone(),
 	};
 	if let Some(model) = requested_model.or(default_model) {
@@ -585,7 +606,12 @@ fn run() -> std::result::Result<(), CliError> {
 			"cannot open session log: persistence disabled due to format error",
 		));
 	}
-	session.history = store.history().to_vec();
+	session.history = if store.has_branch_context() {
+		store.branch_history().map_err(CliError::fail)?
+	} else {
+		store.history().to_vec()
+	};
+	session.checkpoint_host.rehydrate(&store);
 	session.store = store;
 
 	let mode = cli.mode;
@@ -797,6 +823,10 @@ struct Session<'a> {
 	skills_filter: (bool, Vec<String>),
 	store: SessionStore,
 	history: Vec<TurnRecord>,
+	checkpoint_host: CheckpointHost,
+	/// Live branch conversation for `--no-session` runs (no leading system
+	/// message). Rewinds rewrite it; each later request replays it verbatim.
+	in_memory_messages: Option<Vec<pi_agent::Message>>,
 	session_dir: Option<PathBuf>,
 }
 
@@ -837,6 +867,38 @@ impl Session<'_> {
 			(Some(model), Some(level)) => Some(runtime::apply_thinking(model, level)),
 			(model, _) => model.map(str::to_string),
 		};
+		let history_messages = if !self.store.enabled() {
+			// No journal: replay the exact branch conversation the loop last
+			// accepted, so an in-memory rewind survives the next prompt.
+			Some(self.in_memory_messages.clone().unwrap_or_default())
+		} else if self.store.has_branch_context() {
+			if let Some(warning) = self.store.branch_chain_warning() {
+				eprintln!("warning: {warning}");
+			}
+			match CheckpointHost::context_messages(&self.store) {
+				Ok(messages) => Some(messages),
+				Err(err) => {
+					eprintln!("warning: cannot rebuild branch context: {err}");
+					None
+				},
+			}
+		} else {
+			None
+		};
+		let checkpoint_controller = self
+			.config
+			.checkpoint
+			.enabled()
+			.then(|| Arc::clone(self.checkpoint_host.controller()));
+		// Journaled branches rehydrate from the log (it owns `user_todo_edit`
+		// ordering); `--no-session` derives from the in-memory branch the runner
+		// replayed, so a rewind/fork follows `self.history` with no reset hook.
+		let session_persisted = self.store.enabled() && !self.store.is_v1();
+		let todo_phases = if session_persisted {
+			self.store.latest_todo_phases()
+		} else {
+			runtime::latest_todo_phases_from_turns(&self.history)
+		};
 		RunRequest {
 			prompt,
 			parts,
@@ -852,8 +914,11 @@ impl Session<'_> {
 			context_files: self.prompts.files.clone(),
 			skills: self.skills.clone(),
 			history: self.history.clone(),
-			todo_phases: self.store.latest_todo_phases(),
-			session_persisted: self.store.enabled() && !self.store.is_v1(),
+			history_messages,
+			checkpoint_controller,
+			turn_ack: None,
+			todo_phases,
+			session_persisted,
 			config: self.config.clone(),
 			catalog: Arc::clone(&self.catalog),
 			approvals: self.approvals.clone(),
@@ -973,12 +1038,7 @@ impl Session<'_> {
 		};
 
 		let user_id = format!("msg-{}", output::session_id());
-		let parent_id = self
-			.store
-			.messages()
-			.last()
-			.map(|m| m.id.clone())
-			.filter(|id| !id.is_empty());
+		let parent_id = self.store.leaf_id().map(str::to_string);
 
 		let user_entry = MessageEntry::new(
 			user_id.clone(),
@@ -994,25 +1054,49 @@ impl Session<'_> {
 			}
 		}
 
+		let in_memory_before = self.in_memory_messages.as_ref().map_or(0, Vec::len);
+
 		let mut current_parent_id = Some(user_id);
 		let mut tool_name_by_id: std::collections::HashMap<String, String> =
 			std::collections::HashMap::new();
 
 		let cancel_token = pi_agent::CancellationToken::new();
 		let mut request = self.request(full_prompt.clone(), turn_parts.clone(), mode);
+		if !self.store.enabled() {
+			let user_message = runtime::user_message_from_parts(&full_prompt, &turn_parts)?;
+			self
+				.in_memory_messages
+				.get_or_insert_with(Vec::new)
+				.push(user_message);
+		}
 		request.cancellation_token = Some(cancel_token.clone());
+		let turn_ack = pi_agent::TurnAck::new();
+		request.turn_ack = Some(Arc::clone(&turn_ack));
+		let _turn_ack_guard = TurnAckGuard(Arc::clone(&turn_ack));
 		let started = std::time::Instant::now();
 		let mut builder = if !turn_parts.is_empty() {
 			TurnBuilder::new_with_parts(full_prompt, turn_parts)
 		} else {
 			TurnBuilder::new(full_prompt)
 		};
-		let mut stream = self.runner.run(&request)?;
+		let mut stream = match self.runner.run(&request) {
+			Ok(stream) => stream,
+			Err(err) => {
+				if let Some(messages) = self.in_memory_messages.as_mut() {
+					messages.truncate(in_memory_before);
+				}
+				return Err(err);
+			},
+		};
 		let mut reporter_failed = false;
 
 		let session_config = &self.config;
 		let mut handle_event = |event: &agent::Event,
 		                        store: &mut SessionStore,
+		                        host: &CheckpointHost,
+		                        ack: &Arc<pi_agent::TurnAck>,
+		                        in_memory: &mut Option<Vec<pi_agent::Message>>,
+		                        rewind_history: &mut Option<Vec<TurnRecord>>,
 		                        parent: &mut Option<String>,
 		                        tools: &mut std::collections::HashMap<String, String>,
 		                        model_fallback: Option<&str>,
@@ -1144,6 +1228,99 @@ impl Session<'_> {
 						}
 					}
 					*parent = Some(prev_id);
+
+					if !store.enabled()
+						&& let Some(messages) = in_memory.as_mut()
+					{
+						messages.push(message.clone());
+						for tr in tool_results {
+							let name = tools
+								.get(&tr.tool_call_id)
+								.map(String::as_str)
+								.unwrap_or("tool");
+							messages.push(pi_agent::Message::tool_with_status(
+								&tr.tool_call_id,
+								name,
+								&tr.content,
+								tr.is_error,
+							));
+						}
+					}
+
+					// The loop waits for this reply before deciding to continue.
+					let pending = ack.take();
+					let turn_start = pending
+						.as_ref()
+						.map_or(0, |(request, _)| request.turn_start);
+					let mut decision = pi_agent::TurnAckDecision::default();
+					if store.enabled() {
+						let captured = host.note_persisted_tool_results(store, &valid_turn_entries);
+						if let Err(err) = host.persist_active_reminder(store) {
+							eprintln!("warning: {err}");
+						}
+						if captured {
+							decision.warning = host.active_notice().map(str::to_string);
+						}
+						match host.apply_pending_rewind(store) {
+							Ok(Some(applied)) => {
+								// Same-batch checkpoint+rewind: the checkpoint is no
+								// longer active, so its notice must not contradict the
+								// retained report.
+								decision.warning = None;
+								match CheckpointHost::context_messages(store) {
+									Ok(messages) => {
+										decision.rewrite = Some(pi_agent::TurnRewrite::Replace(messages));
+									},
+									Err(err) => {
+										eprintln!("warning: {err}; falling back to branch history");
+										if let Ok(history) = store.branch_history()
+											&& let Ok(messages) = runtime::history_messages(&history)
+										{
+											decision.rewrite = Some(pi_agent::TurnRewrite::Replace(messages));
+										}
+									},
+								}
+								*rewind_history = Some(applied.history);
+								*parent = store.leaf_id().map(str::to_string);
+							},
+							Ok(None) => {},
+							Err(err) => eprintln!("warning: cannot apply rewind: {err}"),
+						}
+					} else {
+						let captured =
+							host.note_unpersisted_tool_results(tool_results, tools, turn_start);
+						if let Some(rewind) = host.apply_pending_rewind_in_memory() {
+							decision.rewrite = match in_memory.as_mut() {
+								Some(messages) => {
+									// The mirror is the uncompacted branch; replay it
+									// wholesale so the current run does not depend on
+									// the checkpoint result surviving compaction.
+									omp_cli::session_checkpoint::apply_in_memory_rewind(
+										messages, &rewind,
+									);
+									Some(pi_agent::TurnRewrite::Replace(messages.clone()))
+								},
+								None => Some(pi_agent::TurnRewrite::InMemory(rewind)),
+							};
+						} else if captured {
+							decision.warning = host.active_notice().map(str::to_string);
+						}
+					}
+					if host.needs_rewind_before_yield() && message.tool_calls.is_empty() {
+						if let Some(warning) = host.controller().yield_warning() {
+							decision.continue_turn = true;
+							decision.warning = Some(warning.to_string());
+						}
+					}
+					if !store.enabled()
+						&& let Some(warning) = decision.warning.as_deref().filter(|w| !w.is_empty())
+						&& let Some(messages) = in_memory.as_mut()
+					{
+						messages.push(pi_agent::Message::system(warning));
+					}
+					if let Some((_, reply)) = pending {
+						let _ = reply.send(decision);
+					}
 				},
 				_ => {},
 			}
@@ -1152,6 +1329,7 @@ impl Session<'_> {
 		let model_opt = self.model.clone();
 		let provider_opt = self.provider.clone();
 
+		let mut rewind_history: Option<Vec<TurnRecord>> = None;
 		let drive_result = deadline::drive(
 			&mut stream,
 			self.deadline,
@@ -1161,6 +1339,10 @@ impl Session<'_> {
 				handle_event(
 					event,
 					&mut self.store,
+					&self.checkpoint_host,
+					&turn_ack,
+					&mut self.in_memory_messages,
+					&mut rewind_history,
 					&mut current_parent_id,
 					&mut tool_name_by_id,
 					model_opt.as_deref(),
@@ -1182,6 +1364,10 @@ impl Session<'_> {
 					handle_event(
 						&event,
 						&mut self.store,
+						&self.checkpoint_host,
+						&turn_ack,
+						&mut self.in_memory_messages,
+						&mut rewind_history,
 						&mut current_parent_id,
 						&mut tool_name_by_id,
 						model_opt.as_deref(),
@@ -1200,10 +1386,22 @@ impl Session<'_> {
 			if record.stop_reason.is_empty() || canon == "toolUse" {
 				record.stop_reason = "aborted".to_string();
 			}
+			self.checkpoint_host.abandon_in_memory_rewind();
+			if let Some(messages) = self.in_memory_messages.as_mut() {
+				messages.truncate(in_memory_before);
+			}
+			if let Some(history) = rewind_history.take() {
+				self.history = history;
+			}
 			self.history.push(record);
 			return Err(err);
 		}
-		self.history.push(record);
+		let rewound = self.checkpoint_host.finish_in_memory_rewind();
+		if let Some(history) = rewind_history.take() {
+			self.history = history;
+		} else if !rewound {
+			self.history.push(record);
+		}
 		Ok(())
 	}
 }

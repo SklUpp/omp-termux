@@ -29,6 +29,12 @@ pub const INTENT_FIELD: &str = "i";
 pub const BRIDGE_REJECTED_TOOLS: &[&str] = &["checkpoint", "rewind"];
 
 /// Resolve a model-invisible bridge call.
+///
+/// Cancellation contract: every async host future MUST resolve once
+/// `ctx.cancellation_token` fires. Dispatch is not wrapped in a bridge timeout;
+/// the cell watchdog stays paused and `agent()` keeps the external-abort shield
+/// raised until the future returns. A host call that ignores cancellation
+/// therefore stalls the eval cell indefinitely.
 #[async_trait]
 pub trait EvalHost: Send + Sync {
 	/// Execute a normal registered session tool. `ctx` carries cwd, env, the
@@ -72,7 +78,11 @@ pub struct ArtifactRef {
 pub fn summarize_tool_result(name: &str, args: &Value, result: &ToolResult) -> EvalStatusEvent {
 	let record = args.as_object();
 	let details = result.details.as_ref().and_then(Value::as_object);
-	let mut event = EvalStatusEvent::new(name);
+	// Upstream reports foreground command execution as `op: "run"`. Only include
+	// count/code/matches when the Rust tool actually emitted those detail keys;
+	// grep/glob/bash currently return `details: None`, so no numbers are invented.
+	let op = if name == "bash" { "run" } else { name };
+	let mut event = EvalStatusEvent::new(op);
 	let mut field = |key: &str, value: Value| {
 		event.fields.insert(key.to_string(), value);
 	};

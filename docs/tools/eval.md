@@ -83,8 +83,8 @@ The renderer merges call and result inline, syntax-highlights from the declared 
 1. `EvalTool` builds a session-specific schema from enabled languages. It is essential, strict, `approval="exec"`, and `concurrency="exclusive"` within one agent session.
 2. `execute()` maps `py/js/rb/jl` to `python/js/ruby/julia`, resolves availability, and wraps the single input in the renderer-compatible internal cell list.
 3. It obtains the retained executor id from `session.getEvalSessionId?.()` or `defaultEvalSessionId(session)`, allocates the output sink/artifact, and registers the run through `trackEvalExecution?.(...)`.
-4. The timeout defaults to 30 seconds. `0` creates no watchdog. Otherwise `IdleTimeout` is combined with tool and session abort signals.
-5. `agent()`, `parallel()`, and `completion()` emit pause/resume status operations: time spent in those host bridges does not consume the cell's runtime-work budget. Compute, output, status helpers, and ordinary `tool.*` calls do consume it.
+4. The timeout defaults to 30 seconds. `0` creates no watchdog. Otherwise the runtime is resolved and the kernel is acquired/started under the caller's real abort token first (discovery is bounded by `min(cell budget, probe budget)`), and only then is `IdleTimeout` armed for the cell. Probe/startup time is therefore not charged to the cell, and a discovery timeout is reported as an unavailable-backend error rather than a cell abort.
+5. The watchdog is paused synchronously in the bridge task, before the host await: `completion()` uses a plain pause; `agent()` pauses and defers an external abort away from the kernel while isolation/worktree host work runs. The host still receives the caller's real token, so the child stops immediately; the deferred abort is applied as soon as the call returns. Compute, output, status helpers, and ordinary `tool.*` calls do consume the cell budget.
 6. The selected backend receives cwd, retained session id, session file, kernel owner, reset flag, callbacks, and cancellation signal.
 7. Output chunks stream into an artifact-aware `OutputSink` and live tail. Rich displays are separated into JSON, image, markdown, and status channels.
 8. Success, nonzero exit, and cancellation are assembled into the result shapes above. The output sink is finalized even when execution fails.
@@ -94,7 +94,8 @@ The renderer merges call and result inline, syntax-highlights from the declared 
 ### JavaScript (`js`)
 
 - Persistent worker VM keyed by `js:${sessionId}`; `reset` recreates the VM and is destructive to concurrent users of that session id.
-- Runs under Bun and exposes host globals including `Bun`, `Buffer`, `fetch`, `process`, `require`, `createRequire`, `fs`, and Web Crypto.
+- Runs under Bun and exposes host globals including `Bun`, `Buffer`, `fetch`, `process`, `require`, `createRequire`, `fs`, and Web Crypto (`crypto`/`webcrypto`).
+- `require("node:process")` and `require("node:fs")` see the real objects, so the runner patches the real stdout/stderr writes and `fs` fd 1/2 write paths after binding its protocol writer. Direct output is captured instead of dropped or injected into the frame stream; non-protocol lines that still reach the kernel are surfaced as cell output.
 - Top-level `await` and bare `return` work through async wrapping.
 - Static top-level imports and dynamic imports are rewritten through the local module loader. Local filesystem imports are cache-busted between cells; bare package and scheme/URL imports retain normal cache identity.
 - Awaited regions can interleave with another session sharing the executor; synchronous code still blocks the worker event loop.
@@ -176,13 +177,14 @@ Runs one subagent through `runStructuredSubagent(...)`:
 - Eval subagent spawning obeys `task.maxRecursionDepth` (default `2`; negative values allow unlimited depth). Helper fan-out uses `task.maxConcurrency` (default 32, `0` unbounded).
 - Malformed params are schema errors; unavailable/disabled backends and missing session are `ToolError`s.
 - Runtime exceptions become backend output with nonzero exit. Interactive stdin is an error. Output truncation does not fail the call.
-- A dead retained managed kernel may be replaced and the invocation retried once by its executor.
+- A dead retained managed kernel may be replaced and the invocation retried once. Retry happens only when the kernel died on its own: never after a turn cancellation or cell timeout, because the first attempt may already have produced side effects. If replacement acquisition fails while the cell is still live, the error propagates.
+- `KernelMode::PerCall` starts a fresh, unregistered kernel for every call and shuts it down before the tool returns, including failed attempts; nothing is retained in the session registry.
 
 ## Notes
 
 - One call is one cell. Use separate calls to exploit persistence and rerun only the failed step.
 - State is isolated by language; resetting Python does not reset JS, Ruby, or Julia.
-- Current schema tokens are only `py`, `js`, `rb`, and `jl`; long language names are renderer/approval formatting aliases, not wire values.
+- Current schema *input* tokens are `py`, `js`, `rb`, and `jl`. Output wire values (`cells[].language`, `details.language`, `details.languages`) use the backend ids `python`, `js`, `ruby`, and `julia`; `js` is the same spelling in both.
 - The former multi-cell `cells` payload, `*** Cell` parser, sniffing fallback, and constrained `eval.lark` grammar are removed.
 - Parent and ordinary task subagents may share an inherited eval executor id; children created by eval's own `agent()` explicitly do not.
 
@@ -203,7 +205,7 @@ Native parity lives in `crates/pi-agent/src/eval/`. The parent wires it into `To
 | `env.rs` | Per-language env allowlist/denylist/prefix filter, PATH/venv resolution |
 | `probe.rs` | Detached, bounded, cancellable availability probes |
 | `output.rs` | MIME display rendering, JSON cap, truncation/artifact metadata |
-| `idle.rs` | Reference-counted pause/resume watchdog |
+| `idle.rs` | Reference-counted pause/resume watchdog plus bridge `CellControl` (kernel token, deferred external abort) |
 | `runners/` | `runner.py`, `prelude.py`, `runner.rb`, `prelude.rb`, `runner.jl`, `prelude.jl`, `runner.js` |
 
 ### Construction
@@ -225,9 +227,11 @@ let tool = EvalTool::new(
         .with_owner(owner)
         .with_session_file(session_file)
         .with_artifacts_dir(artifacts_dir)
-        .with_local_roots(local_roots),
+        .with_local_roots([("local".to_string(), local_root)]), // scheme -> root
 );
 ```
+
+`EvalSessionInfo.local_roots` is a `BTreeMap<String, PathBuf>` serialized to `PI_EVAL_LOCAL_ROOTS` as a JSON object (`{"local": "/abs/root"}`); it is not a delimiter-joined list. Subprocess preludes resolve `local://...` against it.
 
 `EvalHost` is required in full: `call_tool`, `completion`, `agent`, `budget`, `concurrency`, `write_artifact`, and `enqueue_background_result`. There is no default/placeholder host. `checkpoint` and `rewind` are rejected in the bridge dispatcher before the host is called. Synthetic bridge names (`__completion__`, `__agent__`, `__concurrency__`, `__budget__`) are model-invisible.
 
@@ -237,15 +241,18 @@ let tool = EvalTool::new(
 - Gem/bundle/rbenv/asdf layout variables reach Ruby, conda/venv reach Python, `JULIA_*`/BLAS reach Julia. Secret-shaped names (`API_KEY`, `TOKEN`, `SECRET`, `PASSWORD`, …) never cross, even under an allow prefix. Provider keys and `PI_*` credentials are denylisted; bridge values are added after filtering.
 - The bridge is `127.0.0.1` only, requires a per-process bearer token, compares it in constant time, bounds headers/body, and closes each response. The token is passed through environment variables and is never logged.
 - Cancellation sends SIGINT so the runner can emit its own `KeyboardInterrupt`/cancelled frame; after 5 seconds the kernel escalates to SIGTERM/SIGKILL on the process group. Shutdown writes the language exit sentinel, waits 1 second, then sweeps the group.
-- `IdleTimeout` pauses around `agent()`/`completion()` bridge calls and resumes with a fresh window. `parallel`/`pipeline` use the host's live `task.maxConcurrency` width.
-- Availability probes are detached, bounded by the cell/probe budget, cancellable, and share one deadline per candidate list. Missing Julia reports the install prerequisite instead of omitting the language interface.
+- The bridge pauses the watchdog synchronously in the dispatch task before awaiting the host. `completion()` resumes with a fresh window; `agent()` additionally defers an external turn abort away from the kernel during isolation work, applying it on return. `parallel`/`pipeline` use the host's live `task.maxConcurrency` width.
+- Host futures must resolve on the caller's cancellation token. Dispatch has no bridge timeout and the watchdog/shield stay held until the future returns, so a real host that ignores cancellation stalls the cell; wiring must enforce prompt cancellation instead of relying on a bridge cutoff.
+- Availability probes are detached, bounded by the cell/probe budget before the watchdog is armed, cancellable, and share one deadline per candidate list. Missing Julia reports the install prerequisite instead of omitting the language interface.
 - Output: 50 KiB inline window, 100 KiB live-tail budget constant, 3000-line cap, 8000-character per-JSON display cap, `meta.truncated`, and artifact spill through `EvalHost::write_artifact`.
 - Failure text distinguishes timeout (`Command aborted (timeout after Ns)`), external cancellation (`Command aborted`), kernel death (`Kernel exited unexpectedly`), and runtime exceptions.
+- Auto-background starts when the foreground wait (auto-background threshold, capped at `cell timeout − 1s`; `0` = immediately) expires. The reply carries a `running` cell snapshot with the live output preview, `async.state = "running"`, and `async.type = "eval"`; the settled result is delivered through `EvalHost::enqueue_background_result`. If the host declines, the text is queued for the next eval result.
+- Bridged tool status uses the upstream summary shape. Rust `grep`/`glob`/`bash` currently return `details: None`, so its status events carry `op`, `name`, and argument previews but no invented match/line/exit counts; `bash` maps to `op: "run"`.
 
 ### Known gaps owned by the parent
 
 - `ToolResult` carries text only. Images are delivered as typed `details.images: [{ type: "image", data, mimeType }]` plus dimension notes in text; the parent's model-image path must convert them into content blocks. No resize/WebP exclusion is performed in Rust.
-- Auto-background delivery is a `EvalHost::enqueue_background_result` seam (wire it to the existing result sink/supervisor). If the host declines, the completed text is queued in the tool and prepended, with `notice`, to the next eval result.
+- Auto-background delivery is a `EvalHost::enqueue_background_result` seam (wire it to the existing result sink/supervisor). The start reply is already a real running-cell snapshot; live streaming updates use `details.cells[0].output` from that snapshot only. If the host declines delivery, the completed text is queued in the tool and prepended, with `notice`, to the next eval result.
 - Registry registration, session identity, interpreter settings, `PI_*` flag parsing, and owner disposal are parent-owned.
 - The JS kernel follows the upstream contract for persistence and imports, but exotic destructured declarations and class re-declaration rely on script scoping; they are not Babel-rewritten.
 

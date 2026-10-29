@@ -23,7 +23,7 @@ pub use host::{
 	ArtifactRef, BRIDGE_REJECTED_TOOLS, EVAL_AGENT_BRIDGE_NAME, EVAL_BUDGET_BRIDGE_NAME,
 	EVAL_COMPLETION_BRIDGE_NAME, EVAL_CONCURRENCY_BRIDGE_NAME, EvalHost, INTENT_FIELD,
 };
-pub use idle::IdleTimeout;
+pub use idle::{CellControl, IdleTimeout};
 pub use kernel::{Kernel, KernelSpawn};
 pub use output::{
 	ARTIFACT_MAX_BYTES, DEFAULT_MAX_BYTES, LIVE_TAIL_BYTES, MAX_DISPLAY_TEXT_BYTES,
@@ -37,9 +37,9 @@ pub use runtime::{
 	EvalSettings, Interpreters, KernelMode,
 };
 pub use session::{KernelKey, SessionRegistry, normalize_cwd};
-pub use tool::{EvalSessionInfo, EvalTool, local_roots_delimiter};
+pub use tool::{EvalSessionInfo, EvalTool};
 pub use types::{
-	AsyncJob, AsyncState, CellStatus, EvalCellResult, EvalDisplayOutput, EvalError, EvalImage,
-	EvalLanguage, EvalStatusEvent, EvalToolDetails, ImageKind, KernelError, KernelExecuteOptions,
-	KernelExecuteResult, KernelFrame, KernelStatus, OutputMeta,
+	AsyncJob, AsyncState, CellStatus, EvalBackendId, EvalCellResult, EvalDisplayOutput, EvalError,
+	EvalImage, EvalLanguage, EvalStatusEvent, EvalToolDetails, ImageKind, KernelError,
+	KernelExecuteOptions, KernelExecuteResult, KernelFrame, KernelStatus, OutputMeta,
 };

@@ -227,10 +227,12 @@ fn spawn_stdout_reader(stdout: ChildStdout) -> mpsc::Receiver<String> {
 	rx
 }
 
-fn spawn_stderr_reader(stderr: std::process::ChildStderr) -> Arc<Mutex<String>> {
+fn spawn_stderr_reader(
+	stderr: std::process::ChildStderr,
+) -> (Arc<Mutex<String>>, thread::JoinHandle<()>) {
 	let buf = Arc::new(Mutex::new(String::new()));
 	let buf_clone = Arc::clone(&buf);
-	thread::spawn(move || {
+	let handle = thread::spawn(move || {
 		let mut reader = BufReader::new(stderr);
 		let mut line = String::new();
 		while reader.read_line(&mut line).unwrap_or(0) > 0 {
@@ -238,7 +240,35 @@ fn spawn_stderr_reader(stderr: std::process::ChildStderr) -> Arc<Mutex<String>> 
 			line.clear();
 		}
 	});
-	buf
+	(buf, handle)
+}
+
+/// Recursively record every descendant of `root` (bounded by the caller's
+/// polling loop), so a wrapper script cannot hide a leaked grandchild.
+fn descendant_pids(root: u32) -> Vec<u32> {
+	let mut seen = Vec::new();
+	let mut queue = vec![root];
+	while let Some(pid) = queue.pop() {
+		let Ok(output) = ProcCommand::new("pgrep").args(["-P", &pid.to_string()]).output() else {
+			continue;
+		};
+		for token in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+			if let Ok(child) = token.parse::<u32>() {
+				if !seen.contains(&child) {
+					seen.push(child);
+					queue.push(child);
+				}
+			}
+		}
+	}
+	seen
+}
+
+fn process_alive(pid: u32) -> bool {
+	ProcCommand::new("kill")
+		.args(["-0", &pid.to_string()])
+		.status()
+		.is_ok_and(|status| status.success())
 }
 
 fn spawn_byte_reader<R: Read + Send + 'static>(mut stream: R) -> thread::JoinHandle<Vec<u8>> {
@@ -323,7 +353,6 @@ fn test_live_sse_two_turn_read_early_delta_and_resume() {
 	let recorded_reqs_clone = Arc::clone(&recorded_requests);
 
 	let (server_stop_tx, server_stop_rx) = mpsc::channel::<()>();
-	let (delta_sent_tx, _delta_sent_rx) = mpsc::channel::<()>();
 	let (allow_done_tx, allow_done_rx) = mpsc::channel::<()>();
 
 	let server_handle = thread::spawn(move || {
@@ -365,9 +394,6 @@ fn test_live_sse_two_turn_read_early_delta_and_resume() {
 						);
 						let _ = stream.write_all(header.as_bytes());
 						let _ = stream.flush();
-
-						// Notify test that early delta was sent to wire
-						let _ = delta_sent_tx.send(());
 
 						// Wait for test verification before closing with [DONE]
 						let _ = allow_done_rx.recv_timeout(Duration::from_secs(5));
@@ -426,7 +452,7 @@ fn test_live_sse_two_turn_read_early_delta_and_resume() {
 	let child_stdout = child_guard.take_stdout().expect("child stdout");
 	let child_stderr = child_guard.take_stderr().expect("child stderr");
 	let line_rx = spawn_stdout_reader(child_stdout);
-	let captured_stderr = spawn_stderr_reader(child_stderr);
+	let (captured_stderr, stderr_reader) = spawn_stderr_reader(child_stderr);
 
 	let mut observed_lines = Vec::new();
 	let mut early_delta_verified = false;
@@ -466,6 +492,7 @@ fn test_live_sse_two_turn_read_early_delta_and_resume() {
 	}
 
 	let status = child_guard.wait_timeout(Duration::from_secs(5));
+	stderr_reader.join().expect("stderr reader must drain before assertions");
 	assert!(
 		status.success(),
 		"omp must exit 0: status={status:?}, stderr={}",
@@ -696,7 +723,7 @@ fn test_live_sse_sigint_interrupt_during_tool_closes_tool_and_records_aborted() 
 	let child_stdout = child_guard.take_stdout().expect("child stdout");
 	let child_stderr = child_guard.take_stderr().expect("child stderr");
 	let line_rx = spawn_stdout_reader(child_stdout);
-	let captured_stderr = spawn_stderr_reader(child_stderr);
+	let (captured_stderr, stderr_reader) = spawn_stderr_reader(child_stderr);
 
 	// Wait until tool_execution_start is observed on stdout, bounded by timeout
 	let mut tool_started = false;
@@ -719,19 +746,13 @@ fn test_live_sse_sigint_interrupt_during_tool_closes_tool_and_records_aborted() 
 		captured_stderr.lock().unwrap()
 	);
 
-	// Give external script subprocess a moment to launch and verify it is running
-	let mut spawned_pids = String::new();
+	// Record the whole descendant tree (not one shallow snapshot) once the
+	// external script has launched, so a non-`exec` wrapper cannot hide a child.
+	let mut spawned_pids = Vec::new();
 	let start_poll = Instant::now();
 	while start_poll.elapsed() < Duration::from_secs(3) {
-		let pgrep_children = ProcCommand::new("pgrep")
-			.args(["-P", &child_pid.to_string()])
-			.output();
-		let pids = pgrep_children
-			.ok()
-			.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-			.unwrap_or_default();
-		if !pids.is_empty() {
-			spawned_pids = pids;
+		spawned_pids = descendant_pids(child_pid);
+		if !spawned_pids.is_empty() {
 			break;
 		}
 		thread::sleep(Duration::from_millis(50));
@@ -755,20 +776,29 @@ fn test_live_sse_sigint_interrupt_during_tool_closes_tool_and_records_aborted() 
 		"interrupted omp process must exit with non-zero failure"
 	);
 
+	stderr_reader.join().expect("stderr reader must drain before assertions");
 	let stderr = captured_stderr.lock().unwrap().clone();
 	assert!(
 		stderr.contains("interrupted"),
 		"stderr must indicate interruption: {stderr}"
 	);
 
-	// Check that every spawned child process of child_pid is terminated (no orphan processes)
-	thread::sleep(Duration::from_millis(200));
-	for pid_str in spawned_pids.split_whitespace() {
-		let check = ProcCommand::new("kill").args(["-0", pid_str]).status();
+	// Every recorded descendant must be gone within a bounded reap window.
+	let reap_deadline = Instant::now() + Duration::from_secs(2);
+	loop {
+		let survivors: Vec<u32> = spawned_pids
+			.iter()
+			.copied()
+			.filter(|pid| process_alive(*pid))
+			.collect();
+		if survivors.is_empty() {
+			break;
+		}
 		assert!(
-			check.is_err() || !check.unwrap().success(),
-			"child process PID {pid_str} must not be running after tool abort"
+			Instant::now() < reap_deadline,
+			"child process PIDs {survivors:?} still running after tool abort"
 		);
+		thread::sleep(Duration::from_millis(50));
 	}
 
 	// Verify session file records stopReason: aborted and synthetic tool result

@@ -136,8 +136,8 @@ pub fn format_display_outputs_for_text(outputs: &[EvalDisplayOutput]) -> String 
 	chunks.join("\n\n")
 }
 
-fn count_newlines(bytes: &[u8]) -> u64 {
-	bytes.iter().filter(|byte| **byte == b'\n').count() as u64
+fn count_newlines(bytes: &[u8]) -> usize {
+	bytes.iter().filter(|byte| **byte == b'\n').count()
 }
 
 /// Bounded capture for one cell plus an optional full artifact copy.
@@ -173,7 +173,7 @@ impl OutputSink {
 			return;
 		}
 		self.total_bytes += chunk.len() as u64;
-		self.total_lines += count_newlines(chunk.as_bytes());
+		self.total_lines += count_newlines(chunk.as_bytes()) as u64;
 		if let Some(artifact) = &mut self.artifact {
 			if artifact.len() + chunk.len() <= ARTIFACT_MAX_BYTES {
 				artifact.extend_from_slice(chunk.as_bytes());
@@ -204,7 +204,7 @@ impl OutputSink {
 		}
 		self.output_bytes = self.text.len();
 		self.output_lines = count_newlines(self.text.as_bytes());
-		if self.output_lines > MAX_OUTPUT_LINES as u64 {
+		if self.output_lines > MAX_OUTPUT_LINES {
 			self.truncate_lines();
 		}
 	}

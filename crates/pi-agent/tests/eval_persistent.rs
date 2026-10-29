@@ -1,10 +1,15 @@
-//! Consumer-level eval regressions: real Python kernel persistence, env
-//! filtering, timeout, and cancellation. These exercise the tool the model sees,
-//! not the wiring of individual helper functions.
+//! Consumer-level eval regressions: real kernels exercised through the tool the
+//! model sees. Covers persistence, env filtering, truncation, cancellation,
+//! timeout classification, per-call disposal, dead-kernel recovery, local-root
+//! mapping, bridge routing, backgrounding, and the JavaScript capture contract.
+//!
+//! Tests skip (with an eprintln) when the interpreter/runtime is absent; Julia
+//! and Ruby are external prerequisites, not fakeable backends.
 
 use std::{
 	collections::HashMap,
-	sync::Arc,
+	path::PathBuf,
+	sync::{Arc, Mutex},
 	time::{Duration, Instant},
 };
 
@@ -13,27 +18,60 @@ use serde_json::{Value, json};
 
 use pi_agent::{
 	eval::{
-		ArtifactRef, EvalAllowance, EvalHost, EvalRuntime, EvalSessionInfo, EvalSettings, EvalTool,
-		Interpreters,
+		ArtifactRef, AutoBackground, EvalAllowance, EvalHost, EvalLanguage, EvalRuntime, EvalSessionInfo,
+		EvalSettings, EvalTool, Interpreters, KernelMode,
 	},
 	state::{AgentContext, ToolResult},
 	tools::{Tool, ToolError},
 };
 
-struct TestHost;
+#[derive(Default)]
+struct TestHost {
+	calls: Mutex<Vec<(String, Value)>>,
+	deliveries: Mutex<Vec<(String, String)>>,
+	agent_calls: Mutex<usize>,
+	agent_delay: Mutex<Duration>,
+}
 
 #[async_trait]
 impl EvalHost for TestHost {
-	async fn call_tool(&self, name: &str, _args: Value, _ctx: &AgentContext) -> Result<ToolResult, ToolError> {
-		Err(ToolError::ExecutionFailed(format!("unexpected eval bridge tool `{name}`")))
+	async fn call_tool(&self, name: &str, args: Value, _ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+		self
+			.calls
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.push((name.to_string(), args.clone()));
+		let content = match name {
+			"echo" => format!(
+				"echo-ok:{}",
+				args.get("path").and_then(Value::as_str).unwrap_or("missing")
+			),
+			"shot" => "shot-ok".to_string(),
+			"bash" => "bash-ok".to_string(),
+			_ => format!("{name}-ok"),
+		};
+		let details = (name == "shot")
+			.then(|| json!({"images": [{"type": "image", "data": "aGk=", "mimeType": "image/png"}]}));
+		Ok(ToolResult {
+			tool_call_id: String::new(),
+			content,
+			is_error: false,
+			terminate: false,
+			details,
+		})
 	}
 
 	async fn completion(&self, _args: Value, _ctx: &AgentContext) -> Result<Value, String> {
-		Err("completion is not configured for this test host".to_string())
+		Ok(json!({"text": "completion-ok"}))
 	}
 
 	async fn agent(&self, _args: Value, _ctx: &AgentContext) -> Result<Value, String> {
-		Err("agent is not configured for this test host".to_string())
+		*self.agent_calls.lock().unwrap_or_else(|poison| poison.into_inner()) += 1;
+		let delay = *self.agent_delay.lock().unwrap_or_else(|poison| poison.into_inner());
+		if !delay.is_zero() {
+			tokio::time::sleep(delay).await;
+		}
+		Ok(json!({"text": "agent-ok"}))
 	}
 
 	async fn budget(&self, _args: Value, _ctx: &AgentContext) -> Result<Value, String> {
@@ -48,27 +86,67 @@ impl EvalHost for TestHost {
 		Ok(Some(ArtifactRef { id: "artifact-test".to_string(), path: None }))
 	}
 
-	fn enqueue_background_result(&self, _job_id: &str, _text: String) -> bool {
+	fn enqueue_background_result(&self, job_id: &str, text: String) -> bool {
+		self
+			.deliveries
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.push((job_id.to_string(), text));
 		true
 	}
 }
 
-fn python_path() -> Option<std::path::PathBuf> {
-	let env: HashMap<String, String> = std::env::vars().collect();
-	pi_agent::eval::env::which("python3", &env).or_else(|| pi_agent::eval::env::which("python", &env))
+fn ambient_env() -> HashMap<String, String> {
+	std::env::vars().collect()
 }
 
-async fn harness(spill_bytes: usize) -> Option<(Arc<EvalTool>, Arc<EvalRuntime>, AgentContext, std::path::PathBuf)> {
-	if python_path().is_none() {
-		eprintln!("skipping eval regression: no python interpreter on PATH");
-		return None;
-	}
-	let settings = EvalSettings::new(
-		EvalAllowance { python: true, js: false, ruby: false, julia: false },
-		Interpreters::default(),
-	)
-	.with_probe_timeout_ms(5_000)
-	.with_spill_bytes(spill_bytes);
+fn binary(name: &str) -> Option<PathBuf> {
+	pi_agent::eval::env::which(name, &ambient_env())
+}
+
+fn python_path() -> Option<PathBuf> {
+	binary("python3").or_else(|| binary("python"))
+}
+
+fn js_path() -> Option<PathBuf> {
+	binary("bun")
+}
+
+fn ruby_path() -> Option<PathBuf> {
+	binary("ruby")
+}
+
+fn julia_path() -> Option<PathBuf> {
+	binary("julia")
+}
+
+fn py_only() -> EvalAllowance {
+	EvalAllowance { python: true, js: false, ruby: false, julia: false }
+}
+
+fn one_language(language: EvalLanguage) -> EvalAllowance {
+	let mut allowance = EvalAllowance { python: false, js: false, ruby: false, julia: false };
+	allowance.set(language, true);
+	allowance
+}
+
+fn test_session() -> EvalSessionInfo {
+	EvalSessionInfo::new(format!("test-{}", pi_agent::eval::util::random_token()))
+		.with_owner(Some("test-owner".to_string()))
+}
+
+async fn harness_with(
+	allowance: EvalAllowance,
+	interpreters: Interpreters,
+	session: EvalSessionInfo,
+	host: Arc<TestHost>,
+	tune: impl FnOnce(EvalSettings) -> EvalSettings,
+) -> Option<(Arc<EvalTool>, Arc<EvalRuntime>, AgentContext, PathBuf)> {
+	let settings = tune(
+		EvalSettings::new(allowance, interpreters)
+			.with_probe_timeout_ms(5_000)
+			.with_spill_bytes(4096),
+	);
 	let runtime = match EvalRuntime::start(settings).await {
 		Ok(runtime) => Arc::new(runtime),
 		Err(error) => {
@@ -76,26 +154,41 @@ async fn harness(spill_bytes: usize) -> Option<(Arc<EvalTool>, Arc<EvalRuntime>,
 			return None;
 		},
 	};
-	let tool = Arc::new(EvalTool::new(
-		Arc::clone(&runtime),
-		Arc::new(TestHost),
-		EvalSessionInfo::new(format!("test-{}", pi_agent::eval::util::random_token())).with_owner(Some(
-			"test-owner".to_string(),
-		)),
-	));
+	let tool = Arc::new(EvalTool::new(Arc::clone(&runtime), host, session));
 	let cwd = std::env::temp_dir().join(format!("omp-eval-test-{}", pi_agent::eval::util::random_token()));
 	std::fs::create_dir_all(&cwd).expect("temp cwd");
 	let ctx = AgentContext::new(cwd.clone());
 	Some((tool, runtime, ctx, cwd))
 }
 
+async fn py_harness(
+	spill_bytes: usize,
+) -> Option<(Arc<EvalTool>, Arc<EvalRuntime>, AgentContext, PathBuf, Arc<TestHost>)> {
+	python_path()?;
+	let host = Arc::new(TestHost::default());
+	let (tool, runtime, ctx, cwd) =
+		harness_with(py_only(), Interpreters::default(), test_session(), Arc::clone(&host), |settings| {
+			settings.with_spill_bytes(spill_bytes)
+		})
+		.await?;
+	Some((tool, runtime, ctx, cwd, host))
+}
+
 fn cell_details(result: &ToolResult) -> Value {
 	result.details.clone().expect("eval details")
 }
 
+async fn teardown(runtime: &EvalRuntime, cwd: PathBuf) {
+	runtime.dispose_owner(Some("test-owner")).await;
+	runtime.shutdown().await;
+	let _ = std::fs::remove_dir_all(cwd);
+}
+
+const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
+
 #[tokio::test]
 async fn python_state_persists_across_calls_and_secrets_are_filtered() {
-	let Some((tool, runtime, mut ctx, cwd)) = harness(4096).await else { return };
+	let Some((tool, runtime, mut ctx, cwd, _host)) = py_harness(4096).await else { return };
 	ctx.env.insert("PI_API_KEY".to_string(), "sk-test".to_string());
 	ctx.env.insert("CUSTOM_TOKEN".to_string(), "tok".to_string());
 	ctx.env.insert("PI_DEBUG".to_string(), "ok".to_string());
@@ -115,6 +208,9 @@ async fn python_state_persists_across_calls_and_secrets_are_filtered() {
 	assert!(second.content.contains("41"), "state persisted: {}", second.content);
 	let details = cell_details(&second);
 	assert_eq!(details["cells"][0]["status"], "complete");
+	assert_eq!(details["cells"][0]["language"], "python");
+	assert_eq!(details["language"], "python");
+	assert_eq!(details["languages"][0], "python");
 
 	let env_cell = tool
 		.execute(
@@ -135,20 +231,16 @@ async fn python_state_persists_across_calls_and_secrets_are_filtered() {
 		.expect("reset cell");
 	assert!(!after_reset.is_error, "{}", after_reset.content);
 	assert!(after_reset.content.contains("False"), "reset did not wipe state: {}", after_reset.content);
+	assert_eq!(runtime.retained_count(Some("test-owner")), 1, "session mode retains one kernel");
 
-	runtime.dispose_owner(Some("test-owner")).await;
-	runtime.shutdown().await;
-	let _ = std::fs::remove_dir_all(cwd);
+	teardown(&runtime, cwd).await;
 }
 
 #[tokio::test]
 async fn output_truncation_emits_artifact_metadata() {
-	let Some((tool, runtime, ctx, cwd)) = harness(512).await else { return };
+	let Some((tool, runtime, ctx, cwd, _host)) = py_harness(512).await else { return };
 	let result = tool
-		.execute(
-			&json!({"language": "py", "code": "print('a' * 5000)"}),
-			&ctx,
-		)
+		.execute(&json!({"language": "py", "code": "print('a' * 5000)"}), &ctx)
 		.await
 		.expect("big output cell");
 	assert!(!result.is_error, "{}", result.content);
@@ -156,46 +248,63 @@ async fn output_truncation_emits_artifact_metadata() {
 	let details = cell_details(&result);
 	assert_eq!(details["meta"]["truncated"], true);
 	assert_eq!(details["meta"]["artifactId"], "artifact-test");
-	runtime.dispose_owner(Some("test-owner")).await;
-	runtime.shutdown().await;
-	let _ = std::fs::remove_dir_all(cwd);
+	teardown(&runtime, cwd).await;
 }
 
 #[tokio::test]
-async fn cell_timeout_aborts_without_hanging_the_tool() {
-	let Some((tool, runtime, ctx, cwd)) = harness(4096).await else { return };
+async fn cell_timeout_aborts_without_killing_the_kernel_or_replaying() {
+	let Some((tool, runtime, ctx, cwd, _host)) = py_harness(4096).await else { return };
+	let marker = cwd.join("timeout-side-effect.txt");
+	let code = format!(
+		"import time\nopen({:?}, 'a').write('x')\ntime.sleep(30)",
+		marker.display().to_string()
+	);
 	let started = Instant::now();
 	let result = tool
-		.execute(
-			&json!({"language": "py", "code": "import time\ntime.sleep(30)", "timeout": 2}),
-			&ctx,
-		)
+		.execute(&json!({"language": "py", "code": code, "timeout": 2}), &ctx)
 		.await
 		.expect("timeout cell returns a result");
 	assert!(started.elapsed() < Duration::from_secs(10), "timeout escalated slowly");
 	assert!(result.is_error, "timeout must be an error: {}", result.content);
+	assert!(result.content.contains("Command aborted (timeout after 2s)"), "{}", result.content);
 	let details = cell_details(&result);
 	assert_eq!(details["cells"][0]["status"], "error");
-	runtime.dispose_owner(Some("test-owner")).await;
-	runtime.shutdown().await;
-	let _ = std::fs::remove_dir_all(cwd);
+	assert_eq!(
+		std::fs::read_to_string(&marker).expect("side effect").len(),
+		1,
+		"a timed-out cell must not be replayed"
+	);
+
+	let alive = tool
+		.execute(&json!({"language": "py", "code": "print('still-alive')"}), &ctx)
+		.await
+		.expect("post-timeout cell");
+	assert!(!alive.is_error, "timeout must leave the kernel usable: {}", alive.content);
+	assert!(alive.content.contains("still-alive"), "{}", alive.content);
+	teardown(&runtime, cwd).await;
 }
 
 #[tokio::test]
-async fn external_cancellation_stops_the_cell() {
-	let Some((tool, runtime, ctx, cwd)) = harness(4096).await else { return };
+async fn external_cancellation_stops_the_cell_without_replay() {
+	let Some((tool, runtime, ctx, cwd, _host)) = py_harness(4096).await else { return };
+	let marker = cwd.join("cancel-side-effect.txt");
+	let code = format!(
+		"import time\nopen({:?}, 'a').write('x')\ntime.sleep(30)",
+		marker.display().to_string()
+	);
 	let cancellation = ctx.cancellation_token.clone();
 	let runner_tool = Arc::clone(&tool);
 	let runner_ctx = ctx.clone();
 	let task = tokio::spawn(async move {
 		runner_tool
-			.execute(
-				&json!({"language": "py", "code": "import time\ntime.sleep(30)", "timeout": 60}),
-				&runner_ctx,
-			)
+			.execute(&json!({"language": "py", "code": code, "timeout": 60}), &runner_ctx)
 			.await
 	});
-	tokio::time::sleep(Duration::from_millis(400)).await;
+	let deadline = Instant::now() + Duration::from_secs(15);
+	while std::fs::metadata(&marker).map_or(0, |meta| meta.len()) != 1 {
+		assert!(Instant::now() < deadline, "cell never wrote its side effect");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
 	cancellation.cancel();
 	let started = Instant::now();
 	let result = tokio::time::timeout(Duration::from_secs(8), task)
@@ -208,7 +317,587 @@ async fn external_cancellation_stops_the_cell() {
 		Err(ToolError::Aborted(_)) => {},
 		Err(other) => panic!("unexpected cancellation error: {other}"),
 	}
-	runtime.dispose_owner(Some("test-owner")).await;
-	runtime.shutdown().await;
-	let _ = std::fs::remove_dir_all(cwd);
+	assert_eq!(
+		std::fs::read_to_string(&marker).expect("side effect").len(),
+		1,
+		"a cancelled cell must not be replayed"
+	);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn per_call_mode_shuts_each_kernel_down() {
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		py_only(),
+		Interpreters::default(),
+		test_session(),
+		Arc::new(TestHost::default()),
+		|settings| settings.with_kernel_mode(KernelMode::PerCall),
+	)
+	.await
+	else {
+		return;
+	};
+	let first = tool
+		.execute(&json!({"language": "py", "code": "x = 41"}), &ctx)
+		.await
+		.expect("first call");
+	assert!(!first.is_error, "{}", first.content);
+	assert_eq!(runtime.retained_count(Some("test-owner")), 0, "per-call must not retain the kernel");
+	let second = tool
+		.execute(&json!({"language": "py", "code": "print(globals().get('x'))"}), &ctx)
+		.await
+		.expect("second call");
+	assert!(!second.is_error, "{}", second.content);
+	assert!(second.content.contains("None"), "per-call state leaked: {}", second.content);
+	assert_eq!(runtime.retained_count(Some("test-owner")), 0);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn concurrent_per_call_cells_do_not_reset_each_other() {
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		py_only(),
+		Interpreters::default(),
+		test_session(),
+		Arc::new(TestHost::default()),
+		|settings| settings.with_kernel_mode(KernelMode::PerCall),
+	)
+	.await
+	else {
+		return;
+	};
+	let left_args = json!({"language": "py", "code": "import time\ntime.sleep(0.4)\nprint('cell-a')"});
+	let right_args = json!({"language": "py", "code": "import time\ntime.sleep(0.2)\nprint('cell-b')"});
+	let left = tool.execute(&left_args, &ctx);
+	let right = tool.execute(&right_args, &ctx);
+	let (left, right) = tokio::join!(left, right);
+	let left = left.expect("left per-call cell");
+	let right = right.expect("right per-call cell");
+	assert!(!left.is_error, "{}", left.content);
+	assert!(!right.is_error, "{}", right.content);
+	assert!(left.content.contains("cell-a"), "{}", left.content);
+	assert!(right.content.contains("cell-b"), "{}", right.content);
+	assert_eq!(runtime.retained_count(Some("test-owner")), 0);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn dead_kernel_is_replaced_once_and_the_cell_recovers() {
+	let Some((tool, runtime, ctx, cwd, _host)) = py_harness(4096).await else { return };
+	let marker = cwd.join("died-once.txt");
+	let code = format!(
+		"import os, pathlib\nm = pathlib.Path({:?})\nif m.exists():\n    print('recovered')\nelse:\n    m.write_text('x')\n    os._exit(7)",
+		marker.display().to_string()
+	);
+	let result = tool
+		.execute(&json!({"language": "py", "code": code}), &ctx)
+		.await
+		.expect("dead kernel recovery");
+	assert!(!result.is_error, "retry must recover the cell: {}", result.content);
+	assert!(result.content.contains("recovered"), "{}", result.content);
+	assert!(marker.exists(), "first attempt ran exactly once");
+	teardown(&runtime, cwd).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn probe_timeout_is_a_prerequisite_error_not_a_cell_abort() {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let Some(python) = python_path() else { return };
+	let Some((old_tool, old_runtime, ctx, cwd, _host)) = py_harness(4096).await else { return };
+	drop(old_tool);
+	old_runtime.shutdown().await;
+	let wrapper = cwd.join("slow-probe-python");
+	std::fs::write(&wrapper, format!("#!/bin/sh\nsleep 2\nexec '{}' \"$@\"\n", python.display()))
+		.expect("write wrapper");
+	std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+	let interpreters = Interpreters::new(Some(wrapper.display().to_string()), None, None);
+	let settings = EvalSettings::new(py_only(), interpreters).with_probe_timeout_ms(5_000);
+	// The wrapper is an explicit interpreter, so build a dedicated runtime: the
+	// shared runtime above already cached the real interpreter for this cwd.
+	let runtime = Arc::new(EvalRuntime::start(settings).await.expect("runtime"));
+	let tool = Arc::new(EvalTool::new(
+		Arc::clone(&runtime),
+		Arc::new(TestHost::default()),
+		test_session(),
+	));
+	let started = Instant::now();
+	let error = tool
+		.execute(&json!({"language": "py", "code": "print(1)", "timeout": 1}), &ctx)
+		.await
+		.expect_err("probe must time out");
+	assert!(started.elapsed() < Duration::from_secs(5), "probe bound was not enforced");
+	let message = error.to_string();
+	assert!(message.contains("probe timed out"), "{message}");
+	assert!(!message.contains("availability probe was cancelled"), "{message}");
+	drop(tool);
+	teardown(&runtime, cwd).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn probe_and_startup_time_are_not_charged_to_the_cell_budget() {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let Some(python) = python_path() else { return };
+	let cwd = std::env::temp_dir().join(format!("omp-eval-test-{}", pi_agent::eval::util::random_token()));
+	std::fs::create_dir_all(&cwd).expect("temp cwd");
+	let wrapper = cwd.join("slow-start-python");
+	std::fs::write(&wrapper, format!("#!/bin/sh\nsleep 0.5\nexec '{}' \"$@\"\n", python.display()))
+		.expect("write wrapper");
+	std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+	let interpreters = Interpreters::new(Some(wrapper.display().to_string()), None, None);
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		py_only(),
+		interpreters,
+		test_session(),
+		Arc::new(TestHost::default()),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let result = tool
+		.execute(
+			&json!({"language": "py", "code": "import time\ntime.sleep(0.3)\nprint('budget-ok')", "timeout": 1}),
+			&ctx,
+		)
+		.await
+		.expect("slow startup cell");
+	assert!(!result.is_error, "probe/startup consumed the cell budget: {}", result.content);
+	assert!(result.content.contains("budget-ok"), "{}", result.content);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn scheme_map_local_roots_are_visible_to_subprocess_helpers() {
+	let Some((_tool, runtime, _ctx, cwd, _host)) = py_harness(4096).await else { return };
+	let local_root = cwd.join("local-root");
+	std::fs::create_dir_all(&local_root).expect("local root");
+	let session = test_session().with_local_root("local", local_root.clone());
+	let tool = Arc::new(EvalTool::new(
+		Arc::clone(&runtime),
+		Arc::new(TestHost::default()),
+		session,
+	));
+	let ctx = AgentContext::new(cwd.clone());
+	let result = tool
+		.execute(
+			&json!({
+				"language": "py",
+				"code": "write('local://note.txt', 'scheme-ok')\nprint(read('local://note.txt'))"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("local scheme cell");
+	assert!(!result.is_error, "{}", result.content);
+	assert!(result.content.contains("scheme-ok"), "{}", result.content);
+	assert_eq!(
+		std::fs::read_to_string(local_root.join("note.txt")).expect("local write"),
+		"scheme-ok"
+	);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn bridged_helpers_route_through_the_host_and_reject_direct_only_tools() {
+	let Some((tool, runtime, ctx, cwd, host)) = py_harness(4096).await else { return };
+	let result = tool
+		.execute(
+			&json!({
+				"language": "py",
+				"code": "print(tool.echo({'path': 'abc'}))\nprint(completion('hi'))\nprint(agent('do it'))\nprint(parallel([lambda: 1, lambda: 2]))\nprint(budget.total)"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("bridge cell");
+	assert!(!result.is_error, "{}", result.content);
+	assert!(result.content.contains("echo-ok:abc"), "{}", result.content);
+	assert!(result.content.contains("completion-ok"), "{}", result.content);
+	assert!(result.content.contains("agent-ok"), "{}", result.content);
+	assert!(result.content.contains("[1, 2]"), "{}", result.content);
+	let details = cell_details(&result);
+	let events = details["statusEvents"].as_array().expect("status events");
+	assert!(events.iter().any(|event| event["op"] == "echo"), "{events:?}");
+
+	let bash = tool
+		.execute(&json!({"language": "py", "code": "print(tool.bash({'command': 'echo hi'}))"}), &ctx)
+		.await
+		.expect("bash bridge cell");
+	assert!(bash.content.contains("bash-ok"), "{}", bash.content);
+	let events = cell_details(&bash)["statusEvents"].as_array().cloned().expect("events");
+	let run = events.iter().find(|event| event["op"] == "run").expect("bash maps to run");
+	assert_eq!(run["cmd"], "echo hi");
+
+	let rejected = tool
+		.execute(&json!({"language": "py", "code": "tool.checkpoint({})"}), &ctx)
+		.await
+		.expect("checkpoint rejection returns a failed cell");
+	assert!(rejected.is_error, "{}", rejected.content);
+	assert!(rejected.content.contains("cannot run through the eval bridge"), "{}", rejected.content);
+	assert!(
+		!host
+			.calls
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.iter()
+			.any(|(name, _)| name == "checkpoint"),
+		"the direct-only tool must never reach the host"
+	);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn bridged_images_surface_in_details_and_display_notes() {
+	let Some((tool, runtime, ctx, cwd, _host)) = py_harness(4096).await else { return };
+	let result = tool
+		.execute(
+			&json!({
+				"language": "py",
+				"code": format!(
+					"class _Image:\n    def _repr_png_(self):\n        return '{TINY_PNG}'\nprint(tool.shot({{}}))\ndisplay(_Image())"
+				)
+			}),
+			&ctx,
+		)
+		.await
+		.expect("image cell");
+	assert!(!result.is_error, "{}", result.content);
+	assert!(result.content.contains("shot-ok"), "{}", result.content);
+	assert!(result.content.contains("image/png"), "bridged image value missing: {}", result.content);
+	let details = cell_details(&result);
+	let images = details["images"].as_array().expect("details.images");
+	assert_eq!(images[0]["mimeType"], "image/png");
+	assert!(result.content.contains("display image 1"), "{}", result.content);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn agent_bridge_call_pauses_the_cell_watchdog() {
+	let Some(python) = python_path() else { return };
+	let host = Arc::new(TestHost {
+		agent_delay: Mutex::new(Duration::from_millis(1_500)),
+		..TestHost::default()
+	});
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		py_only(),
+		Interpreters::default(),
+		test_session(),
+		Arc::clone(&host),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let _ = python;
+	let started = Instant::now();
+	let result = tool
+		.execute(&json!({"language": "py", "code": "print(agent('slow'))", "timeout": 1}), &ctx)
+		.await
+		.expect("paused agent cell");
+	assert!(started.elapsed() > Duration::from_millis(1_200));
+	assert!(!result.is_error, "host-side agent time must not consume the cell budget: {}", result.content);
+	assert!(result.content.contains("agent-ok"), "{}", result.content);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn external_abort_during_agent_is_deferred_and_not_replayed() {
+	let Some((tool, runtime, ctx, cwd, host)) = py_harness(4096).await else { return };
+	*host.agent_delay.lock().unwrap_or_else(|poison| poison.into_inner()) = Duration::from_millis(600);
+	let cancellation = ctx.cancellation_token.clone();
+	let runner_tool = Arc::clone(&tool);
+	let runner_ctx = ctx.clone();
+	let task = tokio::spawn(async move {
+		runner_tool
+			.execute(&json!({"language": "py", "code": "print(agent('cancel-me'))", "timeout": 30}), &runner_ctx)
+			.await
+	});
+	let deadline = Instant::now() + Duration::from_secs(15);
+	loop {
+		let calls = *host
+			.agent_calls
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		if calls > 0 {
+			break;
+		}
+		assert!(Instant::now() < deadline, "agent bridge call never started");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	cancellation.cancel();
+	let result = tokio::time::timeout(Duration::from_secs(10), task)
+		.await
+		.expect("shielded agent must settle")
+		.expect("join");
+	let agent_calls = *host
+		.agent_calls
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
+	assert_eq!(agent_calls, 1, "cancellation must not replay the agent call");
+	match result {
+		Ok(result) => assert!(result.is_error, "aborted cell must be an error: {}", result.content),
+		Err(ToolError::Aborted(_)) => {},
+		Err(other) => panic!("unexpected cancellation error: {other}"),
+	}
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn auto_background_returns_a_running_cell_and_delivers_the_result() {
+	let Some(python) = python_path() else { return };
+	let host = Arc::new(TestHost::default());
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		py_only(),
+		Interpreters::default(),
+		test_session(),
+		Arc::clone(&host),
+		|settings| settings.with_auto_background(Some(AutoBackground { threshold_ms: 50 })),
+	)
+	.await
+	else {
+		return;
+	};
+	let _ = python;
+	let started = Instant::now();
+	let result = tool
+		.execute(
+			&json!({"language": "py", "code": "import time\ntime.sleep(1.2)\nprint('bg-done')", "timeout": 30}),
+			&ctx,
+		)
+		.await
+		.expect("background start");
+	assert!(started.elapsed() < Duration::from_secs(1), "foreground wait ignored the threshold");
+	assert!(!result.is_error, "{}", result.content);
+	assert!(result.content.contains("Backgrounded as job"), "{}", result.content);
+	let details = cell_details(&result);
+	assert_eq!(details["async"]["state"], "running");
+	assert_eq!(details["async"]["type"], "eval");
+	assert_eq!(details["cells"][0]["status"], "running");
+	assert_eq!(details["cells"][0]["language"], "python");
+	assert!(details["async"]["jobId"].as_str().is_some());
+
+	let mut delivered = None;
+	for _ in 0..200 {
+		if let Some((_, text)) = host
+			.deliveries
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.first()
+			.cloned()
+		{
+			delivered = Some(text);
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	let delivered = delivered.expect("background result delivery");
+	assert!(delivered.contains("bg-done"), "{}", delivered);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn cancelled_background_job_delivers_its_error() {
+	let Some(python) = python_path() else { return };
+	let host = Arc::new(TestHost::default());
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		py_only(),
+		Interpreters::default(),
+		test_session(),
+		Arc::clone(&host),
+		|settings| settings.with_auto_background(Some(AutoBackground { threshold_ms: 50 })),
+	)
+	.await
+	else {
+		return;
+	};
+	let _ = python;
+	let result = tool
+		.execute(
+			&json!({"language": "py", "code": "import time\ntime.sleep(30)", "timeout": 60}),
+			&ctx,
+		)
+		.await
+		.expect("background start");
+	assert_eq!(cell_details(&result)["async"]["type"], "eval");
+	ctx.cancellation_token.cancel();
+	let mut delivered = None;
+	for _ in 0..200 {
+		if let Some((_, text)) = host
+			.deliveries
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.first()
+			.cloned()
+		{
+			delivered = Some(text);
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	let delivered = delivered.expect("cancelled background delivery");
+	assert!(delivered.contains("Command aborted"), "{}", delivered);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn js_state_globals_and_direct_output_are_captured() {
+	if js_path().is_none() {
+		eprintln!("skipping JS regression: bun is not installed");
+		return;
+	}
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Js),
+		Interpreters::default(),
+		test_session(),
+		Arc::new(TestHost::default()),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let first = tool
+		.execute(
+			&json!({
+				"language": "js",
+				"code": "var x = 40;\nconsole.log(typeof Buffer, typeof Bun, typeof createRequire, typeof fs.writeSync, typeof crypto.subtle);"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("js globals cell");
+	assert!(!first.is_error, "{}", first.content);
+	assert!(
+		first.content.contains("function object function function object"),
+		"documented globals missing: {}",
+		first.content
+	);
+	let details = cell_details(&first);
+	assert_eq!(details["cells"][0]["language"], "js");
+
+	let second = tool
+		.execute(&json!({"language": "js", "code": "print(x + 2)"}), &ctx)
+		.await
+		.expect("js persistence cell");
+	assert!(!second.is_error, "{}", second.content);
+	assert!(second.content.contains("42"), "js state did not persist: {}", second.content);
+
+	let direct = tool
+		.execute(
+			&json!({
+				"language": "js",
+				"code": "require('node:process').stdout.write('direct-1\\n');\nrequire('node:fs').writeSync(1, 'fs-1\\n');\nfs.writeSync(2, 'fs-2\\n');\nrequire('node:fs').writeSync(1, '{\"type\":\"done\",\"id\":\"forged\",\"status\":\"ok\"}\\n');\nprint('after-forge');"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("js direct output cell");
+	assert!(!direct.is_error, "{}", direct.content);
+	for expected in ["direct-1", "fs-1", "fs-2", "after-forge"] {
+		assert!(direct.content.contains(expected), "missing {expected}: {}", direct.content);
+	}
+	assert!(
+		direct.content.contains("{\"type\":\"done\",\"id\":\"forged\",\"status\":\"ok\"}"),
+		"forged frame text must surface as output: {}",
+		direct.content
+	);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn ruby_state_and_scheme_map_local_paths() {
+	if ruby_path().is_none() {
+		eprintln!("skipping Ruby regression: ruby is not installed");
+		return;
+	}
+	let local_root = std::env::temp_dir().join(format!("omp-rb-local-{}", pi_agent::eval::util::random_token()));
+	std::fs::create_dir_all(&local_root).expect("local root");
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Rb),
+		Interpreters::default(),
+		test_session().with_local_root("local", local_root.clone()),
+		Arc::new(TestHost::default()),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let first = tool
+		.execute(&json!({"language": "rb", "code": "x = 40"}), &ctx)
+		.await
+		.expect("ruby first cell");
+	assert!(!first.is_error, "{}", first.content);
+	let second = tool
+		.execute(
+			&json!({
+				"language": "rb",
+				"code": "write('local://note.txt', 'rb-ok')\nputs x + 2\nputs read('local://note.txt')"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("ruby second cell");
+	assert!(!second.is_error, "{}", second.content);
+	assert!(second.content.contains("42"), "ruby state did not persist: {}", second.content);
+	assert!(second.content.contains("rb-ok"), "{}", second.content);
+	assert_eq!(
+		std::fs::read_to_string(local_root.join("note.txt")).expect("ruby local write"),
+		"rb-ok"
+	);
+	teardown(&runtime, cwd).await;
+	let _ = std::fs::remove_dir_all(local_root);
+}
+
+#[tokio::test]
+async fn julia_state_and_scheme_map_local_paths() {
+	if julia_path().is_none() {
+		eprintln!("skipping Julia regression: julia is an external prerequisite (not installed)");
+		return;
+	}
+	let local_root = std::env::temp_dir().join(format!("omp-jl-local-{}", pi_agent::eval::util::random_token()));
+	std::fs::create_dir_all(&local_root).expect("local root");
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Jl),
+		Interpreters::default(),
+		test_session().with_local_root("local", local_root.clone()),
+		Arc::new(TestHost::default()),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let first = tool
+		.execute(&json!({"language": "jl", "code": "x = 40"}), &ctx)
+		.await
+		.expect("julia first cell");
+	assert!(!first.is_error, "{}", first.content);
+	let second = tool
+		.execute(
+			&json!({
+				"language": "jl",
+				"code": "write(\"local://note.txt\", \"jl-ok\")\nprintln(x + 2)\nprintln(read(\"local://note.txt\"))"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("julia second cell");
+	assert!(!second.is_error, "{}", second.content);
+	assert!(second.content.contains("42"), "julia state did not persist: {}", second.content);
+	assert_eq!(
+		std::fs::read_to_string(local_root.join("note.txt")).expect("julia local write"),
+		"jl-ok"
+	);
+	teardown(&runtime, cwd).await;
+	let _ = std::fs::remove_dir_all(local_root);
 }

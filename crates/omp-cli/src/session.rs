@@ -1,7 +1,7 @@
 //! Session persistence: TypeScript v3 JSONL logs, 256-byte title slots,
 //! encoded directory layouts, terminal breadcrumbs, and legacy v1 compatibility.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1176,7 +1176,6 @@ impl SessionStore {
 		self.is_v1
 	}
 
-	#[must_use]
 	pub fn entries(&self) -> &[SessionEntry] {
 		&self.entries
 	}
@@ -1190,6 +1189,241 @@ impl SessionStore {
 	#[must_use]
 	pub fn has_image_content(&self) -> bool {
 		self.messages.iter().any(|entry| entry.message.content.has_image())
+	}
+
+	/// Active leaf: the last journal entry. Branching appends a
+	/// `branch_summary` whose `parentId` is the branch point, so the journal
+	/// order alone reconstructs the active path after reload (TS
+	/// `SessionManager.#leaf` + last-physical-entry rule).
+	#[must_use]
+	pub fn leaf_id(&self) -> Option<&str> {
+		self
+			.entries
+			.last()
+			.map(|entry| entry.id.as_str())
+			.filter(|id| !id.is_empty())
+	}
+
+	#[must_use]
+	pub fn has_entry(&self, id: &str) -> bool {
+		!id.is_empty() && self.entries.iter().any(|entry| entry.id == id)
+	}
+
+	/// Warning when the journal has no single coherent `parentId` tree
+	/// (legacy/foreign imports emit repeated roots or dangling parents). Such
+	/// logs fall back to journal order so a resumed conversation is never
+	/// silently truncated.
+	#[must_use]
+	pub fn branch_chain_warning(&self) -> Option<String> {
+		let by_id: HashMap<&str, &SessionEntry> = self
+			.entries
+			.iter()
+			.filter(|entry| !entry.id.is_empty())
+			.map(|entry| (entry.id.as_str(), entry))
+			.collect();
+		let dangling = self.entries.iter().any(|entry| {
+			entry
+				.parent_id
+				.as_deref()
+				.filter(|parent| !parent.is_empty())
+				.is_some_and(|parent| !by_id.contains_key(parent))
+		});
+		let mut roots = self.entries.iter().filter(|entry| {
+			!entry.id.is_empty()
+				&& entry
+					.parent_id
+					.as_deref()
+					.filter(|parent| !parent.is_empty())
+					.is_none()
+		});
+		let _first_root = roots.next();
+		// Later parentless entries are valid only for a rewind-to-root summary.
+		let unexpected_root = roots.any(|entry| {
+			entry.kind != "branch_summary"
+				|| entry.extra.get("fromId").and_then(serde_json::Value::as_str) != Some("root")
+		});
+		if dangling || unexpected_root {
+			Some(
+				"session branch chain is incomplete (imported/legacy entries); using journal order"
+					.to_string(),
+			)
+		} else {
+			None
+		}
+	}
+
+	/// Root-to-leaf path of the active branch, following `parentId` links.
+	/// Missing or cyclic parents terminate the walk, never panic. Incoherent
+	/// chains fall back to journal order (see [`Self::branch_chain_warning`]).
+	#[must_use]
+	pub fn branch_entries(&self) -> Vec<&SessionEntry> {
+		if self.branch_chain_warning().is_some() {
+			return self
+				.entries
+				.iter()
+				.filter(|entry| !entry.id.is_empty())
+				.collect();
+		}
+		let mut by_id: HashMap<&str, &SessionEntry> = HashMap::with_capacity(self.entries.len());
+		for entry in &self.entries {
+			if !entry.id.is_empty() {
+				by_id.insert(entry.id.as_str(), entry);
+			}
+		}
+		let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+		let mut path = Vec::new();
+		let mut cursor = self.entries.last();
+		while let Some(entry) = cursor {
+			if entry.id.is_empty() || !seen.insert(entry.id.as_str()) {
+				break;
+			}
+			path.push(entry);
+			cursor = entry
+				.parent_id
+				.as_deref()
+				.filter(|parent| !parent.is_empty())
+				.and_then(|parent| by_id.get(parent).copied());
+		}
+		path.reverse();
+		path
+	}
+
+	/// Whether the active branch needs the exact context override: rewinds,
+	/// custom entries, or abandoned messages make `history()` lossy.
+	#[must_use]
+	pub fn has_branch_context(&self) -> bool {
+		self.branch_chain_warning().is_some()
+			|| self.messages.len() != self.branch_messages().len()
+			|| self
+				.entries
+				.iter()
+				.any(|entry| entry.kind == "branch_summary" || entry.kind == "custom_message")
+	}
+
+	/// Typed messages on the active branch, in branch order. Abandoned entries
+	/// stay in [`Self::messages`] but are excluded here (they are not ancestors
+	/// of the leaf).
+	#[must_use]
+	pub fn branch_messages(&self) -> Vec<&MessageEntry> {
+		let ids: std::collections::HashSet<&str> = self
+			.branch_entries()
+			.into_iter()
+			.map(|entry| entry.id.as_str())
+			.collect();
+		// A branch cut may land after the checkpoint result while the same
+		// assistant message also called a sibling tool. Production appends
+		// each later toolResult under the previous result, so parentage cannot
+		// identify the batch; tool-call ids are unique, so match by those.
+		let mut batch_call_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+		for entry in self
+			.messages
+			.iter()
+			.filter(|entry| ids.contains(entry.id.as_str()) && entry.message.role == "assistant")
+		{
+			batch_call_ids.extend(
+				entry
+					.message
+					.content
+					.parts()
+					.iter()
+					.filter(|part| part.kind == "toolCall")
+					.filter_map(|part| {
+						part.extra
+							.get("id")
+							.and_then(serde_json::Value::as_str)
+					}),
+			);
+		}
+		self
+			.messages
+			.iter()
+			.filter(|entry| {
+				ids.contains(entry.id.as_str())
+					|| (entry.message.role == "toolResult"
+						&& entry
+							.message
+							.tool_call_id
+							.as_deref()
+							.is_some_and(|id| batch_call_ids.contains(id)))
+			})
+			.collect()
+	}
+
+	/// `TurnRecord` view of the active branch (TS `buildSessionContext` message
+	/// rebuild). Abandoned entries never contribute.
+	pub fn branch_history(&self) -> Result<Vec<TurnRecord>, String> {
+		let messages: Vec<MessageEntry> = self
+			.branch_messages()
+			.into_iter()
+			.cloned()
+			.collect();
+		derive_turn_history(&messages)
+	}
+
+	/// TS `SessionManager.branchWithSummary`: append a `branch_summary` whose
+	/// parent is `branch_from`, moving the leaf there without modifying or
+	/// deleting abandoned entries. `branch_from == None` starts a new root.
+	pub fn branch_with_summary(
+		&mut self,
+		branch_from: Option<&str>,
+		summary: &str,
+		details: serde_json::Value,
+	) -> Result<String, String> {
+		if let Some(id) = branch_from
+			&& !self.has_entry(id)
+		{
+			return Err(format!("Entry {id} not found"));
+		}
+		let id = format!("entry-{}", output::session_id());
+		let mut extra = serde_json::json!({
+			"fromId": branch_from.unwrap_or("root"),
+			"summary": summary,
+		});
+		if !details.is_null()
+			&& let Some(map) = extra.as_object_mut()
+		{
+			map.insert("details".to_string(), details);
+		}
+		self.append_entry(SessionEntry {
+			kind: "branch_summary".to_string(),
+			id: id.clone(),
+			parent_id: branch_from.map(str::to_string),
+			timestamp: output::iso8601(SystemTime::now()),
+			extra,
+		})?;
+		Ok(id)
+	}
+
+	/// TS `SessionManager.appendCustomMessageEntry` for the checkpoint lane:
+	/// persisted `custom_message` with `display` control and details.
+	pub fn append_custom_message(
+		&mut self,
+		custom_type: &str,
+		content: &str,
+		display: bool,
+		details: serde_json::Value,
+	) -> Result<String, String> {
+		let id = format!("entry-{}", output::session_id());
+		let mut extra = serde_json::json!({
+			"customType": custom_type,
+			"content": content,
+			"display": display,
+			"attribution": "agent",
+		});
+		if !details.is_null()
+			&& let Some(map) = extra.as_object_mut()
+		{
+			map.insert("details".to_string(), serde_json::Value::Object(details.clone()));
+		}
+		let parent_id = self.leaf_id().map(str::to_string);
+		self.append_entry(SessionEntry {
+			kind: "custom_message".to_string(),
+			id: id.clone(),
+			parent_id,
+			timestamp: output::iso8601(SystemTime::now()),
+			extra,
+		})?;
+		Ok(id)
 	}
 
 	#[must_use]
@@ -2119,13 +2353,14 @@ struct ParsedSession {
 /// Derive the read-view `TurnRecord` sequence from typed message entries.
 /// `TurnRecord` is never a write source; this is a lossy view for callers that
 /// only need prompt/assistant/tool text.
-fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnRecord>, String> {
+pub(crate) fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnRecord>, String> {
 	let mut turns = Vec::new();
 	let mut current_prompt: Option<String> = None;
 	let mut current_parts: Vec<ContentPart> = Vec::new();
 	let mut current_asst = String::new();
 	let mut current_stop = String::new();
 	let mut current_tool_calls: Vec<ToolCallRecord> = Vec::new();
+	let mut current_matched: std::collections::HashSet<String> = std::collections::HashSet::new();
 
 	let flush =
 		|prompt: &mut Option<String>,
@@ -2133,8 +2368,18 @@ fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnRecord>, Str
 		 asst: &mut String,
 		 stop: &mut String,
 		 calls: &mut Vec<ToolCallRecord>,
+		 matched: &mut std::collections::HashSet<String>,
 		 turns: &mut Vec<TurnRecord>| {
 			if let Some(prompt) = prompt.take() {
+				// A branch cut can exclude a sibling result while keeping its
+				// call; never replay that as an empty success.
+				for call in calls.iter_mut().filter(|call| !matched.contains(&call.id)) {
+					call.is_error = true;
+					if call.result.is_empty() {
+						call.result = "Tool result missing (interrupted)".to_string();
+					}
+				}
+				matched.clear();
 				turns.push(TurnRecord {
 					prompt,
 					assistant: std::mem::take(asst),
@@ -2158,6 +2403,7 @@ fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnRecord>, Str
 					&mut current_asst,
 					&mut current_stop,
 					&mut current_tool_calls,
+					&mut current_matched,
 					&mut turns,
 				);
 				match &entry.message.content {
@@ -2287,6 +2533,7 @@ fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnRecord>, Str
 						call.result_parts = result_parts.clone();
 						call.is_error = is_error;
 						call.details = entry.message.extra.get("details").cloned();
+						current_matched.insert(call_id.to_string());
 						break;
 					}
 				}
@@ -2301,6 +2548,7 @@ fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnRecord>, Str
 		&mut current_asst,
 		&mut current_stop,
 		&mut current_tool_calls,
+		&mut current_matched,
 		&mut turns,
 	);
 	Ok(turns)

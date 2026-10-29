@@ -14,7 +14,7 @@ use std::{
 };
 
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	net::{TcpListener, TcpStream},
@@ -31,6 +31,7 @@ use super::{
 		EVAL_CONCURRENCY_BRIDGE_NAME, EvalHost, normalize_bridge_args, reject_bridged_tool,
 		summarize_tool_result, tool_value,
 	},
+	idle::CellControl,
 	types::{EvalError, EvalStatusEvent},
 	util,
 };
@@ -43,7 +44,8 @@ pub const EVAL_TIMEOUT_RESUME_OP: &str = "timeout-resume";
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 /// Maximum accepted JSON body.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
-/// Idle keep-alive bound for one loopback connection.
+/// Bound on reading one request head/body from a loopback connection. It never
+/// wraps dispatch: host work may legitimately exceed it.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 /// Sleep window for an idle accept loop before checking shutdown.
 const ACCEPT_POLL: Duration = Duration::from_millis(200);
@@ -54,6 +56,7 @@ struct Registration {
 	ctx: AgentContext,
 	intent: String,
 	cancellation: CancellationToken,
+	control: Option<CellControl>,
 	status: mpsc::UnboundedSender<EvalStatusEvent>,
 }
 
@@ -113,7 +116,8 @@ impl Bridge {
 	}
 
 	/// Register one execution. The returned receiver carries host-side status
-	/// events (including timeout pause/resume controls) for the cell.
+	/// events for the cell; watchdog pause/resume is executed synchronously via
+	/// the optional [`CellControl`] instead of travelling through the channel.
 	pub fn register(
 		&self,
 		session_id: &str,
@@ -122,6 +126,7 @@ impl Bridge {
 		ctx: AgentContext,
 		intent: impl Into<String>,
 		cancellation: CancellationToken,
+		control: Option<CellControl>,
 	) -> mpsc::UnboundedReceiver<EvalStatusEvent> {
 		let (status, receiver) = mpsc::unbounded_channel();
 		let registration = Registration {
@@ -129,6 +134,7 @@ impl Bridge {
 			ctx,
 			intent: intent.into(),
 			cancellation,
+			control,
 			status,
 		};
 		self
@@ -191,12 +197,12 @@ async fn accept_loop(
 				connections.fetch_add(1, Ordering::SeqCst);
 				let token = token.clone();
 				let registrations = Arc::clone(&registrations);
+				// The connection timeout bounds *idle* reads only. Host bridge
+				// calls (agent/completion/tool) can legitimately run longer than
+				// that; wrapping the whole handler dropped the dispatch future
+				// mid-await, leaving the watchdog paused and the shield set.
 				tokio::spawn(async move {
-					let _ = tokio::time::timeout(
-						CONNECTION_TIMEOUT,
-						handle_connection(stream, token, registrations),
-					)
-					.await;
+					handle_connection(stream, token, registrations).await;
 				});
 			},
 			Err(_) => {
@@ -224,7 +230,15 @@ async fn handle_connection(
 	token: String,
 	registrations: Arc<Mutex<HashMap<String, Registration>>>,
 ) {
-	let Some((method, path, headers, leftover)) = read_head(&mut stream).await else {
+	let Some((method, path, headers, leftover)) =
+		(match tokio::time::timeout(CONNECTION_TIMEOUT, read_head(&mut stream)).await {
+			Ok(head) => head,
+			Err(_) => {
+				let _ = write_response(&mut stream, 408, "text/plain", b"request timeout").await;
+				return;
+			},
+		})
+	else {
 		let _ = write_response(&mut stream, 400, "text/plain", b"bad request").await;
 		return;
 	};
@@ -255,7 +269,7 @@ async fn handle_connection(
 	}
 	if body.len() < length {
 		let mut rest = vec![0u8; length - body.len()];
-		if stream.read_exact(&mut rest).await.is_err() {
+		if tokio::time::timeout(CONNECTION_TIMEOUT, stream.read_exact(&mut rest)).await.is_err() {
 			let _ = write_response_json(&mut stream, 400, &failure("Incomplete body")).await;
 			return;
 		}
@@ -312,15 +326,29 @@ fn failure(message: &str) -> Value {
 async fn dispatch(registration: &Registration, name: &str, args: Value) -> Result<Value, String> {
 	match name {
 		EVAL_COMPLETION_BRIDGE_NAME => {
-			emit(registration, EvalStatusEvent::new(EVAL_TIMEOUT_PAUSE_OP));
+			// Pause in this task, before the host future is polled: relaying the
+			// control through the status channel races the watchdog deadline.
+			if let Some(control) = &registration.control {
+				control.pause();
+			}
 			let result = registration.host.completion(args, &registration.ctx).await;
-			emit(registration, EvalStatusEvent::new(EVAL_TIMEOUT_RESUME_OP));
+			if let Some(control) = &registration.control {
+				control.resume();
+			}
 			result
 		},
 		EVAL_AGENT_BRIDGE_NAME => {
-			emit(registration, EvalStatusEvent::new(EVAL_TIMEOUT_PAUSE_OP));
+			// `agent()` pauses *and* holds a turn abort away from the kernel while
+			// the subagent (isolation worktree setup/merge) runs. The host call
+			// still receives the caller's real token through `ctx`, so the child
+			// stops immediately on cancel.
+			if let Some(control) = &registration.control {
+				control.pause_deferring_abort();
+			}
 			let result = registration.host.agent(args, &registration.ctx).await;
-			emit(registration, EvalStatusEvent::new(EVAL_TIMEOUT_RESUME_OP));
+			if let Some(control) = &registration.control {
+				control.resume_deferring_abort();
+			}
 			result
 		},
 		EVAL_BUDGET_BRIDGE_NAME => registration.host.budget(args, &registration.ctx).await,

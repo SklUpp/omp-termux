@@ -3,8 +3,16 @@
 //! Mirrors upstream `resolveEditPath`: authored paths resolve against the
 //! session cwd; when a path that must exist is missing, a unique workspace
 //! suffix match is used. Internal URL schemes are refused with upstream's
-//! protocol-handler error; [`InternalUrlEditHost`] is the seam the registry
-//! layer implements and wires, so the engines never invent a local fallback.
+//! protocol-handler error. Accepting them requires the parent host to supply
+//! the `InternalUrlRouter` API from
+//! `packages/coding-agent/src/internal-urls/router.ts`:
+//! `can_handle(url)`, `resolve(url, ctx)` (`ResolveContext`: cwd, session file,
+//! settings, abort signal, and `local://` per-session roots), `write(url,
+//! content, ctx)` (`WriteContext`: cwd, signal, local roots, session `xd`
+//! writer), and `get_handler(scheme).write` for the approval tier. The Rust
+//! parent has no router or per-session context yet, so the engines still refuse
+//! every internal scheme via [`ensure_no_internal_scheme`] and never invent a
+//! local fallback.
 
 use std::{
 	collections::HashSet,
@@ -32,24 +40,6 @@ const INTERNAL_SCHEMES: [&str; 9] = [
 /// Directories skipped by the workspace suffix search.
 const SKIP_DIRS: [&str; 8] = [".git", "node_modules", "target", ".venv", "venv", "dist", "build", ".cache"];
 const SUFFIX_SEARCH_MAX_FILES: usize = 5000;
-
-/// Host adapter that owns internal URL routing. The edit engines refuse
-/// internal URLs rather than inventing a local path: a host that mounts
-/// `local://`, `vault://`, `mcp://`, or `ssh://` implements this seam and the
-/// parent wires it into the registry/approval layer.
-///
-/// Required operations, in order:
-/// 1. `resolve_write_target` — map the URL to the host's editable handle;
-/// 2. `read_target` — return the current bytes for the per-file compare;
-/// 3. `write_target` — publish atomically with the host's own semantics.
-pub trait InternalUrlEditHost {
-	type Target;
-	type Error: std::fmt::Display;
-
-	fn resolve_write_target(&self, url: &str) -> Result<Self::Target, Self::Error>;
-	fn read_target(&self, target: &Self::Target) -> Result<String, Self::Error>;
-	fn write_target(&self, target: &Self::Target, contents: &str, mode: Option<u32>) -> Result<(), Self::Error>;
-}
 
 /// Scheme of a path when it is one of the internal URLs a host must route.
 pub fn internal_url_scheme(path: &str) -> Option<&'static str> {
@@ -210,7 +200,7 @@ fn walk_suffix(root: &Path, suffix: &str, token: &CancellationToken) -> Option<S
 			files += 1;
 			let Ok(relative) = path.strip_prefix(root) else { continue };
 			let relative = relative.to_string_lossy().replace('\\', "/");
-			if relative.ends_with(suffix.as_str()) {
+			if relative.ends_with(suffix) {
 				if !seen.insert(relative.clone()) || found.is_some() {
 					// A second match makes the suffix ambiguous.
 					return None;

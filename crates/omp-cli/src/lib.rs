@@ -26,6 +26,7 @@ pub mod prompts;
 pub mod repl;
 pub mod runtime;
 pub mod session;
+pub mod session_checkpoint;
 pub mod skills;
 pub mod tool_commands;
 pub mod yaml;

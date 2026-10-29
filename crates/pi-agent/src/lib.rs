@@ -1,4 +1,7 @@
 pub mod compaction;
+pub mod dap;
+pub mod eval;
+pub mod lsp;
 pub mod mailbox;
 pub mod mcp;
 #[path = "loop.rs"]
@@ -11,7 +14,10 @@ pub mod tokenizer;
 pub mod tools;
 
 pub use compaction::Compactor;
-pub use loop_module::{AgentError, AgentEvent, AgentLoop, SteeringEvent, INTERRUPTED_TOOL_RESULT};
+pub use loop_module::{
+	AgentError, AgentEvent, AgentLoop, InMemoryRewind, SteeringEvent, TurnAck, TurnAckDecision,
+	TurnAckRequest, TurnRewrite, INTERRUPTED_TOOL_RESULT, repair_tool_batch_boundary, tool_batch_end,
+};
 pub use tokio_util::sync::CancellationToken;
 pub use provider::{
 	ChunkStream, ModelProvider, OpenAiChatRequest, OpenAiCompatibleProvider, OpenAiContent,
@@ -33,7 +39,8 @@ pub use mailbox::{
 	format_incoming,
 };
 pub use tools::{
-	AskTool, AstGrepTool, BashTool, EditTool, GlobTool, GrepTool, HubTool, PendingAction, PendingStore,
-	REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH, ReadTool, TaskTool, ThinkTool, TodoTool, Tool, ToolError,
-	WriteTool, YieldTool, registry::ToolRegistry, scheduler::ToolScheduler,
+	AskTool, AstGrepTool, BashTool, CheckpointTool, EditTool, GlobTool, GrepTool, HubTool,
+	PendingAction, PendingStore, REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH, ReadTool, RewindTool,
+	TaskTool, ThinkTool, TodoTool, Tool, ToolError, WriteTool, YieldTool, registry::ToolRegistry,
+	scheduler::ToolScheduler,
 };

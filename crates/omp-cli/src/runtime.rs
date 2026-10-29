@@ -16,7 +16,7 @@ use std::{
 use async_trait::async_trait;
 use pi_agent::{
 	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, AskTool, AstGrepTool, BashTool,
-	DelegationLimits,
+	CheckpointTool, DelegationLimits, RewindTool,
 	EditTool, GlobTool, GrepTool, ModelProvider, OpenAiCompatibleProvider, PendingStore, ReadTool,
 	SteeringEvent, Supervisor, TodoTool, Tool, ToolApprover, ToolRegistry, WriteTool,
 	process_broker::BrokerProcessBackend,
@@ -27,6 +27,13 @@ use pi_agent::{
 		mcp_tool_match_score, sanitize_mcp_tool_name_part,
 	},
 	tools::hashline::{NativeSnapshotSink, SnapshotStore, edit::EditToolOptions},
+	tools::{
+		edit_variants::{
+			EditMode, ResolvedSessionTools, SessionDisplayResolver, default_session_tools,
+			normalize_edit_mode, resolve_edit_mode,
+		},
+		read::FileDisplayInputs,
+	},
 	tools::task_catalog::{
 		AgentCatalog, ChildModel, ChildModelFactory, EFFORT_SELECTORS, parse_effort_prefix,
 		split_effort_selector,
@@ -45,9 +52,9 @@ pub const DEFAULT_CONTEXT_LIMIT: usize = 32_768;
 
 /// Builtin tools: name and whether the tool only reads.
 ///
-/// `pi-agent` has no approval hook, so the registry *is* the approval gate:
-/// a tool is offered to the model only when the approval matrix would
-/// auto-approve it.
+/// The registry lists every selected tool; approval is not a visibility filter.
+/// `ToolApprover` gates each call in the scheduler immediately before
+/// execution, so denied tools still reach the model and report explicit denial.
 pub const BUILTIN_TOOLS: [(&str, bool); 10] = [
 	("read", true),
 	("glob", true),
@@ -110,6 +117,62 @@ impl RunnerSession {
 	}
 }
 
+/// Exact upstream `parseFlag` truthy set (`packages/utils/src/env.ts`).
+const ENV_FLAG_TRUTHY: [&str; 9] = ["1", "Y", "y", "TRUE", "true", "YES", "yes", "ON", "on"];
+
+fn parse_env_flag(name: &str) -> bool {
+	std::env::var(name).is_ok_and(|value| ENV_FLAG_TRUTHY.contains(&value.as_str()))
+}
+
+/// CLI settings + environment as the injected `edit.mode`/display resolver.
+///
+/// `PI_EDIT_VARIANT` pins the `edit` wire contract (invalid values are a hard
+/// error, `auto`/empty means dynamic), while display resolution follows
+/// upstream precedence: model variant → env → `edit.mode` → hashline/sloppy.
+struct ConfigDisplayResolver {
+	config:       crate::config::Config,
+	env_variant:  Option<EditMode>,
+	strict:       bool,
+}
+
+impl ConfigDisplayResolver {
+	fn from_config(config: &crate::config::Config) -> Result<Self> {
+		let env_variant = match std::env::var("PI_EDIT_VARIANT")
+			.ok()
+			.filter(|raw| !raw.is_empty() && raw != "auto")
+		{
+			Some(raw) => Some(normalize_edit_mode(&raw).ok_or_else(|| {
+				Error::new(format!("Invalid PI_EDIT_VARIANT: {raw}"))
+			})?),
+			None => None,
+		};
+		Ok(Self {
+			config: config.clone(),
+			env_variant,
+			strict: parse_env_flag("PI_STRICT_EDIT_MODE"),
+		})
+	}
+}
+
+impl SessionDisplayResolver for ConfigDisplayResolver {
+	fn resolve(&self, active_model: Option<&str>, has_edit_tool: bool) -> ResolvedSessionTools {
+		let display_mode = resolve_edit_mode(
+			&self.config,
+			active_model,
+			self.env_variant.map(EditMode::as_str),
+			self.strict,
+		);
+		ResolvedSessionTools {
+			display: FileDisplayInputs::new(
+				display_mode,
+				has_edit_tool,
+				self.config.read_line_numbers(),
+			),
+			edit_tool: self.env_variant.unwrap_or(display_mode),
+		}
+	}
+}
+
 impl PiAgentRunner {
 	pub fn new() -> Result<Self> {
 		let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -154,10 +217,13 @@ impl PiAgentRunner {
 
 
 	/// Reuse this runner's root store/`EditTool`, refreshing only the knobs.
-	fn session_tools(&self, options: EditToolOptions) -> Arc<RunnerSession> {
+	fn session_tools(&self, options: EditToolOptions, mode: EditMode) -> Arc<RunnerSession> {
 		let mut slot = self.session.lock().unwrap_or_else(|poison| poison.into_inner());
 		let session = Arc::clone(slot.get_or_insert_with(|| Arc::new(RunnerSession::new(options))));
 		session.edit.set_options(options);
+		// Cross-turn registers/guard survive; only the wire contract follows the
+		// active model/env, as upstream's lazy `get mode()`.
+		session.edit.set_mode(mode);
 		session
 	}
 }
@@ -310,7 +376,11 @@ impl AgentRunner for PiAgentRunner {
 		let edit_options = EditToolOptions {
 			enforce_seen_lines: request.config.edit.enforce_seen_lines(),
 		};
-		let session = self.session_tools(edit_options);
+		let display_resolver = Arc::new(ConfigDisplayResolver::from_config(&request.config)?);
+		let active_model = format!("{}/{}", plan.provider, plan.model);
+		let resolved_display =
+			display_resolver.resolve(Some(&active_model), plan.tools.contains(&"edit"));
+		let session = self.session_tools(edit_options, resolved_display.edit_tool);
 		// `ask` needs the root context's UI: register it after the supervisor has
 		// cloned its child template, so children never receive the tool.
 		let build_tools: Vec<&'static str> = plan
@@ -319,7 +389,7 @@ impl AgentRunner for PiAgentRunner {
 			.copied()
 			.filter(|tool| *tool != "ask")
 			.collect();
-		let base_registry = build_registry_full(
+		let base_registry = build_registry_with_display(
 			&build_tools,
 			mcp_spawn.tools,
 			mcp_spawn.server_errors,
@@ -328,6 +398,7 @@ impl AgentRunner for PiAgentRunner {
 			request.session_persisted,
 			edit_options,
 			Some(&session),
+			resolved_display,
 		)?;
 		let (allow_task, allow_hub) = delegation_selection(request);
 		let child_factory: Option<Arc<dyn ChildModelFactory>> = allow_task.then(|| {
@@ -352,48 +423,15 @@ impl AgentRunner for PiAgentRunner {
 		};
 		let cwd = request.cwd.clone();
 		let prompt = request.prompt.clone();
-		let mut messages = history_messages(&request.history)?;
+		let mut messages = match &request.history_messages {
+			Some(override_messages) => override_messages.clone(),
+			None => history_messages(&request.history)?,
+		};
 		if let Some(system) = plan.system_prompt {
 			messages.insert(0, pi_agent::Message::system(system));
 		}
 
-		let user_message = if !request.parts.is_empty() {
-			let mut pi_parts = Vec::with_capacity(request.parts.len());
-			for (index, p) in request.parts.iter().enumerate() {
-				if p.is_image() {
-					let Some(data) = p.data.as_deref() else {
-						return Err(Error::new(format!(
-							"request contains image part missing data at index {index}"
-						)));
-					};
-					let Some(mime) = p.mime_type.as_deref() else {
-						return Err(Error::new(format!(
-							"request contains image part missing mimeType at index {index}"
-						)));
-					};
-					let (clean_b64, norm_mime) = pi_agent::state::normalize_image_payload(data, mime)
-						.map_err(|err| Error::new(format!("request contains invalid image part at index {index}: {err}")))?;
-					pi_parts.push(pi_agent::ContentPart::Image {
-						data: clean_b64,
-						mime_type: norm_mime,
-					});
-				} else if p.kind == "text" {
-					let Some(text) = p.text.clone() else {
-						return Err(Error::new(format!(
-							"request contains malformed text part missing text at index {index}"
-						)));
-					};
-					pi_parts.push(pi_agent::ContentPart::Text { text });
-				} else {
-					return Err(Error::new(format!(
-						"request contains unsupported content part kind at index {index}"
-					)));
-				}
-			}
-			pi_agent::Message::user_with_parts(pi_parts)
-		} else {
-			pi_agent::Message::user(&prompt)
-		};
+		let user_message = user_message_from_parts(&prompt, &request.parts)?;
 
 		if !plan.supports_images
 			&& (user_message.has_image() || messages.iter().any(pi_agent::Message::has_image))
@@ -460,6 +498,8 @@ impl AgentRunner for PiAgentRunner {
 				},
 			};
 			supervisor.set_edit_options(edit_options);
+			supervisor.set_display_resolver(Arc::clone(&display_resolver));
+			supervisor.set_active_model(active_model.clone());
 			if let Some(processes) = &process_backend {
 				supervisor.set_processes(Arc::clone(processes));
 			}
@@ -515,7 +555,22 @@ impl AgentRunner for PiAgentRunner {
 		if plan.tools.contains(&"ask") {
 			registry.register(Arc::new(AskTool::new()));
 		}
-		let agent = AgentLoop::with_approver(config, provider, registry, approvals);
+		// Root-only checkpoint pair: children inherit the supervisor template,
+		// which never receives these, so they cannot capture the root store.
+		let checkpoint_allowed = request.tools_enabled
+			&& request.config.tools.as_ref().is_none_or(|allowed| {
+				allowed.iter().any(|tool| tool == "checkpoint" || tool == "rewind")
+			});
+		if checkpoint_allowed
+			&& let Some(controller) = &request.checkpoint_controller
+		{
+			registry.register(Arc::new(CheckpointTool::new(Arc::clone(controller))));
+			registry.register(Arc::new(RewindTool::new(Arc::clone(controller))));
+		}
+		let mut agent = AgentLoop::with_approver(config, provider, registry, approvals);
+		if let Some(ack) = &request.turn_ack {
+			agent = agent.with_turn_ack(Arc::clone(ack));
+		}
 		let agent = match (root_supervisor, root_sink) {
 			(Some(supervisor), Some(sink)) => agent
 				.with_background_results(sink)
@@ -1467,6 +1522,7 @@ pub fn build_registry_with_mcp_and_diagnostics(
 }
 
 /// Build the registry with session-restored `todo` phases.
+#[allow(clippy::too_many_arguments)]
 fn build_registry_full(
 	tools: &[&'static str],
 	mcp_tools: Vec<McpTool>,
@@ -1476,6 +1532,32 @@ fn build_registry_full(
 	session_persisted: bool,
 	edit_options: EditToolOptions,
 	session: Option<&Arc<RunnerSession>>,
+) -> Result<ToolRegistry> {
+	build_registry_with_display(
+		tools,
+		mcp_tools,
+		server_errors,
+		all_server_names,
+		todo_phases,
+		session_persisted,
+		edit_options,
+		session,
+		default_session_tools(tools.contains(&"edit")),
+	)
+}
+
+/// Build the registry for one resolved session (CLI settings + active model).
+#[allow(clippy::too_many_arguments)]
+fn build_registry_with_display(
+	tools: &[&'static str],
+	mcp_tools: Vec<McpTool>,
+	server_errors: Vec<(String, String)>,
+	all_server_names: Vec<String>,
+	todo_phases: Vec<pi_agent::tools::todo::TodoPhase>,
+	session_persisted: bool,
+	edit_options: EditToolOptions,
+	session: Option<&Arc<RunnerSession>>,
+	resolved: ResolvedSessionTools,
 ) -> Result<ToolRegistry> {
 	let mut registry = ToolRegistry::new();
 	// Root turns share one snapshot/`EditTool` pair and one pending queue (see
@@ -1489,21 +1571,29 @@ fn build_registry_full(
 	let read_sink = Arc::new(NativeSnapshotSink::new(snapshots.clone()));
 	for name in tools {
 		let tool: Arc<dyn Tool> = match *name {
-			"read" => Arc::new(ReadTool::with_snapshot_sink(read_sink.clone())),
+			"read" => Arc::new(
+				ReadTool::with_snapshot_sink(read_sink.clone())
+					.with_display_inputs(resolved.display),
+			),
 			"glob" => Arc::new(GlobTool),
 			"grep" => Arc::new(GrepTool),
-			"ast_grep" => Arc::new(AstGrepTool),
-			"ast_edit" => Arc::new(pi_agent::tools::AstEditTool::with_display(
+			"ast_grep" => Arc::new(
+				AstGrepTool::with_snapshot_sink(read_sink.clone())
+					.with_display_inputs(resolved.display),
+			),
+			"ast_edit" => Arc::new(pi_agent::tools::AstEditTool::with_display_inputs(
 				Arc::clone(&snapshots),
 				Arc::clone(&pending),
-				// `read` above always mounts a snapshot sink, i.e. hashline
-				// display; the preview must match so its tags anchor `edit`.
-				pi_agent::tools::PreviewDisplay::Hashline,
+				resolved.display,
 			)),
 			"write" => Arc::new(WriteTool::with_pending(Arc::clone(&pending))),
 			"edit" => match session {
 				Some(session) => session.edit.clone(),
-				None => Arc::new(EditTool::with_options(snapshots.clone(), edit_options)),
+				None => Arc::new(EditTool::with_mode(
+					snapshots.clone(),
+					edit_options,
+					resolved.edit_tool,
+				)),
 			},
 			"bash" => Arc::new(BashTool::new()),
 			"todo" => Arc::new(TodoTool::restored(todo_phases.clone(), session_persisted)),
@@ -2238,6 +2328,9 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 	if let Some(requested_tools) = &config.tools {
 		let mut known_tools: Vec<String> = BUILTIN_TOOLS.iter().map(|(n, _)| n.to_string()).collect();
 		known_tools.extend(DELEGATION_TOOLS.iter().map(|name| (*name).to_string()));
+		// `checkpoint`/`rewind` are not default builtins: they mount only when
+		// `checkpoint.enabled` supplies a controller, but `--tools` may name them.
+		known_tools.extend(["checkpoint", "rewind"].map(str::to_string));
 		for tool in &unique_tools {
 			known_tools.push(tool.name().to_string());
 		}
@@ -2397,6 +2490,20 @@ fn convert_content_parts(
 	Ok(pi_parts)
 }
 
+/// Convert the CLI prompt/parts into the same user message the runner appends,
+/// so the no-session mirror stays byte-identical to the loop.
+pub fn user_message_from_parts(
+	prompt: &str,
+	parts: &[crate::session::ContentPart],
+) -> Result<pi_agent::Message, Error> {
+	if parts.is_empty() {
+		return Ok(pi_agent::Message::user(prompt));
+	}
+	Ok(pi_agent::Message::user_with_parts(convert_content_parts(
+		parts, "request",
+	)?))
+}
+
 /// Previous session turns as `pi-agent` history messages.
 pub fn history_messages(history: &[crate::session::TurnRecord]) -> Result<Vec<pi_agent::Message>, Error> {
 	let mut messages = Vec::new();
@@ -2491,6 +2598,37 @@ pub fn history_messages(history: &[crate::session::TurnRecord]) -> Result<Vec<pi
 		}
 	}
 	Ok(messages)
+}
+
+/// Latest todo phases recorded in in-memory turns (`--no-session`), newest turn
+/// and call first. Only successful top-level `todo` calls contribute
+/// `details.phases`; `{"phases": []}` clears, malformed payloads and error
+/// results are skipped. Mirrors [`crate::session::SessionStore::latest_todo_phases`];
+/// nested child task results never appear as top-level calls, so they cannot
+/// leak into root state.
+#[must_use]
+pub fn latest_todo_phases_from_turns(
+	history: &[crate::session::TurnRecord],
+) -> Vec<pi_agent::tools::todo::TodoPhase> {
+	for turn in history.iter().rev() {
+		for call in turn.tool_calls.iter().rev() {
+			if call.name != "todo" || call.is_error {
+				continue;
+			}
+			let Some(phases) = call.details.as_ref().and_then(|details| details.get("phases")) else {
+				continue;
+			};
+			if !phases.is_array() {
+				continue;
+			}
+			if let Ok(phases) =
+				serde_json::from_value::<Vec<pi_agent::tools::todo::TodoPhase>>(phases.clone())
+			{
+				return phases;
+			}
+		}
+	}
+	Vec::new()
 }
 
 /// Process backend that connects to the daemon broker on first use.
@@ -2760,6 +2898,9 @@ mod tests {
 			tools_enabled: true,
 			max_turns: 5,
 			history: Vec::new(),
+			history_messages: None,
+			checkpoint_controller: None,
+			turn_ack: None,
 			todo_phases: Vec::new(),
 			session_persisted: false,
 			cancellation_token: None,
@@ -3918,7 +4059,7 @@ mod tests {
 		runner.runtime.block_on(async {
 		// Turn 1: read mints the tag, `CUT` parks line 2 in a named register.
 		std::fs::write(dir.join("note.txt"), "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n").expect("write");
-		let session = runner.session_tools(plain);
+		let session = runner.session_tools(plain, EditMode::Hashline);
 		let turn1 = build(&session, plain);
 		let read = execute(&turn1, "read", serde_json::json!({ "path": "note.txt" }), &ctx).await;
 		assert!(!read.is_error, "{}", read.content);
@@ -3967,7 +4108,7 @@ mod tests {
 		std::fs::write(dir.join("other.txt"), "o1\no2\no3\no4\no5\no6\no7\no8\no9\no10\n")
 			.expect("write");
 		let guarded = EditToolOptions { enforce_seen_lines: true };
-		let session = runner.session_tools(guarded);
+		let session = runner.session_tools(guarded, EditMode::Hashline);
 		let turn4 = build(&session, guarded);
 		let read = execute(&turn4, "read", serde_json::json!({ "path": "other.txt:1-4" }), &ctx).await;
 		let header = read.content.lines().next().expect("header").to_string();
@@ -4079,7 +4220,7 @@ mod tests {
 		runner.runtime.block_on(async {
 			// Prompt 1 stages the action under the session store; prompt 2 runs
 			// against a rebuilt registry and must still see it.
-			let session = runner.session_tools(options);
+			let session = runner.session_tools(options, EditMode::Hashline);
 			let _turn1 = build(Some(&session));
 			session.pending.register(Arc::new(Stage { path: target.clone(), calls: calls.clone() }));
 			let turn2 = build(Some(&session));
@@ -4214,6 +4355,144 @@ mod tests {
 		assert_eq!(details["storage"], "session");
 
 		std::fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn latest_todo_phases_from_turns_prefers_newest_valid_todo_call() {
+		use crate::session::{ToolCallRecord, TurnRecord};
+
+		fn call(name: &str, is_error: bool, details: Option<serde_json::Value>) -> ToolCallRecord {
+			ToolCallRecord {
+				id: "call".to_string(),
+				name: name.to_string(),
+				arguments: serde_json::json!({}),
+				result: String::new(),
+				is_error,
+				result_parts: Vec::new(),
+				details,
+			}
+		}
+		fn turn(calls: Vec<ToolCallRecord>) -> TurnRecord {
+			TurnRecord {
+				prompt: String::new(),
+				assistant: String::new(),
+				stop_reason: "toolUse".to_string(),
+				tool_calls: calls,
+				parts: Vec::new(),
+			}
+		}
+		fn phases(content: &str) -> serde_json::Value {
+			serde_json::json!([{
+				"name": "Plan",
+				"tasks": [{"content": content, "status": "pending"}],
+			}])
+		}
+		fn details(phases: serde_json::Value) -> Option<serde_json::Value> {
+			Some(serde_json::json!({"op": "init", "phases": phases, "storage": "memory"}))
+		}
+
+		assert!(latest_todo_phases_from_turns(&[]).is_empty(), "empty history has no phases");
+
+		let seed = turn(vec![call("todo", false, details(phases("seed")))]);
+		let found = latest_todo_phases_from_turns(std::slice::from_ref(&seed));
+		assert_eq!(found[0].tasks[0].content, "seed");
+
+		// Newest turn wins over older turns.
+		let newer = turn(vec![call("todo", false, details(phases("newer")))]);
+		let found = latest_todo_phases_from_turns(&[seed.clone(), newer]);
+		assert_eq!(found[0].tasks[0].content, "newer");
+
+		// A failed todo echoes the pre-call state; it never overrides.
+		let failed = turn(vec![call("todo", true, details(phases("stale echo")))]);
+		let found = latest_todo_phases_from_turns(&[seed.clone(), failed]);
+		assert_eq!(found[0].tasks[0].content, "seed");
+
+		// A child `task` result carrying nested phases is not a top-level call.
+		let child = turn(vec![call(
+			"task",
+			false,
+			Some(serde_json::json!({"results": [{"details": {"phases": phases("child")}}]})),
+		)]);
+		assert!(
+			latest_todo_phases_from_turns(&[child]).is_empty(),
+			"nested child task details must never become root todo state"
+		);
+
+		// Malformed payloads are skipped in favour of the older valid call.
+		for malformed in [
+			serde_json::json!({"phases": "oops"}),
+			serde_json::json!({"phases": [{"name": 1}]}),
+			serde_json::json!({}),
+		] {
+			let broken = turn(vec![call("todo", false, Some(malformed))]);
+			let found = latest_todo_phases_from_turns(&[seed.clone(), broken]);
+			assert_eq!(found[0].tasks[0].content, "seed", "malformed payload must not clear");
+		}
+
+		// `{"phases": []}` is a real clear and wins by turn/call order.
+		let cleared = turn(vec![
+			call("todo", false, details(phases("init"))),
+			call("todo", false, details(serde_json::json!([]))),
+		]);
+		assert!(latest_todo_phases_from_turns(&[seed, cleared]).is_empty());
+	}
+
+	#[tokio::test]
+	async fn no_session_todo_tool_rehydrates_memory_phases_from_turns() {
+		let dir = std::env::temp_dir().join(format!(
+			"omp-cli-runtime-todo-memory-{}",
+			crate::output::session_id()
+		));
+		let history = vec![crate::session::TurnRecord {
+			prompt: "plan".to_string(),
+			assistant: "planned".to_string(),
+			stop_reason: "toolUse".to_string(),
+			tool_calls: vec![crate::session::ToolCallRecord {
+				id: "call-todo".to_string(),
+				name: "todo".to_string(),
+				arguments: serde_json::json!({"op": "init"}),
+				result: "todos updated".to_string(),
+				is_error: false,
+				result_parts: Vec::new(),
+				details: Some(serde_json::json!({
+					"op": "init",
+					"phases": [{"name": "Plan", "tasks": [{"content": "resume me", "status": "pending"}]}],
+					"storage": "memory",
+				})),
+			}],
+			parts: Vec::new(),
+		}];
+
+		let phases = latest_todo_phases_from_turns(&history);
+		assert_eq!(phases[0].tasks[0].content, "resume me");
+
+		let registry = build_registry_full(
+			&["todo"],
+			Vec::new(),
+			Vec::new(),
+			Vec::new(),
+			phases,
+			false,
+			EditToolOptions::default(),
+			None,
+		)
+		.expect("registry");
+		let viewed = registry
+			.get("todo")
+			.expect("todo tool")
+			.execute(
+				&serde_json::json!({"op": "view"}),
+				&pi_agent::AgentContext::new(dir.clone()),
+			)
+			.await
+			.expect("todo view executes");
+		assert!(!viewed.is_error);
+		let details = viewed.details.as_ref().expect("details");
+		assert_eq!(details["phases"][0]["tasks"][0]["content"], "resume me");
+		assert_eq!(
+			details["storage"], "memory",
+			"no-session todo details must report memory storage"
+		);
 	}
 
 	#[test]

@@ -54,6 +54,69 @@ impl EvalLanguage {
 	pub fn parse(token: &str) -> Option<Self> {
 		Self::ALL.into_iter().find(|language| language.token() == token)
 	}
+
+	/// Parse a wire backend id (`python`/`js`/`ruby`/`julia`) or an input token.
+	pub fn from_wire(id: &str) -> Option<Self> {
+		Self::ALL
+			.into_iter()
+			.find(|language| language.runtime_name() == id || language.token() == id)
+	}
+}
+
+/// Backend id emitted in `cells[].language` and `details.language(s)`.
+///
+/// Input tokens (`py`/`js`/`rb`/`jl`) stay on [`EvalLanguage`]; output uses the
+/// TypeScript backend ids (`python`/`js`/`ruby`/`julia`). Deserialization accepts
+/// both spellings so persisted cells written by older builds still parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EvalBackendId(EvalLanguage);
+
+impl EvalBackendId {
+	pub fn of(language: EvalLanguage) -> Self {
+		Self(language)
+	}
+
+	pub fn language(self) -> EvalLanguage {
+		self.0
+	}
+
+	pub fn as_str(self) -> &'static str {
+		self.0.runtime_name()
+	}
+}
+
+impl From<EvalLanguage> for EvalBackendId {
+	fn from(language: EvalLanguage) -> Self {
+		Self(language)
+	}
+}
+
+impl Serialize for EvalBackendId {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.serialize_str(self.as_str())
+	}
+}
+
+impl<'de> Deserialize<'de> for EvalBackendId {
+	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		struct Visitor;
+
+		impl<'de> serde::de::Visitor<'de> for Visitor {
+			type Value = EvalBackendId;
+
+			fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+				formatter.write_str("an eval backend id (python/js/ruby/julia or py/js/rb/jl)")
+			}
+
+			fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+				EvalLanguage::from_wire(value).map(EvalBackendId).ok_or_else(|| {
+					E::custom(format!("unknown eval backend id `{value}`"))
+				})
+			}
+		}
+
+		deserializer.deserialize_str(Visitor)
+	}
 }
 
 /// Status event emitted by a prelude helper or a tool-bridge call.
@@ -154,7 +217,7 @@ pub struct EvalCellResult {
 	pub title: Option<String>,
 	pub code: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub language: Option<EvalLanguage>,
+	pub language: Option<EvalBackendId>,
 	pub output: String,
 	pub status: CellStatus,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,9 +247,9 @@ pub struct EvalToolDetails {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub meta: Option<OutputMeta>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub language: Option<EvalLanguage>,
+	pub language: Option<EvalBackendId>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub languages: Option<Vec<EvalLanguage>>,
+	pub languages: Option<Vec<EvalBackendId>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub notice: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -310,4 +373,30 @@ pub enum EvalError {
 	Aborted(String),
 	#[error("Eval I/O: {0}")]
 	Io(#[from] std::io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn backend_ids_serialize_long_and_accept_both_spellings() {
+		assert_eq!(serde_json::to_value(EvalBackendId::of(EvalLanguage::Py)).unwrap(), "python");
+		assert_eq!(serde_json::to_value(EvalBackendId::of(EvalLanguage::Rb)).unwrap(), "ruby");
+		assert_eq!(serde_json::to_value(EvalBackendId::of(EvalLanguage::Jl)).unwrap(), "julia");
+		assert_eq!(serde_json::to_value(EvalBackendId::of(EvalLanguage::Js)).unwrap(), "js");
+		for (wire, language) in [
+			("python", EvalLanguage::Py),
+			("py", EvalLanguage::Py),
+			("ruby", EvalLanguage::Rb),
+			("rb", EvalLanguage::Rb),
+			("julia", EvalLanguage::Jl),
+			("jl", EvalLanguage::Jl),
+		] {
+			let parsed: EvalBackendId = serde_json::from_value(Value::String(wire.to_string())).unwrap();
+			assert_eq!(parsed.language(), language);
+		}
+		assert_eq!(EvalLanguage::parse("py"), Some(EvalLanguage::Py));
+		assert_eq!(EvalLanguage::parse("python"), None);
+	}
 }

@@ -90,9 +90,28 @@ impl ToolRegistry {
 		}
 	}
 
-	/// Look up a tool by name.
+	/// Look up a tool by registry name or model-facing wire name.
+	///
+	/// A wire name that matches more than one tool is rejected (no arbitrary
+	/// winner): ambiguous model-facing names must never route silently.
 	pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-		self.tools.get(name).cloned()
+		if let Some(tool) = self.tools.get(name) {
+			return Some(tool.clone());
+		}
+		let mut matches = self
+			.tools
+			.values()
+			.filter(|tool| tool.wire_name() == Some(name));
+		let tool = matches.next()?.clone();
+		if matches.next().is_some() {
+			return None;
+		}
+		Some(tool)
+	}
+
+	/// Registry keys (internal tool names) in stable order.
+	pub fn names(&self) -> Vec<String> {
+		self.tools.keys().cloned().collect()
 	}
 
 	/// Tool schemas in OpenAI `tools` format.
@@ -104,7 +123,7 @@ impl ToolRegistry {
 				serde_json::json!({
 					"type": "function",
 					"function": {
-						"name": tool.name(),
+						"name": tool.wire_name().unwrap_or_else(|| tool.name()),
 						"description": tool.description(),
 						"parameters": tool.schema()
 					}

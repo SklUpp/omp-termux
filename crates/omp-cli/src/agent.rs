@@ -128,6 +128,15 @@ pub struct RunRequest {
 	pub skills: Vec<Skill>,
 	/// Earlier turns of this session (`--continue`/`--session-id`), oldest first.
 	pub history: Vec<crate::session::TurnRecord>,
+	/// Exact provider-ready branch context from the session (`branch_summary`
+	/// and retained rewind reports included). When set it replaces `history`
+	/// as the request prefix; the live runner appends the new user message.
+	pub history_messages: Option<Vec<pi_agent::Message>>,
+	/// Shared checkpoint controller when `checkpoint.enabled`; tool guards and
+	/// the session owner must see the same state within a run.
+	pub checkpoint_controller: Option<std::sync::Arc<pi_agent::tools::CheckpointController>>,
+	/// Per-turn persistence/rewind handshake channel.
+	pub turn_ack: Option<std::sync::Arc<pi_agent::TurnAck>>,
 	/// Todo phases restored from the session branch (TS
 	/// `getLatestTodoPhasesFromEntries`): the newest `user_todo_edit` custom
 	/// entry or successful `todo` tool result, whichever comes last in the log.
