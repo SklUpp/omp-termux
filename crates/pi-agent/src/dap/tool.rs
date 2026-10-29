@@ -1470,11 +1470,11 @@ mod tests {
 							send_event(&mut output, &mut seq, "initialized", json!({})).await;
 						},
 						"configurationDone" if reject_configuration_done => {
-							*seq += 1;
+							seq += 1;
 							send_frame(
 								&mut output,
 								&json!({
-									"seq": *seq,
+									"seq": seq,
 									"type": "response",
 									"request_seq": request_seq,
 									"success": false,
@@ -1537,11 +1537,11 @@ mod tests {
 							send_event(&mut output, &mut seq, "initialized", json!({})).await;
 						},
 						"configurationDone" => {
-							*seq += 1;
+							seq += 1;
 							send_frame(
 								&mut output,
 								&json!({
-									"seq": *seq,
+									"seq": seq,
 									"type": "response",
 									"request_seq": request_seq,
 									"success": false,

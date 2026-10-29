@@ -640,6 +640,7 @@ pub async fn apply_edits_then_rename(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use super::super::types::TextDocumentEdit;
 	use std::sync::atomic::AtomicUsize;
 
 	#[test]
