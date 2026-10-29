@@ -8,7 +8,7 @@ use std::{
 	collections::{HashMap, HashSet},
 	path::{Path, PathBuf},
 	sync::{
-		Arc, Mutex,
+		Arc, Mutex, Weak,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 };
@@ -417,41 +417,121 @@ impl PiAgentRunner {
 	}
 }
 
-impl Drop for PiAgentRunner {
-	fn drop(&mut self) {
+impl PiAgentRunner {
+	/// Release everything this runner keeps alive across turns: the in-memory
+	/// supervisor, eval kernels and loopback bridge, the LSP ownership scope and
+	/// the root debug tree.
+	///
+	/// Idempotent: every slot is taken before anything is awaited, so a second
+	/// call (or the `Drop` that follows an explicit call) finds them empty and
+	/// returns without touching a torn-down runtime. Call it only once the last
+	/// turn has returned — it cancels live child tasks and detaches adapters.
+	///
+	/// Teardown is bounded (`SHUTDOWN_BUDGET`) and, when called from a Tokio
+	/// thread, awaited on a helper thread and joined, so it has really finished
+	/// when this returns instead of racing process exit.
+	///
+	/// The host needs this because an installed process-wide `AgentRunner`
+	/// keeps the runner alive past `main`, so `Drop` alone never fires on exit.
+	pub fn shutdown(&self) {
 		// Background jobs hold `Arc<Supervisor>`, so the supervisor's own Drop
 		// cannot fire while they run. Shut it down here, before the `runtime`
 		// field is dropped, so queued reservations are cancelled and live child
-		// tasks get their cancellation token plus abort handle.
-		let slot = match self.supervisor.get_mut() {
-			Ok(slot) => slot,
-			Err(poisoned) => poisoned.into_inner(),
-		};
-		if let Some(supervisor) = slot.take() {
+		// tasks get their cancellation token plus abort handle. The slot lock is
+		// released before any callback runs.
+		if let Some(supervisor) = self.take_supervisor() {
 			supervisor.shutdown();
 		}
 		// Kernels, the loopback bridge, LSP connections and the root debug tree
 		// live as long as the runner session. Shut them down explicitly while the
 		// Tokio runtime is still alive: LSP release is ownership-scoped, so a
-		// server another session still uses stays up.
-		let session = self
+		// server another session still uses stays up, and DAP terminate sends
+		// `disconnect` before the adapter is killed.
+		let Some(session) = self.take_session() else {
+			return;
+		};
+		// One hard cap over the whole teardown: every step below already has its
+		// own timeout, but a wedged bridge must never hang process exit.
+		let cleanup = async move {
+			let _ = tokio::time::timeout(SHUTDOWN_BUDGET, shutdown_session(session)).await;
+		};
+		if tokio::runtime::Handle::try_current().is_ok() {
+			// Already on a runtime thread, where `block_on` panics and a
+			// detached task would let the caller (or `process::exit`) finish
+			// first. Await it on a helper thread against our own runtime and
+			// join, so teardown really completed when this returns.
+			let handle = self.runtime.handle().clone();
+			// A panicking teardown must not poison `Drop`: the cap decides.
+			let _ = std::thread::spawn(move || handle.block_on(cleanup)).join();
+		} else {
+			self.runtime.block_on(cleanup);
+		}
+	}
+
+	fn take_supervisor(&self) -> Option<Arc<Supervisor>> {
+		self
+			.supervisor
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.take()
+	}
+
+	fn take_session(&self) -> Option<Arc<RunnerSession>> {
+		self
 			.session
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner())
-			.take();
-		if let Some(session) = session {
-			if let Some(eval) = session.take_eval() {
-				self.runtime.block_on(eval.shutdown());
-			}
-			let lsp = session.lsp_session();
-			let dap = session.dap_manager();
-			self.runtime.block_on(async move {
-				lsp.release().await;
-				let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-				let cancel = pi_agent::CancellationToken::new();
-				let _ = dap.terminate(&cancel, deadline).await;
-			});
-		}
+			.take()
+	}
+}
+
+/// Hard cap over one exit teardown. Each step (eval bridge, LSP per client,
+/// DAP tree) also carries its own timeout; this only stops a wedged bridge.
+const SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Await-needing half of [`PiAgentRunner::shutdown`]: eval bridge disposal, LSP
+/// release (`shutdown` + `exit`, else kill) and the bounded DAP terminate that
+/// disconnects the root tree before killing adapters.
+async fn shutdown_session(session: Arc<RunnerSession>) {
+	if let Some(eval) = session.take_eval() {
+		eval.shutdown().await;
+	}
+	let lsp = session.lsp_session();
+	let dap = session.dap_manager();
+	lsp.release().await;
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+	let cancel = pi_agent::CancellationToken::new();
+	let _ = dap.terminate(&cancel, deadline).await;
+}
+
+impl Drop for PiAgentRunner {
+	fn drop(&mut self) {
+		self.shutdown();
+	}
+}
+
+/// Runs [`PiAgentRunner::shutdown`] when it drops.
+///
+/// A host that installs the runner as the process-wide `AgentRunner` keeps an
+/// `Arc` alive in a static, so the runner's own `Drop` never runs at exit. One
+/// guard next to the runner's creation closes kernels, LSP clients and debug
+/// adapters on every return path, without late-created help/verb paths paying
+/// for a runner they never use.
+pub struct RunnerShutdownGuard(Arc<PiAgentRunner>);
+
+impl RunnerShutdownGuard {
+	#[must_use]
+	pub fn new(runner: Arc<PiAgentRunner>) -> Self {
+		// The idle Ctrl-C path (`process::exit`) must run the same teardown, so
+		// the dispatcher keeps a `Weak` back to this runner.
+		runner.dispatcher.set_owner(&runner);
+		Self(runner)
+	}
+}
+
+impl Drop for RunnerShutdownGuard {
+	fn drop(&mut self) {
+		self.0.shutdown();
 	}
 }
 
@@ -488,6 +568,9 @@ struct SignalDispatcher {
 	/// by the MCP-discovery phase), so `steer` cannot report success for a
 	/// message the discovery watcher would drop.
 	steer_turn:  Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SteeringEvent>>>>,
+	/// Runner the idle Ctrl-C path must tear down before `exit(130)`; a `Weak`
+	/// so the installed static `AgentRunner` stays the only owner.
+	owner:       Arc<Mutex<Weak<PiAgentRunner>>>,
 	_handle:     tokio::task::JoinHandle<()>,
 }
 
@@ -529,6 +612,8 @@ impl SignalDispatcher {
 		let active_turn: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SteeringEvent>>>> =
 			Arc::new(std::sync::Mutex::new(None));
 		let active_turn_clone = Arc::clone(&active_turn);
+		let owner: Arc<Mutex<Weak<PiAgentRunner>>> = Arc::new(Mutex::new(Weak::new()));
+		let owner_clone = Arc::clone(&owner);
 		let _handle = runtime.spawn(async move {
 			loop {
 				if tokio::signal::ctrl_c().await.is_err() {
@@ -544,6 +629,17 @@ impl SignalDispatcher {
 				if let Some(tx) = maybe_tx {
 					let _ = tx.send(SteeringEvent::Interrupt).await;
 				} else {
+					// No turn owns the interrupt: close kernels, LSP clients and
+					// debug adapters before exiting instead of orphaning them.
+					// The `Weak` is upgraded without holding its lock across the
+					// teardown.
+					let runner = owner_clone
+						.lock()
+						.unwrap_or_else(|poison| poison.into_inner())
+						.upgrade();
+					if let Some(runner) = runner {
+						runner.shutdown();
+					}
 					std::process::exit(130);
 				}
 			}
@@ -551,8 +647,14 @@ impl SignalDispatcher {
 		Self {
 			active_turn,
 			steer_turn: Arc::new(std::sync::Mutex::new(None)),
+			owner,
 			_handle,
 		}
+	}
+
+	/// Record the runner the idle Ctrl-C path tears down.
+	fn set_owner(&self, runner: &Arc<PiAgentRunner>) {
+		*self.owner.lock().unwrap_or_else(|poison| poison.into_inner()) = Arc::downgrade(runner);
 	}
 
 	/// Register the interrupt destination for a phase that cannot be steered

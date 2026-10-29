@@ -351,6 +351,12 @@ fn run() -> std::result::Result<(), CliError> {
 	// concrete type behind the live steering channel (`RpcLaunch.steer`), so a
 	// turn and a steering hook never drive two runtimes.
 	let native_runner = Arc::new(PiAgentRunner::new()?);
+	// The installed `AgentRunner` holds an `Arc` in a static, so the runner's
+	// own `Drop` never runs when this process exits; this guard runs the
+	// explicit teardown (supervisor, eval bridge, LSP clients, debug adapters)
+	// on every return path below, including the `?` errors. RPC returns only
+	// after its input is drained, so the guard never cuts a live turn short.
+	let _runner_shutdown = runtime::RunnerShutdownGuard::new(Arc::clone(&native_runner));
 	if agent::install(Box::new(Arc::clone(&native_runner))).is_err() {
 		return Err(CliError::fail("agent runtime already registered"));
 	}
