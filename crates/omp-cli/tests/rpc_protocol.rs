@@ -23,6 +23,7 @@ use omp_cli::{
 	config::{Config, ProviderConfig},
 	prompts::Prompts,
 	rpc::{
+		auth::LOGIN_IN_PROGRESS,
 		frame::{MAX_RPC_FRAME_BYTES, RpcFrameDecoder, RpcFrameEncoder},
 		host_uris::HostUriBridge,
 		input::{Inbound, Output, RpcInput},
@@ -261,9 +262,12 @@ fn parse_frames(bytes: &[u8]) -> Vec<Value> {
 }
 
 struct Harness {
-	tx:     Mutex<Option<Sender<Vec<u8>>>>,
-	out:    SharedBytes,
-	handle: Option<thread::JoinHandle<omp_cli::Result<()>>>,
+	tx:       Mutex<Option<Sender<Vec<u8>>>>,
+	out:      SharedBytes,
+	handle:   Option<thread::JoinHandle<omp_cli::Result<()>>>,
+	/// Per-test credential store; removed on drop so the suite leaves no
+	/// `agent.db` files behind.
+	agent_db: std::path::PathBuf,
 }
 
 impl Harness {
@@ -272,11 +276,12 @@ impl Harness {
 		let out = Arc::new(Mutex::new(Vec::new()));
 		let reader = ChannelReader::new(rx);
 		let writer = SharedWriter(Arc::clone(&out));
+		let agent_db = launch.agent_db.clone();
 		let handle = thread::Builder::new()
 			.name("rpc-test-mode".to_string())
 			.spawn(move || RpcMode::run(launch, reader, writer))
 			.expect("spawn rpc mode");
-		Self { tx: Mutex::new(Some(tx)), out, handle: Some(handle) }
+		Self { tx: Mutex::new(Some(tx)), out, handle: Some(handle), agent_db }
 	}
 
 	fn send(&self, frame: Value) {
@@ -334,6 +339,17 @@ impl Drop for Harness {
 		self.close_stdin();
 		if let Some(handle) = self.handle.take() {
 			let _ = handle.join();
+		}
+		// SQLite keeps `-wal`/`-shm` beside the file; drop the whole triple.
+		for suffix in ["", "-wal", "-shm"] {
+			let path = if suffix.is_empty() {
+				self.agent_db.clone()
+			} else {
+				let mut path = self.agent_db.clone().into_os_string();
+				path.push(suffix);
+				std::path::PathBuf::from(path)
+			};
+			let _ = std::fs::remove_file(path);
 		}
 	}
 }
@@ -476,6 +492,14 @@ fn read_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
 	}
 }
 
+/// Per-test credential store path, unique per launch so parallel tests never
+/// share one `agent.db`.
+fn agent_db_path() -> std::path::PathBuf {
+	static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+	let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	std::env::temp_dir().join(format!("omp-rpc-agent-{}-{next}.db", std::process::id()))
+}
+
 fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
 	let mut config = Config::default();
 	config.providers.insert(
@@ -494,6 +518,7 @@ fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
 		prompts: Prompts::default(),
 		skills: Vec::new(),
 		catalog: Arc::new(Catalog::default()),
+		agent_db: agent_db_path(),
 		approval_mode: ApprovalMode::Yolo,
 		allow: Vec::new(),
 		model: Some(model.to_string()),
@@ -888,4 +913,84 @@ fn fast_mode_true_is_rejected_for_models_without_a_tier_knob() {
 	let response = frames.iter().find(|frame| frame["id"] == "f1").expect("fast");
 	assert_eq!(response["success"], false);
 	assert_eq!(response["error"], "Fast mode is unavailable for the current model.");
+}
+
+#[test]
+fn login_providers_come_from_the_process_credential_store() {
+	// The store is opened by `RpcMode::run` before `ready`. A fresh `agent.db` has
+	// no credential rows, so a known native registry entry must be listed with
+	// `authenticated: false`: the frame is the real registry joined with real
+	// store state, not a placeholder array.
+	let port = spawn_model(Vec::new());
+	let harness = Harness::start(launch(port, "local/mock-model", "local"));
+	harness.wait_frame("ready", timeout());
+	harness.send(json!({ "type": "get_login_providers", "id": "lp1" }));
+	let frames = harness.wait_for(
+		|frames| frames.iter().any(|frame| frame["id"] == "lp1"),
+		timeout(),
+	);
+	let response = frames.iter().find(|frame| frame["id"] == "lp1").expect("providers");
+	assert_eq!(response["success"], true, "{response:#?}");
+	let providers = response["data"]["providers"].as_array().expect("providers array");
+	let gemini = providers
+		.iter()
+		.find(|provider| provider["id"] == "google-gemini-cli")
+		.unwrap_or_else(|| {
+			panic!("native registry must list google-gemini-cli: {response:#?}")
+		});
+	assert_eq!(
+		gemini["authenticated"], false,
+		"an empty credential store reports no login for google-gemini-cli: {gemini:#?}"
+	);
+}
+
+#[test]
+fn unreadable_agent_db_fails_startup_before_any_frame() {
+	// A corrupted store is a startup failure, never a degraded run that resolves
+	// a different credential: no `ready`, no session, no silent fallback.
+	let path = agent_db_path();
+	std::fs::write(&path, b"this is not a sqlite database").expect("write corrupt db");
+	let mut launch = launch(0, "local/mock-model", "local");
+	launch.agent_db = path.clone();
+	let harness = Harness::start(launch);
+	let out = Arc::clone(&harness.out);
+	let result = harness.join();
+	assert!(result.is_err(), "corrupt agent.db must fail startup: {result:?}");
+	let frames = parse_frames(&out.lock().expect("out"));
+	assert!(frames.is_empty(), "no frame may precede a failed auth open: {frames:#?}");
+}
+
+#[test]
+fn compact_and_handoff_reject_while_a_login_owns_the_store() {
+	// `cloudflare-ai-gateway` is an API-key login whose first steps are host
+	// prompts, so the worker parks in the store-owning state without any network
+	// traffic. Summarising for `compact`/`handoff` runs on the stdin thread and
+	// resolves a key synchronously; it must be rejected immediately instead of
+	// blocking every later frame behind the login's store lock.
+	let port = spawn_model(Vec::new());
+	let harness = Harness::start(launch(port, "local/mock-model", "local"));
+	harness.wait_frame("ready", timeout());
+	harness.send(json!({ "type": "login", "id": "l1", "providerId": "cloudflare-ai-gateway" }));
+	let prompting = |frames: &[Value]| {
+		frames.iter().any(|frame| {
+			frame["type"] == "extension_ui_request" && frame["method"] == "input"
+		})
+	};
+	let frames = harness.wait_for(|frames| prompting(frames), timeout());
+	assert!(prompting(&frames), "login must reach a host prompt: {frames:#?}");
+
+	for (id, command) in [("c1", "compact"), ("h1", "handoff")] {
+		harness.send(json!({ "type": command, "id": id }));
+		let frames = harness.wait_for(
+			|frames| frames.iter().any(|frame| frame["id"] == id),
+			timeout(),
+		);
+		let response = frames.iter().find(|frame| frame["id"] == id).expect("response");
+		assert_eq!(response["success"], false, "{command} must be rejected: {response:#?}");
+		assert_eq!(response["code"], LOGIN_IN_PROGRESS, "{command}: {response:#?}");
+	}
+
+	// EOF must not wait for the parked login: teardown cancels it, which withdraws
+	// the prompt, so the mode thread joins instead of hanging on the store lock.
+	assert!(harness.join().is_ok(), "EOF must finish while a login is open");
 }

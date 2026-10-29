@@ -1381,15 +1381,40 @@ impl RunPlan {
 			})?;
 		// A keyless provider (local gateway, `auth: none`) is legal: the OpenAI
 		// client sends an empty bearer token.
-		let api_key = request
-			.api_key
-			.clone()
-			.or_else(|| {
-				connection
-					.as_ref()
-					.and_then(|connection| connection.resolve_api_key())
-			})
-			.unwrap_or_default();
+		//
+		// Precedence is TS `getApiKey` (`model-registry.ts:2297-2315`): an explicit
+		// command/config key returns before the store is consulted at all, then the
+		// credential store (login, env, static), then the connection block. The
+		// store lookup is driven by the turn's own token, so abort/EOF interrupts a
+		// slow refresh instead of stranding it.
+		let api_key = match request.api_key.clone() {
+			Some(explicit) => explicit,
+			None => {
+				let cancel = match &request.cancellation_token {
+					Some(token) => {
+						let token = token.clone();
+						crate::auth::http::Cancel::with_predicate(std::sync::Arc::new(move || {
+							token.is_cancelled()
+						}))
+					},
+					None => crate::auth::http::Cancel::new(),
+				};
+				let stored_key = match request.credential_resolver.as_ref() {
+					Some(resolver) => resolver
+						.0
+						.api_key(&provider, request.session_id.as_deref(), &cancel)
+						.map_err(|error| Error::with_source("credential lookup failed", error))?,
+					None => None,
+				};
+				stored_key
+					.or_else(|| {
+						connection
+							.as_ref()
+							.and_then(|connection| connection.resolve_api_key())
+					})
+					.unwrap_or_default()
+			},
+		};
 		let context_limit = request
 			.catalog
 			.context_window(&provider, &model)
@@ -3444,6 +3469,7 @@ mod tests {
 			url_scope: None,
 			subagent_observer: None,
 			child_session_root: None,
+			credential_resolver: None,
 		}
 	}
 

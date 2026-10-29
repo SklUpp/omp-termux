@@ -211,3 +211,24 @@ Next: commit and push the accepted RPC/URI/auth-source block after scoped review
 
 Last recorded published baseline: `93d`, Actions `40908155304`: Android build/native grep passed; host Julia suite failed after SIGINT. These results do not verify current uncommitted source. New current block has not yet been committed or pushed. Installed CLI remains untouched; no package install, release, tag or PR authorized.
 
+Publication update: accepted block committed as `faad6b5355ceead19d702927559baea56379b577` (73 files). Push exited 1: GitHub GH013 push protection flagged Google OAuth client IDs/secrets in `crates/omp-cli/src/auth/flows/oauth_code/google.rs:57-58,67-68`. Remote branch was not updated and no exact-SHA Actions run exists for this commit. Do not bypass protection, obfuscate constants or print their values. Security review is checking upstream provenance before choosing a correction or requesting owner approval. Native RPC auth runtime wiring continues locally; publication remains a separate unresolved gate.
+
+User decision (2026-10-30): postpone push. Earlier push/Actions publication authorization is suspended until renewed explicit approval. Continue local implementation and scoped verification; do not retry push or bypass GH013. No TS-auth backend cutover was approved; discussion established feasibility only.
+
+Local S1–S4 native RPC auth integration is implemented after `faad6b5355` and source-reviewed: mandatory profile-resolved `agent.db` opens before session/ready, native provider listing/login replaces refusal stubs, explicit API key precedes store resolver and connection fallback, actual turn cancellation reaches credential resolution, auth cancellation/shutdown precedes UI teardown. Scoped protocol suite passed 18/18 (exit 0, 75.09 s including compilation). Actual Android CLI with an isolated configured model catalog listed `google-gemini-cli` as unauthenticated from a fresh DB and exited 0; corrupting that DB made startup exit 1 with no stdout/ready frame. An initial smoke without a model catalog stopped at the existing no-model prerequisite; the corrected smoke supplied the catalog. Live Google login remains untested. S5 online provider discovery and S6 per-child model/credential construction remain unfinished; no no-op discovery implementation or new logout wire command was added. Provider-listing regression is being tightened from presence/type checks to explicit fresh-store authentication state.
+
+Subsequent auth-owner changes modified Google/Anthropic constant decoding and made `Client::config` fallible. A scoped compile exposed `E0308` because its match still returned `Config`; parent fixed only the return wrapper to `Ok(match ...)` in `auth/flows/oauth_code/google.rs:62-86`, preserving the owner's other edits. Verification is running; earlier passing results do not certify these newer changes. Push remains postponed; no secret-scanning exception, publication or history rewrite was performed.
+
+Compile correction verified: `nice -n 15 cargo test --locked --offline -j1 -p omp-cli --test rpc_protocol login_providers_come_from_the_process_credential_store -- --test-threads=1` exited 0 (42.97 s including compilation; 1 passed, 17 filtered). The strengthened regression asserts the specific Gemini provider is unauthenticated in a fresh store. This proves the E0308 correction compiles and that RPC path passes, not real OAuth token exchange or all new decoding tests. Existing warnings remain.
+
+Latest user authorization supersedes the earlier push pause: try normal push, integrate/commit remaining saved work, and audit worktrees for possible cleanup. No deletion or force-push authorized. Normal push of `faad6b5355` again exited 1 with GH013 against that historical commit; changing later source does not remove earlier history. Latest serial local checks exited 0: auth 141/141, RPC protocol 18/18 (90.61 s including compilation). Fresh actual CLI smoke again verified provider listing (exit 0) and corrupt DB rejection before any stdout (exit 1). Review and retained-tree integration audit are in progress; no saved checkout has been removed.
+
+Final pending-block verification after review fixes: auth tests passed 140/140; RPC protocol passed 19/19, including interactive-login compact/handoff rejection and EOF cleanup (serial command exit 0, 95.99 s including compilation). Independent review accepted the scoped changes. The one-test count reduction removes redundant credential-literal copying, not behavior coverage. Manual compact/handoff now reject during login; automatic compaction skips that boundary before emitting a start frame. Detailed retained-directory evidence is in `docs/worktree-audit-2026-10-30.md`. No directory or snapshot ref has been removed.
+
+
+
+
+
+
+
+

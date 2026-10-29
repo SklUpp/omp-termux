@@ -25,6 +25,7 @@ use crate::{
 };
 
 use super::{
+	auth::{AuthBridge, LOGIN_IN_PROGRESS},
 	event_wire,
 	frame::{MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES},
 	host_tools::HostToolBridge,
@@ -591,6 +592,9 @@ impl RunControl {
 /// The RPC transport plus the session it drives.
 pub struct RpcMode {
 	session:  Arc<Mutex<RpcSession>>,
+	/// Process credential store: provider list, login and the resolver the
+	/// session resolves every request key through.
+	auth:     Arc<AuthBridge>,
 	sink:     Arc<Output>,
 	active:   Arc<ActiveTurn>,
 	ui:       Arc<ExtensionUiBridge>,
@@ -622,6 +626,14 @@ impl RpcMode {
 		// permission prompt is an `extension_ui_request` answered by the host
 		// instead of a read of the process terminal.
 		let ui = Arc::new(ExtensionUiBridge::new(Arc::clone(&sink)));
+		// The credential store is opened before the session and before `ready`:
+		// a missing, unreadable or unmigratable `agent.db` is a real startup
+		// failure, never a degraded mode that silently resolves another key. A
+		// fresh database is created here and opens with zero rows.
+		let auth = Arc::new(
+			AuthBridge::open(launch.agent_db.clone(), Arc::clone(&sink), Arc::clone(&ui))
+				.map_err(|error| crate::Error::with_source("auth database unavailable", error))?,
+		);
 		let approval_input: crate::approve::ApprovalInput = Arc::new(Mutex::new(Box::new(
 			super::input::RpcApprovalInput::new(Arc::clone(&ui), None),
 		)));
@@ -648,6 +660,7 @@ impl RpcMode {
 			host_uris,
 			internal_urls,
 			Arc::clone(&observer),
+			auth.resolver(),
 		)?;
 		sink.send(super::types::ready_frame(
 			MAX_RPC_FRAME_BYTES,
@@ -655,6 +668,7 @@ impl RpcMode {
 		));
 		let mut mode = Self {
 			session: Arc::new(Mutex::new(session)),
+			auth,
 			sink: output.clone(),
 			active: Arc::new(ActiveTurn::default()),
 			ui,
@@ -744,6 +758,12 @@ impl RpcMode {
 		// `close()` is the authoritative stop: it cancels the live token and the
 		// queued drain, so no separate `ActiveTurn::abort` exists any more.
 		self.control.close();
+		// Auth teardown before the UI bridge: cancelling a live login withdraws its
+		// prompts, and joining the worker keeps a callback from firing into a
+		// transport that is already finishing. A worker that outlives the bound is
+		// left with a fired token, never with a pending write.
+		self.auth.cancel_login();
+		let _ = self.auth.shutdown(Duration::from_secs(5));
 		self.ui.cancel_all();
 		self.active.abort_bash();
 		// Closed: stop forwarding subagent events and drop live snapshots.
@@ -810,6 +830,9 @@ impl RpcMode {
 				// Cancelled inside the run lock; nothing here touches `ActiveTurn`, or a
 				// replacement's fresh scope could be cancelled by a stale abort.
 				self.control.abort();
+				// A live login belongs to this run: cancel it (which also withdraws
+				// its prompt requests) before the UI bridge does.
+				self.auth.cancel_login();
 				self.ui.cancel_all();
 				Some(ok())
 			},
@@ -819,6 +842,7 @@ impl RpcMode {
 				// ended, this prompt starts a fresh run instead of being lost.
 				match self.control.replace(input) {
 					Ok(()) => {
+						self.auth.cancel_login();
 						self.ui.cancel_all();
 						Some(ok())
 					},
@@ -982,6 +1006,17 @@ impl RpcMode {
 						"Cannot compact while a response is streaming".to_string(),
 					));
 				}
+				// Summarising runs on this thread and asks the store for a key. A
+				// login worker owns the store while it awaits host prompts, so this
+				// must be rejected up front instead of blocking stdin.
+				if self.auth.is_logging_in() {
+					return Some(RpcResponse::error_code(
+						id_ref,
+						kind,
+						"Cannot compact while a login owns the credential store",
+						LOGIN_IN_PROGRESS,
+					));
+				}
 				Some(match self.lock_session().compact(custom_instructions) {
 					Err(error) => err(error.to_string()),
 					Ok(result) => ok_data(result),
@@ -1073,6 +1108,16 @@ impl RpcMode {
 						"Cannot hand off while a response is in progress".to_string(),
 					));
 				}
+				// Same store-ownership hazard as `compact`: the summarise turn
+				// resolves its key synchronously on this thread.
+				if self.auth.is_logging_in() {
+					return Some(RpcResponse::error_code(
+						id_ref,
+						kind,
+						"Cannot hand off while a login owns the credential store",
+						LOGIN_IN_PROGRESS,
+					));
+				}
 				Some(match self.lock_session().handoff(custom_instructions) {
 					Err(error) => err(error.to_string()),
 					Ok(Some(saved_path)) => ok_data(json!({ "savedPath": saved_path })),
@@ -1088,24 +1133,8 @@ impl RpcMode {
 				Some(self.messages_page(id_ref, cursor.as_deref(), limit))
 			},
 
-			RpcCommand::GetLoginProviders { .. } => Some(RpcResponse::error_code(
-				id_ref,
-				kind,
-				"No OAuth provider registry or credential store exists in this build (native \
-				 seam: provider auth registry + credential store; RPC maps its providers and \
-				 the login callbacks to extension_ui_request frames)",
-				"auth_unavailable",
-			)),
-			RpcCommand::Login { provider_id, .. } => Some(RpcResponse::error_code(
-				id_ref,
-				kind,
-				format!(
-					"Cannot log in to '{provider_id}': this build has no credential store (native \
-					 seam: provider auth registry + credential store; RPC maps the login \
-					 callbacks to extension_ui_request frames)"
-				),
-				"auth_unavailable",
-			)),
+			RpcCommand::GetLoginProviders { .. } => self.auth.providers(id_ref),
+			RpcCommand::Login { provider_id, .. } => self.auth.login(id_ref, &provider_id),
 		}
 	}
 
@@ -1236,6 +1265,7 @@ impl RpcMode {
 		let sink: Arc<dyn FrameSink> = self.sink.clone();
 		let active = Arc::clone(&self.active);
 		let control = Arc::clone(&self.control);
+		let auth = Arc::clone(&self.auth);
 		// A new run owns the scope: admission opens here, once, and the worker never
 		// resets it. `begin_run` refuses after shutdown, so a prompt arriving at or
 		// after EOF cannot resurrect the transport.
@@ -1304,7 +1334,7 @@ impl RpcMode {
 						);
 					}
 					if outcome.error.is_none() && !outcome.aborted {
-						maybe_auto_compact(&session, &sink);
+						maybe_auto_compact(&session, &sink, &auth);
 					}
 					// Turn boundary, committed inside the run lock: the queue drain and
 					// the terminal `agent_end` are one critical section, so a queued
@@ -1440,7 +1470,18 @@ impl RpcMode {
 /// ponytail: 90% of the advertised window until the compaction-settings seam
 /// (threshold tokens/percent) lands; the summary itself is the real model path
 /// (`RpcSession::compact`), never a stub.
-fn maybe_auto_compact(session: &Arc<Mutex<RpcSession>>, sink: &Arc<dyn FrameSink>) {
+fn maybe_auto_compact(
+	session: &Arc<Mutex<RpcSession>>,
+	sink: &Arc<dyn FrameSink>,
+	auth: &Arc<AuthBridge>,
+) {
+	// A login worker owns the credential store while it awaits host prompts, so the
+	// summarise turn would block on it with nothing to cancel. Skip this boundary
+	// silently — before any `auto_compaction_start` frame — and let the next turn
+	// re-check the threshold.
+	if auth.is_logging_in() {
+		return;
+	}
 	let (enabled, percent, busy) = {
 		let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 		(

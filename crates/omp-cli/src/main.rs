@@ -733,6 +733,9 @@ fn run() -> std::result::Result<(), CliError> {
 			prompts: session.prompts.clone(),
 			skills: session.skills.clone(),
 			catalog: Arc::clone(&session.catalog),
+			// One store for the whole process; the auth bridge opens it before the
+			// session exists and fails startup when it cannot.
+			agent_db: dirs::agent_dir().join("agent.db"),
 			approval_mode: session.config.approval_mode.unwrap_or_default(),
 			allow: session.config.allow.clone(),
 			model: session.model.clone(),
@@ -1115,6 +1118,7 @@ impl Session<'_> {
 			url_scope: None,
 			subagent_observer: None,
 			child_session_root: None,
+			credential_resolver: None,
 		}
 	}
 

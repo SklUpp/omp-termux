@@ -467,6 +467,7 @@ fn fake_request(prompt: &str) -> RunRequest {
 		url_scope: None,
 		subagent_observer: None,
 		child_session_root: None,
+		credential_resolver: None,
 	}
 }
 

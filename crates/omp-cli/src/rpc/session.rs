@@ -111,6 +111,9 @@ pub struct RpcLaunch {
 	pub prompts:  Prompts,
 	pub skills:   Vec<Skill>,
 	pub catalog:  Arc<Catalog>,
+	/// Resolved credential-store path (`<agent dir>/agent.db`), resolved once by
+	/// the CLI so no hidden default can pick a different store here.
+	pub agent_db: PathBuf,
 	pub approval_mode: ApprovalMode,
 	pub allow:    Vec<String>,
 	pub model:    Option<String>,
@@ -241,6 +244,9 @@ pub struct TurnInput {
 /// Long-lived session state owned by the RPC transport.
 pub struct RpcSession {
 	pub(crate) runner:   Arc<dyn AgentRunner>,
+	/// Credential store shared with the RPC auth bridge; every request this
+	/// session builds resolves keys through it.
+	pub(crate) resolver: Arc<dyn crate::rpc::auth::CredentialResolver>,
 	pub(crate) config:   Config,
 	pub(crate) cwd:      PathBuf,
 	pub(crate) prompts:  Prompts,
@@ -305,6 +311,7 @@ impl RpcSession {
 		host_uris: Arc<HostUriBridge>,
 		internal_urls: Arc<InternalUrlRouter>,
 		observer: Arc<dyn SubagentObserver>,
+		resolver: Arc<dyn crate::rpc::auth::CredentialResolver>,
 	) -> Result<Self> {
 		let RpcLaunch {
 			runner,
@@ -313,6 +320,7 @@ impl RpcSession {
 			prompts,
 			skills,
 			catalog,
+			agent_db: _,
 			approval_mode: _,
 			allow: _,
 			model,
@@ -365,6 +373,7 @@ impl RpcSession {
 		let todo_phases = store.latest_todo_phases();
 		Ok(Self {
 			runner,
+			resolver,
 			config,
 			cwd,
 			prompts,
@@ -1343,6 +1352,7 @@ impl RpcSession {
 			internal_urls: Some(Arc::clone(&self.internal_urls)),
 			url_scope: Some(self.url_scope()),
 			subagent_observer: Some(crate::agent::ObserverHandle(Arc::clone(&self.observer))),
+			credential_resolver: Some(crate::agent::ResolverHandle(Arc::clone(&self.resolver))),
 			child_session_root: self.child_session_root(),
 		})
 	}

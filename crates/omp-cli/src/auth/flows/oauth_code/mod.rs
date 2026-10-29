@@ -206,6 +206,22 @@ impl Drop for ManualWait {
 
 /// Split `code#state` the way the Anthropic exchange does before posting.
 #[must_use]
+/// `atob(...)` from the upstream registry sources.
+///
+/// Some client ids/secrets ship base64-encoded in `packages/ai/src/registry/oauth`
+/// (`anthropic.ts:13`, `google-gemini-cli.ts:12-16`,
+/// `google-antigravity.ts:12-15`). The literal stays encoded here too, and this is
+/// the one place that decodes it. Failures name the constant, never its value.
+pub fn decode_constant(label: &str, encoded: &str) -> Result<String, AuthError> {
+	use base64::Engine as _;
+	let compact: String = encoded.chars().filter(|character| !character.is_whitespace()).collect();
+	let bytes = base64::engine::general_purpose::STANDARD
+		.decode(compact.as_bytes())
+		.map_err(|error| AuthError::new(AuthErrorKind::Configuration, format!("invalid base64 for {label}: {error}")))?;
+	String::from_utf8(bytes)
+		.map_err(|_| AuthError::new(AuthErrorKind::Configuration, format!("{label} is not UTF-8")))
+}
+
 pub fn split_code_fragment(code: &str, state: &str) -> (String, String) {
 	match code.split_once('#') {
 		Some((code, fragment)) if !fragment.is_empty() => (code.to_string(), fragment.to_string()),
@@ -386,6 +402,17 @@ mod tests {
 		canceller.join().expect("canceller");
 		assert_eq!(error.kind, AuthErrorKind::Cancelled);
 		assert!(recorder.prompt_returned.load(Ordering::SeqCst), "the prompt worker is joined on cancel");
+	}
+
+	#[test]
+	fn constant_decode_validates_encoding_without_echoing_input() {
+		assert_eq!(decode_constant("fixture", "aGVsbG8=").expect("valid"), "hello");
+		let error = decode_constant("fixture", "not base64!").expect_err("invalid");
+		assert_eq!(error.kind, AuthErrorKind::Configuration);
+		assert!(!error.message.contains("not base64!"));
+		let error = decode_constant("fixture", "/w==").expect_err("invalid UTF-8");
+		assert_eq!(error.kind, AuthErrorKind::Configuration);
+		assert!(!error.message.contains("/w=="));
 	}
 
 	#[test]

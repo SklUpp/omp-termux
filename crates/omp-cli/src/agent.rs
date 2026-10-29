@@ -205,6 +205,22 @@ pub struct RunRequest {
 	/// Directory child transcripts are written to; `None` leaves
 	/// `get_subagent_messages` without a file to page.
 	pub child_session_root: Option<std::path::PathBuf>,
+	/// Per-request credential resolver installed by the RPC auth bridge. Key
+	/// precedence stays TS `getApiKey` order: an explicit `--api-key`/config key
+	/// wins, then this store (login, env, static), then the connection block.
+	/// `None` keeps the non-RPC path unchanged.
+	pub credential_resolver: Option<ResolverHandle>,
+}
+
+/// Resolver handle that keeps [`RunRequest`]'s derived `Debug` intact: the
+/// resolver is a trait object, the handle only names that one was installed.
+#[derive(Clone)]
+pub struct ResolverHandle(pub std::sync::Arc<dyn crate::rpc::auth::CredentialResolver>);
+
+impl std::fmt::Debug for ResolverHandle {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("ResolverHandle")
+	}
 }
 
 /// Observer handle that keeps [`RunRequest`]'s derived `Debug` intact: the

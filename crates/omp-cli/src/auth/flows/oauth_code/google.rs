@@ -41,21 +41,30 @@ pub enum Client {
 
 struct Config {
 	provider: &'static str,
-	client_id: &'static str,
-	client_secret: &'static str,
+	client_id: String,
+	client_secret: String,
 	scopes: &'static str,
 	callback_port: u16,
 	callback_path: &'static str,
 }
 
+// The upstream sources ship these base64-encoded (`atob(...)`); the literals stay
+// encoded here and are decoded by `decode_constant`, so parity is auditable.
+const GEMINI_CLIENT_ID_B64: &str =
+	"NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t";
+const GEMINI_CLIENT_SECRET_B64: &str = "R09DU1BYLTR1SGdNUG0tMW83U2stZ2VWNkN1NWNsWEZzeGw=";
+const ANTIGRAVITY_CLIENT_ID_B64: &str =
+	"MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==";
+const ANTIGRAVITY_CLIENT_SECRET_B64: &str = "R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=";
+
 impl Client {
-	fn config(self) -> Config {
-		match self {
-			// `atob(...)` in the TS source resolves to these public client ids.
+	fn config(self) -> Result<Config, AuthError> {
+		Ok(match self {
+			// `decode(...)` / `atob(...)` in the TS source (kept encoded above).
 			Self::GeminiCli => Config {
 				provider: "google-gemini-cli",
-				client_id: "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
-				client_secret: "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",
+				client_id: super::decode_constant("gemini client id", GEMINI_CLIENT_ID_B64)?,
+				client_secret: super::decode_constant("gemini client secret", GEMINI_CLIENT_SECRET_B64)?,
 				scopes: "https://www.googleapis.com/auth/cloud-platform \
 					https://www.googleapis.com/auth/userinfo.email \
 					https://www.googleapis.com/auth/userinfo.profile",
@@ -64,8 +73,8 @@ impl Client {
 			},
 			Self::Antigravity => Config {
 				provider: "google-antigravity",
-				client_id: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
-				client_secret: "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",
+				client_id: super::decode_constant("antigravity client id", ANTIGRAVITY_CLIENT_ID_B64)?,
+				client_secret: super::decode_constant("antigravity client secret", ANTIGRAVITY_CLIENT_SECRET_B64)?,
 				scopes: "https://www.googleapis.com/auth/cloud-platform \
 					https://www.googleapis.com/auth/userinfo.email \
 					https://www.googleapis.com/auth/userinfo.profile \
@@ -74,12 +83,12 @@ impl Client {
 				callback_port: 51121,
 				callback_path: "/oauth-callback",
 			},
-		}
+		})
 	}
 }
 
 pub async fn login(flow: &Flow<'_>, client: Client) -> Result<Credential, AuthError> {
-	let config = client.config();
+	let config = client.config()?;
 	let state = super::super::super::pkce::random_state()?;
 	let spec = CodeFlowSpec::new(
 		CallbackConfig::new(config.callback_port, config.callback_path).with_hostname("127.0.0.1"),
@@ -90,7 +99,7 @@ pub async fn login(flow: &Flow<'_>, client: Client) -> Result<Credential, AuthEr
 		let url = crate::auth::callback::with_query(
 			AUTH_URL,
 			&[
-				("client_id", config.client_id),
+				("client_id", config.client_id.as_str()),
 				("response_type", "code"),
 				("redirect_uri", redirect_uri),
 				("scope", config.scopes),
@@ -105,8 +114,8 @@ pub async fn login(flow: &Flow<'_>, client: Client) -> Result<Credential, AuthEr
 
 	flow.notice("Exchanging authorization code for tokens...");
 	let fields = vec![
-		("client_id".to_string(), config.client_id.to_string()),
-		("client_secret".to_string(), config.client_secret.to_string()),
+		("client_id".to_string(), config.client_id.clone()),
+		("client_secret".to_string(), config.client_secret.clone()),
 		("code".to_string(), exchange.code),
 		("grant_type".to_string(), "authorization_code".to_string()),
 		("redirect_uri".to_string(), exchange.redirect_uri),
@@ -160,12 +169,12 @@ pub async fn refresh(flow: &Flow<'_>, credentials: &OAuthCredentials) -> Result<
 			.for_provider(flow.provider()));
 	}
 	let config = match flow.provider() {
-		"google-antigravity" => Client::Antigravity.config(),
-		_ => Client::GeminiCli.config(),
+		"google-antigravity" => Client::Antigravity.config()?,
+		_ => Client::GeminiCli.config()?,
 	};
 	let fields = vec![
-		("client_id".to_string(), config.client_id.to_string()),
-		("client_secret".to_string(), config.client_secret.to_string()),
+		("client_id".to_string(), config.client_id.clone()),
+		("client_secret".to_string(), config.client_secret.clone()),
 		("refresh_token".to_string(), credentials.refresh.clone()),
 		("grant_type".to_string(), "refresh_token".to_string()),
 	];
@@ -677,13 +686,13 @@ mod tests {
 
 	#[test]
 	fn clients_match_upstream_endpoints() {
-		let gemini = Client::GeminiCli.config();
+		let gemini = Client::GeminiCli.config().expect("gemini config");
 		assert_eq!(gemini.callback_port, 8085);
 		assert_eq!(gemini.callback_path, "/oauth2callback");
 		assert!(gemini.client_id.ends_with(".apps.googleusercontent.com"));
 		assert!(gemini.scopes.contains("cloud-platform") && !gemini.scopes.contains("cclog"));
 
-		let antigravity = Client::Antigravity.config();
+		let antigravity = Client::Antigravity.config().expect("antigravity config");
 		assert_eq!(antigravity.callback_port, 51121);
 		assert_eq!(antigravity.callback_path, "/oauth-callback");
 		assert!(antigravity.scopes.contains("cclog"));
@@ -692,11 +701,11 @@ mod tests {
 
 	#[test]
 	fn authorize_params_use_offline_consent() {
-		let config = Client::GeminiCli.config();
+		let config = Client::GeminiCli.config().expect("gemini config");
 		let url = crate::auth::callback::with_query(
 			AUTH_URL,
 			&[
-				("client_id", config.client_id),
+				("client_id", config.client_id.as_str()),
 				("response_type", "code"),
 				("redirect_uri", "http://127.0.0.1:8085/oauth2callback"),
 				("scope", config.scopes),

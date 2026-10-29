@@ -167,6 +167,7 @@ fn make_run_request(
 		url_scope: None,
 		subagent_observer: None,
 		child_session_root: None,
+		credential_resolver: None,
 	}
 }
 

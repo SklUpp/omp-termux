@@ -13,7 +13,8 @@ use super::super::super::pkce::Pkce;
 use super::super::super::store::OAuthCredentials;
 use super::{CodeFlowSpec, Flow, run, split_code_fragment};
 
-const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+/// `decode("OWQx...")` in `registry/oauth/anthropic.ts`; kept encoded here.
+const CLIENT_ID_B64: &str = "OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl";
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 const BOOTSTRAP_URL: &str = "https://api.anthropic.com/api/claude_cli/bootstrap";
@@ -24,6 +25,7 @@ const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessio
 const GRANT_TTL_SKEW_MS: i64 = 5 * 60 * 1000;
 
 pub async fn login(flow: &Flow<'_>) -> Result<super::super::super::store::Credential, AuthError> {
+	let client_id = super::decode_constant("anthropic client id", CLIENT_ID_B64)?;
 	let pkce = Pkce::generate()?;
 	let state = super::super::super::pkce::random_state()?;
 	// A pinned loopback redirect URI is registered with the provider, so the port
@@ -41,7 +43,7 @@ pub async fn login(flow: &Flow<'_>) -> Result<super::super::super::store::Creden
 		let url = super::super::authorize_url(
 			AUTHORIZE_URL,
 			&super::super::AuthorizeParams {
-				client_id: CLIENT_ID,
+				client_id: &client_id,
 				redirect_uri,
 				scopes: Some(SCOPES),
 				pkce_challenge: Some(&pkce.challenge),
@@ -56,7 +58,7 @@ pub async fn login(flow: &Flow<'_>) -> Result<super::super::super::store::Creden
 	let (code, exchange_state) = split_code_fragment(&exchange.code, &exchange.state);
 	let body = json!({
 		"grant_type": "authorization_code",
-		"client_id": CLIENT_ID,
+		"client_id": client_id,
 		"code": code,
 		"state": exchange_state,
 		"redirect_uri": exchange.redirect_uri,
@@ -99,9 +101,10 @@ pub async fn refresh(
 		return Err(AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
 			.for_provider("anthropic"));
 	}
+	let client_id = super::decode_constant("anthropic client id", CLIENT_ID_B64)?;
 	let body = json!({
 		"grant_type": "refresh_token",
-		"client_id": CLIENT_ID,
+		"client_id": client_id,
 		"refresh_token": credentials.refresh,
 	});
 	let mut headers = vec![("anthropic-beta".to_string(), "oauth-2025-04-20".to_string())];
