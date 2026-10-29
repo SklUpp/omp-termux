@@ -35,28 +35,41 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: rust-agent-host
-      - name: Diagnose Julia availability probe
+      - name: Check agent workspace members
+        run: cargo check --locked -p pi-agent -p omp-cli
+      - name: Test agent core and CLI
+        run: cargo test --locked -p pi-agent -p omp-cli
+
+  # Temporary evidence job: each matrix variant starts on a fresh runner, so the
+  # measured invocation is the first Julia process on that VM (no warm depot or
+  # page cache from an earlier probe). Dispatch manually; remove after use.
+  diagnose-julia-cold:
+    name: Julia cold probe (${{ matrix.variant }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [bare, startup-off, kernel-flags, filtered]
+    steps:
+      - name: Measure first Julia invocation
         timeout-minutes: 2
         run: |
-          set +e
-          julia=/usr/bin/julia
-          echo "--- interpreter ---"
-          command -v julia
-          ls -l "$julia"
-          readlink -f "$julia" || true
-          start=$(date +%s%N)
-          version_out=$(timeout 15 "$julia" --version 2>&1)
-          version_status=$?
-          end=$(date +%s%N)
-          echo "version: status=$version_status elapsed_ms=$(( (end - start) / 1000000 )) output=$version_out"
-          python3 - "$julia" <<'PY'
+          python3 - "${{ matrix.variant }}" <<'PY'
           import os, re, subprocess, sys, time
 
-          julia = sys.argv[1]
+          variant = sys.argv[1]
+          julia = "/usr/bin/julia"
 
-          # Mirror crates/pi-agent/src/eval/env.rs: COMMON_ALLOW + JL_ALLOW,
-          # JL prefixes, SHARED_DENY, then SECRET_PATTERN. Values are never
-          # printed; only names of the filtered JULIA_/XDG_ keys.
+          if variant == "startup-off":
+              extra = ["--startup-file=no"]
+          elif variant == "kernel-flags":
+              extra = ["--startup-file=no", "--history-file=no", "--color=no"]
+          else:
+              extra = []
+
+          # Mirror crates/pi-agent/src/eval/env.rs for the filtered variant.
           common_allow = {
               "PATH", "HOME", "USER", "USERNAME", "LOGNAME", "SHELL", "LANG",
               "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TERM", "TERM_PROGRAM",
@@ -93,45 +106,42 @@ jobs:
                       filtered[key] = value
               return filtered
 
-          filtered = filter_env(os.environ)
-
-          def run(label, argv, env):
-              started = time.monotonic()
-              try:
-                  proc = subprocess.run(
-                      argv,
-                      env=env,
-                      stdin=subprocess.DEVNULL,
-                      stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL,
-                      timeout=15,
-                      start_new_session=True,
-                  )
-                  status = proc.returncode
-              except subprocess.TimeoutExpired:
-                  status = "timeout"
-              except OSError as error:
-                  status = f"spawn-error: {error.errno}"
-              elapsed = int((time.monotonic() - started) * 1000)
-              print(f"{label}: status={status} elapsed_ms={elapsed}")
-
-          run("bare", [julia, "-e", "exit(0)"], dict(os.environ))
-          run(
-              "flags",
-              [julia, "--startup-file=no", "--history-file=no", "--color=no", "-e", "exit(0)"],
-              dict(os.environ),
-          )
-          run("filtered", [julia, "-e", "exit(0)"], filtered)
-          names = sorted(key for key in filtered if key.startswith(("JULIA_", "XDG_")))
-          present = [key for key in ("LD_LIBRARY_PATH", "HOME", "PATH") if key in filtered]
-          print("filtered JULIA_/XDG_ names:", ",".join(names) if names else "(none)")
-          print("filtered core presence:", ",".join(present))
-          print("filtered env count:", len(filtered))
+          env = filter_env(os.environ) if variant == "filtered" else dict(os.environ)
+          argv = [julia] + extra + ["-e", "exit(0)"]
+          started = time.monotonic()
+          try:
+              proc = subprocess.run(
+                  argv,
+                  env=env,
+                  stdin=subprocess.DEVNULL,
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+                  timeout=15,
+                  start_new_session=True,
+              )
+              status = proc.returncode
+          except subprocess.TimeoutExpired:
+              status = "timeout"
+          except OSError as error:
+              status = f"spawn-error: {error.errno}"
+          elapsed = int((time.monotonic() - started) * 1000)
+          print(f"cold variant={variant} status={status} elapsed_ms={elapsed}")
+          if variant == "filtered":
+              names = sorted(key for key in env if key.startswith(("JULIA_", "XDG_")))
+              present = [key for key in ("LD_LIBRARY_PATH", "HOME", "PATH") if key in env]
+              print("filtered JULIA_/XDG_ names:", ",".join(names) if names else "(none)")
+              print("filtered core presence:", ",".join(present))
+          try:
+              version = subprocess.run(
+                  [julia, "--version"],
+                  capture_output=True,
+                  text=True,
+                  timeout=15,
+              ).stdout.strip()
+          except Exception as error:
+              version = f"unavailable: {type(error).__name__}"
+          print("version:", version)
           PY
-      - name: Check agent workspace members
-        run: cargo check --locked -p pi-agent -p omp-cli
-      - name: Test agent core and CLI
-        run: cargo test --locked -p pi-agent -p omp-cli
 
   test-native-grep:
     name: Native grep and matcher tests (linux x86_64)
