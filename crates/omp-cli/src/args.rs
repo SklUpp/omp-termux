@@ -307,6 +307,38 @@ pub fn parse_file_arg(token: &str) -> String {
 	}
 }
 
+/// Whether `value` is a canonical 8-4-4-4-12 session UUID, matching TS
+/// `SESSION_ID_ARG_RE` (ASCII hex, case-insensitive, exact length).
+#[must_use]
+pub fn is_session_uuid(value: &str) -> bool {
+	let bytes = value.as_bytes();
+	bytes.len() == 36
+		&& bytes.iter().enumerate().all(|(index, byte)| match index {
+			8 | 13 | 18 | 23 => *byte == b'-',
+			_ => byte.is_ascii_hexdigit(),
+		})
+}
+
+/// TS `normalizeContinueSessionArgs`: `--continue <session-uuid>` targets that
+/// session instead of continuing the latest one with the UUID as prompt text.
+/// An explicit `--resume`/`--fork` wins, and a non-UUID prompt is untouched.
+pub fn normalize_continue_session_args(cli: &mut Cli) {
+	if !cli.continue_session
+		|| cli.resume.is_some()
+		|| cli.fork.is_some()
+		|| cli.prompt.len() != 1
+	{
+		return;
+	}
+	let message = cli.prompt[0].trim();
+	if !is_session_uuid(message) {
+		return;
+	}
+	cli.resume = Some(message.to_string());
+	cli.continue_session = false;
+	cli.prompt.clear();
+}
+
 impl Cli {
 	fn from_launch(raw: LaunchArgs, command: Option<Command>) -> Self {
 		let _ = raw.profile_boundary;
@@ -923,6 +955,89 @@ mod tests {
 
 	fn parse(args: &[&str]) -> Cli {
 		Cli::try_parse_from(args).expect("parse")
+	}
+
+	#[test]
+	fn session_uuid_detection_matches_ts_pattern() {
+		assert!(is_session_uuid("019ea530-ffff-7000-8000-000000000000"));
+		assert!(is_session_uuid("019EA530-FFFF-7000-8000-000000000000"));
+		assert!(!is_session_uuid("019ea530-ffff-7000-8000-00000000000"));
+		assert!(!is_session_uuid("019ea530-ffff-7000-8000-0000000000000"));
+		assert!(!is_session_uuid("019ea530-ffff-7000-8000-00000000000g"));
+		assert!(!is_session_uuid("019ea530ffff70008000000000000000"));
+		assert!(!is_session_uuid("019ea530-ffff-7000-8000-00000000000-"));
+		assert!(!is_session_uuid("summarize the diff"));
+	}
+
+	#[test]
+	fn continue_with_session_uuid_resumes_that_session() {
+		let mut cli = parse(&[
+			"omp",
+			"--continue",
+			"019EA530-FFFF-7000-8000-000000000000",
+			"--no-title",
+		]);
+		assert!(cli.continue_session);
+		normalize_continue_session_args(&mut cli);
+		assert!(!cli.continue_session);
+		assert_eq!(cli.resume.as_deref(), Some("019EA530-FFFF-7000-8000-000000000000"));
+		assert!(cli.prompt.is_empty());
+	}
+
+	#[test]
+	fn continue_non_uuid_prompt_stays_prompt() {
+		let mut cli = parse(&["omp", "--continue", "summarize the diff"]);
+		normalize_continue_session_args(&mut cli);
+		assert!(cli.continue_session);
+		assert_eq!(cli.resume, None);
+		assert_eq!(cli.prompt, ["summarize the diff"]);
+	}
+
+	#[test]
+	fn continue_bare_or_uuid_prompt_with_more_text_stays_unchanged() {
+		let mut bare = parse(&["omp", "--continue"]);
+		normalize_continue_session_args(&mut bare);
+		assert!(bare.continue_session);
+		assert!(bare.resume.is_none());
+		assert!(bare.prompt.is_empty());
+
+		let mut multi = parse(&[
+			"omp",
+			"--continue",
+			"019EA530-FFFF-7000-8000-000000000000",
+			"also this",
+		]);
+		normalize_continue_session_args(&mut multi);
+		assert!(multi.continue_session);
+		assert_eq!(multi.resume, None);
+		assert_eq!(multi.prompt.len(), 2);
+	}
+
+	#[test]
+	fn explicit_resume_or_fork_is_never_overridden() {
+		let mut resumed = parse(&[
+			"omp",
+			"--continue",
+			"--resume",
+			"abc",
+			"019EA530-FFFF-7000-8000-000000000000",
+		]);
+		normalize_continue_session_args(&mut resumed);
+		assert!(resumed.continue_session);
+		assert_eq!(resumed.resume.as_deref(), Some("abc"));
+		assert_eq!(resumed.prompt, ["019EA530-FFFF-7000-8000-000000000000"]);
+
+		let mut forked = parse(&[
+			"omp",
+			"--continue",
+			"--fork",
+			"abc",
+			"019EA530-FFFF-7000-8000-000000000000",
+		]);
+		normalize_continue_session_args(&mut forked);
+		assert!(forked.continue_session);
+		assert_eq!(forked.fork.as_deref(), Some("abc"));
+		assert_eq!(forked.prompt, ["019EA530-FFFF-7000-8000-000000000000"]);
 	}
 
 	#[test]

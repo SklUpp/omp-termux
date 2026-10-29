@@ -11,7 +11,7 @@ use omp_cli::{
 	agent::{self, AgentRunner, RunRequest},
 	agents,
 	approve::Approvals,
-	args::{Command, parse_cli, refused_verb_message},
+	args::{Command, normalize_continue_session_args, parse_cli, refused_verb_message},
 	catalog::Catalog,
 	completions,
 	config::Config,
@@ -138,7 +138,9 @@ fn run() -> std::result::Result<(), CliError> {
 	}
 	// Share this profile's exact runtime scope with `pi-agent` broker clients.
 	daemon_broker::share_runtime_root(&dirs::agent_dir());
-	let cli = parse_cli(bootstrap.argv);
+	let mut cli = parse_cli(bootstrap.argv);
+	// `--continue <uuid>` names a session (TS parity), not prompt text.
+	normalize_continue_session_args(&mut cli);
 	if let Some(alias_name) = &bootstrap.alias {
 		let result = profile::install_alias(alias_name, profile.as_deref())?;
 		print!(
