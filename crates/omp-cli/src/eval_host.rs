@@ -370,15 +370,24 @@ impl EvalHost for CliEvalHost {
 			Some(Value::String(value)) => value.as_str(),
 			Some(_) => return Err("completion() `model` must be a string".to_string()),
 		};
+		// Cancellation law: never dispatch after a pre-cancelled context, and let
+		// cancellation win over an instantly-ready provider.
+		if ctx.cancellation_token.is_cancelled() {
+			return Err("completion() cancelled".to_string());
+		}
 		let provider = self.provider_for(model)?;
 		let messages = completion_messages(prompt, system, schema)?;
 		let completion = provider.complete(&messages, &[], &ToolChoice::Auto);
 		let message = tokio::select! {
+			biased;
 			_ = ctx.cancellation_token.cancelled() => {
 				return Err("completion() cancelled".to_string());
 			},
 			result = completion => result.map_err(|error| format!("completion failed: {error}"))?,
 		};
+		if ctx.cancellation_token.is_cancelled() {
+			return Err("completion() cancelled".to_string());
+		}
 		let text = completion_text(&message, schema.is_some())?;
 		Ok(json!({ "text": text }))
 	}
@@ -689,6 +698,7 @@ mod tests {
 		assert_eq!(eval_settings(&config).auto_background(), None);
 
 		// Enabled without a threshold keeps the upstream 60s default.
+		config.eval_config.auto_background_threshold_ms = None;
 		config.eval_config.auto_background_enabled = Some(true);
 		assert_eq!(
 			eval_settings(&config).auto_background(),
