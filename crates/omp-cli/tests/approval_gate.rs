@@ -153,6 +153,8 @@ fn make_run_request(
 		turn_ack: None,
 		todo_phases: Vec::new(),
 		session_persisted: false,
+		session_file: None,
+		session_id: None,
 		config,
 		catalog: Arc::new(Catalog::default()),
 		approvals,

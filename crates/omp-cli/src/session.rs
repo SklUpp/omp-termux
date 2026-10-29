@@ -2960,7 +2960,10 @@ pub fn read_terminal_breadcrumb(override_path: Option<&Path>) -> Option<Terminal
 }
 
 /// TS `artifactsDirectoryFor`: session file minus `.jsonl` suffix.
-fn artifacts_dir_for(session_file: &Path) -> Option<PathBuf> {
+///
+/// Exposed so the eval host can allocate artifact files in the same
+/// session-scoped directory the session log owns.
+pub fn artifacts_directory_for(session_file: &Path) -> Option<PathBuf> {
 	if session_file.extension().and_then(|ext| ext.to_str()) == Some(LOG_EXTENSION) {
 		Some(session_file.with_extension(""))
 	} else {
@@ -3063,8 +3066,8 @@ pub fn move_session_to(
 		session_moved = true;
 	}
 
-	let artifacts_source = artifacts_dir_for(&source);
-	let artifacts_dest = artifacts_dir_for(&dest);
+	let artifacts_source = artifacts_directory_for(&source);
+	let artifacts_dest = artifacts_directory_for(&dest);
 	if let (Some(old_art), Some(new_art)) = (&artifacts_source, &artifacts_dest)
 		&& old_art != new_art
 		&& old_art.is_dir()
@@ -3374,7 +3377,7 @@ pub fn fork_session(
 
 	// TS fork copies the session artifacts directory alongside the log.
 	if let (Some(old_art), Some(new_art)) =
-		(artifacts_dir_for(source_path), artifacts_dir_for(&target_file))
+		(artifacts_directory_for(source_path), artifacts_directory_for(&target_file))
 		&& old_art.is_dir()
 	{
 		copy_dir_recursive(&old_art, &new_art).map_err(|e| {

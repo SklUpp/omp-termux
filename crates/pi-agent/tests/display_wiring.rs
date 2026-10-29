@@ -154,7 +154,7 @@ async fn children_resolve_their_own_model_and_drop_anchors_without_edit() {
 	// Agent allowlist removes `edit`; rebinding with the child model suppresses
 	// hashline display and leaves the read in plain mode (no anchors).
 	child.remove("edit");
-	supervisor.rebind_session_tools(&mut child, Some("local/child-model"));
+	supervisor.rebind_session_tools(&mut child, Some("local/child-model"), None);
 	assert_eq!(
 		resolver.seen.lock().expect("seen").last().cloned(),
 		Some((Some("local/child-model".to_string()), false))

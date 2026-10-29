@@ -9,8 +9,8 @@ use crate::{
 	mailbox::{Mailbox, format_incoming},
 	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
 	state::{
-		AgentConfig, AgentContext, AgentState, Message, Role, SoftToolRequirement, ToolApprover,
-		ToolCall, ToolPolicy, ToolResult, TurnResult, TurnStatus,
+		AgentConfig, AgentContext, AgentState, ContentPart, Message, Role, SoftToolRequirement,
+		ToolApprover, ToolCall, ToolPolicy, ToolResult, TurnResult, TurnStatus,
 	},
 	supervisor::BackgroundResultSink,
 	tools::{registry::ToolRegistry, scheduler::ToolScheduler},
@@ -24,6 +24,57 @@ const MIN_RECENT_MESSAGES: usize = 4;
 /// OpenAI history requires every `tool_call` to be answered, so an interrupted
 /// batch is closed with this marker instead of leaving orphan calls behind.
 pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution interrupted by user]";
+
+/// Extract `details.images` into validated content parts for the next provider
+/// request. Invalid payloads fail closed: the tool result becomes an error and
+/// the image is not attached, so a bad kernel payload cannot break every later
+/// request in the turn.
+fn tool_image_parts(
+	results: &mut [ToolResult],
+) -> std::collections::HashMap<String, Vec<ContentPart>> {
+	let mut by_call = std::collections::HashMap::new();
+	for result in results {
+		let Some(images) = result
+			.details
+			.as_ref()
+			.and_then(|details| details.get("images"))
+			.and_then(serde_json::Value::as_array)
+		else {
+			continue;
+		};
+		let mut parts = Vec::with_capacity(images.len());
+		let mut rejected = None;
+		for image in images {
+			let data = image.get("data").and_then(serde_json::Value::as_str);
+			let mime = image
+				.get("mimeType")
+				.or_else(|| image.get("mime_type"))
+				.and_then(serde_json::Value::as_str);
+			match (data, mime) {
+				(Some(data), Some(mime)) => match ContentPart::image(data, mime) {
+					Ok(part) => parts.push(part),
+					Err(error) => {
+						rejected = Some(error);
+						break;
+					},
+				},
+				_ => {
+					rejected = Some("image entry needs base64 `data` and `mimeType`".to_string());
+					break;
+				},
+			}
+		}
+		if let Some(error) = rejected {
+			result.is_error = true;
+			result.content = format!("{}\n\n[image payload rejected: {error}]", result.content);
+			continue;
+		}
+		if !parts.is_empty() {
+			by_call.insert(result.tool_call_id.clone(), parts);
+		}
+	}
+	by_call
+}
 
 /// Metadata the loop hands the turn-end consumer with each ack request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -787,9 +838,10 @@ impl AgentLoop {
 				}
 			}
 
-			let outcome = self
+			let mut outcome = self
 				.run_tools(&assistant.tool_calls, &ctx, &cancellation_token, steering_rx.as_mut())
 				.await;
+			let image_parts = tool_image_parts(&mut outcome.results);
 
 			if let Some(events_sink) = events.as_ref() {
 				let tool_names: std::collections::HashMap<&str, &str> = assistant
@@ -820,9 +872,21 @@ impl AgentLoop {
 				.collect();
 			for result in &outcome.results {
 				let name = tool_names.get(result.tool_call_id.as_str()).copied().unwrap_or("tool");
-				state
-					.messages
-					.push(Message::tool_with_status(&result.tool_call_id, name, &result.content, result.is_error));
+				match image_parts.get(&result.tool_call_id) {
+					Some(parts) => state.messages.push(Message::tool_with_status_and_parts(
+						&result.tool_call_id,
+						name,
+						&result.content,
+						parts.clone(),
+						result.is_error,
+					)),
+					None => state.messages.push(Message::tool_with_status(
+						&result.tool_call_id,
+						name,
+						&result.content,
+						result.is_error,
+					)),
+				}
 			}
 			// Injected messages land after the tool responses, so the history stays valid.
 			for message in pending_injections.into_iter().chain(outcome.injections) {
@@ -1328,5 +1392,41 @@ mod live_cut_tests {
 		assert!(text.contains("Retained report"));
 		assert!(!text.contains("exploration"));
 		assert!(!text.contains("secret"));
+	}
+
+	#[test]
+	fn tool_images_are_validated_and_invalid_payloads_fail_closed() {
+		let mut results = vec![
+			ToolResult {
+				tool_call_id: "ok".to_string(),
+				content: "one image".to_string(),
+				is_error: false,
+				terminate: false,
+				details: Some(serde_json::json!({
+					"images": [{
+						"type": "image",
+						"data": "iVBORw0KGgo=",
+						"mimeType": "image/png",
+					}],
+				})),
+			},
+			ToolResult {
+				tool_call_id: "bad".to_string(),
+				content: "broken".to_string(),
+				is_error: false,
+				terminate: false,
+				details: Some(serde_json::json!({
+					"images": [{ "data": "not base64!!", "mimeType": "image/png" }],
+				})),
+			},
+		];
+		let parts = tool_image_parts(&mut results);
+		assert_eq!(parts.len(), 1);
+		assert_eq!(parts["ok"].len(), 1);
+		assert!(parts["ok"][0].is_image());
+		assert!(!results[0].is_error);
+		assert!(results[1].is_error, "invalid image fails closed");
+		assert!(results[1].content.contains("image payload rejected"));
+		assert!(!parts.contains_key("bad"));
 	}
 }

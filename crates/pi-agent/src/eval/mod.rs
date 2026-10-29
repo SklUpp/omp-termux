@@ -21,7 +21,8 @@ pub mod util;
 pub use bridge::{Bridge, BridgeEndpoint, EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP};
 pub use host::{
 	ArtifactRef, BRIDGE_REJECTED_TOOLS, EVAL_AGENT_BRIDGE_NAME, EVAL_BUDGET_BRIDGE_NAME,
-	EVAL_COMPLETION_BRIDGE_NAME, EVAL_CONCURRENCY_BRIDGE_NAME, EvalHost, INTENT_FIELD,
+	EVAL_COMPLETION_BRIDGE_NAME, EVAL_CONCURRENCY_BRIDGE_NAME, EvalHost, EvalToolBinder,
+	INTENT_FIELD,
 };
 pub use idle::{CellControl, IdleTimeout};
 pub use kernel::{Kernel, KernelSpawn};

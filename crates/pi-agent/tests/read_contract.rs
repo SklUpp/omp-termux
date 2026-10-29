@@ -430,7 +430,7 @@ async fn snapshot_sink_adds_header_and_records_displayed_lines() {
 }
 
 #[tokio::test]
-async fn raw_read_with_sink_records_without_a_header() {
+async fn raw_read_with_sink_preserves_bytes_without_provenance() {
 	let dir = TempDir::new("sink-raw");
 	dir.write("f.txt", "one\ntwo\n");
 	let sink = std::sync::Arc::new(TestSink::default());
@@ -438,14 +438,13 @@ async fn raw_read_with_sink_records_without_a_header() {
 	let ctx = ctx(&dir);
 
 	let result = tool
-		.execute(&json!({ "path": "f.txt:raw:2-2" }), &ctx)
+		.execute(&json!({ "path": "f.txt:raw" }), &ctx)
 		.await
 		.expect("read");
-	assert_eq!(result.content, "two");
-	let files = sink.files.lock().expect("files");
-	assert_eq!(files.len(), 1);
-	let seen = sink.seen.lock().expect("seen");
-	assert_eq!(seen[0].2, vec![2]);
+	// No header, verbatim bytes, and no snapshot/seen-line provenance.
+	assert_eq!(result.content, "one\ntwo\n");
+	assert!(sink.files.lock().expect("files").is_empty());
+	assert!(sink.seen.lock().expect("seen").is_empty());
 }
 
 #[tokio::test]

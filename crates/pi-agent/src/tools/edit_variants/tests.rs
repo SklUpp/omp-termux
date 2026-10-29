@@ -310,12 +310,12 @@ async fn sloppy_expands_whole_line_deletion_over_separator_blank() {
 }
 
 #[tokio::test]
-async fn sloppy_aligns_rewrite_that_echoes_surrounding_boundaries() {
+async fn sloppy_aligns_explicit_rewrite_that_echoes_surrounding_boundaries() {
 	let dir = temp_dir("sloppy-boundary-echo");
 	let file = dir.join("demo.txt");
 	std::fs::write(&file, "const x = 1;\n").unwrap();
 	let ctx = context(&dir);
-	let payload = "§demo.txt\n«const x = ⟪1│const x = 2⟫;";
+	let payload = "§demo.txt\n«\nconst x = ⟪1⟫;\n»\nconst x = 2";
 	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
@@ -390,13 +390,70 @@ async fn sloppy_rejects_multi_selection_rewrite_that_proves_neither_shape() {
 async fn sloppy_reemits_lone_deletion_reference_above_its_anchor() {
 	let dir = temp_dir("sloppy-lone-reference");
 	let file = dir.join("demo.txt");
-	std::fs::write(&file, "keep();\na();").unwrap();
+	std::fs::write(&file, "keep();\na();\n").unwrap();
+	let ctx = context(&dir);
+	let payload = "§demo.txt\n«\na();\n»\n«\nkeep();\n»\n»1";
+	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+		.await
+		.unwrap();
+	assert_eq!(read(&file), "a();\n\nkeep();\n");
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn sloppy_reuses_inline_deletion_reference_in_later_insertion() {
+	let dir = temp_dir("sloppy-inline-reference");
+	let file = dir.join("demo.txt");
+	std::fs::write(&file, "const moved = createMoved();\nbefore();\nafter();\n").unwrap();
+	let ctx = context(&dir);
+	let payload = "§demo.txt\n«\n⟪const moved = createMoved();│⟫\n«\nbefore();\n⟪│\n»1\n⟫\nafter();";
+	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+		.await
+		.unwrap();
+	assert_eq!(read(&file), "before();\nconst moved = createMoved();\nafter();\n");
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn sloppy_reemits_register_with_glued_markers() {
+	let dir = temp_dir("sloppy-glued-reference");
+	let file = dir.join("demo.txt");
+	std::fs::write(&file, "keep();\na();\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«a();\n»\n«keep();\n»\n»1";
 	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "a();\n\nkeep();\n");
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn sloppy_reemits_register_with_trailing_space() {
+	let dir = temp_dir("sloppy-reference-trailing-space");
+	let file = dir.join("demo.txt");
+	std::fs::write(&file, "keep();\na();\n").unwrap();
+	let ctx = context(&dir);
+	let payload = "§demo.txt\n«\na();\n»\n«\nkeep();\n»\n»1 ";
+	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+		.await
+		.unwrap();
+	assert_eq!(read(&file), "a();\n\nkeep();\n");
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn sloppy_rejects_ordinal_opener_instead_of_splitting_it() {
+	let dir = temp_dir("sloppy-ordinal-opener");
+	let file = dir.join("demo.txt");
+	std::fs::write(&file, "a();\n").unwrap();
+	let ctx = context(&dir);
+	let payload = "§demo.txt\n«1\na();";
+	let err = super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+		.await
+		.unwrap_err();
+	assert!(err.to_string().contains("not a valid opener"), "{err}");
+	assert_eq!(read(&file), "a();\n");
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -612,16 +669,29 @@ async fn sloppy_deletes_every_match_for_star_empty_rewrite() {
 }
 
 #[tokio::test]
-async fn sloppy_recovers_unique_punctuation_insertion() {
+async fn sloppy_recovers_unique_non_bracket_punctuation_insertion() {
 	let dir = temp_dir("sloppy-punctuation");
 	let file = dir.join("demo.txt");
-	std::fs::write(&file, "runTask(alpha);\n").unwrap();
+	std::fs::write(&file, "runTask:alpha);\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«runTask alpha);\n»runTask(beta);";
 	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "runTask(beta);\n");
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn sloppy_refuses_bracket_insertion_punctuation_recovery() {
+	let dir = temp_dir("sloppy-punctuation-bracket");
+	let file = dir.join("demo.txt");
+	std::fs::write(&file, "runTask(alpha);\n").unwrap();
+	let ctx = context(&dir);
+	let payload = "§demo.txt\n«runTask alpha);\n»runTask(beta);";
+	let result = super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx).await;
+	assert!(result.is_err());
+	assert_eq!(read(&file), "runTask(alpha);\n");
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 

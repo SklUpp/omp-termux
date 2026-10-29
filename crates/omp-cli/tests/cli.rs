@@ -239,6 +239,8 @@ fn fake_request(prompt: &str) -> RunRequest {
 		turn_ack: None,
 		todo_phases: Vec::new(),
 		session_persisted: false,
+		session_file: None,
+		session_id: None,
 		config: Config::default(),
 		catalog: Arc::new(Catalog::default()),
 		approvals: Approvals::default(),

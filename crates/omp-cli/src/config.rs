@@ -386,6 +386,66 @@ impl CheckpointConfig {
 	}
 }
 
+/// `eval` / `python` / `ruby` / `julia` settings groups.
+///
+/// Raw layer values only: environment booleans (`PI_PY` …) are folded in by the
+/// runtime, so `config.yml` parsing never reads process environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvalConfig {
+	/// `eval.py`; absent keeps the eval default (`true`).
+	pub python:             Option<bool>,
+	/// `eval.js`; absent keeps the eval default (`true`).
+	pub js:                 Option<bool>,
+	/// `eval.rb`; absent keeps the eval default (`false`).
+	pub ruby:               Option<bool>,
+	/// `eval.jl`; absent keeps the eval default (`false`).
+	pub julia:              Option<bool>,
+	/// `python.kernelMode` (`session` or `per-call`).
+	pub python_kernel_mode: Option<pi_agent::eval::KernelMode>,
+	pub python_interpreter: Option<String>,
+	pub ruby_interpreter:   Option<String>,
+	pub julia_interpreter:  Option<String>,
+	/// `eval.autoBackground.enabled`; absent keeps the upstream default
+	/// (`false`), so long cells stay foreground unless configured.
+	pub auto_background_enabled: Option<bool>,
+	/// `eval.autoBackground.thresholdMs`; absent keeps the upstream default
+	/// (`60_000`). Only consulted when auto-background is enabled.
+	pub auto_background_threshold_ms: Option<u64>,
+}
+
+impl EvalConfig {
+	fn merge(&mut self, overlay: Self) {
+		for (target, value) in [
+			(&mut self.python, overlay.python),
+			(&mut self.js, overlay.js),
+			(&mut self.ruby, overlay.ruby),
+			(&mut self.julia, overlay.julia),
+		] {
+			if value.is_some() {
+				*target = value;
+			}
+		}
+		if overlay.python_kernel_mode.is_some() {
+			self.python_kernel_mode = overlay.python_kernel_mode;
+		}
+		if overlay.auto_background_enabled.is_some() {
+			self.auto_background_enabled = overlay.auto_background_enabled;
+		}
+		if overlay.auto_background_threshold_ms.is_some() {
+			self.auto_background_threshold_ms = overlay.auto_background_threshold_ms;
+		}
+		for (target, value) in [
+			(&mut self.python_interpreter, overlay.python_interpreter),
+			(&mut self.ruby_interpreter, overlay.ruby_interpreter),
+			(&mut self.julia_interpreter, overlay.julia_interpreter),
+		] {
+			if value.is_some() {
+				*target = value;
+			}
+		}
+	}
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
 	pub default_model:        Option<String>,
@@ -402,6 +462,10 @@ pub struct Config {
 	pub lsp:                  LspConfig,
 	pub debug:                DebugConfig,
 	pub checkpoint:           CheckpointConfig,
+	/// `eval.*` backend enablement and interpreter groups.
+	pub eval_config:          EvalConfig,
+	/// `tools.maxTimeout` in seconds; `0` means no global cap.
+	pub max_tool_timeout_secs: Option<u64>,
 	/// `readLineNumbers` (root schema key, not a `read` group leaf); absent
 	/// means `false`. Drives plain line numbers in read output.
 	pub read_line_numbers:    Option<bool>,
@@ -453,6 +517,10 @@ impl Config {
 		self.lsp.merge(overlay.lsp);
 		self.debug.merge(overlay.debug);
 		self.checkpoint.merge(overlay.checkpoint);
+		self.eval_config.merge(overlay.eval_config);
+		if overlay.max_tool_timeout_secs.is_some() {
+			self.max_tool_timeout_secs = overlay.max_tool_timeout_secs;
+		}
 		if overlay.read_line_numbers.is_some() {
 			self.read_line_numbers = overlay.read_line_numbers;
 		}
@@ -856,7 +924,86 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	if let Some(enabled) = settings_leaf(value, "checkpoint", "enabled", "checkpoint.enabled") {
 		config.checkpoint.enabled = expect_bool(enabled, "checkpoint.enabled", path)?;
 	}
+	for (language, group, dotted) in [
+		("python", "py", "eval.py"),
+		("javascript", "js", "eval.js"),
+		("ruby", "rb", "eval.rb"),
+		("julia", "jl", "eval.jl"),
+	] {
+		if let Some(enabled) = settings_leaf(value, "eval", group, dotted) {
+			let enabled = expect_bool(enabled, dotted, path)?;
+			match language {
+				"python" => config.eval_config.python = enabled,
+				"javascript" => config.eval_config.js = enabled,
+				"ruby" => config.eval_config.ruby = enabled,
+				"julia" => config.eval_config.julia = enabled,
+				_ => {},
+			}
+		}
+	}
+	if let Some(mode) = settings_leaf(value, "python", "kernelMode", "python.kernelMode") {
+		config.eval_config.python_kernel_mode =
+			parse_kernel_mode(mode, "python.kernelMode", path)?;
+	}
+	if let Some(interpreter) =
+		settings_leaf(value, "python", "interpreter", "python.interpreter")
+	{
+		config.eval_config.python_interpreter =
+			expect_text(interpreter, "python.interpreter", path)?
+				.filter(|value| !value.trim().is_empty());
+	}
+	if let Some(interpreter) = settings_leaf(value, "ruby", "interpreter", "ruby.interpreter") {
+		config.eval_config.ruby_interpreter =
+			expect_text(interpreter, "ruby.interpreter", path)?
+				.filter(|value| !value.trim().is_empty());
+	}
+	if let Some(interpreter) = settings_leaf(value, "julia", "interpreter", "julia.interpreter") {
+		config.eval_config.julia_interpreter =
+			expect_text(interpreter, "julia.interpreter", path)?
+				.filter(|value| !value.trim().is_empty());
+	}
+	if let Some(enabled) = settings_nested_leaf(
+		value,
+		"eval",
+		"autoBackground",
+		"enabled",
+		"eval.autoBackground.enabled",
+	) {
+		config.eval_config.auto_background_enabled =
+			expect_bool(enabled, "eval.autoBackground.enabled", path)?;
+	}
+	if let Some(threshold) = settings_nested_leaf(
+		value,
+		"eval",
+		"autoBackground",
+		"thresholdMs",
+		"eval.autoBackground.thresholdMs",
+	) {
+		config.eval_config.auto_background_threshold_ms =
+			expect_millis(threshold, "eval.autoBackground.thresholdMs", path)?;
+	}
+	if let Some(timeout) = settings_leaf(value, "tools", "maxTimeout", "tools.maxTimeout") {
+		config.max_tool_timeout_secs = expect_usize(timeout, "tools.maxTimeout", path)?
+			.map(|seconds| seconds as u64);
+	}
 	Ok(())
+}
+
+/// `python.kernelMode`: the schema enum, so an invalid value is a load error
+/// rather than a silent session-mode fallback.
+fn parse_kernel_mode(
+	value: &Value,
+	key: &str,
+	path: &Path,
+) -> Result<Option<pi_agent::eval::KernelMode>> {
+	let Some(raw) = expect_text(value, key, path)? else {
+		return Ok(None);
+	};
+	match raw.as_str() {
+		"session" => Ok(Some(pi_agent::eval::KernelMode::Session)),
+		"per-call" => Ok(Some(pi_agent::eval::KernelMode::PerCall)),
+		_ => Err(invalid(path, key, "expected `session` or `per-call`")),
+	}
 }
 
 /// Settings leaf written either nested (`lsp: { enabled: … }`) or as a quoted
@@ -870,6 +1017,31 @@ fn settings_leaf<'a>(value: &'a Value, group: &str, leaf: &str, dotted: &str) ->
 	};
 	match group_value {
 		Value::Map(_) => group_value.get(leaf),
+		_ => None,
+	}
+}
+
+/// Two-level settings leaf (`eval.autoBackground.enabled`). Same rules as
+/// [`settings_leaf`]: the nested path wins, and a non-object group or subgroup
+/// shadows every leaf below it, matching `dropSettingsGroupShadows`.
+fn settings_nested_leaf<'a>(
+	value: &'a Value,
+	group: &str,
+	subgroup: &str,
+	leaf: &str,
+	dotted: &str,
+) -> Option<&'a Value> {
+	let Some(group_value) = value.get(group) else {
+		return value.get(dotted);
+	};
+	let Value::Map(_) = group_value else {
+		return None;
+	};
+	let Some(subgroup_value) = group_value.get(subgroup) else {
+		return None;
+	};
+	match subgroup_value {
+		Value::Map(_) => subgroup_value.get(leaf),
 		_ => None,
 	}
 }
@@ -1247,6 +1419,20 @@ fn expect_usize(value: &Value, key: &str, path: &Path) -> Result<Option<usize>> 
 			.map_err(|_| invalid(path, key, "expected a non-negative integer")),
 		_ => Err(invalid(path, key, "expected an integer")),
 	}
+}
+
+/// `*.thresholdMs`: the schema type is `number`, so integers and finite floats
+/// both load. Upstream floors the value and treats `<= 0` as "background
+/// immediately"; negative values clamp to `0` for the same behaviour.
+fn expect_millis(value: &Value, key: &str, path: &Path) -> Result<Option<u64>> {
+	let millis = match value {
+		Value::Null => return Ok(None),
+		Value::Int(value) => *value as f64,
+		Value::Float(value) if value.is_finite() => *value,
+		Value::Float(_) => return Err(invalid(path, key, "expected a finite number")),
+		_ => return Err(invalid(path, key, "expected a number")),
+	};
+	Ok(Some(millis.max(0.0).floor() as u64))
 }
 
 fn invalid(path: &Path, key: &str, expected: &str) -> Error {
@@ -1946,6 +2132,130 @@ mod tests {
 			let err = parse_config(text).expect_err(text);
 			assert!(err.to_string().contains("test.yml"), "{err}");
 		}
+	}
+
+	#[test]
+	fn eval_and_max_timeout_settings_parse_with_layer_precedence() {
+		let config = parse_config(
+			"eval:\n  py: false\n  js: true\n  rb: true\n  jl: false\n\
+			 python:\n  kernelMode: per-call\n  interpreter: /opt/py\n\
+			 ruby:\n  interpreter: /opt/rb\n\
+			 tools:\n  maxTimeout: 45\n",
+		)
+		.expect("eval settings");
+		assert_eq!(config.eval_config.python, Some(false));
+		assert_eq!(config.eval_config.js, Some(true));
+		assert_eq!(config.eval_config.ruby, Some(true));
+		assert_eq!(config.eval_config.julia, Some(false));
+		assert_eq!(
+			config.eval_config.python_kernel_mode,
+			Some(pi_agent::eval::KernelMode::PerCall)
+		);
+		assert_eq!(config.eval_config.python_interpreter.as_deref(), Some("/opt/py"));
+		assert_eq!(config.eval_config.ruby_interpreter.as_deref(), Some("/opt/rb"));
+		assert_eq!(config.max_tool_timeout_secs, Some(45));
+
+		// Empty interpreter means auto-detect, never a literal empty program.
+		let empty = parse_config("python:\n  interpreter: \"\"\n").expect("empty interpreter");
+		assert_eq!(empty.eval_config.python_interpreter, None);
+
+		// Dotted schema paths work, nested wins, and a bad enum fails the load.
+		let dotted = parse_config("\"eval.py\": false\n\"python.kernelMode\": session\n")
+			.expect("dotted eval");
+		assert_eq!(dotted.eval_config.python, Some(false));
+		assert_eq!(
+			dotted.eval_config.python_kernel_mode,
+			Some(pi_agent::eval::KernelMode::Session)
+		);
+		let both = parse_config("eval:\n  py: true\n\"eval.py\": false\n").expect("both");
+		assert_eq!(both.eval_config.python, Some(true), "nested wins over dotted");
+		assert!(parse_config("python:\n  kernelMode: sometimes\n").is_err());
+		assert!(parse_config("eval:\n  py: yes\n").is_err());
+
+		// Higher layer false/true replaces the lower value; absent keys persist.
+		let mut layered = parse_config("eval:\n  py: false\n  js: false\n").expect("base");
+		layered.merge(parse_config("eval:\n  py: true\n").expect("overlay"));
+		assert_eq!(layered.eval_config.python, Some(true));
+		assert_eq!(layered.eval_config.js, Some(false));
+	}
+
+	#[test]
+	fn eval_auto_background_settings_honor_defaults_precedence_and_boundaries() {
+		// Upstream defaults: disabled, 60s threshold; neither is materialized
+		// until configured so layers can still override independently.
+		let default = parse_config("").expect("default");
+		assert_eq!(default.eval_config.auto_background_enabled, None);
+		assert_eq!(default.eval_config.auto_background_threshold_ms, None);
+
+		let nested = parse_config(
+			"eval:\n  autoBackground:\n    enabled: true\n    thresholdMs: 250\n",
+		)
+		.expect("nested auto-background");
+		assert_eq!(nested.eval_config.auto_background_enabled, Some(true));
+		assert_eq!(nested.eval_config.auto_background_threshold_ms, Some(250));
+
+		// Dotted schema paths work, and the nested group wins, like every other
+		// settings leaf.
+		let dotted = parse_config(
+			"\"eval.autoBackground.enabled\": true\n\"eval.autoBackground.thresholdMs\": 900\n",
+		)
+		.expect("dotted auto-background");
+		assert_eq!(dotted.eval_config.auto_background_enabled, Some(true));
+		assert_eq!(dotted.eval_config.auto_background_threshold_ms, Some(900));
+		let both = parse_config(
+			"eval:\n  autoBackground:\n    enabled: false\n\
+			 \"eval.autoBackground.enabled\": true\n",
+		)
+		.expect("both");
+		assert_eq!(
+			both.eval_config.auto_background_enabled,
+			Some(false),
+			"nested wins over dotted"
+		);
+
+		// `number` accepts floats and clamps non-positive values to immediate
+		// background, matching `resolveAutoBackgroundWaitMs`.
+		let boundaries = parse_config(
+			"eval:\n  autoBackground:\n    thresholdMs: 12.9\n",
+		)
+		.expect("float threshold");
+		assert_eq!(boundaries.eval_config.auto_background_threshold_ms, Some(12));
+		let immediate = parse_config("eval:\n  autoBackground:\n    thresholdMs: -5\n")
+			.expect("negative threshold");
+		assert_eq!(immediate.eval_config.auto_background_threshold_ms, Some(0));
+		let zero = parse_config("eval:\n  autoBackground:\n    thresholdMs: 0\n")
+			.expect("zero threshold");
+		assert_eq!(zero.eval_config.auto_background_threshold_ms, Some(0));
+
+		// Wrong types fail at the trust boundary.
+		for text in [
+			"eval:\n  autoBackground:\n    enabled: yes\n",
+			"eval:\n  autoBackground:\n    thresholdMs: soon\n",
+		] {
+			let error = parse_config(text).expect_err(text);
+			assert!(error.to_string().contains("test.yml"), "{error}");
+		}
+		// A non-object subgroup shadows its dotted leaves, like the upstream
+		// group-shadow guard.
+		let shadow = parse_config(
+			"eval:\n  autoBackground: false\n\"eval.autoBackground.enabled\": true\n",
+		)
+		.expect("subgroup shadow");
+		assert_eq!(shadow.eval_config.auto_background_enabled, None);
+
+		// Per-layer merge: a higher layer owns the threshold it sets and leaves
+		// the other key inherited.
+		let mut layered = parse_config(
+			"eval:\n  autoBackground:\n    enabled: true\n    thresholdMs: 250\n",
+		)
+		.expect("base");
+		layered.merge(parse_config("eval:\n  autoBackground:\n    thresholdMs: 500\n").expect("overlay"));
+		assert_eq!(layered.eval_config.auto_background_enabled, Some(true));
+		assert_eq!(layered.eval_config.auto_background_threshold_ms, Some(500));
+
+		// Dotted `tools.maxTimeout` is the schema path form of the nested key.
+		let dotted_timeout = parse_config("\"tools.maxTimeout\": 30\n").expect("dotted maxTimeout");
+		assert_eq!(dotted_timeout.max_tool_timeout_secs, Some(30));
 	}
 
 	#[test]

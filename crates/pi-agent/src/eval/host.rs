@@ -73,6 +73,33 @@ pub struct ArtifactRef {
 	pub path: Option<String>,
 }
 
+/// Host seam that mounts an eval tool into a registry.
+///
+/// Root runs bind once after the final registry exists; child registries bind
+/// from [`crate::supervisor::Supervisor::child_registry_unbound`] before the
+/// allowlist filter (so `eval` is filtered by internal key) and again after
+/// `rebind_session_tools`, so the host's tool-call view sees the child's fresh
+/// session tools. `dispose_owner` releases retained child kernels.
+#[async_trait]
+pub trait EvalToolBinder: Send + Sync {
+	fn bind(&self, registry: &mut crate::tools::registry::ToolRegistry, owner: Option<&str>);
+
+	/// Rebind `owner`'s eval host with the exact provider its agent loop
+	/// resolved. Children must override the binder's session provider so
+	/// `completion(model = "default")` answers with the child model, not the
+	/// root model. The default keeps the binder's own provider.
+	fn bind_with_provider(
+		&self,
+		registry: &mut crate::tools::registry::ToolRegistry,
+		owner: Option<&str>,
+		_provider: Option<std::sync::Arc<dyn crate::provider::ModelProvider>>,
+	) {
+		self.bind(registry, owner);
+	}
+
+	async fn dispose_owner(&self, _owner: &str) {}
+}
+
 /// Stable status summary for one bridged tool call (TypeScript
 /// `summarizeToolResult`). Error results include a 500-character slice.
 pub fn summarize_tool_result(name: &str, args: &Value, result: &ToolResult) -> EvalStatusEvent {

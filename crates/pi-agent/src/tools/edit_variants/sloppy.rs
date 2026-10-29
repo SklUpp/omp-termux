@@ -1044,7 +1044,15 @@ fn split_glued_marker(line: &str) -> Option<(String, String)> {
 	if content.is_empty() {
 		return None;
 	}
-	if marker == "»" && register_number(content).is_some() {
+	let trimmed_line = line.trim();
+	if marker == "«"
+		&& let Some(rest) = trimmed_line.strip_prefix(OPENER)
+		&& !rest.is_empty()
+		&& rest.chars().all(|ch| ch.is_ascii_digit())
+	{
+		return None;
+	}
+	if marker == "»" && is_register_reference(trimmed_line) {
 		return None;
 	}
 	Some((marker.to_string(), content.to_string()))

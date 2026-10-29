@@ -381,13 +381,12 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
 		match pattern.first() {
 			None => name.is_empty(),
 			Some(b'*') => {
-				if name.is_empty() {
-					walk(&pattern[1..], name)
-				} else {
-					walk(&pattern[1..], name) || walk(pattern, &name[1..])
-				}
-			}
-			Some(b'?') => !name.is_empty() && walk(&pattern[1..], &name[1..]),
+				walk(&pattern[1..], name)
+					|| (!name.is_empty() && name[0] != b'/' && walk(pattern, &name[1..]))
+			},
+			Some(b'?') => {
+				!name.is_empty() && name[0] != b'/' && walk(&pattern[1..], &name[1..])
+			},
 			Some(byte) => name.first() == Some(byte) && walk(&pattern[1..], &name[1..]),
 		}
 	}
@@ -593,7 +592,11 @@ mod tests {
 	#[test]
 	fn wildcard_root_marker_matches_one_level() {
 		assert!(wildcard_match("*.cabal", "pkg.cabal"));
-		assert!(!wildcard_match("*.cabal", "sub.pkg.cabal"));
+		// Dots are filename characters, not separators (upstream Bun.Glob).
+		assert!(wildcard_match("*.cabal", "sub.pkg.cabal"));
+		// Wildcards stop at a path separator, so markers stay one level deep.
+		assert!(!wildcard_match("*.cabal", "sub/pkg.cabal"));
+		assert!(!wildcard_match("sub?pkg.cabal", "sub/pkg.cabal"));
 		assert!(wildcard_match("*.sln", "App.sln"));
 	}
 }

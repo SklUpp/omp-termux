@@ -55,7 +55,7 @@ pub const DEFAULT_CONTEXT_LIMIT: usize = 32_768;
 /// The registry lists every selected tool; approval is not a visibility filter.
 /// `ToolApprover` gates each call in the scheduler immediately before
 /// execution, so denied tools still reach the model and report explicit denial.
-pub const BUILTIN_TOOLS: [(&str, bool); 10] = [
+pub const BUILTIN_TOOLS: [(&str, bool); 11] = [
 	("read", true),
 	("glob", true),
 	("grep", true),
@@ -64,6 +64,7 @@ pub const BUILTIN_TOOLS: [(&str, bool); 10] = [
 	("write", false),
 	("edit", false),
 	("bash", false),
+	("eval", false),
 	("todo", false),
 	("ask", true),
 ];
@@ -105,6 +106,13 @@ struct RunnerSession {
 	/// Session-owned soft requirement policy: a staged preview must keep
 	/// reminding and forcing across prompt turns whose registry is rebuilt.
 	policy:    Arc<dyn pi_agent::state::ToolPolicy>,
+	/// Process-stable eval identity for in-memory sessions; replaced by the
+	/// persisted session id when the host has one.
+	eval_session_id: Mutex<String>,
+	session_file:    Mutex<Option<PathBuf>>,
+	/// Started from the runner's Tokio runtime on the first eval-enabled turn.
+	/// Settings changes restart the bridge and dispose retained kernels.
+	eval:            Mutex<Option<(pi_agent::eval::EvalSettings, Arc<pi_agent::eval::EvalRuntime>)>>,
 }
 
 impl RunnerSession {
@@ -113,7 +121,63 @@ impl RunnerSession {
 		let edit = Arc::new(EditTool::with_options(snapshots.clone(), options));
 		let pending = Arc::new(PendingStore::new());
 		let policy = Arc::new(pi_agent::state::StagedPreviewPolicy::new(Arc::clone(&pending)));
-		Self { snapshots, edit, pending, policy }
+		Self {
+			snapshots,
+			edit,
+			pending,
+			policy,
+			eval_session_id: Mutex::new(crate::output::session_id()),
+			session_file: Mutex::new(None),
+			eval: Mutex::new(None),
+		}
+	}
+
+	fn set_session_identity(&self, id: Option<&str>, file: Option<&Path>) {
+		if let Some(id) = id.filter(|id| !id.is_empty()) {
+			*self.eval_session_id.lock().unwrap_or_else(|poison| poison.into_inner()) =
+				id.to_string();
+		}
+		*self.session_file.lock().unwrap_or_else(|poison| poison.into_inner()) =
+			file.map(Path::to_path_buf);
+	}
+
+	fn eval_session_id(&self) -> String {
+		self
+			.eval_session_id
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone()
+	}
+
+	fn eval_runtime(
+		&self,
+		runtime: &tokio::runtime::Runtime,
+		settings: pi_agent::eval::EvalSettings,
+	) -> crate::Result<Arc<pi_agent::eval::EvalRuntime>> {
+		let mut slot = self.eval.lock().unwrap_or_else(|poison| poison.into_inner());
+		if let Some((current, eval)) = slot.as_ref()
+			&& current == &settings
+		{
+			return Ok(Arc::clone(eval));
+		}
+		if let Some((_, previous)) = slot.take() {
+			runtime.block_on(previous.shutdown());
+		}
+		let started = runtime
+			.block_on(pi_agent::eval::EvalRuntime::start(settings.clone()))
+			.map_err(|error| Error::new(format!("eval bridge start failed: {error}")))?;
+		let eval = Arc::new(started);
+		*slot = Some((settings, Arc::clone(&eval)));
+		Ok(eval)
+	}
+
+	fn take_eval(&self) -> Option<Arc<pi_agent::eval::EvalRuntime>> {
+		self
+			.eval
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.take()
+			.map(|(_, eval)| eval)
 	}
 }
 
@@ -240,6 +304,18 @@ impl Drop for PiAgentRunner {
 		};
 		if let Some(supervisor) = slot.take() {
 			supervisor.shutdown();
+		}
+		// Kernels and the loopback bridge live as long as the runner session.
+		// Shut them down explicitly while the Tokio runtime is still alive.
+		let session = self
+			.session
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.take();
+		if let Some(session) = session
+			&& let Some(eval) = session.take_eval()
+		{
+			self.runtime.block_on(eval.shutdown());
 		}
 	}
 }
@@ -382,6 +458,10 @@ impl AgentRunner for PiAgentRunner {
 		let resolved_display =
 			display_resolver.resolve(Some(&active_model), plan.tools.contains(&"edit"));
 		let session = self.session_tools(edit_options, resolved_display.edit_tool);
+		session.set_session_identity(
+			request.session_id.as_deref(),
+			request.session_file.as_deref(),
+		);
 		// `ask` needs the root context's UI: register it after the supervisor has
 		// cloned its child template, so children never receive the tool.
 		let build_tools: Vec<&'static str> = plan
@@ -402,16 +482,18 @@ impl AgentRunner for PiAgentRunner {
 			resolved_display,
 		)?;
 		let (allow_task, allow_hub) = delegation_selection(request);
-		let child_factory: Option<Arc<dyn ChildModelFactory>> = allow_task.then(|| {
-			Arc::new(CliChildModelFactory {
-				config: request.config.clone(),
-				catalog: Arc::clone(&request.catalog),
-				explicit_provider: request.provider.clone(),
-				api_key: request.api_key.clone(),
-				default_model: request.model.clone(),
-				root_provider: Some(plan.provider.clone()),
-			}) as Arc<dyn ChildModelFactory>
+		// Needed for completion tiers and agent spawning; the `task` tool remains
+		// gated separately by `allow_task`.
+		let model_factory: Arc<dyn ChildModelFactory> = Arc::new(CliChildModelFactory {
+			config: request.config.clone(),
+			catalog: Arc::clone(&request.catalog),
+			explicit_provider: request.provider.clone(),
+			api_key: request.api_key.clone(),
+			default_model: request.model.clone(),
+			root_provider: Some(plan.provider.clone()),
 		});
+		let child_factory: Option<Arc<dyn ChildModelFactory>> =
+			allow_task.then(|| Arc::clone(&model_factory));
 		let limits = DelegationLimits {
 			max_depth: request
 				.config
@@ -567,6 +649,46 @@ impl AgentRunner for PiAgentRunner {
 		{
 			registry.register(Arc::new(CheckpointTool::new(Arc::clone(controller))));
 			registry.register(Arc::new(RewindTool::new(Arc::clone(controller))));
+		}
+		// Eval is mounted after the final registry exists: the host's bridged
+		// `tool.*` view must see ask/checkpoint/bash, and registering before the
+		// supervisor clones its template would leak a root-bound host to children.
+		let eval_allowed = request.tools_enabled && plan.tools.contains(&"eval");
+		let eval_binder = if eval_allowed {
+			let settings = crate::eval_host::eval_settings(&request.config);
+			let eval_runtime = session.eval_runtime(&self.runtime, settings)?;
+			let artifacts_dir = request
+				.session_file
+				.as_deref()
+				.and_then(crate::session::artifacts_directory_for);
+			if let Some(directory) = &artifacts_dir {
+				std::fs::create_dir_all(directory).map_err(|error| {
+					Error::new(format!(
+						"cannot create session artifacts directory {}: {error}",
+						directory.display()
+					))
+				})?;
+			}
+			let context = crate::eval_host::EvalMountContext {
+				runtime: eval_runtime,
+				supervisor: root_supervisor.as_ref().map(Arc::downgrade),
+				provider: Arc::clone(&provider),
+				model_factory: Some(Arc::clone(&model_factory)),
+				session_id: session.eval_session_id(),
+				session_file: request.session_file.clone(),
+				artifacts_dir,
+				limits,
+			};
+			Some(Arc::new(crate::eval_host::CliEvalBinder::new(context))
+				as Arc<dyn pi_agent::eval::EvalToolBinder>)
+		} else {
+			None
+		};
+		if let Some(supervisor) = &root_supervisor {
+			supervisor.set_eval_binder(eval_binder.clone());
+		}
+		if let Some(binder) = &eval_binder {
+			binder.bind(&mut registry, None);
 		}
 		let mut agent = AgentLoop::with_approver(config, provider, registry, approvals);
 		if let Some(ack) = &request.turn_ack {
@@ -1599,6 +1721,9 @@ fn build_registry_with_display(
 			"bash" => Arc::new(BashTool::new()),
 			"todo" => Arc::new(TodoTool::restored(todo_phases.clone(), session_persisted)),
 			"ask" => Arc::new(AskTool::new()),
+			// Eval needs a session-scoped runtime/host; `run_turn` mounts it into
+			// the final root/child registries instead.
+			"eval" => continue,
 			other => {
 				return Err(Error::new(format!(
 					"unknown builtin tool `{other}`: BUILTIN_TOOLS and build_registry drifted"
@@ -2904,6 +3029,8 @@ mod tests {
 			turn_ack: None,
 			todo_phases: Vec::new(),
 			session_persisted: false,
+			session_file: None,
+			session_id: None,
 			cancellation_token: None,
 		}
 	}

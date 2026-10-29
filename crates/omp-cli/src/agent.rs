@@ -144,6 +144,12 @@ pub struct RunRequest {
 	/// Whether turns are written to a session log; tools report
 	/// `details.storage` as `session` instead of `memory`.
 	pub session_persisted: bool,
+	/// Session log path when persistence is enabled. Eval derives its artifact
+	/// directory from this file and exposes it to kernels.
+	pub session_file: Option<std::path::PathBuf>,
+	/// Stable session identity for eval kernel/artifact scoping. `None` lets
+	/// the runner generate one process-stable id for in-memory sessions.
+	pub session_id: Option<String>,
 	pub config: Config,
 	pub catalog: Arc<Catalog>,
 	pub approvals: Approvals,

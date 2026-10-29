@@ -2527,7 +2527,8 @@ mod display_tests {
 
 		let result = read_with(&tool, &dir, "f.txt:raw").await;
 		assert!(!result.is_error, "{}", result.content);
-		assert_eq!(result.content, "alpha\nbeta");
+		// Raw is verbatim: the fixture's trailing newline is bytes, not padding.
+		assert_eq!(result.content, "alpha\nbeta\n");
 		assert!(sink.files.lock().expect("files").is_empty());
 	}
 

@@ -32,7 +32,7 @@ pi-walker.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite = { version = "0.33.0", features = ["bundled"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "fs", "io-util", "sync", "macros"] }
 tokio-util.workspace = true
 
 [dev-dependencies]

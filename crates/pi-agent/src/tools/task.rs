@@ -157,7 +157,7 @@ impl ChildContext {
 		}
 
 		self.supervisor
-			.rebind_session_tools(&mut registry, active_model);
+			.rebind_session_tools(&mut registry, active_model, Some(child_id));
 
 		Ok((registry, effective))
 	}
@@ -513,7 +513,7 @@ impl TaskTool {
 			|| self.supervisor.provider(),
 			|model| model.provider,
 		);
-		let (child_registry, _effective_tools) =
+		let (mut child_registry, _effective_tools) =
 			match child_ctx.prepare_registry(&child_id, &item.agent, resolved_model.as_deref()) {
 				Ok(prepared) => prepared,
 				Err(message) => {
@@ -539,6 +539,11 @@ impl TaskTool {
 					);
 				},
 			};
+		self.supervisor.rebind_eval_provider(
+			&mut child_registry,
+			&child_id,
+			Arc::clone(&child_provider),
+		);
 		let prompt_schema = item.output_schema.clone().or_else(|| {
 			if item.schema_error.is_none() {
 				item.agent.output.clone()
@@ -820,6 +825,7 @@ impl TaskTool {
 			},
 		};
 		self.supervisor.release_outstanding(&outstanding_id);
+		self.supervisor.dispose_eval_owner(&outstanding_id).await;
 		result
 	}
 
@@ -895,7 +901,15 @@ impl TaskTool {
 			)
 			.await;
 			supervisor.unregister_active_child(&task_id);
-			settle_background_result(supervisor, task_id, start, outcome, item_for_settle);
+			let eval_owner = task_id.clone();
+			settle_background_result(
+				Arc::clone(&supervisor),
+				task_id,
+				start,
+				outcome,
+				item_for_settle,
+			);
+			supervisor.dispose_eval_owner(&eval_owner).await;
 			lifecycle.disarm();
 		});
 
@@ -913,6 +927,137 @@ impl TaskTool {
 		}
 		let _ = start_tx.send(());
 		Ok(child_id)
+	}
+
+	/// Run one eval `agent()` call synchronously through the same reserve /
+	/// depth / admission / `ChildGuard` path as the model-facing `task` tool.
+	///
+	/// Input is the bridge shape (`prompt`, `agent`, `label`, `schema`,
+	/// `schemaMode`, `isolated`/`apply`/`merge`, `handle`). Worktree isolation
+	/// and apply/merge are not implemented, so requesting them fails instead of
+	/// being silently ignored. Returns the prelude value shape
+	/// (`{"text", "data"?, "details": {"id", "agent"}}`).
+	pub async fn run_eval_agent(&self, args: &Value, ctx: &AgentContext) -> Result<Value, String> {
+		let limits = self.supervisor.limits();
+		let max_depth = self
+			.catalog()
+			.as_ref()
+			.and_then(|catalog| catalog.max_recursion_depth)
+			.unwrap_or(limits.max_depth);
+		if max_depth >= 0 && self.depth >= max_depth {
+			return Err(format!(
+				"Cannot spawn another agent at task depth {}; maximum depth is {max_depth}.",
+				self.depth
+			));
+		}
+		let obj = args
+			.as_object()
+			.ok_or_else(|| "agent() arguments must be an object".to_string())?;
+		for key in obj.keys() {
+			if !matches!(
+				key.as_str(),
+				"prompt"
+					| "agent" | "label"
+					| "schema" | "schemaMode"
+					| "isolated" | "apply" | "merge" | "handle"
+			) {
+				return Err(format!("agent() unknown argument `{key}`"));
+			}
+		}
+		let prompt = obj
+			.get("prompt")
+			.and_then(Value::as_str)
+			.filter(|prompt| !prompt.trim().is_empty())
+			.ok_or_else(|| "agent() requires a non-empty `prompt`".to_string())?;
+		for (flag, effect) in [
+			("isolated", "there is no worktree create/apply/cleanup implementation"),
+			("apply", "worktree apply is not implemented"),
+			("merge", "worktree merge is not implemented"),
+		] {
+			match obj.get(flag) {
+				None | Some(Value::Null) | Some(Value::Bool(false)) => {},
+				Some(Value::Bool(true)) => {
+					return Err(format!("agent() `{flag}` is not supported: {effect}"));
+				},
+				Some(_) => return Err(format!("agent() `{flag}` must be a boolean")),
+			}
+		}
+
+		let mut item_obj = serde_json::Map::new();
+		item_obj.insert("task".to_string(), Value::String(prompt.to_string()));
+		for (from, to) in [
+			("agent", "agent"),
+			("label", "name"),
+			("schema", "outputSchema"),
+			("schemaMode", "schemaMode"),
+		] {
+			if let Some(value) = obj.get(from) {
+				item_obj.insert(to.to_string(), value.clone());
+			}
+		}
+		let defaults = ItemDefaults {
+			output_schema: None,
+			schema_mode: SchemaMode::default(),
+			effort: None,
+		};
+		let child_ctx = self.child_context();
+		let item = self
+			.build_item(&item_obj, None, &defaults)
+			.map_err(|error| error.to_string())?;
+		let expects_schema = item.output_schema.is_some()
+			|| (item.agent.output.is_some() && item.schema_error.is_none());
+		let single = self.run_single_task(0, item, ctx, &child_ctx).await;
+		if single.aborted == Some(true) {
+			return Err(single
+				.abort_reason
+				.unwrap_or_else(|| "agent() aborted".to_string()));
+		}
+		if let Some(error) = single.error {
+			return Err(error);
+		}
+		if single.exit_code != 0 {
+			return Err(if single.stderr.trim().is_empty() {
+				single.output
+			} else {
+				single.stderr
+			});
+		}
+		let structured_data = single
+			.structured_output
+			.as_ref()
+			.filter(|structured| structured.status == "valid")
+			.and_then(|structured| structured.data.clone());
+		let yielded_data = single
+			.extracted_tool_data
+			.as_ref()
+			.and_then(|map| map.get("yield"))
+			.and_then(|values| values.first())
+			.and_then(|value| value.get("data"))
+			.cloned();
+		let data = structured_data
+			.or(yielded_data)
+			.or_else(|| {
+				expects_schema
+					.then(|| serde_json::from_str::<Value>(&single.output).ok())
+					.flatten()
+			});
+		if expects_schema && data.is_none() {
+			return Err(
+				"agent() schema_violation: no structured result was produced".to_string(),
+			);
+		}
+		let text = match &data {
+			Some(data) => serde_json::to_string(data).unwrap_or_else(|_| single.output.clone()),
+			None => single.output,
+		};
+		let mut result = json!({
+			"text": text,
+			"details": { "id": single.id, "agent": single.agent },
+		});
+		if let Some(data) = data {
+			result["data"] = data;
+		}
+		Ok(result)
 	}
 }
 
@@ -936,9 +1081,14 @@ async fn run_background_child(
 		|| supervisor.provider(),
 		|model| model.provider,
 	);
-	let (child_registry, _effective_tools) = child_ctx
+	let (mut child_registry, _effective_tools) = child_ctx
 		.prepare_registry(&child_id, &item.agent, child_active_model.as_deref())
 		.map_err(AgentError::Internal)?;
+	supervisor.rebind_eval_provider(
+		&mut child_registry,
+		&child_id,
+		Arc::clone(&child_provider),
+	);
 	let prompt_schema = item.output_schema.clone().or_else(|| {
 		if item.schema_error.is_none() {
 			item.agent.output.clone()
@@ -1183,6 +1333,13 @@ impl Drop for SettlementGuard {
 			self.supervisor.release_outstanding_if_undelivered(&self.id);
 		}
 		self.supervisor.unregister_active_child(&self.id);
+		// A child that panics or aborts before its explicit settlement still
+		// owns eval kernels under this id; release them off the drop path.
+		if let Ok(handle) = tokio::runtime::Handle::try_current() {
+			let supervisor = Arc::clone(&self.supervisor);
+			let id = self.id.clone();
+			handle.spawn(async move { supervisor.dispose_eval_owner(&id).await });
+		}
 	}
 }
 
@@ -2385,5 +2542,165 @@ mod tests {
 			.prepare_registry("task-1", &agent, None)
 			.expect("registry");
 		assert!(effective.is_none(), "None ceiling must not expand to a set");
+	}
+
+	struct SharedFactory(Arc<dyn ModelProvider>);
+
+	impl ChildModelFactory for SharedFactory {
+		fn can_resolve(&self, _model: &str) -> bool {
+			true
+		}
+
+		fn resolve(
+			&self,
+			model: &str,
+			_effort: Option<&str>,
+			_fallback_effort: Option<&str>,
+		) -> std::result::Result<ChildModel, String> {
+			Ok(ChildModel {
+				provider: Arc::clone(&self.0),
+				model: model.to_string(),
+				role: None,
+			})
+		}
+	}
+
+	struct EvalStub;
+
+	#[async_trait]
+	impl Tool for EvalStub {
+		fn name(&self) -> &str {
+			"eval"
+		}
+
+		fn description(&self) -> &str {
+			"test eval stub"
+		}
+
+		fn schema(&self) -> Value {
+			json!({"type": "object", "properties": {}})
+		}
+
+		async fn execute(&self, _args: &Value, _ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+			Err(ToolError::ExecutionFailed("stub".to_string()))
+		}
+	}
+
+	#[derive(Default)]
+	struct ProviderRecorder {
+		providers: std::sync::Mutex<Vec<Arc<dyn ModelProvider>>>,
+	}
+
+	#[async_trait]
+	impl crate::eval::EvalToolBinder for ProviderRecorder {
+		fn bind(&self, registry: &mut ToolRegistry, _owner: Option<&str>) {
+			registry.register(Arc::new(EvalStub));
+		}
+
+		fn bind_with_provider(
+			&self,
+			registry: &mut ToolRegistry,
+			owner: Option<&str>,
+			provider: Option<Arc<dyn ModelProvider>>,
+		) {
+			if let Some(provider) = provider {
+				self.providers.lock().unwrap().push(provider);
+			}
+			self.bind(registry, owner);
+		}
+	}
+
+	/// `completion(model = "default")` inside a child eval session must use the
+	/// child's resolved provider, never the root session provider.
+	#[tokio::test]
+	async fn eval_child_rebinds_default_completion_to_its_resolved_provider() {
+		let root: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let child: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::clone(&root),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		let recorder = Arc::new(ProviderRecorder::default());
+		supervisor.set_eval_binder(Some(
+			recorder.clone() as Arc<dyn crate::eval::EvalToolBinder>
+		));
+		let catalog = Arc::new(
+			AgentCatalog::new(vec![model_agent()], None)
+				.with_model_factory(Arc::new(SharedFactory(Arc::clone(&child)))),
+		);
+		let tool = TaskTool::new(Arc::clone(&supervisor), 0).with_catalog(catalog);
+		let ctx = AgentContext::new(std::path::PathBuf::from("."));
+		let _ = tool.run_eval_agent(&json!({"prompt": "work"}), &ctx).await;
+
+		let recorded = recorder.providers.lock().unwrap();
+		assert!(
+			recorded.iter().any(|provider| Arc::ptr_eq(provider, &child)),
+			"child eval must be bound with the resolved child provider"
+		);
+		assert!(
+			!recorded.iter().any(|provider| Arc::ptr_eq(provider, &root)),
+			"root provider must never answer child default completions"
+		);
+	}
+
+	/// The detached background path builds its own registry after the spawn
+	/// future, so it needs the same provider rebind as the foreground path.
+	/// Assert through the binder seam rather than the child loop's request.
+	#[tokio::test]
+	async fn eval_background_child_rebinds_default_completion_to_its_resolved_provider() {
+		let root: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let child: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::clone(&root),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		let recorder = Arc::new(ProviderRecorder::default());
+		supervisor.set_eval_binder(Some(
+			recorder.clone() as Arc<dyn crate::eval::EvalToolBinder>
+		));
+		let catalog = Arc::new(
+			AgentCatalog::new(vec![model_agent()], None)
+				.with_model_factory(Arc::new(SharedFactory(Arc::clone(&child)))),
+		);
+		let tool = TaskTool::new(Arc::clone(&supervisor), 0).with_catalog(catalog);
+		let item = TaskItemSpec {
+			name: "task-bg".to_string(),
+			agent: model_agent(),
+			task: "work".to_string(),
+			context: None,
+			output_schema: None,
+			schema_mode: SchemaMode::default(),
+			schema_error: None,
+			effort: None,
+		};
+		let (_steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
+		let _ = run_background_child(
+			Arc::clone(&supervisor),
+			"task-bg".to_string(),
+			item,
+			std::path::PathBuf::from("."),
+			steering_rx,
+			tokio_util::sync::CancellationToken::new(),
+			tool.child_context(),
+		)
+		.await;
+
+		let recorded = recorder.providers.lock().unwrap();
+		assert!(
+			recorded.iter().any(|provider| Arc::ptr_eq(provider, &child)),
+			"background child eval must be bound with the resolved child provider"
+		);
+		assert!(
+			!recorded.iter().any(|provider| Arc::ptr_eq(provider, &root)),
+			"background child eval must never fall back to the root provider"
+		);
 	}
 }

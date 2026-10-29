@@ -16,6 +16,7 @@ pub mod config;
 pub mod daemon_broker;
 pub mod deadline;
 pub mod dirs;
+pub mod eval_host;
 pub mod file_mentions;
 pub mod foreign_session;
 pub mod local_models;

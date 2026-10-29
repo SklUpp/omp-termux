@@ -717,8 +717,8 @@ fn to_tool_error(error: DapError) -> ToolError {
 fn resolve_timeout(raw: Option<f64>, max_timeout: Option<u64>) -> u64 {
 	let requested = raw.filter(|value| value.is_finite()).unwrap_or(DEFAULT_TIMEOUT_SECS);
 	let capped = match max_timeout {
-		Some(limit) => requested.min(limit as f64),
-		None => requested,
+		Some(limit) if limit > 0 => requested.min(limit as f64),
+		_ => requested,
 	};
 	capped.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS) as u64
 }

@@ -13,6 +13,7 @@ use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+	eval::EvalToolBinder,
 	loop_module::SteeringEvent,
 	mailbox::Mailbox,
 	provider::ModelProvider,
@@ -233,6 +234,9 @@ pub struct Supervisor {
 	/// Injected by the host (broker client); otherwise a lazily created local
 	/// manager rooted at `process_root`.
 	processes: Mutex<Option<Arc<dyn ProcessBackend>>>,
+	/// Host-mounted eval tool factory. Root binds after the final registry is
+	/// assembled; children bind per owner so each gets a fresh eval session.
+	eval_binder: Mutex<Option<Arc<dyn EvalToolBinder>>>,
 	process_root: PathBuf,
 	/// Runner-unique prefix for backend-visible process owners. UI ids such as
 	/// `task-1` repeat across concurrent CLIs; process scoping must not.
@@ -314,6 +318,7 @@ impl Supervisor {
 			active_model: Mutex::new(None),
 			agent_catalog: Mutex::new(None),
 			processes: Mutex::new(None),
+			eval_binder: Mutex::new(None),
 			process_root: {
 				std::env::temp_dir()
 					.join(format!("omp-agent-processes-{}-{scope}", std::process::id()))
@@ -471,8 +476,15 @@ impl Supervisor {
 	/// one pending store are created, then `read`, `ast_grep`, `edit`,
 	/// `ast_edit`, and `write` are replaced only when mounted. Callers must do
 	/// this after any allowlist filtering so `has_edit_tool` reflects the final
-	/// set (no anchors for agents without `edit`).
-	pub fn rebind_session_tools(&self, registry: &mut ToolRegistry, active_model: Option<&str>) {
+	/// set (no anchors for agents without `edit`). `owner` identifies the child
+	/// eval session so the eval host re-binds with the fresh child tools; root
+	/// calls use `None`.
+	pub fn rebind_session_tools(
+		&self,
+		registry: &mut ToolRegistry,
+		active_model: Option<&str>,
+		owner: Option<&str>,
+	) {
 		let has_edit_tool = registry.get("edit").is_some();
 		let resolved = self.resolve_session_tools(active_model, has_edit_tool);
 		let snapshots = Arc::new(SnapshotStore::new());
@@ -513,6 +525,13 @@ impl Supervisor {
 			registry.register(Arc::new(WriteTool::with_pending(Arc::clone(&pending))));
 		}
 		registry.set_policy(Arc::new(StagedPreviewPolicy::new(pending)));
+		if registry.get("eval").is_some()
+			&& let Some(binder) = self.eval_binder()
+		{
+			// Rebind after display/session tools so the eval host's tool-call
+			// view contains the child's fresh read/edit/write instances.
+			binder.bind(registry, owner);
+		}
 	}
 
 	pub fn task_enabled(&self) -> bool {
@@ -526,6 +545,83 @@ impl Supervisor {
 	/// `async.enabled`: default `true`, matching the upstream setting.
 	pub fn async_enabled(&self) -> bool {
 		self.async_enabled.load(Ordering::SeqCst)
+	}
+
+	/// Install/replace the per-turn eval mount. `None` removes eval from child
+	/// registries (tool not selected or tools disabled).
+	pub fn set_eval_binder(&self, binder: Option<Arc<dyn EvalToolBinder>>) {
+		*self.eval_binder.lock().unwrap_or_else(|poison| poison.into_inner()) = binder;
+	}
+
+	pub fn eval_binder(&self) -> Option<Arc<dyn EvalToolBinder>> {
+		self
+			.eval_binder
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone()
+	}
+
+	/// Release eval kernels retained for a settled child owner.
+	pub async fn dispose_eval_owner(&self, owner: &str) {
+		if let Some(binder) = self.eval_binder() {
+			binder.dispose_owner(owner).await;
+		}
+	}
+
+	/// Rebind a child's eval host with the exact provider its loop resolved.
+	/// Without this, `completion(model = "default")` inside a child eval session
+	/// would answer with the root session model.
+	pub fn rebind_eval_provider(
+		&self,
+		registry: &mut ToolRegistry,
+		owner: &str,
+		provider: Arc<dyn ModelProvider>,
+	) {
+		if registry.get("eval").is_some()
+			&& let Some(binder) = self.eval_binder()
+		{
+			binder.bind_with_provider(registry, Some(owner), Some(provider));
+		}
+	}
+
+	/// Build the `task` tool used by eval `agent()`. Root usage shares the root
+	/// concurrency permits. A child owner gets its real depth, agent definition
+	/// (self-spawn/spawns policy), parent tool ceiling, and its own permits, so
+	/// eval cannot bypass recursion or delegation rules.
+	pub fn eval_task_tool(
+		self: &Arc<Self>,
+		owner: Option<&str>,
+		parent_tools: Option<std::collections::BTreeSet<String>>,
+	) -> TaskTool {
+		let Some(owner) = owner else {
+			return TaskTool::with_semaphore(Arc::clone(self), 0, Arc::clone(&self.root_permits));
+		};
+		let (depth, agent_name) = {
+			let state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+			let mut depth = 0i32;
+			let mut current = Some(owner.to_string());
+			let mut agent = None;
+			while let Some(id) = current {
+				let Some(record) = state.records.get(&id) else {
+					break;
+				};
+				depth = depth.saturating_add(1);
+				if agent.is_none() {
+					agent = Some(record.agent.clone());
+				}
+				current = record.parent_id.clone();
+			}
+			(depth.max(1), agent.unwrap_or_else(|| "task".to_string()))
+		};
+		let mut tool = TaskTool::with_parent(Arc::clone(self), depth, Some(owner.to_string()));
+		tool.agent_name = Some(agent_name.clone());
+		if let Some(catalog) = self.agent_catalog()
+			&& let Some(definition) = catalog.get(&agent_name)
+		{
+			tool.spawns = definition.spawns.clone();
+		}
+		tool.parent_tools = parent_tools;
+		tool
 	}
 
 	pub fn set_async_enabled(&self, enabled: bool) {
@@ -641,6 +737,48 @@ impl Supervisor {
 		}
 		state.pending_bytes += text.len();
 		state.pending.push_back(PendingDelivery { id: id.to_string(), owner, text });
+	}
+
+	/// Enqueue a non-task background result (eval auto-background) scoped to an
+	/// owner. Unlike [`Self::enqueue_delivery`] the id has no supervisor
+	/// admission slot, so this is the host's exactly-once entry point: a
+	/// consumed or already-queued id is rejected. A settled owner routes to its
+	/// nearest live ancestor (root = `None`).
+	pub fn enqueue_owner_result(&self, owner: Option<&str>, id: &str, text: String) -> bool {
+		let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+		if state.consumed.contains(id)
+			|| state.pending.iter().any(|delivery| delivery.id == id)
+		{
+			return false;
+		}
+		let mut owner = owner.map(str::to_string);
+		while let Some(current) = owner.clone() {
+			let live = state
+				.records
+				.get(&current)
+				.is_some_and(|record| record.status == ChildStatus::Running);
+			if live {
+				break;
+			}
+			owner = state
+				.records
+				.get(&current)
+				.and_then(|record| record.parent_id.clone());
+		}
+		let (mut text, _) = cap_result_text(&text);
+		let remaining = MAX_PENDING_RESULT_BYTES.saturating_sub(state.pending_bytes);
+		if remaining == 0 {
+			return false;
+		}
+		if text.len() > remaining {
+			text = truncate_to_bytes(&text, remaining);
+		}
+		if text.is_empty() {
+			return false;
+		}
+		state.pending_bytes += text.len();
+		state.pending.push_back(PendingDelivery { id: id.to_string(), owner, text });
+		true
 	}
 
 	/// Atomically consume a set of settled results for a snapshot. Returns the
@@ -772,7 +910,7 @@ impl Supervisor {
 		// Direct callers (tests, host convenience) get a fully bound child.
 		// `task` instead filters its allowlist first and rebinds exactly once
 		// with the child's effective model, so no store is allocated twice.
-		self.rebind_session_tools(&mut reg, None);
+		self.rebind_session_tools(&mut reg, None, owner);
 		reg
 	}
 
@@ -805,6 +943,12 @@ impl Supervisor {
 		}
 		reg.register(Arc::new(YieldTool::new()));
 		reg.register(Arc::new(ThinkTool::new()));
+		// Add eval before the task tool filters the child allowlist, so `eval`
+		// is matched by internal registry key. `rebind_session_tools` replaces
+		// it once the child's fresh session tools exist.
+		if let Some(binder) = self.eval_binder() {
+			binder.bind(&mut reg, owner);
+		}
 		let limits = self.limits();
 		if self.task_enabled() && (limits.max_depth < 0 || depth < limits.max_depth) {
 			reg.register(Arc::new(TaskTool::with_parent(
@@ -1387,5 +1531,28 @@ mod process_wiring_tests {
 		assert!(again.to_string().contains("No pending action to apply"));
 
 		std::fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn eval_owner_results_dedupe_and_route_to_live_ancestor() {
+		let supervisor = supervisor();
+		assert!(supervisor.enqueue_owner_result(None, "eval-a", "one".to_string()));
+		// Same id is exactly-once even before consumption.
+		assert!(!supervisor.enqueue_owner_result(None, "eval-a", "duplicate".to_string()));
+		// Settled/missing child owner routes to root.
+		assert!(supervisor.enqueue_owner_result(
+			Some("child-that-settled"),
+			"eval-b",
+			"two".to_string(),
+		));
+		assert!(supervisor.take_results_for(Some("child-that-settled")).is_empty());
+		assert_eq!(
+			supervisor.take_results_for(None),
+			vec!["one".to_string(), "two".to_string()]
+		);
+		// Consumed ids never resurrect.
+		assert!(!supervisor.enqueue_owner_result(None, "eval-a", "late".to_string()));
+		// No sink attached means background delivery is unavailable.
+		assert!(!supervisor.background_ready());
 	}
 }

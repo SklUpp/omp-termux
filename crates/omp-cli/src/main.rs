@@ -919,6 +919,10 @@ impl Session<'_> {
 			turn_ack: None,
 			todo_phases,
 			session_persisted,
+			session_file: session_persisted
+				.then(|| self.store.file().map(std::path::Path::to_path_buf))
+				.flatten(),
+			session_id: session_persisted.then(|| self.store.id().to_string()),
 			config: self.config.clone(),
 			catalog: Arc::clone(&self.catalog),
 			approvals: self.approvals.clone(),
