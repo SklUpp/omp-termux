@@ -21,13 +21,13 @@ pub use loop_module::{
 pub use tokio_util::sync::CancellationToken;
 pub use provider::{
 	ChunkStream, ModelProvider, OpenAiChatRequest, OpenAiCompatibleProvider, OpenAiContent,
-	OpenAiContentPart, OpenAiImageUrl, OpenAiMessage, OpenAiToolChoice, OpenAiToolChoiceFunction,
-	ProviderError, StreamAssembler, StreamChunk, ToolCallDelta, ToolChoice, parse_sse_line,
-	sse_stream, to_openai_messages,
+	OpenAiContentPart, OpenAiImageUrl, OpenAiMessage, OpenAiStreamOptions, OpenAiToolChoice,
+	OpenAiToolChoiceFunction, OpenAiUsage, ProviderError, StreamAssembler, StreamChunk,
+	ToolCallDelta, ToolChoice, normalize_usage, parse_sse_line, sse_stream, to_openai_messages,
 };
 pub use state::{
-	AgentConfig, AgentContext, AgentState, ContentPart, ImagePart, Message, Role, ToolApprover,
-	ToolCall, ToolResult, TurnResult, TurnStatus,
+	AgentConfig, AgentContext, AgentState, ContentPart, ImagePart, Message, Role, TokenUsage,
+	ToolApprover, ToolCall, ToolResult, TurnResult, TurnStatus,
 };
 pub use tokenizer::Tokenizer;
 pub use supervisor::{

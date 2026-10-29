@@ -693,10 +693,10 @@ mod tests {
 			input: 11,
 			output: 7,
 			total_tokens: 18,
-			cost: crate::session::Cost {
+			cost: Some(crate::session::Cost {
 				total: 0.5,
 				..crate::session::Cost::default()
-			},
+			}),
 			..crate::session::Usage::default()
 		});
 		let entries = vec![
@@ -797,7 +797,7 @@ mod tests {
 			.expect("retained checkpoint turn");
 		let usage = retained.message.usage.as_ref().expect("usage preserved");
 		assert_eq!(usage.input, 11);
-		assert_eq!(usage.cost.total, 0.5);
+		assert_eq!(usage.cost.as_ref().expect("cost").total, 0.5);
 
 		let branch_kinds: Vec<&str> = store
 			.branch_entries()

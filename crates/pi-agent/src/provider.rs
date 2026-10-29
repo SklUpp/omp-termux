@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Message, Role, ToolCall};
+use crate::state::{Message, Role, TokenUsage, ToolCall};
 
 /// TCP/TLS connect budget for a provider endpoint.
 ///
@@ -61,6 +61,11 @@ pub struct StreamChunk {
 	pub content: Option<String>,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub tool_call_deltas: Vec<ToolCallDelta>,
+	/// Usage snapshot the provider reported with this chunk, when the dialect
+	/// sends one. Each snapshot describes the whole request, so consumers keep
+	/// the last one instead of adding them up.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub usage: Option<TokenUsage>,
 	pub is_done: bool,
 }
 
@@ -152,6 +157,12 @@ pub struct OpenAiCompatibleProvider {
 	/// requested. Rust models no prompt-cache mode, so callers enable this only
 	/// for the kimi-code dialect.
 	prompt_cache_enabled: bool,
+	/// Whether the streaming dialect accepts `stream_options.include_usage`
+	/// (TS compat `supportsUsageInStreaming`, true unless a dialect opts out).
+	///
+	/// Enabled by default because that is the TS default; only dialects known to
+	/// reject the field should turn it off.
+	usage_in_streaming: bool,
 }
 
 impl OpenAiCompatibleProvider {
@@ -194,6 +205,7 @@ impl OpenAiCompatibleProvider {
 			session_id: None,
 			prompt_cache_key: None,
 			prompt_cache_enabled: false,
+			usage_in_streaming: true,
 		}
 	}
 
@@ -244,6 +256,16 @@ impl OpenAiCompatibleProvider {
 	/// cache identity it may reject. `kimi-code` is the dialect wired by the CLI.
 	pub fn with_prompt_cache_enabled(mut self, enabled: bool) -> Self {
 		self.prompt_cache_enabled = enabled;
+		self
+	}
+
+	/// Enable or disable `stream_options.include_usage` on streamed requests.
+	///
+	/// On by default (TS default). Dialects that reject unknown request fields
+	/// must disable it; the provider then reports no streaming usage instead of
+	/// breaking the stream.
+	pub fn with_usage_in_streaming(mut self, enabled: bool) -> Self {
+		self.usage_in_streaming = enabled;
 		self
 	}
 
@@ -303,6 +325,8 @@ impl OpenAiCompatibleProvider {
 			tools: tools.to_vec(),
 			tool_choice,
 			stream,
+			stream_options: (stream && self.usage_in_streaming)
+				.then_some(OpenAiStreamOptions { include_usage: true }),
 			reasoning_effort: self.effort.clone(),
 			prompt_cache_key: self.prompt_cache_enabled.then(|| self.prompt_cache_key()).flatten(),
 		})
@@ -344,10 +368,13 @@ impl ModelProvider for OpenAiCompatibleProvider {
 				snippet(&text)
 			))
 		})?;
+		let usage = parsed.usage.as_ref().map(normalize_usage);
 		let choice = parsed.choices.into_iter().next().ok_or_else(|| {
 			ProviderError::Protocol("chat completion contained no choices".to_string())
 		})?;
-		Ok(from_openai_response(choice.message))
+		let mut message = from_openai_response(choice.message);
+		message.usage = usage;
+		Ok(message)
 	}
 
 	async fn stream(
@@ -391,10 +418,14 @@ impl ModelProvider for OpenAiCompatibleProvider {
 /// Text deltas are concatenated in arrival order; tool-call deltas are joined by
 /// their `index`, so a call whose name arrives in one chunk and whose arguments
 /// arrive in later chunks still becomes one [`ToolCall`].
+///
+/// Usage snapshots are replaced, never summed: each one describes the whole
+/// request, and the terminal usage-only trailer repeats the counters.
 #[derive(Debug, Default)]
 pub struct StreamAssembler {
 	content: String,
 	calls: BTreeMap<usize, PendingCall>,
+	usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Default)]
@@ -413,6 +444,9 @@ impl StreamAssembler {
 	pub fn push(&mut self, chunk: &StreamChunk) {
 		if let Some(content) = &chunk.content {
 			self.content.push_str(content);
+		}
+		if let Some(usage) = chunk.usage {
+			self.usage = Some(usage);
 		}
 		for delta in &chunk.tool_call_deltas {
 			let pending = self.calls.entry(delta.index).or_default();
@@ -451,12 +485,19 @@ impl StreamAssembler {
 				arguments,
 			});
 		}
-		Ok(Message::assistant_with_tools(self.content, tool_calls))
+		let mut message = Message::assistant_with_tools(self.content, tool_calls);
+		message.usage = self.usage;
+		Ok(message)
 	}
 
 	/// Produce a partial assistant message (content only, no tool calls) for aborted or failed turns.
+	///
+	/// Carries whatever usage the provider already reported, so a failed or
+	/// cancelled request is accounted exactly once instead of silently dropped.
 	pub(crate) fn finish_partial(&self) -> Message {
-		Message::assistant(&self.content)
+		let mut message = Message::assistant(&self.content);
+		message.usage = self.usage;
+		message
 	}
 }
 
@@ -472,12 +513,22 @@ pub struct OpenAiChatRequest {
 	pub tool_choice: Option<OpenAiToolChoice>,
 	#[serde(default)]
 	pub stream: bool,
+	/// OpenAI-compatible `stream_options`; omitted for non-streaming requests
+	/// and for dialects without streaming usage support.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stream_options: Option<OpenAiStreamOptions>,
 	/// OpenAI-compatible `reasoning_effort`; omitted when unset.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reasoning_effort: Option<String>,
 	/// OpenAI-compatible `prompt_cache_key`; omitted when unset.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub prompt_cache_key: Option<String>,
+}
+
+/// `stream_options` body field asking the host for a usage trailer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiStreamOptions {
+	pub include_usage: bool,
 }
 
 /// OpenAI chat-completions `tool_choice` for a forced function.
@@ -558,6 +609,9 @@ pub struct OpenAiFunctionCall {
 pub struct OpenAiChatResponse {
 	#[serde(default)]
 	pub choices: Vec<OpenAiChoice>,
+	/// Absent when the host reports no usage; never synthesized.
+	#[serde(default)]
+	pub usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,15 +628,24 @@ pub struct OpenAiResponseMessage {
 }
 
 /// SSE chunk schema for a streamed chat completion.
+///
+/// A `stream_options.include_usage` trailer typically arrives with an empty
+/// `choices` array, so `usage` must be read independently of the deltas.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiStreamChunk {
 	#[serde(default)]
 	pub choices: Vec<OpenAiStreamChoice>,
+	#[serde(default)]
+	pub usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiStreamChoice {
 	pub delta: OpenAiDelta,
+	/// vLLM-style per-choice usage; only read when the chunk has no top-level
+	/// `usage` (TS `parseChunkUsage` choice fallback).
+	#[serde(default)]
+	pub usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -608,6 +671,113 @@ pub struct OpenAiStreamFunctionCall {
 	pub name: Option<String>,
 	#[serde(default)]
 	pub arguments: Option<String>,
+}
+
+/// Usage payload as OpenAI-compatible hosts report it.
+///
+/// Every counter is optional and lenient: a host that sends a malformed or
+/// unknown counter shape must not fail the whole response/stream, and TS
+/// (`parseChunkUsage`) likewise treats any non-number as absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenAiUsage {
+	#[serde(default, deserialize_with = "lenient_count")]
+	pub prompt_tokens: Option<u64>,
+	#[serde(default, deserialize_with = "lenient_count")]
+	pub completion_tokens: Option<u64>,
+	#[serde(default, deserialize_with = "lenient_count")]
+	pub cached_tokens: Option<u64>,
+	/// DeepSeek-shaped cache read counter.
+	#[serde(default, deserialize_with = "lenient_count")]
+	pub prompt_cache_hit_tokens: Option<u64>,
+	/// DeepSeek-shaped cache write counter.
+	#[serde(default, deserialize_with = "lenient_count")]
+	pub prompt_cache_miss_tokens: Option<u64>,
+	/// Vertex/Gemini cache read counter behind an OpenAI-compatible gateway.
+	#[serde(
+		default,
+		rename = "cachedContentTokenCount",
+		deserialize_with = "lenient_count"
+	)]
+	pub cached_content_token_count: Option<u64>,
+	#[serde(default)]
+	pub prompt_tokens_details: Option<OpenAiPromptTokenDetails>,
+	#[serde(default)]
+	pub completion_tokens_details: Option<OpenAiCompletionTokenDetails>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenAiPromptTokenDetails {
+	#[serde(default, deserialize_with = "lenient_count")]
+	pub cached_tokens: Option<u64>,
+	#[serde(default, deserialize_with = "lenient_count")]
+	pub cache_write_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenAiCompletionTokenDetails {
+	#[serde(default, deserialize_with = "lenient_count")]
+	pub reasoning_tokens: Option<u64>,
+}
+
+/// Accept any JSON value as an optional token count: numbers count, everything
+/// else is absent. Keeps an anomalous `usage` payload from failing the stream.
+fn lenient_count<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+	Ok(value.and_then(|value| {
+		value
+			.as_u64()
+			.or_else(|| value.as_f64().filter(|n| *n > 0.0).map(|n| n as u64))
+	}))
+}
+
+/// Normalize a reported usage payload into disjoint [`TokenUsage`] counters.
+///
+/// Port of TS `calculateOpenAIUsageAccounting`
+/// (`packages/ai/src/providers/openai-shared.ts`): `input` is the prefill total
+/// minus cache reads and cache writes, cache reads arrive under four vendor
+/// spellings, and DeepSeek reports the write side as `prompt_cache_miss_tokens`
+/// (already included in `prompt_tokens`, so it is not charged twice).
+pub fn normalize_usage(raw: &OpenAiUsage) -> TokenUsage {
+	let prompt = raw.prompt_tokens.unwrap_or(0);
+	let output = raw.completion_tokens.unwrap_or(0);
+	let details = raw.prompt_tokens_details.as_ref();
+	let cache_read = [
+		raw.cached_tokens,
+		raw.prompt_cache_hit_tokens,
+		details.and_then(|details| details.cached_tokens),
+		raw.cached_content_token_count,
+	]
+	.into_iter()
+	.flatten()
+	.find(|value| *value > 0)
+	.unwrap_or(0);
+
+	let write_reported = details.and_then(|details| details.cache_write_tokens);
+	let write_deepseek = raw.prompt_cache_miss_tokens;
+	// TS `isDeepSeekUsage`: both DeepSeek counters present, no explicit write
+	// counter, and a positive miss count.
+	let deepseek_style = raw.prompt_cache_hit_tokens.is_some()
+		&& write_deepseek.is_some()
+		&& write_reported.is_none()
+		&& write_deepseek.unwrap_or(0) > 0;
+	let write = write_reported.or(write_deepseek).unwrap_or(0);
+	let input = if deepseek_style {
+		prompt.saturating_sub(cache_read)
+	} else {
+		prompt.saturating_sub(cache_read).saturating_sub(write)
+	};
+	let cache_write = if deepseek_style { 0 } else { write };
+
+	TokenUsage {
+		input,
+		output,
+		cache_read,
+		cache_write,
+		total_tokens: input + output + cache_read + cache_write,
+	}
 }
 
 /// Convert pi-agent domain messages into OpenAI API messages.
@@ -791,13 +961,26 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 
 	let data = trimmed.strip_prefix("data:")?.trim();
 	if data == "[DONE]" {
-		return Some(Ok(StreamChunk { content: None, tool_call_deltas: Vec::new(), is_done: true }));
+		return Some(Ok(StreamChunk {
+			content: None,
+			tool_call_deltas: Vec::new(),
+			usage: None,
+			is_done: true,
+		}));
 	}
 
 	match serde_json::from_str::<OpenAiStreamChunk>(data) {
 		Ok(chunk) => {
 			let mut content = None;
 			let mut tool_call_deltas = Vec::new();
+			// TS reads the top-level payload first and only falls back to the
+			// first choice's usage (vLLM-style hosts).
+			let choice_usage = chunk.choices.first().and_then(|choice| choice.usage.as_ref());
+			let usage = chunk
+				.usage
+				.as_ref()
+				.or(choice_usage)
+				.map(normalize_usage);
 
 			for choice in chunk.choices {
 				if let Some(delta) = choice.delta.content {
@@ -817,7 +1000,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 				}
 			}
 
-			Some(Ok(StreamChunk { content, tool_call_deltas, is_done: false }))
+			Some(Ok(StreamChunk { content, tool_call_deltas, usage, is_done: false }))
 		},
 		Err(err) => Some(Err(ProviderError::Serialization(err))),
 	}
@@ -915,6 +1098,7 @@ mod tests {
 				name: None,
 				arguments_delta: Some("{}".into()),
 			}],
+			usage: None,
 			is_done: false,
 		});
 		let err = assembler.finish().unwrap_err();
@@ -932,6 +1116,7 @@ mod tests {
 				name: Some("   ".into()),
 				arguments_delta: Some("{}".into()),
 			}],
+			usage: None,
 			is_done: false,
 		});
 		let err = assembler.finish().unwrap_err();
@@ -949,6 +1134,7 @@ mod tests {
 				name: Some("read".into()),
 				arguments_delta: Some("{}".into()),
 			}],
+			usage: None,
 			is_done: false,
 		});
 		let msg = assembler.finish().unwrap();
@@ -1088,6 +1274,7 @@ mod tests {
 			tool_calls: Vec::new(),
 			tool_call_id: Some("c1".to_string()),
 			is_error: false,
+			usage: None,
 		};
 		let err = to_openai_messages(&[t1]).unwrap_err();
 		assert!(matches!(err, ProviderError::UnsupportedImage(_)));

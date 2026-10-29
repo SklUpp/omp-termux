@@ -1901,7 +1901,12 @@ impl ModelProvider for StreamingProvider {
 }
 
 fn text_chunk(delta: &str) -> StreamChunk {
-	StreamChunk { content: Some(delta.to_string()), tool_call_deltas: Vec::new(), is_done: false }
+	StreamChunk {
+		content: Some(delta.to_string()),
+		tool_call_deltas: Vec::new(),
+		usage: None,
+		is_done: false,
+	}
 }
 
 fn tool_delta(
@@ -1918,12 +1923,13 @@ fn tool_delta(
 			name: name.map(ToString::to_string),
 			arguments_delta: arguments_delta.map(ToString::to_string),
 		}],
+		usage: None,
 		is_done: false,
 	}
 }
 
 fn done_chunk() -> StreamChunk {
-	StreamChunk { content: None, tool_call_deltas: Vec::new(), is_done: true }
+	StreamChunk { content: None, tool_call_deltas: Vec::new(), usage: None, is_done: true }
 }
 
 /// Drains the event channel concurrently with the dialog: `run_dialog_with`
@@ -2029,6 +2035,7 @@ async fn streaming_rejects_missing_tool_name() {
 			name: None,
 			arguments_delta: Some("{\"path\":\"x\"}".to_string()),
 		}],
+		usage: None,
 		is_done: true,
 	});
 
@@ -2197,6 +2204,7 @@ fn reasoning_effort_is_serialized_only_when_set() {
 		tools: Vec::new(),
 		tool_choice: None,
 		stream: false,
+		stream_options: None,
 		reasoning_effort: None,
 		prompt_cache_key: None,
 	};
@@ -3244,6 +3252,7 @@ fn directly_constructed_message_with_content_and_image_part_preserves_both_on_wi
 		tool_calls: vec![],
 		tool_call_id: None,
 		is_error: false,
+		usage: None,
 	};
 	let wire = pi_agent::to_openai_messages(&[msg]).expect("openai messages");
 	let val = serde_json::to_value(&wire[0]).expect("serialize");

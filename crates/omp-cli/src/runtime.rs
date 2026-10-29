@@ -617,6 +617,9 @@ impl AgentRunner for PiAgentRunner {
 			.with_effort(plan.effort)
 			.with_images(plan.supports_images)
 			.with_prompt_cache_enabled(plan.provider == "kimi-code")
+			// TS compat `supportsUsageInStreaming: !isCerebras` (`compat/openai.ts`):
+			// the Cerebras dialect rejects the `stream_options` field.
+			.with_usage_in_streaming(plan.provider != "cerebras")
 			.with_session_id(request.provider_session_id.clone())
 			.with_prompt_cache_key(request.prompt_cache_key.clone());
 		let config = AgentConfig {
@@ -1492,7 +1495,9 @@ impl ChildModelFactory for CliChildModelFactory {
 				Ok(provider) => provider
 					.with_effort(chosen_effort)
 					.with_images(supports_images)
-					.with_prompt_cache_enabled(provider_id == "kimi-code"),
+					.with_prompt_cache_enabled(provider_id == "kimi-code")
+					// TS compat `supportsUsageInStreaming: !isCerebras`.
+					.with_usage_in_streaming(provider_id != "cerebras"),
 				Err(error) => {
 					last_error = Some(error.to_string());
 					continue;

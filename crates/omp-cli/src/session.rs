@@ -174,6 +174,11 @@ pub struct Cost {
 }
 
 /// TS `Usage` (`packages/catalog/src/types.ts`).
+///
+/// The token counters are exactly what the provider reported. `cost` is
+/// `None` unless a price is actual data (a vendor-reported or catalog-priced
+/// amount): this crate never estimates one, so an absent cost block means
+/// "unknown", not "free".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Usage {
 	#[serde(default)]
@@ -190,11 +195,73 @@ pub struct Usage {
 	pub context_tokens: Option<u64>,
 	#[serde(default, rename = "reasoningTokens", skip_serializing_if = "Option::is_none")]
 	pub reasoning_tokens: Option<u64>,
-	#[serde(default)]
-	pub cost: Cost,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cost: Option<Cost>,
 	/// Unknown forward fields (`cttl`, `server`, `orchestration`, ...) preserved verbatim.
 	#[serde(flatten)]
 	pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl From<pi_agent::TokenUsage> for Usage {
+	fn from(usage: pi_agent::TokenUsage) -> Self {
+		Self {
+			input: usage.input,
+			output: usage.output,
+			cache_read: usage.cache_read,
+			cache_write: usage.cache_write,
+			total_tokens: usage.total_tokens,
+			..Self::default()
+		}
+	}
+}
+
+/// Session view of one assistant message's provider-reported usage.
+///
+/// `None` when the provider reported nothing: callers must persist the absence
+/// instead of a zero-filled [`Usage`].
+#[must_use]
+pub fn reported_usage(message: &pi_agent::Message) -> Option<Usage> {
+	message.usage.map(Usage::from)
+}
+
+/// Cumulative token usage of a session log.
+///
+/// Every persisted assistant entry contributes once, matching TS
+/// `SessionManager`'s running index (`session-manager.ts` `addUsage`): the sum
+/// is therefore stable across resume/fork/compaction and never counts a
+/// request twice. `reported_messages` is the coverage: entries whose provider
+/// reported usage out of `assistant_messages`. It is not a total — an
+/// unreported request leaves the counters untouched rather than adding zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsage {
+	#[serde(default)]
+	pub input: u64,
+	#[serde(default)]
+	pub output: u64,
+	#[serde(default, rename = "cacheRead")]
+	pub cache_read: u64,
+	#[serde(default, rename = "cacheWrite")]
+	pub cache_write: u64,
+	#[serde(default, rename = "totalTokens")]
+	pub total_tokens: u64,
+	#[serde(default, rename = "reportedMessages")]
+	pub reported_messages: usize,
+	#[serde(default, rename = "assistantMessages")]
+	pub assistant_messages: usize,
+}
+
+impl SessionUsage {
+	/// Whether any request actually reported usage.
+	#[must_use]
+	pub fn is_known(&self) -> bool {
+		self.reported_messages > 0
+	}
+
+	/// Whether every assistant message in the log reported usage.
+	#[must_use]
+	pub fn is_complete(&self) -> bool {
+		self.assistant_messages > 0 && self.reported_messages == self.assistant_messages
+	}
 }
 
 /// One typed content part: TS `TextContent` | `ImageContent`, plus lossless
@@ -1189,6 +1256,53 @@ impl SessionStore {
 	#[must_use]
 	pub fn has_image_content(&self) -> bool {
 		self.messages.iter().any(|entry| entry.message.content.has_image())
+	}
+
+	/// Cumulative provider-reported usage for this session log.
+	///
+	/// Counts each persisted assistant entry exactly once (TS running index),
+	/// so reopening the log, forking it, or compacting it never changes the
+	/// reported counters. Entries without usage only raise the coverage
+	/// denominator; they never contribute zeros.
+	#[must_use]
+	pub fn session_usage(&self) -> SessionUsage {
+		let mut total = SessionUsage::default();
+		for entry in &self.messages {
+			if entry.message.role != "assistant" {
+				continue;
+			}
+			total.assistant_messages += 1;
+			let Some(usage) = &entry.message.usage else {
+				continue;
+			};
+			total.reported_messages += 1;
+			total.input += usage.input;
+			total.output += usage.output;
+			total.cache_read += usage.cache_read;
+			total.cache_write += usage.cache_write;
+			total.total_tokens += usage.total_tokens;
+		}
+		total
+	}
+
+	/// Prompt-side token occupancy of the newest reported request.
+	///
+	/// Mirrors TS `calculatePromptTokens` (`packages/agent/src/compaction/compaction.ts`):
+	/// `input + cache_read + cache_write`, falling back to `total_tokens` only
+	/// when that sum is zero. Only the active branch counts, and `None` means no
+	/// request on the branch reported usage — never an invented number.
+	#[must_use]
+	pub fn latest_context_tokens(&self) -> Option<u64> {
+		self
+			.branch_messages()
+			.into_iter()
+			.rev()
+			.filter(|entry| entry.message.role == "assistant")
+			.find_map(|entry| entry.message.usage.as_ref())
+			.map(|usage| {
+				let prompt = usage.input + usage.cache_read + usage.cache_write;
+				if prompt > 0 { prompt } else { usage.total_tokens }
+			})
 	}
 
 	/// Active leaf: the last journal entry. Branching appends a
@@ -3683,6 +3797,117 @@ mod tests {
 			}],
 			parts: Vec::new(),
 		}
+	}
+
+	/// Reported usage is summed once per assistant entry, stays identical after
+	/// a reload, and an entry without usage only widens the coverage gap.
+	#[test]
+	fn session_usage_sums_reported_entries_once_across_reload() {
+		const TS: &str = "2026-01-01T00:00:00.000Z";
+		let reported = Usage {
+			input: 10,
+			output: 2,
+			cache_read: 3,
+			cache_write: 4,
+			total_tokens: 19,
+			..Usage::default()
+		};
+		let dir = temp_dir();
+		let before;
+		{
+			let mut store = SessionStore::open(&options(dir.clone(), Some("usage-sum")));
+			assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+			store
+				.append_messages(&[
+					MessageEntry::new(
+						"u1",
+						None,
+						TS,
+						SessionMessage::user(MessageContent::Text("hi".to_string()), 0),
+					),
+					MessageEntry::new(
+						"a1",
+						Some("u1".to_string()),
+						TS,
+						SessionMessage::assistant(
+							MessageContent::Text("one".to_string()),
+							"chat",
+							"local",
+							"llama3",
+							Some(reported.clone()),
+							"stop",
+							1,
+						),
+					),
+					MessageEntry::new(
+						"a2",
+						Some("a1".to_string()),
+						TS,
+						SessionMessage::assistant(
+							MessageContent::Text("two".to_string()),
+							"chat",
+							"local",
+							"llama3",
+							None,
+							"stop",
+							2,
+						),
+					),
+					MessageEntry::new(
+						"a3",
+						Some("a2".to_string()),
+						TS,
+						SessionMessage::assistant(
+							MessageContent::Text("three".to_string()),
+							"chat",
+							"local",
+							"llama3",
+							Some(Usage {
+								input: 5,
+								output: 6,
+								total_tokens: 11,
+								..Usage::default()
+							}),
+							"stop",
+							3,
+						),
+					),
+				])
+				.expect("append usage entries");
+
+			before = store.session_usage();
+			assert_eq!(before.input, 15, "two reported responses accumulate");
+			assert_eq!(before.output, 8);
+			assert_eq!(before.cache_read, 3);
+			assert_eq!(before.cache_write, 4);
+			assert_eq!(before.total_tokens, 30);
+			assert_eq!(before.assistant_messages, 3);
+			assert_eq!(before.reported_messages, 2);
+			assert!(before.is_known(), "two requests reported usage");
+			assert!(!before.is_complete(), "one request reported nothing");
+			assert_eq!(
+				store.latest_context_tokens(),
+				Some(5),
+				"newest reported prompt side = input + cacheRead + cacheWrite"
+			);
+		}
+
+		let reopened = SessionStore::open(&options(dir.clone(), Some("usage-sum")));
+		assert_eq!(
+			reopened.session_usage(),
+			before,
+			"reload must reproduce the same counters, not double them"
+		);
+		assert_eq!(reopened.latest_context_tokens(), Some(5));
+		assert!(
+			reopened
+				.messages()
+				.iter()
+				.filter(|entry| entry.message.role == "assistant")
+				.any(|entry| entry.message.usage.is_none()),
+			"the unreported entry round-trips as absence, never as zeros"
+		);
+		fs::remove_dir_all(dir).ok();
 	}
 
 	#[test]

@@ -19,6 +19,13 @@ use crate::{
 pub const MISSING_RUNTIME: &str = "agent runtime not linked";
 
 /// One streamed event of an agent turn.
+///
+/// Usage accounting rides on the embedded `pi_agent::Message`:
+/// [`Event::MessageEnd`] fires exactly once per provider request, so its
+/// `message.usage` is that request's report and is the only tick to sum.
+/// [`Event::TurnEnd`] and [`Event::AgentEnd`] repeat the same messages (a loop
+/// turn may hold several model calls), so accounting must never add them to the
+/// `MessageEnd` totals. `usage: None` means the provider reported nothing.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {

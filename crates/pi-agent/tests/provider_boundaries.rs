@@ -35,7 +35,12 @@ fn delta(
 }
 
 fn chunk(content: Option<&str>, deltas: Vec<ToolCallDelta>) -> StreamChunk {
-	StreamChunk { content: content.map(str::to_string), tool_call_deltas: deltas, is_done: false }
+	StreamChunk {
+		content: content.map(str::to_string),
+		tool_call_deltas: deltas,
+		usage: None,
+		is_done: false,
+	}
 }
 
 async fn read_request(socket: &mut TcpStream) -> Option<(String, Value)> {

@@ -13,6 +13,29 @@ pub enum Role {
 	Tool,
 }
 
+/// Token usage for exactly one model request, as its provider reported it.
+///
+/// Mirrors the TS `Usage` token counters (`packages/catalog/src/types.ts`,
+/// camelCase on the wire) after provider normalization: `input` already
+/// excludes cache reads and cache writes, so the counters are disjoint and
+/// `total_tokens == input + output + cache_read + cache_write`.
+///
+/// Absence of a report is `None` on the carrying [`Message`] — never a
+/// zero-filled stand-in for "the provider said nothing".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+	#[serde(default)]
+	pub input: u64,
+	#[serde(default)]
+	pub output: u64,
+	#[serde(default, rename = "cacheRead")]
+	pub cache_read: u64,
+	#[serde(default, rename = "cacheWrite")]
+	pub cache_write: u64,
+	#[serde(default, rename = "totalTokens")]
+	pub total_tokens: u64,
+}
+
 /// A tool invocation request by model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -302,6 +325,11 @@ pub struct Message {
 	pub tool_call_id: Option<String>,
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub is_error: bool,
+	/// Provider-reported usage for the request that produced this assistant
+	/// message. `None` on non-assistant roles and when the provider reported
+	/// nothing at all.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub usage: Option<TokenUsage>,
 }
 
 #[derive(Deserialize)]
@@ -324,6 +352,8 @@ struct RawMessage {
 	tool_call_id: Option<String>,
 	#[serde(default)]
 	is_error: bool,
+	#[serde(default)]
+	usage: Option<TokenUsage>,
 }
 
 impl<'de> Deserialize<'de> for Message {
@@ -360,6 +390,7 @@ impl<'de> Deserialize<'de> for Message {
 			tool_calls: raw.tool_calls,
 			tool_call_id: raw.tool_call_id,
 			is_error: raw.is_error,
+			usage: raw.usage,
 		})
 	}
 }
@@ -373,6 +404,7 @@ impl Message {
 			tool_calls: Vec::new(),
 			tool_call_id: None,
 			is_error: false,
+			usage: None,
 		}
 	}
 
@@ -385,6 +417,7 @@ impl Message {
 			tool_calls: Vec::new(),
 			tool_call_id: None,
 			is_error: false,
+			usage: None,
 		}
 	}
 
@@ -405,6 +438,7 @@ impl Message {
 			tool_calls: Vec::new(),
 			tool_call_id: None,
 			is_error: false,
+			usage: None,
 		}
 	}
 
@@ -428,6 +462,7 @@ impl Message {
 			tool_calls: Vec::new(),
 			tool_call_id: None,
 			is_error: false,
+			usage: None,
 		}
 	}
 
@@ -448,6 +483,7 @@ impl Message {
 			tool_calls: Vec::new(),
 			tool_call_id: None,
 			is_error: false,
+			usage: None,
 		}
 	}
 
@@ -460,6 +496,7 @@ impl Message {
 			tool_calls,
 			tool_call_id: None,
 			is_error: false,
+			usage: None,
 		}
 	}
 
@@ -472,6 +509,7 @@ impl Message {
 			tool_calls: Vec::new(),
 			tool_call_id: Some(tool_call_id.into()),
 			is_error: false,
+			usage: None,
 		}
 	}
 
@@ -489,6 +527,7 @@ impl Message {
 			tool_calls: Vec::new(),
 			tool_call_id: Some(tool_call_id.into()),
 			is_error,
+			usage: None,
 		}
 	}
 	pub fn tool_with_status_and_parts(
@@ -506,6 +545,7 @@ impl Message {
 			tool_calls: Vec::new(),
 			tool_call_id: Some(tool_call_id.into()),
 			is_error,
+			usage: None,
 		}
 	}
 }
