@@ -21,6 +21,9 @@ pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 10_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeResult {
 	pub exit_code: Option<i32>,
+	/// Terminating signal on Unix; `None` when the child exited normally, was
+	/// killed by us, or the platform has no signal notion.
+	pub signal: Option<i32>,
 	pub timed_out: bool,
 	pub aborted: bool,
 }
@@ -45,6 +48,28 @@ fn bound(timeout_ms: Option<u64>, ceiling_ms: Option<u64>) -> Duration {
 	Duration::from_millis(requested.min(ceiling))
 }
 
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+	use std::os::unix::process::ExitStatusExt as _;
+	status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+	None
+}
+
+/// One human-readable outcome that separates a numeric exit from a signal
+/// death, so `SIGSYS` (Termux Bun without its compat preload) is not reported
+/// as an anonymous non-zero exit.
+fn describe_exit(result: &ProbeResult) -> String {
+	match (result.exit_code, result.signal) {
+		(Some(code), _) => format!("exit code {code}"),
+		(None, Some(signal)) => format!("signal {signal}"),
+		(None, None) => "unknown exit status".to_string(),
+	}
+}
+
 /// Spawn `command` detached from host stdio and wait for it under `options`.
 ///
 /// Returns `Err` only when the spawn itself fails (e.g. `ENOENT`); callers treat
@@ -61,7 +86,7 @@ pub async fn run_bounded_probe(
 		return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty probe command"));
 	};
 	if cancellation.is_cancelled() {
-		return Ok(ProbeResult { exit_code: None, timed_out: false, aborted: true });
+		return Ok(ProbeResult { exit_code: None, signal: None, timed_out: false, aborted: true });
 	}
 	let mut process = Command::new(program);
 	process
@@ -94,21 +119,22 @@ pub async fn run_bounded_probe(
 	match waited {
 		None => {
 			kill_tree(&mut child, pid).await;
-			Ok(ProbeResult { exit_code: None, timed_out: false, aborted: true })
+			Ok(ProbeResult { exit_code: None, signal: None, timed_out: false, aborted: true })
 		},
 		Some(Ok(Ok(status))) => Ok(ProbeResult {
 			exit_code: status.code(),
+			signal: exit_signal(&status),
 			timed_out: false,
 			aborted: false,
 		}),
 		Some(Ok(Err(_))) => {
 			// The child was reaped by someone else or the wait failed; treat as
 			// an unavailable candidate rather than a hard error.
-			Ok(ProbeResult { exit_code: None, timed_out: false, aborted: false })
+			Ok(ProbeResult { exit_code: None, signal: None, timed_out: false, aborted: false })
 		},
 		Some(Err(_)) => {
 			kill_tree(&mut child, pid).await;
-			Ok(ProbeResult { exit_code: None, timed_out: true, aborted: false })
+			Ok(ProbeResult { exit_code: None, signal: None, timed_out: true, aborted: false })
 		},
 	}
 }
@@ -162,8 +188,7 @@ pub async fn probe_candidates(
 				failures.push(format!("{} (probe timed out)", candidate.label));
 			},
 			Ok(result) => {
-				let code = result.exit_code.map_or_else(|| "signal".to_string(), |code| code.to_string());
-				failures.push(format!("{} (exit code {code})", candidate.label));
+				failures.push(format!("{} ({})", candidate.label, describe_exit(&result)));
 			},
 			Err(error) => failures.push(format!("{} ({error})", candidate.label)),
 		}
@@ -208,5 +233,40 @@ mod tests {
 		.await
 		.expect("spawn");
 		assert!(result.aborted);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn signalled_probe_reports_signal_not_exit_code() {
+		let result = run_bounded_probe(
+			&["sh".to_string(), "-c".to_string(), "kill -9 $$".to_string()],
+			Path::new("."),
+			&HashMap::new(),
+			&CancellationToken::new(),
+			Some(2_000),
+			None,
+		)
+		.await
+		.expect("spawn");
+		assert_eq!(result.exit_code, None);
+		assert_eq!(result.signal, Some(libc::SIGKILL));
+		assert!(!result.timed_out);
+		assert!(!result.aborted);
+	}
+
+	#[test]
+	fn diagnostic_separates_numeric_exit_from_signal() {
+		let outcome = |exit_code, signal| ProbeResult {
+			exit_code,
+			signal,
+			timed_out: false,
+			aborted: false,
+		};
+		let zero = describe_exit(&outcome(Some(0), None));
+		let one = describe_exit(&outcome(Some(1), None));
+		let signalled = describe_exit(&outcome(None, Some(31)));
+		assert!(zero.contains('0') && !zero.contains("signal"), "{zero}");
+		assert!(one.contains('1') && !one.contains("signal"), "{one}");
+		assert!(signalled.contains("31") && !signalled.contains("exit code"), "{signalled}");
 	}
 }

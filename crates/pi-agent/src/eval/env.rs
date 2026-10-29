@@ -73,7 +73,9 @@ const COMMON_ALLOW: &[&str] = &[
 
 const PY_ALLOW: &[&str] = &["CONDA_PREFIX", "CONDA_DEFAULT_ENV", "VIRTUAL_ENV", "PYTHONPATH"];
 const JL_ALLOW: &[&str] = &["DISPLAY", "XAUTHORITY"];
-const JS_ALLOW: &[&str] = &["BUN_INSTALL", "NODE_OPTIONS"];
+// `LD_PRELOAD` is loader-critical for Bun on Termux, where the installed
+// compat shim is injected by the user's ambient environment; it stays JS-only.
+const JS_ALLOW: &[&str] = &["BUN_INSTALL", "NODE_OPTIONS", "LD_PRELOAD"];
 
 static SECRET_REGEX: LazyLock<Regex> =
 	LazyLock::new(|| Regex::new(SECRET_PATTERN).expect("secret pattern is valid"));
@@ -346,6 +348,29 @@ mod tests {
 		assert!(!filtered.contains_key("PI_TOOL_BRIDGE_TOKEN"));
 		assert!(!filtered.contains_key("OPENAI_API_KEY"));
 		assert!(!filtered.contains_key("CUSTOM_TOKEN"));
+	}
+
+	#[test]
+	fn js_keeps_loader_preload_and_other_languages_drop_it() {
+		let base = env(&[
+			("PATH", "/bin"),
+			("LD_PRELOAD", "/lib/libomp-compat.so"),
+			("BUN_INSTALL", "/bun"),
+			("BUN_TOKEN", "secret"),
+			("OPENAI_API_KEY", "secret"),
+		]);
+		let js = filter_env(EvalLanguage::Js, &base);
+		assert_eq!(js.get("LD_PRELOAD").map(String::as_str), Some("/lib/libomp-compat.so"));
+		assert_eq!(js.get("BUN_INSTALL").map(String::as_str), Some("/bun"));
+		// Secret filtering still applies to the JS allow prefixes.
+		assert!(!js.contains_key("BUN_TOKEN"));
+		assert!(!js.contains_key("OPENAI_API_KEY"));
+		for language in [EvalLanguage::Py, EvalLanguage::Rb, EvalLanguage::Jl] {
+			assert!(
+				!filter_env(language, &base).contains_key("LD_PRELOAD"),
+				"{language:?} must not inherit the JS loader hook"
+			);
+		}
 	}
 
 	#[test]
