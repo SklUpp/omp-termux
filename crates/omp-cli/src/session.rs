@@ -1314,23 +1314,22 @@ impl SessionStore {
 		// assistant message also called a sibling tool. Production appends
 		// each later toolResult under the previous result, so parentage cannot
 		// identify the batch; tool-call ids are unique, so match by those.
-		let mut batch_call_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+		let mut batch_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 		for entry in self
 			.messages
 			.iter()
 			.filter(|entry| ids.contains(entry.id.as_str()) && entry.message.role == "assistant")
 		{
+			let parts = entry.message.content.parts();
 			batch_call_ids.extend(
-				entry
-					.message
-					.content
-					.parts()
+				parts
 					.iter()
 					.filter(|part| part.kind == "toolCall")
 					.filter_map(|part| {
 						part.extra
 							.get("id")
 							.and_then(serde_json::Value::as_str)
+							.map(str::to_string)
 					}),
 			);
 		}
@@ -1411,9 +1410,10 @@ impl SessionStore {
 			"attribution": "agent",
 		});
 		if !details.is_null()
+			&& details.is_object()
 			&& let Some(map) = extra.as_object_mut()
 		{
-			map.insert("details".to_string(), serde_json::Value::Object(details.clone()));
+			map.insert("details".to_string(), details.clone());
 		}
 		let parent_id = self.leaf_id().map(str::to_string);
 		self.append_entry(SessionEntry {

@@ -142,18 +142,32 @@ pub struct EditConfig {
 
 impl pi_agent::tools::edit_variants::EditModeSettings for Config {
 	fn get_edit_mode(&self) -> Option<&str> {
-		self.edit.mode.map(pi_agent::tools::edit_variants::EditMode::as_str)
+		self.edit.mode.map(EditMode::as_str)
 	}
 
 	fn get_edit_variant_for_model(
 		&self,
 		model: Option<&str>,
 	) -> Option<pi_agent::tools::edit_variants::EditMode> {
-		model.and_then(|model| self.edit.variant_for_model(model))
+		model
+			.and_then(|model| self.edit.variant_for_model(model))
+			.map(core_edit_mode)
 	}
 
 	fn get_read_line_numbers(&self) -> bool {
 		self.read_line_numbers()
+	}
+}
+
+/// CLI settings keep their own [`EditMode`]; map it onto the core wire enum at
+/// this boundary (same five variants, exhaustive so drift fails to compile).
+fn core_edit_mode(mode: EditMode) -> pi_agent::tools::edit_variants::EditMode {
+	match mode {
+		EditMode::Replace => pi_agent::tools::edit_variants::EditMode::Replace,
+		EditMode::Patch => pi_agent::tools::edit_variants::EditMode::Patch,
+		EditMode::Hashline => pi_agent::tools::edit_variants::EditMode::Hashline,
+		EditMode::ApplyPatch => pi_agent::tools::edit_variants::EditMode::ApplyPatch,
+		EditMode::Sloppy => pi_agent::tools::edit_variants::EditMode::Sloppy,
 	}
 }
 

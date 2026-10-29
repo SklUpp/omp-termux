@@ -214,7 +214,7 @@ impl CheckpointHost {
 					captured = true;
 				},
 				REWIND_TOOL_NAME => {
-					if let Some(report) = tool_report(details, &message.content) {
+					if let Some(report) = tool_report(details, &message.content.text()) {
 						self.controller.note_rewind_tool_result(&report);
 					}
 				},
@@ -336,7 +336,9 @@ impl CheckpointHost {
 		let pending = self.controller.pending_rewind()?;
 		*applied = true;
 		Some(InMemoryRewind {
-			keep: pending.checkpoint_message_count,
+			// The mirror cuts by checkpoint tool-call id, never by a stale
+			// live-loop position; zero only applies if that id is absent.
+			keep: 0,
 			checkpoint_tool_call_id: pending.checkpoint_tool_call_id,
 			summary: render_branch_summary_context(&pending.report),
 			report: render_rewind_report(&pending.report),
@@ -467,16 +469,15 @@ impl CheckpointHost {
 				// Same assistant batch, sibling results are not branch
 				// ancestors; replay them right after the call message.
 				if message.message.role == "assistant" {
-					let call_ids: std::collections::HashSet<&str> = message
-						.message
-						.content
-						.parts()
+					let parts = message.message.content.parts();
+					let call_ids: std::collections::HashSet<String> = parts
 						.iter()
 						.filter(|part| part.kind == "toolCall")
 						.filter_map(|part| {
 							part.extra
 								.get("id")
 								.and_then(Value::as_str)
+								.map(str::to_string)
 						})
 						.collect();
 					for sibling in store.messages().iter().filter(|sibling| {
@@ -536,10 +537,10 @@ impl CheckpointHost {
 	}
 }
 
-fn tool_report(details: Option<&Value>, content: &crate::session::MessageContent) -> Option<String> {
+fn tool_report(details: Option<&Value>, content: &str) -> Option<String> {
 	let report = match details.and_then(|details| details.get("report")).and_then(Value::as_str) {
 		Some(report) if !report.trim().is_empty() => report.trim().to_string(),
-		_ => content.text().trim().to_string(),
+		_ => content.trim().to_string(),
 	};
 	(!report.is_empty()).then_some(report)
 }

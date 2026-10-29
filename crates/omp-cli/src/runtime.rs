@@ -376,7 +376,8 @@ impl AgentRunner for PiAgentRunner {
 		let edit_options = EditToolOptions {
 			enforce_seen_lines: request.config.edit.enforce_seen_lines(),
 		};
-		let display_resolver = Arc::new(ConfigDisplayResolver::from_config(&request.config)?);
+		let display_resolver: Arc<dyn SessionDisplayResolver> =
+			Arc::new(ConfigDisplayResolver::from_config(&request.config)?);
 		let active_model = format!("{}/{}", plan.provider, plan.model);
 		let resolved_display =
 			display_resolver.resolve(Some(&active_model), plan.tools.contains(&"edit"));
