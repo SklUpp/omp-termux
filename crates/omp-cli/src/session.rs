@@ -11,6 +11,7 @@ use pi_agent::tools::todo::{TodoPhase, USER_TODO_EDIT_CUSTOM_TYPE};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::Event;
+use crate::goal::GOAL_COMPLETED_CUSTOM_TYPE;
 use crate::{dirs, output};
 
 /// Directory under the agent dir that holds CLI session logs.
@@ -1405,6 +1406,31 @@ impl SessionStore {
 			})
 	}
 
+	/// Last `mode_change` on the active branch as `(mode, data)` (TS
+	/// `buildSessionContext`'s `mode`/`modeData`). Only the active path counts,
+	/// so a session branched before a later transition restores the pre-branch
+	/// mode instead of the whole-file last entry. A missing mode yields `""`,
+	/// which no real mode matches; a `null` `data` is absent, like `undefined`.
+	#[must_use]
+	pub fn latest_mode_change(&self) -> Option<(&str, Option<&serde_json::Value>)> {
+		self.branch_entries().into_iter().rev().find_map(|entry| {
+			if entry.kind != "mode_change" {
+				return None;
+			}
+			Some((
+				entry
+					.extra
+					.get("mode")
+					.and_then(serde_json::Value::as_str)
+					.unwrap_or_default(),
+				entry
+					.extra
+					.get("data")
+					.filter(|data| !data.is_null()),
+			))
+		})
+	}
+
 	/// Active leaf: the last journal entry. Branching appends a
 	/// `branch_summary` whose `parentId` is the branch point, so the journal
 	/// order alone reconstructs the active path after reload (TS
@@ -1665,6 +1691,51 @@ impl SessionStore {
 			parent_id,
 			timestamp: output::iso8601(SystemTime::now()),
 			extra,
+		})?;
+		Ok(id)
+	}
+
+	/// TS `SessionManager.appendModeChange`: the generic mode lane
+	/// (`none`, `plan`, `vibe`, the goal modes). `data` is omitted when absent,
+	/// as `JSON.stringify` drops an `undefined` payload.
+	pub fn append_mode_change(
+		&mut self,
+		mode: &str,
+		data: Option<serde_json::Value>,
+	) -> Result<String, String> {
+		if mode.is_empty() {
+			return Err("cannot persist mode_change: mode unavailable".to_string());
+		}
+		let id = format!("entry-{}", output::session_id());
+		let mut extra = serde_json::Map::new();
+		extra.insert("mode".to_string(), serde_json::Value::String(mode.to_string()));
+		if let Some(data) = data.filter(|data| !data.is_null()) {
+			extra.insert("data".to_string(), data);
+		}
+		self.append_entry(SessionEntry {
+			kind: "mode_change".to_string(),
+			id: id.clone(),
+			parent_id: self.leaf_id().map(str::to_string),
+			timestamp: output::iso8601(SystemTime::now()),
+			extra: serde_json::Value::Object(extra),
+		})?;
+		Ok(id)
+	}
+
+	/// TS `appendCustomEntry("goal-completed", data)`: a `custom` entry (never
+	/// `custom_message`, so it does not replay into the model context) carrying
+	/// the terminal budget metric of an exited goal.
+	pub fn append_goal_completed(&mut self, data: serde_json::Value) -> Result<String, String> {
+		let id = format!("entry-{}", output::session_id());
+		self.append_entry(SessionEntry {
+			kind: "custom".to_string(),
+			id: id.clone(),
+			parent_id: self.leaf_id().map(str::to_string),
+			timestamp: output::iso8601(SystemTime::now()),
+			extra: serde_json::json!({
+				"customType": GOAL_COMPLETED_CUSTOM_TYPE,
+				"data": data,
+			}),
 		})?;
 		Ok(id)
 	}
