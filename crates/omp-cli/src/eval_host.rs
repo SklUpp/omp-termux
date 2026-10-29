@@ -621,12 +621,12 @@ mod tests {
 			))
 		}
 
-		fn stream(
+		async fn stream(
 			&self,
 			_messages: &[Message],
 			_tools: &[Value],
 			_tool_choice: &ToolChoice,
-		) -> pi_agent::provider::ChunkStream {
+		) -> Result<pi_agent::provider::ChunkStream, pi_agent::provider::ProviderError> {
 			Err(pi_agent::provider::ProviderError::Protocol(
 				"test provider cannot stream".to_string(),
 			))
@@ -740,12 +740,12 @@ mod tests {
 		let root = temp_dir("omp-eval-artifacts");
 		let directory = root.join("session");
 		std::fs::create_dir_all(&directory).expect("session dir");
-		let host = Arc::new(host(Some(directory.clone())));
+		let session_host = Arc::new(host(Some(directory.clone())));
 		// Pre-existing artifact must never be overwritten and drives the scan.
 		std::fs::write(directory.join("4.eval.log"), b"old").expect("seed artifact");
 		let (first, second) = tokio::join!(
-			host.write_artifact("eval", b"first"),
-			host.write_artifact("eval", b"second")
+			session_host.write_artifact("eval", b"first"),
+			session_host.write_artifact("eval", b"second")
 		);
 		let first = first.expect("first").expect("available");
 		let second = second.expect("second").expect("available");
@@ -863,12 +863,12 @@ mod tests {
 			std::future::pending().await
 		}
 
-		fn stream(
+		async fn stream(
 			&self,
 			_messages: &[Message],
 			_tools: &[Value],
 			_tool_choice: &ToolChoice,
-		) -> pi_agent::provider::ChunkStream {
+		) -> Result<pi_agent::provider::ChunkStream, pi_agent::provider::ProviderError> {
 			Err(pi_agent::provider::ProviderError::Protocol(
 				"test provider cannot stream".to_string(),
 			))
