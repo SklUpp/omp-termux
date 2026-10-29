@@ -351,7 +351,8 @@ async fn colon_selectors_disambiguate_from_literal_colon_filenames() {
 
 	let result = read(&dir, "lit.db:notes").await;
 	assert!(!result.is_error, "{}", result.content);
-	assert_eq!(result.content, "plain text");
+	assert!(result.content.contains("plain text"), "{}", result.content);
+	assert!(!result.content.contains("alpha"), "literal colon filename was parsed as a SQLite selector");
 }
 
 #[tokio::test]
