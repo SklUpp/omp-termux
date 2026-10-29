@@ -4352,19 +4352,17 @@ mod tests {
 
 				let resp = serde_json::json!({
 					"id": "cmpl-img",
-					"object": "chat.completion",
+					"object": "chat.completion.chunk",
 					"created": 1,
 					"model": "vision-model",
 					"choices": [{
 						"index": 0,
-						"message": { "role": "assistant", "content": "I see the chart" },
-						"finish_reason": "stop"
+						"delta": { "role": "assistant", "content": "I see the chart" },
+						"finish_reason": null
 					}]
 				}).to_string();
 				let http_resp = format!(
-					"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-					resp.len(),
-					resp
+					"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {resp}\n\ndata: [DONE]\n\n"
 				);
 				stream
 					.write_all(http_resp.as_bytes())
