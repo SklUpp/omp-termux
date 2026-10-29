@@ -627,7 +627,7 @@ fn parse_selector(sub_path: &str, query_string: &str) -> ReadResult<SqliteSelect
 	if has_query_params {
 		for key_name in params.keys() {
 			if !matches!(key_name, "limit" | "offset" | "order" | "where") {
-				return Err(format!("Unsupported SQLite query parameter '{key_name}'"));
+				return Err(format!("Unsupported SQLite query parameter '{key_name}'").into());
 			}
 		}
 		return Ok(SqliteSelector::Query {
@@ -640,7 +640,7 @@ fn parse_selector(sub_path: &str, query_string: &str) -> ReadResult<SqliteSelect
 	}
 
 	if let Some(key_name) = params.keys().next() {
-		return Err(format!("Unsupported SQLite query parameter '{key_name}'"));
+		return Err(format!("Unsupported SQLite query parameter '{key_name}'").into());
 	}
 
 	Ok(SqliteSelector::Schema { table: table.to_string(), sample_limit: DEFAULT_SCHEMA_SAMPLE_LIMIT })
