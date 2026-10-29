@@ -13,8 +13,10 @@ use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+	dap::DapTool,
 	eval::EvalToolBinder,
 	loop_module::SteeringEvent,
+	lsp::LspTool,
 	mailbox::Mailbox,
 	provider::ModelProvider,
 	state::{StagedPreviewPolicy, ToolApprover},
@@ -29,6 +31,27 @@ use crate::{
 		task_catalog::AgentCatalog,
 	},
 };
+
+/// Settings a child's isolated `lsp`/`debug` instances inherit from the root.
+///
+/// Root instances live in the supervisor template and hold the runner's shared
+/// LSP ownership scope and DAP session tree. A child must not see, drive, or
+/// terminate the parent's debuggee and must not keep the parent's owned LSP
+/// processes alive, so [`Supervisor::child_registry_unbound`] swaps in fresh
+/// instances built from these values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildToolSettings {
+	/// `lsp.shared`: children use the same broker transport preference.
+	pub lsp_shared:       bool,
+	/// `tools.maxTimeout` ceiling handed to the child debug tool.
+	pub debug_max_timeout: Option<u64>,
+}
+
+impl Default for ChildToolSettings {
+	fn default() -> Self {
+		Self { lsp_shared: true, debug_max_timeout: None }
+	}
+}
 
 /// Settled job records stay inspectable for five minutes (TypeScript
 /// `DEFAULT_RETENTION_MS`), with a hard count cap so a long-lived REPL session
@@ -237,6 +260,10 @@ pub struct Supervisor {
 	/// Host-mounted eval tool factory. Root binds after the final registry is
 	/// assembled; children bind per owner so each gets a fresh eval session.
 	eval_binder: Mutex<Option<Arc<dyn EvalToolBinder>>>,
+	/// Settings for child-scoped `lsp`/`debug` instances (see
+	/// [`ChildToolSettings`]). Set by the host from `lsp.shared` and
+	/// `tools.maxTimeout` on every root turn.
+	child_tool_settings: Mutex<ChildToolSettings>,
 	process_root: PathBuf,
 	/// Runner-unique prefix for backend-visible process owners. UI ids such as
 	/// `task-1` repeat across concurrent CLIs; process scoping must not.
@@ -319,6 +346,7 @@ impl Supervisor {
 			agent_catalog: Mutex::new(None),
 			processes: Mutex::new(None),
 			eval_binder: Mutex::new(None),
+			child_tool_settings: Mutex::new(ChildToolSettings::default()),
 			process_root: {
 				std::env::temp_dir()
 					.join(format!("omp-agent-processes-{}-{scope}", std::process::id()))
@@ -369,6 +397,22 @@ impl Supervisor {
 			.agent_catalog
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner()) = Some(catalog);
+	}
+
+	/// Record the settings isolated child `lsp`/`debug` instances inherit.
+	pub fn set_child_tool_settings(&self, settings: ChildToolSettings) {
+		*self
+			.child_tool_settings
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = settings;
+	}
+
+	#[must_use]
+	pub fn child_tool_settings(&self) -> ChildToolSettings {
+		*self
+			.child_tool_settings
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
 	}
 
 	#[must_use]
@@ -943,6 +987,20 @@ impl Supervisor {
 		}
 		reg.register(Arc::new(YieldTool::new()));
 		reg.register(Arc::new(ThinkTool::new()));
+		// The template's `lsp`/`debug` instances belong to the root: the LSP tool
+		// holds the root's shared ownership scope and the debug tool the root's
+		// session tree. A child must neither drive the parent's debuggee nor keep
+		// the parent's owned LSP servers open, so it gets isolated instances with
+		// the same settings (`lsp.shared`, `tools.maxTimeout`).
+		let child_tools = self.child_tool_settings();
+		if reg.get("lsp").is_some() {
+			reg.remove("lsp");
+			reg.register(Arc::new(LspTool::with_shared(child_tools.lsp_shared)));
+		}
+		if reg.get("debug").is_some() {
+			reg.remove("debug");
+			reg.register(Arc::new(DapTool::new().with_max_timeout(child_tools.debug_max_timeout)));
+		}
 		// Add eval before the task tool filters the child allowlist, so `eval`
 		// is matched by internal registry key. `rebind_session_tools` replaces
 		// it once the child's fresh session tools exist.
@@ -1413,6 +1471,76 @@ mod process_wiring_tests {
 		let first = one.process_owner(Some("task-1"));
 		assert_eq!(first, Some(format!("{}:task-1", one.process_owner_ns)));
 		assert_ne!(first, two.process_owner(Some("task-1")));
+	}
+
+	#[test]
+	fn child_registry_gets_isolated_lsp_scope_and_debug_tree() {
+		let mut template = ToolRegistry::new();
+		template.register(Arc::new(LspTool::with_shared(false)));
+		template.register(Arc::new(DapTool::new()));
+		let supervisor = Supervisor::with_selection(
+			template.clone(),
+			Arc::new(QuietProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			true,
+		);
+		supervisor.set_child_tool_settings(ChildToolSettings {
+			lsp_shared:     true,
+			debug_max_timeout: Some(45),
+		});
+
+		let root_lsp = template.get("lsp").expect("template lsp");
+		let root_debug = template.get("debug").expect("template debug");
+		let first = supervisor.child_registry(1, Some("task-1"));
+		let first_lsp = first.get("lsp").expect("child lsp");
+		let first_debug = first.get("debug").expect("child debug");
+		assert!(
+			!Arc::ptr_eq(&root_lsp, &first_lsp),
+			"a child must not join the root LSP ownership scope"
+		);
+		assert!(
+			!Arc::ptr_eq(&root_debug, &first_debug),
+			"a child must not see or terminate the root debug session tree"
+		);
+
+		let second = supervisor.child_registry(1, Some("task-2"));
+		let second_debug = second.get("debug").expect("second child debug");
+		assert!(
+			!Arc::ptr_eq(&first_debug, &second_debug),
+			"sibling children must not share one debug session tree"
+		);
+	}
+
+	#[test]
+	fn root_registry_keeps_the_template_lsp_scope_and_debug_tree() {
+		let mut template = ToolRegistry::new();
+		template.register(Arc::new(LspTool::with_shared(true)));
+		template.register(Arc::new(DapTool::new()));
+		let supervisor = Supervisor::with_selection(
+			template.clone(),
+			Arc::new(QuietProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			true,
+		);
+		let root = supervisor.root_registry();
+		assert!(
+			Arc::ptr_eq(
+				&template.get("debug").expect("template debug"),
+				&root.get("debug").expect("root debug"),
+			),
+			"root turns must keep one debug session tree"
+		);
+		assert!(
+			Arc::ptr_eq(
+				&template.get("lsp").expect("template lsp"),
+				&root.get("lsp").expect("root lsp"),
+			),
+			"root turns must keep one LSP ownership scope"
+		);
 	}
 
 	#[tokio::test]

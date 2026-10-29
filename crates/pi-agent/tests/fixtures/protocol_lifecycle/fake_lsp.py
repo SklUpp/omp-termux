@@ -105,6 +105,35 @@ def main():
             continue
         elif method == "test/crash":
             os._exit(3)
+        elif method == "textDocument/hover":
+            position = params.get("position") or {}
+            respond(
+                message,
+                {
+                    "contents": {
+                        "kind": "markdown",
+                        "value": "fixture hover at line %s" % position.get("line", 0),
+                    }
+                },
+            )
+        elif method == "textDocument/rename":
+            document = params.get("textDocument") or {}
+            respond(
+                message,
+                {
+                    "changes": {
+                        document.get("uri", ""): [
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 5},
+                                },
+                                "newText": params.get("newName", ""),
+                            }
+                        ]
+                    }
+                },
+            )
         elif method in ("textDocument/didOpen", "textDocument/didChange"):
             document = params.get("textDocument") or {}
             version = document.get("version", 1)

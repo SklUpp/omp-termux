@@ -1,15 +1,16 @@
 //! Native LSP stack for the Rust agent.
 //!
-//! Module seam for parent integration (already declared as `pub mod lsp;`):
-//! - register `Arc::new(crate::lsp::LspTool::with_shared(shared))` behind the
-//!   existing `lsp.enabled` gate in the tool registry
-//! - call `crate::lsp::client::get_config(cwd)` for cached configuration and
-//!   `crate::lsp::client::shutdown_all()` on session teardown
-//! - map `lsp.shared` to `LspTool::with_shared(bool)`; the mux daemon itself is
-//!   the hidden CLI worker `omp __omp_worker_lsp_mux` (see [`mux::worker`])
+//! Port of `packages/coding-agent/src/lsp/*`. The CLI mounts [`LspTool`] behind
+//! `lsp.enabled`; `lsp.shared` selects [`LspSession`]'s broker transport.
 //!
-//! The module tree can be compiled and reviewed on its own; only the `lib.rs`
-//! declaration, the tool registration, and the CLI worker hunk live outside it.
+//! Ownership is explicit because the client registry is process-global: every
+//! acquisition through [`get_or_create_client_for`] records the calling
+//! [`LspSession`], and only the last owner to release closes the connection.
+//! Root turns share the runner's session, children own theirs, and a shared mux
+//! server is never killed — the broker answers `shutdown` and `exit` closes
+//! just that link. The mux daemon is the hidden CLI worker
+//! `omp __omp_worker_lsp_mux` (see [`mux::worker`]).
+//!
 //! See `docs/tools/lsp.md`.
 
 pub mod client;
@@ -28,8 +29,10 @@ pub mod workspace_diagnostics;
 pub mod yaml;
 
 pub use client::{
-	get_active_clients, get_config, get_or_create_client, shutdown_all, LspClient, LspError,
+	get_active_clients, get_config, get_or_create_client, get_or_create_client_for, shutdown_all,
+	LspClient, LspError, LspSession,
 };
 pub use config::load_config;
 pub use mux::worker::{run_mux_worker, run_mux_worker_blocking};
 pub use tool::LspTool;
+pub use types::{is_readonly_action as is_readonly_lsp_action, LSP_READONLY_ACTIONS};

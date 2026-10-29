@@ -24,9 +24,10 @@ use crate::{
 
 use super::{
 	client::{
-		self, clear_initialization_failure, get_active_clients, get_config, get_or_create_client,
-		ensure_file_open, refresh_file, reload_server, shutdown_stale_clients,
-		wait_for_diagnostics, wait_for_project_loaded, LspClient, LspError, WaitDiagnosticsOptions,
+		self, clear_initialization_failure, get_active_clients, get_config,
+		get_or_create_client_for, ensure_file_open, refresh_file, reload_server,
+		shutdown_stale_clients, wait_for_diagnostics, wait_for_project_loaded, LspClient, LspError,
+		LspSession, WaitDiagnosticsOptions,
 	},
 	config::{
 		get_lsp_server_for_file, get_lsp_servers, get_lsp_servers_for_file, get_servers_for_file,
@@ -171,7 +172,10 @@ fn lsp_error_text(error: &LspError) -> String {
 // =============================================================================
 
 pub struct LspTool {
-	shared_mux: bool,
+	/// Ownership scope over the process-wide client registry. Root turns share
+	/// the runner's scope (`RunnerSession`), children get their own, so a
+	/// teardown never closes a server another session still uses.
+	session: Arc<LspSession>,
 }
 
 impl Default for LspTool {
@@ -184,7 +188,7 @@ impl LspTool {
 	/// Tool with the default `lsp.shared = true` transport preference.
 	#[must_use]
 	pub fn new() -> Self {
-		Self { shared_mux: true }
+		Self { session: LspSession::new(true) }
 	}
 
 	/// Tool whose clients prefer (`true`) or avoid (`false`) the broker mux.
@@ -195,7 +199,22 @@ impl LspTool {
 	/// cleanup, so concurrent sessions with different settings stay isolated.
 	#[must_use]
 	pub fn with_shared(shared_mux: bool) -> Self {
-		Self { shared_mux }
+		Self { session: LspSession::new(shared_mux) }
+	}
+
+	/// Tool that joins an existing ownership scope.
+	///
+	/// The runner rebuilds its registry every prompt but must keep one LSP
+	/// session across turns, exactly like snapshots and the `EditTool` state.
+	#[must_use]
+	pub fn with_session(session: Arc<LspSession>) -> Self {
+		Self { session }
+	}
+
+	/// Ownership scope this tool claims clients under.
+	#[must_use]
+	pub fn session(&self) -> &Arc<LspSession> {
+		&self.session
 	}
 }
 
@@ -538,7 +557,7 @@ impl LspTool {
 			}
 			return result;
 		}
-		let client = get_or_create_client(server_config, cwd, None, &run.cancel, self.shared_mux).await?;
+		let client = get_or_create_client_for(&self.session, server_config, cwd, None, &run.cancel).await?;
 		if server_config.is_project_aware() {
 			wait_for_project_loaded(&client, &run.cancel, Some(absolute_path)).await;
 		}
@@ -591,10 +610,10 @@ impl LspTool {
 			));
 		};
 		if normalized == "reload" {
-			clear_initialization_failure(&server_config, cwd, self.shared_mux);
+			clear_initialization_failure(&server_config, cwd, self.session.shared_mux());
 		}
 
-		let client = match get_or_create_client(&server_config, cwd, None, &run.cancel, self.shared_mux).await {
+		let client = match get_or_create_client_for(&self.session, &server_config, cwd, None, &run.cancel).await {
 			Ok(client) => client,
 			Err(LspError::Cancelled) => return Err(run.abort_error(normalized, Some(&server_name))),
 			Err(error) => {
@@ -990,7 +1009,7 @@ impl LspTool {
 		}
 		let config = get_config(cwd);
 		let servers = get_servers_for_file(&config, &resolved);
-		let (status, _formatted) = diagnostics::format_file(&resolved, cwd, &servers, &run.cancel, self.shared_mux)
+		let (status, _formatted) = diagnostics::format_file(&resolved, cwd, &servers, &run.cancel, &self.session)
 			.await
 			.map_err(ToolError::ExecutionFailed)?;
 		if run.cancel.is_cancelled() {
@@ -1124,7 +1143,7 @@ impl LspTool {
 		let mut hard_failures = Vec::new();
 
 		for (server_name, server_config) in &servers {
-			let client = match get_or_create_client(server_config, cwd, None, &run.cancel, self.shared_mux).await {
+			let client = match get_or_create_client_for(&self.session, server_config, cwd, None, &run.cancel).await {
 				Ok(client) => client,
 				Err(LspError::Cancelled) => return Err(run.abort_error(action, Some(server_name))),
 				Err(error) => {
@@ -1298,7 +1317,7 @@ impl LspTool {
 		summary.push(format!("  Renamed {source_label} → {dest_label}"));
 
 		for (server_name, server_config) in &servers {
-			let client = match get_or_create_client(server_config, cwd, None, &run.cancel, self.shared_mux).await {
+			let client = match get_or_create_client_for(&self.session, server_config, cwd, None, &run.cancel).await {
 				Ok(client) => client,
 				Err(error) => {
 					server_notes.push(format!("  {server_name}: {error}"));
@@ -1371,7 +1390,7 @@ impl LspTool {
 			if run.cancel.is_cancelled() {
 				return Err(run.abort_error(action, Some(&server_name)));
 			}
-			match get_or_create_client(&server_config, cwd, None, &run.cancel, self.shared_mux).await {
+			match get_or_create_client_for(&self.session, &server_config, cwd, None, &run.cancel).await {
 				Ok(client) => {
 					responding.push(server_name.clone());
 					let capabilities = client.server_capabilities().unwrap_or_else(|| json!({}));
@@ -1468,7 +1487,7 @@ impl LspTool {
 			json!({})
 		};
 
-		let client = match get_or_create_client(&chosen_config, cwd, None, &run.cancel, self.shared_mux).await {
+		let client = match get_or_create_client_for(&self.session, &chosen_config, cwd, None, &run.cancel).await {
 			Ok(client) => client,
 			Err(LspError::Cancelled) => return Err(run.abort_error(action, Some(&chosen_name))),
 			Err(error) => {
@@ -1549,7 +1568,7 @@ impl LspTool {
 			if run.cancel.is_cancelled() {
 				return Err(run.abort_error(action, Some(server_name)));
 			}
-			let client = match get_or_create_client(server_config, cwd, None, &run.cancel, self.shared_mux).await {
+			let client = match get_or_create_client_for(&self.session, server_config, cwd, None, &run.cancel).await {
 				Ok(client) => client,
 				Err(LspError::Cancelled) => return Err(run.abort_error(action, Some(server_name))),
 				Err(error) => {
@@ -1633,7 +1652,7 @@ impl LspTool {
 		let config = get_config(cwd);
 		let servers: Vec<(String, ServerConfig)> = get_lsp_servers(&config);
 		let server_configs: Vec<ServerConfig> = servers.iter().map(|(_, server)| server.clone()).collect();
-		let stopped = shutdown_stale_clients(cwd, &server_configs, &run.cancel, self.shared_mux).await;
+		let stopped = shutdown_stale_clients(cwd, &server_configs, &run.cancel, self.session.shared_mux()).await;
 		let stopped = match stopped {
 			Ok(stopped) => stopped,
 			Err(LspError::Cancelled) => return Err(run.abort_error(action, None)),
@@ -1658,8 +1677,8 @@ impl LspTool {
 			if run.cancel.is_cancelled() {
 				return Err(run.abort_error(action, Some(&server_name)));
 			}
-			clear_initialization_failure(&server_config, cwd, self.shared_mux);
-			match get_or_create_client(&server_config, cwd, None, &run.cancel, self.shared_mux).await {
+			clear_initialization_failure(&server_config, cwd, self.session.shared_mux());
+			match get_or_create_client_for(&self.session, &server_config, cwd, None, &run.cancel).await {
 				Ok(client) => match reload_server(&client, &server_name, &run.cancel).await {
 					Ok(line) => outputs.push(line),
 					Err(LspError::Cancelled) => return Err(run.abort_error(action, Some(&server_name))),

@@ -22,10 +22,11 @@ use tokio_util::sync::CancellationToken;
 
 use pi_agent::{
 	dap::{
-		AttachOptions, ConnectMode, DapSessionManager, LaunchOptions, ResolvedAdapter, SessionStatus,
+		AttachOptions, ConnectMode, DapSessionManager, DapTool, LaunchOptions, ResolvedAdapter,
+		SessionStatus,
 	},
 	lsp::{
-		LspError,
+		LspError, LspSession, LspTool,
 		client::{
 			ClientStatus, ensure_file_open, get_active_clients, get_or_create_client, notify_saved,
 			shutdown_client_instance, sync_content,
@@ -34,6 +35,8 @@ use pi_agent::{
 		types::ServerConfig,
 		utils::file_to_uri,
 	},
+	state::AgentContext,
+	Tool,
 };
 
 // =============================================================================
@@ -918,6 +921,261 @@ async fn dap_fresh_manager_cannot_see_or_terminate_another_managers_session() {
 			.terminate(&cancel, Instant::now() + Duration::from_secs(5))
 			.await
 			.expect("parent terminate");
+	})
+	.await;
+}
+
+// =============================================================================
+// Tool-level mounting: the CLI's `lsp` / `debug` tools over the same fixtures
+// =============================================================================
+
+fn write_lsp_project(dir: &Path, python: &Path, script: &Path, log: &Path) {
+	let config = json!({
+		"servers": {
+			"fixture": {
+				"command": python.to_string_lossy(),
+				"args": [script.to_string_lossy(), log.to_string_lossy()],
+				"fileTypes": [".ltool"],
+				"rootMarkers": ["fixture-root"],
+				"languageId": "testlang",
+			}
+		}
+	});
+	std::fs::write(dir.join("lsp.json"), serde_json::to_string(&config).expect("lsp json"))
+		.expect("write lsp.json");
+	std::fs::write(dir.join("fixture-root"), "").expect("lsp root marker");
+}
+
+fn write_dap_project(dir: &Path, python: &Path, script: &Path, log: &Path) {
+	let config = json!({
+		"fixture": {
+			"command": python.to_string_lossy(),
+			"args": [
+				script.to_string_lossy(),
+				log.to_string_lossy(),
+				"protocol-fixture-sentinel"
+			],
+			"fileTypes": [".py"],
+			"rootMarkers": ["fixture-root"],
+			"launchDefaults": { "request": "launch" },
+			"connectMode": "stdio"
+		}
+	});
+	std::fs::write(dir.join("dap.json"), serde_json::to_string(&config).expect("dap json"))
+		.expect("write dap.json");
+	std::fs::write(dir.join("fixture-root"), "").expect("dap root marker");
+}
+
+#[tokio::test]
+async fn lsp_tool_hover_rename_and_owned_release() {
+	let Some(python) = require_python() else { return };
+	bounded("lsp tool", 40, async move {
+		let dir = TestDir::new("lsp-tool");
+		let log = dir.path().join("lsp.log");
+		write_lsp_project(dir.path(), &python, &fixture("fake_lsp.py"), &log);
+		let source = dir.path().join("sample.ltool");
+		std::fs::write(&source, "value = 1\n").expect("source file");
+
+		let session = LspSession::new(false);
+		let tool = LspTool::with_session(Arc::clone(&session));
+		let ctx = AgentContext::new(dir.path().to_path_buf());
+
+		let hover = tool
+			.execute(
+				&json!({"action": "hover", "file": "sample.ltool", "line": 1, "symbol": "value"}),
+				&ctx,
+			)
+			.await
+			.expect("hover");
+		assert!(!hover.is_error, "{}", hover.content);
+		assert!(hover.content.contains("fixture hover"), "{}", hover.content);
+
+		let rename = tool
+			.execute(
+				&json!({
+					"action": "rename",
+					"file": "sample.ltool",
+					"line": 1,
+					"symbol": "value",
+					"new_name": "renamed",
+				}),
+				&ctx,
+			)
+			.await
+			.expect("rename");
+		assert!(!rename.is_error, "{}", rename.content);
+		assert_eq!(
+			std::fs::read_to_string(&source).expect("source after rename"),
+			"renamed = 1\n",
+			"rename must apply the server's workspace edit"
+		);
+
+		let entries = read_log(&log);
+		for method in [
+			"initialize",
+			"textDocument/didOpen",
+			"textDocument/hover",
+			"textDocument/rename",
+		] {
+			assert!(incoming_index(&entries, method).is_some(), "missing {method} on the wire");
+		}
+
+		// Runner teardown: this session owns the private fixture server, so
+		// release sends shutdown + exit and the client leaves the registry.
+		session.release().await;
+		assert!(
+			wait_until(Duration::from_secs(5), || {
+				read_log(&log)
+					.iter()
+					.any(|entry| entry["dir"] == "in" && entry["msg"]["method"] == "shutdown")
+			})
+			.await,
+			"release must send shutdown"
+		);
+		assert!(
+			wait_until(Duration::from_secs(5), || {
+				read_log(&log).iter().any(|entry| entry["dir"] == "in" && entry["msg"]["method"] == "exit")
+			})
+			.await,
+			"release must send exit"
+		);
+		assert!(
+			wait_until(Duration::from_secs(5), || {
+				get_active_clients()
+					.iter()
+					.all(|client| !client.file_types.iter().any(|kind| kind == ".ltool"))
+			})
+			.await,
+			"released client must leave the registry"
+		);
+	})
+	.await;
+}
+
+#[tokio::test]
+async fn lsp_scope_keeps_a_client_another_owner_still_uses() {
+	let Some(python) = require_python() else { return };
+	bounded("lsp scope refcount", 40, async move {
+		let dir = TestDir::new("lsp-scope");
+		let log = dir.path().join("lsp.log");
+		write_lsp_project(dir.path(), &python, &fixture("fake_lsp.py"), &log);
+		std::fs::write(dir.path().join("sample.ltool"), "value = 1\n").expect("source file");
+
+		let root = LspSession::new(false);
+		let child = LspSession::new(false);
+		let root_tool = LspTool::with_session(Arc::clone(&root));
+		let child_tool = LspTool::with_session(Arc::clone(&child));
+		let ctx = AgentContext::new(dir.path().to_path_buf());
+		let hover = json!({"action": "hover", "file": "sample.ltool", "line": 1, "symbol": "value"});
+
+		root_tool.execute(&hover, &ctx).await.expect("root hover");
+		child_tool.execute(&hover, &ctx).await.expect("child hover");
+		assert_eq!(
+			get_active_clients()
+				.iter()
+				.filter(|client| client.file_types.iter().any(|kind| kind == ".ltool"))
+				.count(),
+			1,
+			"same command+cwd identity must reuse one client"
+		);
+
+		// The child finishes first: the root still owns the client.
+		child.release().await;
+		let still_there = root_tool
+			.execute(&hover, &ctx)
+			.await
+			.expect("hover after sibling release");
+		assert!(!still_there.is_error, "{}", still_there.content);
+		assert!(
+			!read_log(&log).iter().any(|entry| entry["dir"] == "in" && entry["msg"]["method"] == "shutdown"),
+			"a sibling release must not shut down a client another owner uses"
+		);
+
+		root.release().await;
+		assert!(
+			wait_until(Duration::from_secs(5), || {
+				read_log(&log)
+					.iter()
+					.any(|entry| entry["dir"] == "in" && entry["msg"]["method"] == "shutdown")
+			})
+			.await,
+			"the last owner releases the client"
+		);
+	})
+	.await;
+}
+
+#[tokio::test]
+async fn debug_tool_shares_root_session_and_isolates_children() {
+	let Some(python) = require_python() else { return };
+	bounded("debug tool", 40, async move {
+		let dir = TestDir::new("debug-tool");
+		let log = dir.path().join("dap.log");
+		write_dap_project(dir.path(), &python, &fixture("fake_dap.py"), &log);
+		std::fs::write(dir.path().join("main.py"), "print(1)\n").expect("program");
+
+		let manager = DapSessionManager::new();
+		let tool = DapTool::shared(manager.clone());
+		let ctx = AgentContext::new(dir.path().to_path_buf());
+		let launch = tool
+			.execute(
+				&json!({
+					"action": "launch",
+					"adapter": "fixture",
+					"program": "main.py",
+					"timeout": 10,
+				}),
+				&ctx,
+			)
+			.await
+			.expect("launch");
+		assert!(!launch.is_error, "{}", launch.content);
+		assert!(launch.content.contains("main.py"), "{}", launch.content);
+
+		let threads = tool.execute(&json!({"action": "threads"}), &ctx).await.expect("threads");
+		assert!(threads.content.contains("main"), "{}", threads.content);
+
+		// The registry is rebuilt every root turn; the next turn's tool joins the
+		// same manager and still sees the live debuggee.
+		let next_turn = DapTool::shared(manager.clone());
+		let sessions = next_turn
+			.execute(&json!({"action": "sessions"}), &ctx)
+			.await
+			.expect("sessions");
+		assert!(!sessions.content.contains("No debug sessions"), "{}", sessions.content);
+
+		// A child's fresh manager can neither see nor terminate the root tree.
+		let child = DapTool::new();
+		let child_sessions = child
+			.execute(&json!({"action": "sessions"}), &ctx)
+			.await
+			.expect("child sessions");
+		assert!(child_sessions.content.contains("No debug sessions"), "{}", child_sessions.content);
+		let child_terminate = child
+			.execute(&json!({"action": "terminate"}), &ctx)
+			.await
+			.expect("child terminate");
+		assert!(
+			child_terminate.content.contains("No debug session"),
+			"{}",
+			child_terminate.content
+		);
+		assert_eq!(manager.list_sessions().len(), 1, "root debuggee must survive a child terminate");
+
+		let terminate = next_turn
+			.execute(&json!({"action": "terminate"}), &ctx)
+			.await
+			.expect("terminate");
+		assert!(terminate.content.contains("terminated"), "{}", terminate.content);
+		assert!(manager.list_sessions().is_empty(), "terminate disposes the root tree");
+
+		let entries = read_log(&log);
+		for command in ["initialize", "launch", "configurationDone", "threads", "terminate"] {
+			assert!(
+				incoming_request_index(&entries, command).is_some(),
+				"missing {command} on the DAP wire"
+			);
+		}
 	})
 	.await;
 }

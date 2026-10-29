@@ -378,6 +378,30 @@ pub struct DapSessionManager {
 	inner: Arc<ManagerInner>,
 }
 
+/// A dropped manager must not leave adapters running. The root runner
+/// terminates its active tree explicitly before dropping; this covers child
+/// agents and abort paths where no teardown code runs.
+impl Drop for ManagerInner {
+	fn drop(&mut self) {
+		let sessions: Vec<Arc<DapSession>> = {
+			let mut guard = lock(&self.sessions);
+			std::mem::take(&mut *guard).into_values().collect()
+		};
+		if sessions.is_empty() {
+			return;
+		}
+		// `Drop` cannot await. With a live runtime the transports are disposed
+		// detached; without one the adapters' `kill_on_drop` handles still apply.
+		if let Ok(handle) = tokio::runtime::Handle::try_current() {
+			handle.spawn(async move {
+				for session in sessions.into_iter().rev() {
+					session.client.dispose().await;
+				}
+			});
+		}
+	}
+}
+
 impl Default for DapSessionManager {
 	fn default() -> Self {
 		Self::new()
@@ -405,10 +429,15 @@ impl DapSessionManager {
 	}
 
 	fn start_cleanup_timer(&self) {
-		if self.inner.cleanup_started.swap(true, Ordering::SeqCst) {
+		if self.inner.cleanup_started.load(Ordering::SeqCst) {
 			return;
 		}
+		// A manager can be constructed outside a runtime (runner setup); do not
+		// mark the timer as started until there is a runtime to run it on.
 		if tokio::runtime::Handle::try_current().is_err() {
+			return;
+		}
+		if self.inner.cleanup_started.swap(true, Ordering::SeqCst) {
 			return;
 		}
 		let weak = Arc::downgrade(&self.inner);
@@ -469,6 +498,9 @@ impl DapSessionManager {
 		deadline: Instant,
 	) -> Result<SessionSummary, DapError> {
 		self.ensure_launch_slot().await?;
+		// The manager can be constructed outside a runtime (runner setup); start
+		// idle cleanup on the first session so stale adapters are still reaped.
+		self.start_cleanup_timer();
 		let client = DapClient::spawn(&options.adapter, &options.cwd, &options.env).await?;
 		let session = self.register(
 			client,
@@ -494,6 +526,9 @@ impl DapSessionManager {
 		deadline: Instant,
 	) -> Result<SessionSummary, DapError> {
 		self.ensure_launch_slot().await?;
+		// The manager can be constructed outside a runtime (runner setup); start
+		// idle cleanup on the first session so stale adapters are still reaped.
+		self.start_cleanup_timer();
 		let client = DapClient::spawn(&options.adapter, &options.cwd, &options.env).await?;
 		let session = self.register(
 			client,

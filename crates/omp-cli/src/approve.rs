@@ -137,6 +137,30 @@ pub fn classify_tool(name: &str, args: &serde_json::Value) -> ToolTier {
 		// dispatch stays Read like `write`.
 		"ast_edit" => ToolTier::Write,
 		"bash" => ToolTier::Exec,
+		// Upstream classifies LSP per action: rename/reload/raw `request`/format
+		// mutate state, so they need explicit approval even though the tool is
+		// mostly read-only.
+		"lsp" => {
+			let action = args
+				.get("action")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_ascii_lowercase();
+			if pi_agent::lsp::is_readonly_lsp_action(&action) {
+				ToolTier::Read
+			} else {
+				ToolTier::Write
+			}
+		},
+		// Debug mutate/debuggee actions are exec-tier, matching `debug.ts`.
+		"debug" => {
+			let action = args.get("action").and_then(|v| v.as_str()).unwrap_or_default();
+			if pi_agent::dap::is_readonly_action(action) {
+				ToolTier::Read
+			} else {
+				ToolTier::Exec
+			}
+		},
 		// MCP tools and unknown tools default to conservative Exec
 		_ => ToolTier::Exec,
 	}
@@ -156,6 +180,26 @@ pub fn extract_tool_detail(name: &str, args: &serde_json::Value) -> Option<Strin
 		}),
 		"write" | "edit" | "read" => {
 			args.get("path").and_then(|v| v.as_str()).map(|p| p.trim().to_string())
+		},
+		// Upstream `formatApprovalDetails`: the action (and file/target) is what
+		// the operator needs to judge an `lsp`/`debug` prompt.
+		"lsp" => {
+			let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("(missing)");
+			match args.get("file").and_then(|v| v.as_str()).filter(|file| !file.is_empty()) {
+				Some(file) => Some(format!("action: {action}, file: {file}")),
+				None => Some(format!("action: {action}")),
+			}
+		},
+		"debug" => {
+			let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("(missing)");
+			match args
+				.get("program")
+				.and_then(|v| v.as_str())
+				.filter(|program| !program.is_empty())
+			{
+				Some(program) => Some(format!("action: {action}, program: {program}")),
+				None => Some(format!("action: {action}")),
+			}
 		},
 		_ => None,
 	}
@@ -498,6 +542,57 @@ mod tests {
 		);
 		assert_eq!(classify_tool("bash", &json!({"command": "ls"})), ToolTier::Exec);
 		assert_eq!(classify_tool("mcp__server_tool", &json!({})), ToolTier::Exec);
+
+		// LSP is per action: reads stay auto in the read tier, rename/format/raw
+		// request need explicit approval.
+		for action in [
+			"diagnostics",
+			"definition",
+			"type_definition",
+			"implementation",
+			"references",
+			"hover",
+			"symbols",
+			"status",
+			"capabilities",
+		] {
+			assert_eq!(
+				classify_tool("lsp", &json!({"action": action})),
+				ToolTier::Read,
+				"lsp action {action}"
+			);
+		}
+		for action in ["rename", "rename_file", "format", "reload", "request", "code_actions"] {
+			assert_eq!(
+				classify_tool("lsp", &json!({"action": action})),
+				ToolTier::Write,
+				"lsp action {action}"
+			);
+		}
+		// Debug mutates the debuggee or session: exec tier except pure reads.
+		for action in ["output", "threads", "stack_trace", "scopes", "variables", "sessions"] {
+			assert_eq!(
+				classify_tool("debug", &json!({"action": action})),
+				ToolTier::Read,
+				"debug action {action}"
+			);
+		}
+		for action in ["launch", "attach", "continue", "evaluate", "set_breakpoint", "terminate"] {
+			assert_eq!(
+				classify_tool("debug", &json!({"action": action})),
+				ToolTier::Exec,
+				"debug action {action}"
+			);
+		}
+
+		assert_eq!(
+			extract_tool_detail("lsp", &json!({"action": "rename", "file": "src/lib.rs"})),
+			Some("action: rename, file: src/lib.rs".to_string())
+		);
+		assert_eq!(
+			extract_tool_detail("debug", &json!({"action": "launch", "program": "./app"})),
+			Some("action: launch, program: ./app".to_string())
+		);
 
 		// Tier decisions
 		let write_mode = approvals(ApprovalMode::Write, &[]);

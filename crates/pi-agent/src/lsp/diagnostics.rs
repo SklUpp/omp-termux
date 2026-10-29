@@ -4,7 +4,7 @@
 //! `format-options.ts`. Each server pipeline is bounded by a wall-clock budget
 //! so a wedged server cannot hold an edit or diagnostics request forever.
 
-use std::{collections::HashSet, path::Path, time::Duration};
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
 use futures::future::join_all;
 use serde_json::json;
@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use super::{
 	editorconfig::get_editor_config_formatting,
 	client::{
-		self, ensure_file_open, get_or_create_client, wait_for_diagnostics,
-		wait_for_project_loaded, LspClient, LspError, WaitDiagnosticsOptions,
+		self, ensure_file_open, get_or_create_client_for, wait_for_diagnostics,
+		wait_for_project_loaded, LspClient, LspError, LspSession, WaitDiagnosticsOptions,
 	},
 	config::has_root_marker_ancestor,
 	linter,
@@ -64,7 +64,7 @@ pub async fn capture_diagnostic_versions(
 	servers: &[(String, ServerConfig)],
 	init_timeout: Option<Duration>,
 	cancel: &CancellationToken,
-	shared_mux: bool,
+	session: &Arc<LspSession>,
 ) -> ServerVersionMap {
 	let mut versions = ServerVersionMap::default();
 	let futures = servers.iter().filter_map(|(name, config)| {
@@ -75,8 +75,11 @@ pub async fn capture_diagnostic_versions(
 		let config = config.clone();
 		let cwd = cwd.to_path_buf();
 		let cancel = cancel.clone();
+		let session = Arc::clone(session);
 		Some(async move {
-			if let Ok(client) = get_or_create_client(&config, &cwd, init_timeout, &cancel, shared_mux).await {
+			if let Ok(client) =
+				get_or_create_client_for(&session, &config, &cwd, init_timeout, &cancel).await
+			{
 				Some((name, client.diagnostics_version()))
 			} else {
 				None
@@ -94,7 +97,7 @@ pub async fn capture_open_file_versions(
 	cwd: &Path,
 	servers: &[(String, ServerConfig)],
 	cancel: &CancellationToken,
-	shared_mux: bool,
+	session: &Arc<LspSession>,
 ) -> OpenVersionMap {
 	let uri = file_to_uri(absolute_path);
 	let futures = servers.iter().filter_map(|(name, config)| {
@@ -106,8 +109,11 @@ pub async fn capture_open_file_versions(
 		let cwd = cwd.to_path_buf();
 		let cancel = cancel.clone();
 		let uri = uri.clone();
+		let session = Arc::clone(session);
 		Some(async move {
-			let client = get_or_create_client(&config, &cwd, None, &cancel, shared_mux).await.ok()?;
+			let client = get_or_create_client_for(&session, &config, &cwd, None, &cancel)
+				.await
+				.ok()?;
 			let version = client.open_file_version(&uri)?;
 			Some((name, version))
 		})
@@ -176,7 +182,7 @@ pub async fn get_diagnostics_for_file(
 	servers: &[(String, ServerConfig)],
 	options: GetDiagnosticsOptions<'_>,
 	cancel: &CancellationToken,
-	shared_mux: bool,
+	session: &Arc<LspSession>,
 ) -> Option<FileDiagnosticsResult> {
 	if servers.is_empty() {
 		return None;
@@ -200,7 +206,7 @@ pub async fn get_diagnostics_for_file(
 		let uri = uri.clone();
 		let rel_path = rel_path.clone();
 		let cancel = cancel.clone();
-		let shared_mux = shared_mux;
+		let session = Arc::clone(session);
 		let min_version = options.min_versions.and_then(|versions| versions.get(&server_name));
 		let expected_version = options
 			.expected_document_versions
@@ -213,12 +219,12 @@ pub async fn get_diagnostics_for_file(
 						Err(error) => Some((server_name, server_config, Vec::<Diagnostic>::new(), Some(error))),
 					};
 				}
-				let client = get_or_create_client(
+				let client = get_or_create_client_for(
+					&session,
 					&server_config,
 					&cwd,
 					Some(pipeline_budget),
 					&cancel,
-					shared_mux,
 				)
 				.await
 				.ok()?;
@@ -400,7 +406,7 @@ pub async fn format_content(
 	cwd: &Path,
 	servers: &[(String, ServerConfig)],
 	cancel: &CancellationToken,
-	shared_mux: bool,
+	session: &Arc<LspSession>,
 ) -> FormatContentResult {
 	if servers.is_empty() {
 		return FormatContentResult { content: content.to_string(), failed: false, unsupported: true };
@@ -422,7 +428,7 @@ pub async fn format_content(
 				}
 			}
 		}
-		let client = match get_or_create_client(server_config, cwd, None, cancel, shared_mux).await {
+		let client = match get_or_create_client_for(session, server_config, cwd, None, cancel).await {
 			Ok(client) => client,
 			Err(LspError::Cancelled) => break,
 			Err(_) => {
@@ -493,12 +499,12 @@ pub async fn format_file(
 	cwd: &Path,
 	servers: &[(String, ServerConfig)],
 	cancel: &CancellationToken,
-	shared_mux: bool,
+	session: &Arc<LspSession>,
 ) -> Result<(FormatResultStatus, String), String> {
 	let original = tokio::fs::read_to_string(absolute_path)
 		.await
 		.map_err(|error| error.to_string())?;
-	let result = format_content(absolute_path, &original, cwd, servers, cancel, shared_mux).await;
+	let result = format_content(absolute_path, &original, cwd, servers, cancel, session).await;
 	if result.failed {
 		return Ok((FormatResultStatus::Failed, original));
 	}

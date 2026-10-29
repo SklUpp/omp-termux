@@ -31,8 +31,8 @@ pub use state::{
 };
 pub use tokenizer::Tokenizer;
 pub use supervisor::{
-	BackgroundResultSink, CancelAttempt, ChildGuard, ChildRecord, ChildStatus, DelegationLimits,
-	Supervisor,
+	BackgroundResultSink, CancelAttempt, ChildGuard, ChildRecord, ChildStatus, ChildToolSettings,
+	DelegationLimits, Supervisor,
 };
 pub use mailbox::{
 	DEFAULT_IRC_TIMEOUT_MS, IrcMessage, MAIN_AGENT_ID, MAILBOX_CAP, Mailbox, MailboxWaiter,

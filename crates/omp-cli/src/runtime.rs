@@ -17,10 +17,13 @@ use async_trait::async_trait;
 use pi_agent::{
 	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, AskTool, AstGrepTool, BashTool,
 	CheckpointTool, DelegationLimits, RewindTool,
-	EditTool, GlobTool, GrepTool, ModelProvider, OpenAiCompatibleProvider, PendingStore, ReadTool,
+	ChildToolSettings, EditTool, GlobTool, GrepTool, ModelProvider,
+	OpenAiCompatibleProvider, PendingStore, ReadTool,
 	SteeringEvent, Supervisor, TodoTool, Tool, ToolApprover, ToolRegistry, WriteTool,
+	dap::{DapSessionManager, DapTool},
 	process_broker::BrokerProcessBackend,
 	tools::process::{ProcessBackend, ProcessManager},
+	lsp::{LspSession, LspTool},
 	mcp::{
 		MCPContent, MCPServerConfig, MCPStdioServerConfig, McpConnection, McpError,
 		McpToolOriginSource, connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key,
@@ -56,7 +59,11 @@ pub const DEFAULT_CONTEXT_LIMIT: usize = 32_768;
 /// The registry lists every selected tool; approval is not a visibility filter.
 /// `ToolApprover` gates each call in the scheduler immediately before
 /// execution, so denied tools still reach the model and report explicit denial.
-pub const BUILTIN_TOOLS: [(&str, bool); 11] = [
+///
+/// `lsp` and `debug` are mixed-tier: approval classifies their per-action
+/// readonly sets, so both are listed as not read-only here. Their availability
+/// still follows `lsp.enabled`/`debug.enabled` (see [`allowed_tools`]).
+pub const BUILTIN_TOOLS: [(&str, bool); 13] = [
 	("read", true),
 	("glob", true),
 	("grep", true),
@@ -68,6 +75,8 @@ pub const BUILTIN_TOOLS: [(&str, bool); 11] = [
 	("eval", false),
 	("todo", false),
 	("ask", true),
+	("lsp", false),
+	("debug", false),
 ];
 
 /// Delegation tools assembled around a [`Supervisor`] rather than built from
@@ -114,6 +123,27 @@ struct RunnerSession {
 	/// Started from the runner's Tokio runtime on the first eval-enabled turn.
 	/// Settings changes restart the bridge and dispose retained kernels.
 	eval:            Mutex<Option<(pi_agent::eval::EvalSettings, Arc<pi_agent::eval::EvalRuntime>)>>,
+	/// One debug session tree for every root turn: the registry (and its
+	/// `debug` tool) is rebuilt per prompt, but launched debuggees must survive
+	/// until `terminate` or runner teardown. Children get their own manager.
+	dap:             Arc<DapSessionManager>,
+	/// LSP ownership scope shared by every root turn. Process-global clients are
+	/// claimed here so teardown closes only sessions nothing else uses.
+	lsp:             Mutex<LspSlot>,
+	/// `tools.maxTimeout` handed to the root `debug` tool each turn.
+	debug_timeout:   Mutex<Option<u64>>,
+}
+
+/// Shared LSP ownership scope plus the transport preference it was built with.
+struct LspSlot {
+	shared:  bool,
+	session: Arc<LspSession>,
+}
+
+impl LspSlot {
+	fn new(shared: bool) -> Self {
+		Self { shared, session: LspSession::new(shared) }
+	}
 }
 
 impl RunnerSession {
@@ -130,7 +160,47 @@ impl RunnerSession {
 			eval_session_id: Mutex::new(crate::output::session_id()),
 			session_file: Mutex::new(None),
 			eval: Mutex::new(None),
+			dap: Arc::new(DapSessionManager::new()),
+			lsp: Mutex::new(LspSlot::new(true)),
+			debug_timeout: Mutex::new(None),
 		}
+	}
+
+	/// Root DAP session tree shared by every turn of this runner.
+	fn dap_manager(&self) -> Arc<DapSessionManager> {
+		Arc::clone(&self.dap)
+	}
+
+	/// Root LSP ownership scope shared by every turn of this runner.
+	fn lsp_session(&self) -> Arc<LspSession> {
+		Arc::clone(&self.lsp.lock().unwrap_or_else(|poison| poison.into_inner()).session)
+	}
+
+	/// Follow `lsp.shared`, replacing (and releasing) the previous scope when it
+	/// changes so clients created under the old transport are not left open.
+	fn set_lsp_shared(&self, shared: bool, runtime: &tokio::runtime::Runtime) {
+		let previous = {
+			let mut slot = self.lsp.lock().unwrap_or_else(|poison| poison.into_inner());
+			if slot.shared == shared {
+				return;
+			}
+			std::mem::replace(&mut *slot, LspSlot::new(shared))
+		};
+		// Close the superseded scope off the caller's thread; release is
+		// ownership-scoped, so clients another session still uses survive.
+		let session = previous.session;
+		runtime.spawn(async move {
+			session.release().await;
+		});
+	}
+
+	fn set_debug_timeout(&self, seconds: Option<u64>) {
+		*self.debug_timeout.lock().unwrap_or_else(|poison| poison.into_inner()) =
+			seconds.filter(|seconds| *seconds > 0);
+	}
+
+	fn debug_timeout(&self) -> Option<u64> {
+		*self.debug_timeout.lock().unwrap_or_else(|poison| poison.into_inner())
 	}
 
 	fn set_session_identity(&self, id: Option<&str>, file: Option<&Path>) {
@@ -306,17 +376,27 @@ impl Drop for PiAgentRunner {
 		if let Some(supervisor) = slot.take() {
 			supervisor.shutdown();
 		}
-		// Kernels and the loopback bridge live as long as the runner session.
-		// Shut them down explicitly while the Tokio runtime is still alive.
+		// Kernels, the loopback bridge, LSP connections and the root debug tree
+		// live as long as the runner session. Shut them down explicitly while the
+		// Tokio runtime is still alive: LSP release is ownership-scoped, so a
+		// server another session still uses stays up.
 		let session = self
 			.session
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner())
 			.take();
-		if let Some(session) = session
-			&& let Some(eval) = session.take_eval()
-		{
-			self.runtime.block_on(eval.shutdown());
+		if let Some(session) = session {
+			if let Some(eval) = session.take_eval() {
+				self.runtime.block_on(eval.shutdown());
+			}
+			let lsp = session.lsp_session();
+			let dap = session.dap_manager();
+			self.runtime.block_on(async move {
+				lsp.release().await;
+				let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+				let cancel = pi_agent::CancellationToken::new();
+				let _ = dap.terminate(&cancel, deadline).await;
+			});
 		}
 	}
 }
@@ -463,6 +543,10 @@ impl AgentRunner for PiAgentRunner {
 			request.session_id.as_deref(),
 			request.session_file.as_deref(),
 		);
+		// `lsp.shared`/`tools.maxTimeout` are applied before the registry is built
+		// so the root tool instances carry this turn's transport and cap.
+		session.set_lsp_shared(request.config.lsp.shared(), &self.runtime);
+		session.set_debug_timeout(request.config.max_tool_timeout_secs);
 		// `ask` needs the root context's UI: register it after the supervisor has
 		// cloned its child template, so children never receive the tool.
 		let build_tools: Vec<&'static str> = plan
@@ -583,6 +667,10 @@ impl AgentRunner for PiAgentRunner {
 			};
 			supervisor.set_edit_options(edit_options);
 			supervisor.set_display_resolver(Arc::clone(&display_resolver));
+			supervisor.set_child_tool_settings(ChildToolSettings {
+				lsp_shared: request.config.lsp.shared(),
+				debug_max_timeout: request.config.max_tool_timeout_secs,
+			});
 			supervisor.set_active_model(active_model.clone());
 			if let Some(processes) = &process_backend {
 				supervisor.set_processes(Arc::clone(processes));
@@ -1597,9 +1685,16 @@ fn allowed_tools(request: &RunRequest, _has_mcp_tools: bool) -> Result<Vec<&'sta
 		return Ok(Vec::new());
 	}
 	let ask_available = request.config.ask.enabled() && request.approvals.ask_channel().is_some();
+	let lsp_enabled = request.config.lsp.enabled();
+	let debug_enabled = request.config.debug.enabled();
 	let mut tools: Vec<&'static str> = BUILTIN_TOOLS
 		.iter()
 		.map(|(name, _)| *name)
+		.filter(|name| match *name {
+			"lsp" => lsp_enabled,
+			"debug" => debug_enabled,
+			_ => true,
+		})
 		.collect();
 	if let Some(allowed) = &request.config.tools {
 		// An excluded upstream tool must state the boundary instead of vanishing
@@ -1610,6 +1705,18 @@ fn allowed_tools(request: &RunRequest, _has_mcp_tools: bool) -> Result<Vec<&'sta
 					"tool `{name}` is excluded by the platform boundary: {reason}"
 				)));
 			}
+		}
+		// A setting that turns a selected tool off is a configuration conflict,
+		// not a silent empty selection.
+		if allowed.iter().any(|tool| tool == "lsp") && !lsp_enabled {
+			return Err(Error::new(
+				"tool `lsp` is disabled by `lsp.enabled`; enable it or drop it from --tools",
+			));
+		}
+		if allowed.iter().any(|tool| tool == "debug") && !debug_enabled {
+			return Err(Error::new(
+				"tool `debug` is disabled by `debug.enabled`; enable it or drop it from --tools",
+			));
 		}
 		tools.retain(|name| allowed.iter().any(|a| a == *name));
 		if allowed.iter().any(|tool| tool == "ask") && !ask_available {
@@ -1731,6 +1838,19 @@ fn build_registry_with_display(
 			"bash" => Arc::new(BashTool::new()),
 			"todo" => Arc::new(TodoTool::restored(todo_phases.clone(), session_persisted)),
 			"ask" => Arc::new(AskTool::new()),
+			// Session-scoped: the LSP owner scope and the debug session tree live
+			// on `RunnerSession`, because the registry (and these tool instances)
+			// is rebuilt every prompt while servers/debuggees must survive turns.
+			"lsp" => match session {
+				Some(session) => Arc::new(LspTool::with_session(session.lsp_session())),
+				None => Arc::new(LspTool::new()),
+			},
+			"debug" => match session {
+				Some(session) => Arc::new(
+					DapTool::shared(session.dap_manager()).with_max_timeout(session.debug_timeout()),
+				),
+				None => Arc::new(DapTool::new()),
+			},
 			// Eval needs a session-scoped runtime/host; `run_turn` mounts it into
 			// the final root/child registries instead.
 			"eval" => continue,
@@ -2346,6 +2466,47 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 	let mut all_tools = Vec::new();
 	let mut server_errors: Vec<(String, String)> = Vec::new();
 	let all_server_names = collect_all_configured_server_names(cwd, Some(agent_dir), &discovered);
+	if let Some(requested_tools) = &config.tools {
+		// Boundary and typo validation must happen before any ambiguity check or
+		// MCP server launch: a selected excluded tool is a platform decision, not
+		// a retryable unknown name, and nothing should spawn on a bad selection.
+		for name in requested_tools {
+			if let Some(reason) = excluded_tool_reason(name) {
+				return Err(Error::new(format!(
+					"tool `{name}` is excluded by the platform boundary: {reason}"
+				)));
+			}
+		}
+		let mut valid: Vec<String> = BUILTIN_TOOLS.iter().map(|(n, _)| (*n).to_string()).collect();
+		valid.extend(DELEGATION_TOOLS.iter().map(|name| (*name).to_string()));
+		// `checkpoint`/`rewind` mount only when `checkpoint.enabled` supplies a
+		// controller, but `--tools` may always name them.
+		valid.extend(["checkpoint", "rewind"].map(str::to_string));
+		valid.extend(all_server_names.iter().cloned());
+		// MCP tool ids are only enumerable after a server responds; a name that
+		// matches no builtin, no delegation tool, and no configured server cannot
+		// become valid, so reject it before spending a launch handshake.
+		let unknown: Vec<&String> = requested_tools
+			.iter()
+			.filter(|name| {
+				!valid.iter().any(|known| known == *name)
+					&& !name.starts_with("mcp__")
+					&& !all_server_names
+						.iter()
+						.any(|server| mcp_tool_match_score(server, name) > 0)
+			})
+			.collect();
+		if !unknown.is_empty() {
+			let plural = if unknown.len() == 1 { "" } else { "s" };
+			return Err(Error::new(format!(
+				"Unknown tool{} in --tools: {}. Valid tools: {}.",
+				plural,
+				unknown.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", "),
+				valid.join(", ")
+			)));
+		}
+	}
+
 	if let Some(requested_tools) = &config.tools {
 		for req in requested_tools {
 			let mut top_score = 0;
@@ -3063,6 +3224,63 @@ mod tests {
 		request.config.tools = Some(vec!["read".to_string(), "grep".to_string()]);
 		let tools = allowed_tools(&request, false).expect("selection");
 		assert_eq!(tools, ["grep", "read"]);
+	}
+
+	#[test]
+	fn lsp_and_debug_follow_their_enable_flags() {
+		let mut request = request(yolo());
+		let tools = allowed_tools(&request, false).expect("defaults");
+		assert!(tools.contains(&"lsp"), "lsp.enabled defaults to true");
+		assert!(tools.contains(&"debug"), "debug.enabled defaults to true");
+
+		request.config.lsp.enabled = Some(false);
+		request.config.debug.enabled = Some(false);
+		let tools = allowed_tools(&request, false).expect("disabled");
+		assert!(!tools.contains(&"lsp"));
+		assert!(!tools.contains(&"debug"));
+
+		// A selected tool that the settings disable is an explicit conflict, not
+		// a silently empty selection.
+		request.config.tools = Some(vec!["lsp".to_string()]);
+		let error = allowed_tools(&request, false).expect_err("lsp is disabled");
+		assert!(error.to_string().contains("lsp.enabled"), "{error}");
+		request.config.tools = Some(vec!["debug".to_string()]);
+		let error = allowed_tools(&request, false).expect_err("debug is disabled");
+		assert!(error.to_string().contains("debug.enabled"), "{error}");
+	}
+
+	#[test]
+	fn runner_session_keeps_one_lsp_scope_and_debug_tree_across_turns() {
+		let session = RunnerSession::new(EditToolOptions::default());
+		assert!(
+			Arc::ptr_eq(&session.lsp_session(), &session.lsp_session()),
+			"root turns must share one LSP ownership scope"
+		);
+		assert!(
+			Arc::ptr_eq(&session.dap_manager(), &session.dap_manager()),
+			"root turns must share one debug session tree"
+		);
+		let other = RunnerSession::new(EditToolOptions::default());
+		assert!(!Arc::ptr_eq(&session.dap_manager(), &other.dap_manager()));
+		assert!(!Arc::ptr_eq(&session.lsp_session(), &other.lsp_session()));
+
+		let registry = build_registry_full(
+			&["lsp", "debug"],
+			Vec::new(),
+			Vec::new(),
+			Vec::new(),
+			Vec::new(),
+			false,
+			EditToolOptions::default(),
+			Some(&Arc::new(session)),
+		)
+		.expect("session registry");
+		assert!(registry.get("lsp").is_some());
+		assert!(registry.get("debug").is_some());
+		// Standalone registries (tests, helpers) still implement both names.
+		let standalone = build_registry(&["lsp", "debug"]).expect("standalone registry");
+		assert!(standalone.get("lsp").is_some());
+		assert!(standalone.get("debug").is_some());
 	}
 
 	#[test]
