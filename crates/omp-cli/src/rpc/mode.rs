@@ -52,6 +52,23 @@ fn now_ms() -> u64 {
 		.as_millis() as u64
 }
 
+/// TS `tool_execution_end` carries one result payload plus `isError`; it has no
+/// separate error string. The native event synthesizes `error` from the same
+/// result text, so emitting both would duplicate it on the wire. Keep a
+/// genuinely distinct error as one extra line, drop a redundant one.
+fn tool_end_text(result: &str, error: Option<&str>) -> String {
+	let Some(error) = error.filter(|error| !error.is_empty()) else {
+		return result.to_string();
+	};
+	if result.is_empty() {
+		return error.to_string();
+	}
+	if result.trim_end().ends_with(error) {
+		return result.to_string();
+	}
+	format!("{result}\n{error}")
+}
+
 /// Fallback metadata for frames that carry no provider identity themselves.
 #[derive(Debug, Clone, Default)]
 struct Meta {
@@ -143,10 +160,7 @@ impl EventFrames {
 			AgentEvent::ToolEnd { id, tool, result, error, images, details } => {
 				self.saw_tool = true;
 				let is_error = error.is_some();
-				let content = match &error {
-					Some(error) => format!("{result}\n{error}"),
-					None => result.clone(),
-				};
+				let content = tool_end_text(result.as_str(), error.as_deref());
 				sink.send(event_wire::tool_end(
 					&id,
 					&tool,
@@ -1790,6 +1804,23 @@ fn run_turn(
 		guard.finish_turn(&mut prepared, &outcome);
 	}
 	outcome
+}
+
+#[cfg(test)]
+mod tool_end_text_tests {
+	use super::tool_end_text;
+
+	#[test]
+	fn error_appears_once_and_distinct_context_survives() {
+		assert_eq!(
+			tool_end_text("read failed: no such file", Some("read failed: no such file")),
+			"read failed: no such file"
+		);
+		assert_eq!(
+			tool_end_text("exit code 1", Some("command not found: nope")),
+			"exit code 1\ncommand not found: nope"
+		);
+	}
 }
 
 #[cfg(test)]
