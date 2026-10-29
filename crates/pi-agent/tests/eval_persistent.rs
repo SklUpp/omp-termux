@@ -143,9 +143,10 @@ async fn harness_with(
 	tune: impl FnOnce(EvalSettings) -> EvalSettings,
 ) -> Option<(Arc<EvalTool>, Arc<EvalRuntime>, AgentContext, PathBuf)> {
 	let settings = tune(
-		EvalSettings::new(allowance, interpreters)
-			.with_probe_timeout_ms(5_000)
-			.with_spill_bytes(4096),
+		// Keep the contract default probe budget (10 s): cold Julia discovery on
+		// CI runners can exceed a 5 s test-only override. The dedicated
+		// short-timeout regression sets its own explicit budget.
+		EvalSettings::new(allowance, interpreters).with_spill_bytes(4096),
 	);
 	let runtime = match EvalRuntime::start(settings).await {
 		Ok(runtime) => Arc::new(runtime),
