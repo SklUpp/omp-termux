@@ -876,12 +876,19 @@ cwd: /tmp/work
 
 	#[test]
 	fn quoted_numeric_strings_round_trip_as_strings() {
+		// The contract is the consumer's value, not the emitted spelling: a
+		// scalar that the core schema already reads as a string (`1_000`) may
+		// stay plain, the numeric-looking ones need quoting. Either way the
+		// string must survive a write/read cycle exactly.
 		for text in ["0x10", "0o17", "0b101", "1e3", "5.", ".5", ".inf", "-.nan", "1_000"] {
-			let value = Value::Str(text.to_string());
-			let document = Value::Map(vec![("custom".to_string(), value.clone())]);
+			let document = Value::Map(vec![("custom".to_string(), Value::Str(text.to_string()))]);
 			let yaml = to_string(&document);
-			assert!(yaml.contains('"'), "{text} must be quoted: {yaml}");
-			assert_eq!(parse(&yaml).expect("parse"), document, "{text}");
+			let parsed = parse(&yaml).expect("parse");
+			assert_eq!(parsed, document, "{text} did not round-trip through {yaml:?}");
+			assert!(
+				matches!(parsed.get("custom"), Some(Value::Str(value)) if value.as_str() == text),
+				"{text} came back as a non-string in {yaml:?}"
+			);
 		}
 	}
 
