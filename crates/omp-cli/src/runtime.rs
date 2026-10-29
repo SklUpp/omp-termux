@@ -102,6 +102,9 @@ pub struct PiAgentRunner {
 	/// Per-runner nonce folded into the local fallback log root, so two CLIs on
 	/// the same project never prune each other's logs when one manager drops.
 	process_scope_ns: String,
+	/// Exit teardown ownership: one caller runs it, the rest report its real
+	/// completion instead of returning on empty slots.
+	shutdown_latch: Arc<ShutdownLatch>,
 }
 
 /// One snapshot store plus one `EditTool` per runner: tags, seen-line ranges,
@@ -369,6 +372,7 @@ impl PiAgentRunner {
 			session: Mutex::new(None),
 			processes: Mutex::new(HashMap::new()),
 			process_scope_ns: crate::output::session_id(),
+			shutdown_latch: Arc::new(ShutdownLatch::new()),
 		})
 	}
 
@@ -422,18 +426,36 @@ impl PiAgentRunner {
 	/// supervisor, eval kernels and loopback bridge, the LSP ownership scope and
 	/// the root debug tree.
 	///
-	/// Idempotent: every slot is taken before anything is awaited, so a second
-	/// call (or the `Drop` that follows an explicit call) finds them empty and
-	/// returns without touching a torn-down runtime. Call it only once the last
-	/// turn has returned — it cancels live child tasks and detaches adapters.
+	/// Idempotent and coalesced: the first caller owns teardown, later callers
+	/// wait for its real completion (`ShutdownLatch`) instead of returning on
+	/// already-empty slots while adapters are still draining. Call it only once
+	/// the last turn has returned — it cancels live child tasks and detaches
+	/// adapters.
 	///
-	/// Teardown is bounded (`SHUTDOWN_BUDGET`) and, when called from a Tokio
-	/// thread, awaited on a helper thread and joined, so it has really finished
-	/// when this returns instead of racing process exit.
+	/// Never blocks a Tokio thread: teardown needs that same runtime to drive
+	/// the LSP/DAP futures, so a worker waiting here would deadlock a
+	/// single-worker runtime. Off a Tokio thread this returns only after every
+	/// owned adapter is closed; on one, teardown completes detached and the
+	/// caller returns — the idle-Ctrl-C path therefore tears down and exits
+	/// from a plain thread.
+	///
+	/// Per-operation bounds are unchanged (LSP `shutdown`/`exit` per client, the
+	/// DAP terminate deadline, the kernel grace in `EvalRuntime::shutdown`).
+	/// There is deliberately no outer cap: cancelling `LspSession::release`
+	/// once it had drained its keys would leak every client still queued.
 	///
 	/// The host needs this because an installed process-wide `AgentRunner`
 	/// keeps the runner alive past `main`, so `Drop` alone never fires on exit.
 	pub fn shutdown(&self) {
+		if !self.shutdown_latch.begin() {
+			// Another caller owns teardown. Off a runtime thread, report only
+			// once it really finished; on one, waiting would stall the workers
+			// it depends on.
+			if tokio::runtime::Handle::try_current().is_err() {
+				self.shutdown_latch.wait();
+			}
+			return;
+		}
 		// Background jobs hold `Arc<Supervisor>`, so the supervisor's own Drop
 		// cannot fire while they run. Shut it down here, before the `runtime`
 		// field is dropped, so queued reservations are cancelled and live child
@@ -448,23 +470,20 @@ impl PiAgentRunner {
 		// server another session still uses stays up, and DAP terminate sends
 		// `disconnect` before the adapter is killed.
 		let Some(session) = self.take_session() else {
+			self.shutdown_latch.finish();
 			return;
 		};
-		// One hard cap over the whole teardown: every step below already has its
-		// own timeout, but a wedged bridge must never hang process exit.
-		let cleanup = async move {
-			let _ = tokio::time::timeout(SHUTDOWN_BUDGET, shutdown_session(session)).await;
-		};
-		if tokio::runtime::Handle::try_current().is_ok() {
-			// Already on a runtime thread, where `block_on` panics and a
-			// detached task would let the caller (or `process::exit`) finish
-			// first. Await it on a helper thread against our own runtime and
-			// join, so teardown really completed when this returns.
-			let handle = self.runtime.handle().clone();
-			// A panicking teardown must not poison `Drop`: the cap decides.
-			let _ = std::thread::spawn(move || handle.block_on(cleanup)).join();
-		} else {
-			self.runtime.block_on(cleanup);
+		// Teardown always runs on a plain thread: `Runtime::block_on` panics in
+		// a runtime context, and `LatchFinish` closes the latch even if an
+		// adapter panics, so a waiting caller sees completion either way.
+		let handle = self.runtime.handle().clone();
+		let latch = Arc::clone(&self.shutdown_latch);
+		let teardown = std::thread::spawn(move || {
+			let _finish = LatchFinish(latch);
+			handle.block_on(shutdown_session(session));
+		});
+		if tokio::runtime::Handle::try_current().is_err() {
+			let _ = teardown.join();
 		}
 	}
 
@@ -485,23 +504,97 @@ impl PiAgentRunner {
 	}
 }
 
-/// Hard cap over one exit teardown. Each step (eval bridge, LSP per client,
-/// DAP tree) also carries its own timeout; this only stops a wedged bridge.
-const SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// Deadline handed to the DAP terminate at exit: `terminate` disconnects and
+/// kills each adapter before it, so the debug tree never outlives the process.
+const DAP_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Await-needing half of [`PiAgentRunner::shutdown`]: eval bridge disposal, LSP
-/// release (`shutdown` + `exit`, else kill) and the bounded DAP terminate that
-/// disconnects the root tree before killing adapters.
+/// Await-needing half of [`PiAgentRunner::shutdown`]: eval kernel/bridge
+/// disposal, LSP release (`shutdown` + `exit`, else kill) and the bounded DAP
+/// terminate that disconnects the root tree before killing adapters.
+///
+/// The three run concurrently and each carries its own bound, so a slow LSP
+/// client can never starve the DAP disconnect (or kernels) of teardown, and no
+/// outer cap can cancel `LspSession::release` midway — it marks itself released
+/// and drains its keys before the first await, so a cancelled release leaks
+/// every client it had not reached yet.
 async fn shutdown_session(session: Arc<RunnerSession>) {
-	if let Some(eval) = session.take_eval() {
-		eval.shutdown().await;
-	}
+	let eval = session.take_eval();
 	let lsp = session.lsp_session();
 	let dap = session.dap_manager();
-	lsp.release().await;
-	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-	let cancel = pi_agent::CancellationToken::new();
-	let _ = dap.terminate(&cancel, deadline).await;
+	let dispose_eval = async move {
+		if let Some(eval) = eval {
+			eval.shutdown().await;
+		}
+	};
+	let release_lsp = async move {
+		lsp.release().await;
+	};
+	let terminate_dap = async move {
+		let deadline = std::time::Instant::now() + DAP_SHUTDOWN_DEADLINE;
+		let cancel = pi_agent::CancellationToken::new();
+		let _ = dap.terminate(&cancel, deadline).await;
+	};
+	tokio::join!(dispose_eval, release_lsp, terminate_dap);
+}
+
+/// One-shot gate over the runner's exit teardown: `begin` elects the single
+/// caller that runs it, `wait` reports its real completion to the others, so a
+/// concurrent `shutdown` cannot believe the teardown is done just because the
+/// slots it looked at were already empty.
+///
+/// Never waited on from a Tokio thread: those workers drive the futures
+/// teardown awaits.
+struct ShutdownLatch {
+	state:    Mutex<ShutdownState>,
+	finished: std::sync::Condvar,
+}
+
+struct ShutdownState {
+	started: bool,
+	done:    bool,
+}
+
+impl ShutdownLatch {
+	fn new() -> Self {
+		Self {
+			state:    Mutex::new(ShutdownState { started: false, done: false }),
+			finished: std::sync::Condvar::new(),
+		}
+	}
+
+	/// `true` for the one caller that must run teardown.
+	fn begin(&self) -> bool {
+		let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+		if state.started {
+			return false;
+		}
+		state.started = true;
+		true
+	}
+
+	fn finish(&self) {
+		let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+		state.done = true;
+		self.finished.notify_all();
+	}
+
+	/// Block until the elected caller finished. Off a Tokio thread only.
+	fn wait(&self) {
+		let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+		while !state.done {
+			state = self.finished.wait(state).unwrap_or_else(|poison| poison.into_inner());
+		}
+	}
+}
+
+/// Closes the latch on every exit path, including a panicking adapter, so a
+/// waiting caller sees completion instead of hanging on a dead owner.
+struct LatchFinish(Arc<ShutdownLatch>);
+
+impl Drop for LatchFinish {
+	fn drop(&mut self) {
+		self.0.finish();
+	}
 }
 
 impl Drop for PiAgentRunner {
@@ -637,10 +730,17 @@ impl SignalDispatcher {
 						.lock()
 						.unwrap_or_else(|poison| poison.into_inner())
 						.upgrade();
-					if let Some(runner) = runner {
-						runner.shutdown();
-					}
-					std::process::exit(130);
+					// Teardown is driven by this runtime's own workers, so it must
+					// not run here: a plain thread performs it (blocking until every
+					// owned adapter is closed) and exits 130 afterwards, while this
+					// task ends and frees the worker it occupied.
+					std::thread::spawn(move || {
+						if let Some(runner) = runner {
+							runner.shutdown();
+						}
+						std::process::exit(130);
+					});
+					break;
 				}
 			}
 		});
@@ -5858,6 +5958,35 @@ mod process_scope_tests {
 			.flat_map(|_| [a.next_background_name(), b.next_background_name()])
 			.collect();
 		assert_eq!(names.len(), 64, "background job names collided across backends");
+	}
+
+	/// A second `shutdown` caller must not read the already-empty slots as
+	/// "teardown done": `begin` elects exactly one owner and `wait` returns only
+	/// after that owner reported real completion.
+	#[test]
+	fn shutdown_latch_waits_for_the_real_teardown() {
+		let latch = Arc::new(ShutdownLatch::new());
+		assert!(latch.begin(), "first caller owns teardown");
+		assert!(!latch.begin(), "second caller must not repeat teardown");
+		let finished = Arc::new(AtomicBool::new(false));
+		let waiter = {
+			let latch = Arc::clone(&latch);
+			let finished = Arc::clone(&finished);
+			std::thread::spawn(move || {
+				latch.wait();
+				assert!(
+					finished.load(Ordering::SeqCst),
+					"wait returned before teardown finished"
+				);
+			})
+		};
+		std::thread::sleep(std::time::Duration::from_millis(50));
+		finished.store(true, Ordering::SeqCst);
+		latch.finish();
+		waiter.join().expect("waiter thread");
+		// Closed latch: later callers return at once and elect nobody.
+		latch.wait();
+		assert!(!latch.begin());
 	}
 
 }

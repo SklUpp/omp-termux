@@ -42,6 +42,10 @@ use super::types::Capabilities;
 
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on the graceful half of [`DapClient::dispose`] (writer lock + flush):
+/// a transport that stopped draining must not hold up exit cleanup, which
+/// continues into kill/reap either way.
+const DISPOSE_GRACE: Duration = Duration::from_secs(2);
 const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_STDERR_BYTES: usize = 8 * 1024;
 
@@ -389,17 +393,30 @@ impl DapClient {
 			return;
 		}
 		self.inner.fail(format!("DAP adapter {} disposed", self.inner.adapter_name));
-		let mut writer = self.inner.writer.lock().await;
-		let _ = writer.flush().await;
-		drop(writer);
-		let mut process = self.inner.process.lock().unwrap_or_else(|poison| poison.into_inner());
-		if let Some(mut child) = process.take() {
+		// Graceful stage, bounded as one unit: the lock can be held by a write
+		// stuck on a peer that stopped draining, and the flush can block on a
+		// backed-up pipe. Expiring it only skips the courtesy flush — the kill
+		// and reap below always run, so a stalled transport is still disposed
+		// instead of hanging the exit teardown.
+		let graceful = async {
+			let mut writer = self.inner.writer.lock().await;
+			let _ = writer.flush().await;
+		};
+		let _ = timeout(DISPOSE_GRACE, graceful).await;
+		// Kill and reap before returning: the host's exit guard must not race a
+		// detached reaper. The std mutex is released before the await.
+		let child = self
+			.inner
+			.process
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.take();
+		if let Some(mut child) = child {
 			let _ = child.start_kill();
-			tokio::spawn(async move {
-				let _ = timeout(Duration::from_secs(2), child.wait()).await;
-			});
+			// Existing reap window is the only reap attempt; on expiry the handle
+			// is dropped, which still kills the signalled adapter but does not reap it.
+			let _ = timeout(Duration::from_secs(2), child.wait()).await;
 		}
-		drop(process);
 		if let Some(path) = self.inner.socket_path.lock().unwrap_or_else(|poison| poison.into_inner()).take() {
 			let _ = std::fs::remove_file(path);
 		}
@@ -1053,4 +1070,42 @@ fn error_response(inner: &Inner, request_seq: u64, command: &str, message: Strin
 		"message": message,
 		"body": { "error": { "id": 1, "format": message } },
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A transport whose peer stopped draining must not stall disposal: the
+	/// graceful stage is bounded and the disposal still completes, so exit
+	/// teardown cannot wait on a wedged adapter.
+	#[tokio::test]
+	async fn dispose_is_bounded_when_the_peer_stops_draining() {
+		let (reader, _adapter_reader) = tokio::io::duplex(64);
+		let (_adapter_writer, writer) = tokio::io::duplex(8);
+		let client = Arc::new(DapClient::from_duplex("stalled", reader, writer));
+		// A wedged adapter leaves a write holding the writer lock; hold it here
+		// instead, and let the holder report readiness itself so nothing depends
+		// on task scheduling.
+		let (locked, lock_held) = tokio::sync::oneshot::channel();
+		let write = {
+			let client = Arc::clone(&client);
+			tokio::spawn(async move {
+				let _guard = client.inner.writer.lock().await;
+				let _ = locked.send(());
+				tokio::time::sleep(Duration::from_secs(30)).await;
+			})
+		};
+		lock_held.await.expect("writer lock was acquired");
+		let started = Instant::now();
+		timeout(DISPOSE_GRACE + Duration::from_secs(3), client.dispose())
+			.await
+			.expect("dispose waited on the stalled write");
+		assert!(
+			started.elapsed() < DISPOSE_GRACE + Duration::from_secs(3),
+			"graceful stage was bounded"
+		);
+		assert!(!client.is_alive(), "stalled transport still alive after dispose");
+		write.abort();
+	}
 }

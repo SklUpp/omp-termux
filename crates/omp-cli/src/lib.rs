@@ -21,6 +21,7 @@ pub mod dirs;
 pub mod eval_host;
 pub mod file_mentions;
 pub mod foreign_session;
+pub mod goal;
 pub mod local_models;
 pub mod output;
 pub mod process_cli;

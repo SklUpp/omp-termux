@@ -152,11 +152,21 @@ async fn spawn_mock_server(
 						// Route on the latest message only: the request body carries the
 						// whole history, so matching on it replays the first route forever.
 						let resp_json = route_response(&last_message_text(&body));
-						let resp_body = serde_json::to_string(&resp_json).unwrap();
+						// Root turns run with `complete` (`stream: false`); child turns
+						// forward events and therefore use `stream: true`. The mock must
+						// answer both shapes or every child dies before its first tool call.
+						let wants_stream = serde_json::from_str::<Value>(&body)
+							.ok()
+							.and_then(|request| request.get("stream").and_then(Value::as_bool))
+							.unwrap_or(false);
+						let (content_type, payload) = if wants_stream {
+							("text/event-stream", stream_sse_body(&resp_json))
+						} else {
+							("application/json", serde_json::to_string(&resp_json).unwrap())
+						};
 						let response = format!(
-							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-							resp_body.len(),
-							resp_body
+							"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+							payload.len(),
 						);
 
 						let _ = socket.write_all(response.as_bytes()).await;
@@ -316,6 +326,40 @@ fn route_response(latest: &str) -> Value {
 	}
 
 	text_response("fallback")
+}
+
+/// Encode one scripted chat completion as OpenAI SSE events.
+///
+/// The non-streaming fixtures put content in `message.content` and calls in
+/// `message.tool_calls`; streaming clients expect the same data as `delta`
+/// frames, with tool arguments still carried as a JSON string.
+fn stream_sse_body(response: &Value) -> String {
+	let message = &response["choices"][0]["message"];
+	let mut events = String::new();
+	if let Some(content) = message.get("content").and_then(Value::as_str) {
+		let delta = json!({ "choices": [{ "delta": { "content": content } }] });
+		events.push_str(&format!("data: {delta}\n\n"));
+	}
+	if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+		let deltas: Vec<Value> = calls
+			.iter()
+			.enumerate()
+			.map(|(index, call)| {
+				json!({
+					"index": index,
+					"id": call.get("id"),
+					"function": {
+						"name": call["function"]["name"],
+						"arguments": call["function"]["arguments"],
+					}
+				})
+			})
+			.collect();
+		let delta = json!({ "choices": [{ "delta": { "tool_calls": deltas } }] });
+		events.push_str(&format!("data: {delta}\n\n"));
+	}
+	events.push_str("data: [DONE]\n\n");
+	events
 }
 
 #[tokio::test]

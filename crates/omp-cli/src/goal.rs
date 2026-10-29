@@ -182,7 +182,8 @@ fn count(value: &Value) -> Option<u64> {
 		return Some(count);
 	}
 	let float = value.as_f64()?;
-	(float.is_finite() && float >= 0.0 && float.fract() == 0.0).then_some(float as u64)
+	(float.is_finite() && float >= 0.0 && float < u64::MAX as f64 && float.fract() == 0.0)
+		.then_some(float as u64)
 }
 
 /// What a reopened/forked/branched session must do with the persisted mode
@@ -379,7 +380,8 @@ mod tests {
 		parent.append_mode_change(MODE_NONE, None).expect("exit mode");
 		parent.append_goal_completed(completed_data.clone()).expect("completed metric");
 		assert_eq!(plan_restore(&parent, true), RestorePlan::Idle);
-		let metric = parent.branch_entries().last().expect("metric entry");
+		let entries = parent.branch_entries();
+		let metric = entries.last().expect("metric entry");
 		assert_eq!(metric.kind, "custom");
 		assert_eq!(
 			metric.extra.get("customType").and_then(Value::as_str),
@@ -421,6 +423,9 @@ mod tests {
 		assert_eq!(goal_from_mode_data(Some(&json!({"goal": {"id": 1, "tokensUsed": "x"}}))), None);
 		assert_eq!(goal_from_mode_data(Some(&json!({"goal": {}}))), None);
 		assert_eq!(goal_from_mode_data(None), None);
+		let mut oversized = encode_mode_change_data(&goal).expect("valid goal");
+		oversized["goal"]["tokensUsed"] = json!(1e30);
+		assert_eq!(goal_from_mode_data(Some(&oversized)), None);
 
 		let unbounded = goal_from_mode_data(Some(&json!({"goal": {
 			"id": "g1",
@@ -431,7 +436,7 @@ mod tests {
 			"timeUsedSeconds": 30,
 			"createdAt": 1,
 			"updatedAt": 2
-		})))
+		}})))
 		.expect("a string budget is unbounded, not an error");
 		assert_eq!(unbounded.token_budget, None);
 		assert_eq!(unbounded.remaining_tokens(), None);
@@ -444,7 +449,7 @@ mod tests {
 			"timeUsedSeconds": 30,
 			"createdAt": 1,
 			"updatedAt": 2
-		})))
+		}})))
 		.expect("an unknown status is tolerated on read");
 		assert_eq!(unknown.status, GoalStatus::Unknown);
 		assert!(!unknown.status.is_accounting(), "an unknown status never accrues");

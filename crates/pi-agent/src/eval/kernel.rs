@@ -464,14 +464,19 @@ impl Kernel {
 			return;
 		}
 		self.alive.store(false, Ordering::SeqCst);
-		{
+		let grace = languages::SHUTDOWN_GRACE;
+		// Graceful stage, bounded as one unit: the stdin lock can be held by a
+		// write stuck on a kernel that stopped draining its pipe. Expiring it
+		// only skips the courtesy exit payload — the escalation below always
+		// runs, so a stalled kernel is still killed and reaped.
+		let graceful = async {
 			let mut stdin = self.stdin.lock().await;
 			let _ = stdin.write_all(languages::exit_payload(self.language).as_bytes()).await;
 			let _ = stdin.write_all(b"\n").await;
 			let _ = stdin.flush().await;
 			let _ = stdin.shutdown().await;
-		}
-		let grace = languages::SHUTDOWN_GRACE;
+		};
+		let _ = tokio::time::timeout(grace, graceful).await;
 		let mut child = self.child.lock().await;
 		if tokio::time::timeout(grace, child.wait()).await.is_ok() {
 			return;
@@ -730,5 +735,52 @@ done"#;
 		assert!(result.cancelled || result.kernel_killed);
 		assert!(started.elapsed() < Duration::from_secs(2), "escalation was bounded");
 		assert!(!kernel.is_alive() || result.kernel_killed);
+	}
+
+	/// A kernel that stopped draining its stdin must not stall exit teardown:
+	/// the graceful write stage is bounded, and the SIGTERM/SIGKILL escalation
+	/// still runs, so the process is killed and reaped instead of leaked.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn shutdown_bounds_a_stalled_stdin_stage_and_still_kills() {
+		let env = std::env::vars().collect::<HashMap<_, _>>();
+		let kernel = Arc::new(
+			Kernel::spawn_process(
+				EvalLanguage::Py,
+				&["sh".to_string(), "-c".to_string(), "exec sleep 30".to_string()],
+				Path::new("."),
+				env,
+			)
+			.expect("stalled kernel spawn"),
+		);
+		let pid = kernel.pid().expect("kernel pid");
+		// Wedge the write path the way a non-draining pipe does: the stdin
+		// writer stays locked for longer than the graceful bound. The holder
+		// reports readiness itself, so nothing depends on task scheduling.
+		let (locked, lock_held) = tokio::sync::oneshot::channel();
+		let hold = {
+			let kernel = Arc::clone(&kernel);
+			tokio::spawn(async move {
+				let _guard = kernel.stdin.lock().await;
+				let _ = locked.send(());
+				tokio::time::sleep(Duration::from_secs(30)).await;
+			})
+		};
+		lock_held.await.expect("stdin lock was acquired");
+		let started = Instant::now();
+		tokio::time::timeout(Duration::from_secs(5), kernel.shutdown())
+			.await
+			.expect("shutdown waited on the stalled write");
+		assert!(started.elapsed() < Duration::from_secs(5), "graceful stage was bounded");
+		assert!(!kernel.is_alive(), "kernel was retired");
+		assert!(!pid_alive(pid), "stalled kernel survived teardown");
+		hold.abort();
+	}
+
+	/// Signal-0 existence probe: after the reap the pid is gone.
+	#[cfg(unix)]
+	fn pid_alive(pid: u32) -> bool {
+		// SAFETY: signal 0 delivers nothing; it only asks whether the pid exists.
+		unsafe { libc::kill(pid as i32, 0) == 0 }
 	}
 }

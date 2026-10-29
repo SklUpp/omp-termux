@@ -322,21 +322,42 @@ pub fn is_session_uuid(value: &str) -> bool {
 /// TS `normalizeContinueSessionArgs`: `--continue <session-uuid>` targets that
 /// session instead of continuing the latest one with the UUID as prompt text.
 /// An explicit `--resume`/`--fork` wins, and a non-UUID prompt is untouched.
-pub fn normalize_continue_session_args(cli: &mut Cli) {
-	if !cli.continue_session
-		|| cli.resume.is_some()
-		|| cli.fork.is_some()
-		|| cli.prompt.len() != 1
-	{
+///
+/// A sole prompt is the candidate; with several prompt messages only the token
+/// immediately after the first literal `-c`/`--continue` counts. The candidate
+/// must still match a prompt entry exactly (TS `messages.indexOf`), so a padded
+/// token is left alone.
+pub fn normalize_continue_session_args(cli: &mut Cli, raw_args: &[std::ffi::OsString]) {
+	if !cli.continue_session || cli.resume.is_some() || cli.fork.is_some() {
 		return;
 	}
-	let message = cli.prompt[0].trim();
-	if !is_session_uuid(message) {
+	let candidate = if cli.prompt.len() == 1 {
+		cli.prompt[0].trim().to_string()
+	} else {
+		let Some(continue_index) = raw_args.iter().position(|arg| {
+			arg.to_str()
+				.is_some_and(|text| text == "--continue" || text == "-c")
+		}) else {
+			return;
+		};
+		let Some(token) = raw_args.get(continue_index + 1).and_then(|arg| arg.to_str()) else {
+			return;
+		};
+		token.trim().to_string()
+	};
+	if !is_session_uuid(&candidate) {
 		return;
 	}
-	cli.resume = Some(message.to_string());
+	let Some(index) = cli
+		.prompt
+		.iter()
+		.position(|prompt| prompt.as_str() == candidate.as_str())
+	else {
+		return;
+	};
+	cli.resume = Some(candidate);
 	cli.continue_session = false;
-	cli.prompt.clear();
+	cli.prompt.remove(index);
 }
 
 impl Cli {
@@ -957,6 +978,12 @@ mod tests {
 		Cli::try_parse_from(args).expect("parse")
 	}
 
+	const UUID: &str = "019EA530-FFFF-7000-8000-000000000000";
+
+	fn raw(args: &[&str]) -> Vec<std::ffi::OsString> {
+		args.iter().map(std::ffi::OsString::from).collect()
+	}
+
 	#[test]
 	fn session_uuid_detection_matches_ts_pattern() {
 		assert!(is_session_uuid("019ea530-ffff-7000-8000-000000000000"));
@@ -971,73 +998,112 @@ mod tests {
 
 	#[test]
 	fn continue_with_session_uuid_resumes_that_session() {
-		let mut cli = parse(&[
-			"omp",
-			"--continue",
-			"019EA530-FFFF-7000-8000-000000000000",
-			"--no-title",
-		]);
+		let cli_args = ["omp", "--continue", UUID, "--no-title"];
+		let mut cli = parse(&["omp", "--continue", UUID, "--no-title"]);
 		assert!(cli.continue_session);
-		normalize_continue_session_args(&mut cli);
+		normalize_continue_session_args(&mut cli, &raw(&cli_args));
 		assert!(!cli.continue_session);
-		assert_eq!(cli.resume.as_deref(), Some("019EA530-FFFF-7000-8000-000000000000"));
+		assert_eq!(cli.resume.as_deref(), Some(UUID));
 		assert!(cli.prompt.is_empty());
 	}
 
 	#[test]
 	fn continue_non_uuid_prompt_stays_prompt() {
-		let mut cli = parse(&["omp", "--continue", "summarize the diff"]);
-		normalize_continue_session_args(&mut cli);
+		let cli_args = ["omp", "--continue", "summarize the diff"];
+		let mut cli = parse(&cli_args);
+		normalize_continue_session_args(&mut cli, &raw(&cli_args));
 		assert!(cli.continue_session);
 		assert_eq!(cli.resume, None);
 		assert_eq!(cli.prompt, ["summarize the diff"]);
 	}
 
 	#[test]
-	fn continue_bare_or_uuid_prompt_with_more_text_stays_unchanged() {
+	fn continue_bare_stays_latest() {
 		let mut bare = parse(&["omp", "--continue"]);
-		normalize_continue_session_args(&mut bare);
+		normalize_continue_session_args(&mut bare, &raw(&["omp", "--continue"]));
 		assert!(bare.continue_session);
 		assert!(bare.resume.is_none());
 		assert!(bare.prompt.is_empty());
+	}
 
-		let mut multi = parse(&[
-			"omp",
-			"--continue",
-			"019EA530-FFFF-7000-8000-000000000000",
-			"also this",
-		]);
-		normalize_continue_session_args(&mut multi);
-		assert!(multi.continue_session);
-		assert_eq!(multi.resume, None);
-		assert_eq!(multi.prompt.len(), 2);
+	#[test]
+	fn continue_selector_comes_only_from_token_after_first_continue_flag() {
+		// Multi-message branch: the token after `-c` is the session; the
+		// follow-up prompt stays.
+		let follow_args = ["omp", "-c", UUID, "follow up"];
+		let mut follow = parse(&follow_args);
+		normalize_continue_session_args(&mut follow, &raw(&follow_args));
+		assert!(!follow.continue_session);
+		assert_eq!(follow.resume.as_deref(), Some(UUID));
+		assert_eq!(follow.prompt, ["follow up"]);
+
+		// `-c more <uuid>`: the UUID later in argv is never selected.
+		let other_args = ["omp", "-c", "more", UUID];
+		let mut other = parse(&other_args);
+		normalize_continue_session_args(&mut other, &raw(&other_args));
+		assert!(other.continue_session);
+		assert_eq!(other.resume, None);
+		assert_eq!(other.prompt, ["more", UUID]);
+
+		// `-c --print <uuid> follow`: a flag sits immediately after `-c`.
+		let flag_args = ["omp", "-c", "--print", UUID, "follow"];
+		let mut flag_after = parse(&flag_args);
+		normalize_continue_session_args(&mut flag_after, &raw(&flag_args));
+		assert!(flag_after.continue_session);
+		assert_eq!(flag_after.resume, None);
+		assert_eq!(flag_after.prompt, [UUID, "follow"]);
+
+		// `omp <uuid> -c follow`: scan starts at the first literal `-c`, not at
+		// the first UUID-shaped prompt.
+		let before_args = ["omp", UUID, "-c", "follow"];
+		let mut before = parse(&before_args);
+		normalize_continue_session_args(&mut before, &raw(&before_args));
+		assert!(before.continue_session);
+		assert_eq!(before.resume, None);
+		assert_eq!(before.prompt, [UUID, "follow"]);
+
+		// The bootstrap sentinel is not skipped when it follows `-c`.
+		let sentinel_args = ["omp", "-c", "--omp-profile-boundary", UUID, "follow"];
+		let mut sentinel = parse(&["omp", "-c", UUID, "follow"]);
+		normalize_continue_session_args(&mut sentinel, &raw(&sentinel_args));
+		assert!(sentinel.continue_session);
+		assert_eq!(sentinel.resume, None);
+		assert_eq!(sentinel.prompt, [UUID, "follow"]);
+	}
+
+	#[test]
+	fn continue_padded_selector_token_is_not_rewritten() {
+		let padded = format!("  {UUID}  ");
+		let sole_args = ["omp", "--continue", padded.as_str()];
+		let mut sole = parse(&sole_args);
+		normalize_continue_session_args(&mut sole, &raw(&sole_args));
+		assert!(sole.continue_session);
+		assert_eq!(sole.resume, None);
+		assert_eq!(sole.prompt, [padded.as_str()]);
+
+		let follow_args = ["omp", "-c", padded.as_str(), "follow"];
+		let mut follow = parse(&follow_args);
+		normalize_continue_session_args(&mut follow, &raw(&follow_args));
+		assert!(follow.continue_session);
+		assert_eq!(follow.resume, None);
+		assert_eq!(follow.prompt, [padded.as_str(), "follow"]);
 	}
 
 	#[test]
 	fn explicit_resume_or_fork_is_never_overridden() {
-		let mut resumed = parse(&[
-			"omp",
-			"--continue",
-			"--resume",
-			"abc",
-			"019EA530-FFFF-7000-8000-000000000000",
-		]);
-		normalize_continue_session_args(&mut resumed);
+		let resumed_args = ["omp", "--continue", "--resume", "abc", UUID];
+		let mut resumed = parse(&resumed_args);
+		normalize_continue_session_args(&mut resumed, &raw(&resumed_args));
 		assert!(resumed.continue_session);
 		assert_eq!(resumed.resume.as_deref(), Some("abc"));
-		assert_eq!(resumed.prompt, ["019EA530-FFFF-7000-8000-000000000000"]);
+		assert_eq!(resumed.prompt, [UUID]);
 
-		let mut forked = parse(&[
-			"omp",
-			"--continue",
-			"--fork",
-			"abc",
-			"019EA530-FFFF-7000-8000-000000000000",
-		]);
-		normalize_continue_session_args(&mut forked);
+		let forked_args = ["omp", "--continue", "--fork", "abc", UUID];
+		let mut forked = parse(&forked_args);
+		normalize_continue_session_args(&mut forked, &raw(&forked_args));
 		assert!(forked.continue_session);
 		assert_eq!(forked.fork.as_deref(), Some("abc"));
-		assert_eq!(forked.prompt, ["019EA530-FFFF-7000-8000-000000000000"]);
+		assert_eq!(forked.prompt, [UUID]);
 	}
 
 	#[test]

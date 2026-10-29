@@ -138,9 +138,9 @@ fn run() -> std::result::Result<(), CliError> {
 	}
 	// Share this profile's exact runtime scope with `pi-agent` broker clients.
 	daemon_broker::share_runtime_root(&dirs::agent_dir());
-	let mut cli = parse_cli(bootstrap.argv);
+	let mut cli = parse_cli(bootstrap.argv.clone());
 	// `--continue <uuid>` names a session (TS parity), not prompt text.
-	normalize_continue_session_args(&mut cli);
+	normalize_continue_session_args(&mut cli, &bootstrap.argv);
 	if let Some(alias_name) = &bootstrap.alias {
 		let result = profile::install_alias(alias_name, profile.as_deref())?;
 		print!(
