@@ -145,16 +145,26 @@ pub fn resolve_explicit_path(interpreter: &str, cwd: &Path, env: &HashMap<String
 	}
 }
 
-/// First executable named `binary` in the filtered `PATH`.
-pub fn which(binary: &str, env: &HashMap<String, String>) -> Option<PathBuf> {
-	let path = env.get("PATH")?;
+/// Every executable `binary` on the filtered `PATH`, in priority order.
+pub fn which_all(binary: &str, env: &HashMap<String, String>) -> Vec<PathBuf> {
+	let Some(path) = env.get("PATH") else {
+		return Vec::new();
+	};
+	let mut seen = HashSet::new();
 	path.split(':')
 		.filter(|entry| !entry.is_empty())
 		.map(|entry| Path::new(entry).join(binary))
-		.find(|candidate| is_executable(candidate))
+		.filter(|candidate| is_executable(candidate))
+		.filter(|candidate| seen.insert(candidate.canonicalize().unwrap_or_else(|_| candidate.clone())))
+		.collect()
 }
 
-fn is_executable(path: &Path) -> bool {
+/// First executable named `binary` in the filtered `PATH`.
+pub fn which(binary: &str, env: &HashMap<String, String>) -> Option<PathBuf> {
+	which_all(binary, env).into_iter().next()
+}
+
+pub(crate) fn is_executable(path: &Path) -> bool {
 	let Ok(metadata) = std::fs::metadata(path) else {
 		return false;
 	};
@@ -353,5 +363,30 @@ mod tests {
 		let base = env(&[("HOME", "/home/u")]);
 		assert_eq!(resolve_explicit_path("~/bin/python", Path::new("/work"), &base), PathBuf::from("/home/u/bin/python"));
 		assert_eq!(resolve_explicit_path("./py", Path::new("/work"), &base), PathBuf::from("/work/./py"));
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn which_all_keeps_path_order_and_skips_non_executables() {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let root = std::env::temp_dir().join(format!("omp-which-{}", crate::eval::util::random_token()));
+		let first = root.join("first");
+		let second = root.join("second");
+		let empty = root.join("empty");
+		std::fs::create_dir_all(&second).expect("second dir");
+		std::fs::create_dir_all(&first).expect("first dir");
+		std::fs::create_dir_all(&empty).expect("empty dir");
+		std::fs::write(first.join("julia"), "#!/bin/sh\nexit 0\n").expect("first julia");
+		std::fs::set_permissions(first.join("julia"), std::fs::Permissions::from_mode(0o755))
+			.expect("chmod");
+		std::fs::write(second.join("julia"), "#!/bin/sh\nexit 0\n").expect("second julia");
+		std::fs::set_permissions(second.join("julia"), std::fs::Permissions::from_mode(0o644))
+			.expect("chmod");
+		let search = format!("{}:{}:{}", empty.display(), first.display(), second.display());
+		let path = env(&[("PATH", search.as_str())]);
+		assert_eq!(which_all("julia", &path), vec![first.join("julia")]);
+		assert_eq!(which("julia", &path), Some(first.join("julia")));
+		let _ = std::fs::remove_dir_all(&root);
 	}
 }

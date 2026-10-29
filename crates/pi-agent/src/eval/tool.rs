@@ -292,10 +292,12 @@ impl CellJob {
 			Some(requested) => settings.resolve_timeout_secs(Some(requested)),
 			None => settings.resolve_timeout_secs(None),
 		});
-		// Discovery is bounded by the cell budget and the caller's real token; the
-		// cell watchdog is armed only after the runtime is resolved and the kernel
-		// is up, so probe/startup time is never charged to the cell.
+		// Discovery is bounded by the cell budget and the caller's real token.
+		// Julia readiness draws the same cell budget as its execution; every other
+		// backend keeps probe/startup outside the cell watchdog.
 		let cell_timeout_ms = idle_secs.filter(|seconds| *seconds > 0).map(|seconds| seconds * 1000);
+		// One anchor for the whole cell: a dead-kernel retry gets the remainder.
+		let cell_deadline = cell_timeout_ms.map(|budget| started + Duration::from_millis(budget));
 		let probe_timeout_ms = settings.probe_timeout_ms();
 		let probe_bound_ms = match (cell_timeout_ms, probe_timeout_ms) {
 			(Some(cell), 0) => Some(cell),
@@ -313,6 +315,7 @@ impl CellJob {
 				&self.ctx.env,
 				self.reset,
 				probe_bound_ms,
+				cell_deadline,
 				self.ctx.cancellation_token.clone(),
 			)
 			.await;
@@ -324,9 +327,18 @@ impl CellJob {
 		let mut kernel = acquired;
 		let per_call = matches!(settings.kernel_mode(), KernelMode::PerCall);
 
-		let idle = idle_secs
-			.filter(|seconds| *seconds > 0)
-			.map(|seconds| IdleTimeout::new(Duration::from_secs(seconds)));
+		// Julia readiness is the interpreter boot itself and draws on the cell
+		// budget, so its execution must fit in the remainder. Probing backends keep
+		// the existing contract: probe and startup are not charged to the cell.
+		let idle = match (self.language, cell_deadline) {
+			(EvalLanguage::Jl, Some(deadline)) => {
+				let remaining = deadline.saturating_duration_since(Instant::now());
+				Some(IdleTimeout::new(remaining.max(Duration::from_millis(1))))
+			},
+			_ => idle_secs
+				.filter(|seconds| *seconds > 0)
+				.map(|seconds| IdleTimeout::new(Duration::from_secs(seconds))),
+		};
 		let control = CellControl::new(self.ctx.cancellation_token.clone(), idle);
 		let cancellation = control.kernel_token();
 		let run_id = format!("eval-{}-{}", self.language.token(), &util::random_token()[..8]);
@@ -428,6 +440,7 @@ impl CellJob {
 					&self.ctx.env,
 					true,
 					probe_bound_ms,
+					cell_deadline,
 					self.ctx.cancellation_token.clone(),
 				)
 				.await

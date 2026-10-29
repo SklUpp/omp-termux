@@ -4,7 +4,8 @@
 //! mapping, bridge routing, backgrounding, and the JavaScript capture contract.
 //!
 //! Tests skip (with an eprintln) when the interpreter/runtime is absent; Julia
-//! and Ruby are external prerequisites, not fakeable backends.
+//! and Ruby semantics are external prerequisites. Julia readiness is the one
+//! exception: its kernel handshake is exercised with a protocol wrapper.
 
 use std::{
 	collections::HashMap,
@@ -104,6 +105,27 @@ fn binary(name: &str) -> Option<PathBuf> {
 	pi_agent::eval::env::which(name, &ambient_env())
 }
 
+/// Absolute `sh` script: fixtures must not depend on the narrowed `PATH`.
+#[cfg(unix)]
+fn shell_script(body: &str) -> Option<String> {
+	let shell = binary("sh")?;
+	Some(format!("#!{}\n{body}", shell.display()))
+}
+
+/// Fake `julia` that records its child pid and hangs. Shell *and* sleep are
+/// absolute: the narrowed test `PATH` hides them and Termux has no `/bin`.
+#[cfg(unix)]
+fn hang_script(pid_file: &std::path::Path) -> Option<String> {
+	let sleep = binary("sleep")?;
+	let body = format!(
+		"'{}' 30 &\necho $! > '{}'\n'{}' 30",
+		sleep.display(),
+		pid_file.display(),
+		sleep.display()
+	);
+	shell_script(&body)
+}
+
 fn python_path() -> Option<PathBuf> {
 	binary("python3").or_else(|| binary("python"))
 }
@@ -143,9 +165,10 @@ async fn harness_with(
 	tune: impl FnOnce(EvalSettings) -> EvalSettings,
 ) -> Option<(Arc<EvalTool>, Arc<EvalRuntime>, AgentContext, PathBuf)> {
 	let settings = tune(
-		// Keep the contract default probe budget (10 s): cold Julia discovery on
-		// CI runners can exceed a 5 s test-only override. The dedicated
-		// short-timeout regression sets its own explicit budget.
+		// Contract defaults: a 10 s probe budget for probed backends and a 30 s
+		// cell budget. Julia readiness draws from the cell budget, so cold CI
+		// boots are covered without a test-only override; the dedicated
+		// short-timeout regressions set their own bounds.
 		EvalSettings::new(allowance, interpreters).with_spill_bytes(4096),
 	);
 	let runtime = match EvalRuntime::start(settings).await {
@@ -901,4 +924,348 @@ async fn julia_state_and_scheme_map_local_paths() {
 	);
 	teardown(&runtime, cwd).await;
 	let _ = std::fs::remove_dir_all(local_root);
+}
+
+/// Julia readiness is a real kernel handshake: no throwaway probe boot.
+///
+/// A protocol wrapper stands in for the interpreter (no Julia needed) so the
+/// observable contract is testable anywhere: the first cell boots exactly one
+/// interpreter, the second cell reuses it, and a broken candidate earlier on
+/// `PATH` is skipped. Real Julia semantics stay covered by
+/// `julia_state_and_scheme_map_local_paths`.
+#[cfg(unix)]
+#[tokio::test]
+async fn julia_readiness_boots_one_interpreter_and_reuses_it() {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let Some(python) = python_path() else { return };
+	let Some((tool, runtime, mut ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Jl),
+		Interpreters::default(),
+		test_session(),
+		Arc::new(TestHost::default()),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let write_script = |path: &std::path::Path, body: &str| {
+		std::fs::write(path, body).expect("write script");
+		std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+	};
+	let Some(broken_script) = shell_script("exit 1") else { return };
+	let broken = cwd.join("broken");
+	let working = cwd.join("working");
+	std::fs::create_dir_all(&broken).expect("broken dir");
+	std::fs::create_dir_all(&working).expect("working dir");
+	write_script(&broken.join("julia"), &broken_script);
+	let log = cwd.join("julia-starts.log");
+	let wrapper = format!(
+		r#"#!{python}
+import json, os, sys
+with open({log:?}, "a") as handle:
+    handle.write(str(os.getpid()) + "\n")
+count = 0
+for raw in sys.stdin:
+    line = raw.rstrip("\n")
+    if not line:
+        continue
+    if line == "exit":
+        break
+    parts = line.split("\t")
+    if parts[0] != "run":
+        continue
+    rid = parts[1]
+    count += 1
+    sys.stdout.write(json.dumps({{"type": "stdout", "id": rid, "data": "pid:%d cell:%d\n" % (os.getpid(), count)}}) + "\n")
+    sys.stdout.write(json.dumps({{"type": "done", "id": rid, "status": "ok", "execution_count": count}}) + "\n")
+    sys.stdout.flush()
+"#,
+		python = python.display(),
+		log = log.display().to_string(),
+	);
+	write_script(&working.join("julia"), &wrapper);
+	ctx.env.insert(
+		"PATH".to_string(),
+		format!(
+			"{}:{}:{}",
+			broken.display(),
+			working.display(),
+			std::env::var("PATH").unwrap_or_default()
+		),
+	);
+
+	let first = tool
+		.execute(&json!({"language": "jl", "code": "x = 1"}), &ctx)
+		.await
+		.expect("first julia cell");
+	assert!(!first.is_error, "{}", first.content);
+	let second = tool
+		.execute(&json!({"language": "jl", "code": "x + 1"}), &ctx)
+		.await
+		.expect("second julia cell");
+	assert!(!second.is_error, "{}", second.content);
+
+	let starts = std::fs::read_to_string(&log).expect("startup log");
+	let pids: Vec<&str> = starts.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+	assert_eq!(pids.len(), 1, "exactly one interpreter startup: {starts}");
+	let pid = format!("pid:{}", pids[0]);
+	assert!(first.content.contains(&pid), "{}", first.content);
+	assert!(second.content.contains(&pid), "interpreter was not reused: {}", second.content);
+
+	// Reset boots exactly one replacement, bounded by the same cell budget.
+	let third = tool
+		.execute(&json!({"language": "jl", "code": "x = 1", "reset": true}), &ctx)
+		.await
+		.expect("reset julia cell");
+	assert!(!third.is_error, "{}", third.content);
+	let starts = std::fs::read_to_string(&log).expect("startup log");
+	let pids: Vec<&str> = starts.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+	assert_eq!(pids.len(), 2, "reset starts one replacement: {starts}");
+	let reset_pid = format!("pid:{}", pids[1]);
+	assert!(third.content.contains(&reset_pid), "reset kernel served the cell: {}", third.content);
+	assert_ne!(reset_pid, pid);
+	teardown(&runtime, cwd).await;
+}
+
+/// Julia readiness spends the cell budget, so the cell body gets the remainder
+/// instead of a fresh full timeout.
+#[cfg(unix)]
+#[tokio::test]
+async fn julia_cell_body_stays_inside_the_readiness_budget() {
+	let Some(python) = python_path() else { return };
+	let Some((tool, runtime, mut ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Jl),
+		Interpreters::default(),
+		test_session(),
+		Arc::new(TestHost::default()),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let working = cwd.join("working");
+	std::fs::create_dir_all(&working).expect("working dir");
+	let wrapper = format!(
+		r#"#!{python}
+import json, sys, time
+time.sleep(0.6)
+count = 0
+for raw in sys.stdin:
+    line = raw.rstrip("\n")
+    if not line:
+        continue
+    if line == "exit":
+        break
+    parts = line.split("\t")
+    if parts[0] != "run":
+        continue
+    rid = parts[1]
+    count += 1
+    if count >= 3:
+        time.sleep(1.8)
+    sys.stdout.write(json.dumps({{"type": "done", "id": rid, "status": "ok", "execution_count": count}}) + "\n")
+    sys.stdout.flush()
+"#,
+		python = python.display(),
+	);
+	let executable = working.join("julia");
+	std::fs::write(&executable, wrapper).expect("write wrapper");
+	{
+		use std::os::unix::fs::PermissionsExt as _;
+		std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+	}
+	ctx.env.insert(
+		"PATH".to_string(),
+		format!("{}:{}", working.display(), std::env::var("PATH").unwrap_or_default()),
+	);
+
+	let started = Instant::now();
+	let result = tool
+		.execute(&json!({"language": "jl", "code": "1", "timeout": 2}), &ctx)
+		.await
+		.expect("julia cell");
+	assert!(result.is_error, "the body must not get a fresh cell timeout: {}", result.content);
+	assert!(result.content.contains("timeout after 2s"), "{}", result.content);
+	assert!(started.elapsed() < Duration::from_secs(8), "cell budget was not enforced");
+	teardown(&runtime, cwd).await;
+}
+
+/// A wrapper that exits cleanly is not a ready kernel: candidate failures are
+/// reported in `PATH` order, with the reason, and never become a false ready.
+#[cfg(unix)]
+#[tokio::test]
+async fn julia_candidate_failures_are_ordered_and_never_false_ready() {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let Some((tool, runtime, mut ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Jl),
+		Interpreters::default(),
+		test_session(),
+		Arc::new(TestHost::default()),
+		|settings| settings.with_probe_timeout_ms(5_000),
+	)
+	.await
+	else {
+		return;
+	};
+	let write_script = |path: &std::path::Path, body: &str| {
+		std::fs::write(path, body).expect("write script");
+		std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+	};
+	let Some(exiting_script) = shell_script("exit 1") else { return };
+	// Speaks no protocol but exits 0: a working process, not a ready kernel.
+	let Some(mute_script) = shell_script("echo hello\nexit 0") else { return };
+	let first = cwd.join("first");
+	let second = cwd.join("second");
+	std::fs::create_dir_all(&first).expect("first dir");
+	std::fs::create_dir_all(&second).expect("second dir");
+	write_script(&first.join("julia"), &exiting_script);
+	write_script(&second.join("julia"), &mute_script);
+	ctx.env
+		.insert("PATH".to_string(), format!("{}:{}", first.display(), second.display()));
+
+	let error = tool
+		.execute(&json!({"language": "jl", "code": "1"}), &ctx)
+		.await
+		.expect_err("no working julia");
+	let message = error.to_string();
+	assert!(message.contains("No working Julia interpreter found"), "{message}");
+	let first_at = message
+		.find(&first.join("julia").display().to_string())
+		.expect("first candidate label");
+	let second_at = message
+		.find(&second.join("julia").display().to_string())
+		.expect("second candidate label");
+	assert!(first_at < second_at, "candidate order is preserved: {message}");
+	assert_eq!(message.matches("kernel exited unexpectedly").count(), 2, "{message}");
+
+	// Explicit interpreters are path-validated before any spawn is attempted.
+	let settings = EvalSettings::new(
+		one_language(EvalLanguage::Jl),
+		Interpreters::new(None, None, Some(cwd.join("absent-julia").display().to_string())),
+	);
+	let explicit = Arc::new(EvalRuntime::start(settings).await.expect("runtime"));
+	let explicit_tool = Arc::new(EvalTool::new(
+		Arc::clone(&explicit),
+		Arc::new(TestHost::default()),
+		test_session(),
+	));
+	let error = explicit_tool
+		.execute(&json!({"language": "jl", "code": "1"}), &ctx)
+		.await
+		.expect_err("absent explicit interpreter");
+	assert!(error.to_string().contains("not executable"), "{error}");
+	drop(explicit_tool);
+	explicit.shutdown().await;
+	teardown(&runtime, cwd).await;
+}
+
+/// Deadline expiry during readiness is bounded and sweeps the whole candidate
+/// process group (the wrapper's own `sleep` child included).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn julia_readiness_deadline_kills_the_candidate_group() {
+	let Some((tool, runtime, mut ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Jl),
+		Interpreters::default(),
+		test_session(),
+		Arc::new(TestHost::default()),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let hang = cwd.join("hang");
+	std::fs::create_dir_all(&hang).expect("hang dir");
+	let grandchild = cwd.join("grandchild.pid");
+	let Some(script) = hang_script(&grandchild) else { return };
+	let executable = hang.join("julia");
+	std::fs::write(&executable, script).expect("hang script");
+	{
+		use std::os::unix::fs::PermissionsExt as _;
+		std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+	}
+	ctx.env.insert("PATH".to_string(), hang.display().to_string());
+
+	let started = Instant::now();
+	let error = tool
+		.execute(&json!({"language": "jl", "code": "1", "timeout": 2}), &ctx)
+		.await
+		.expect_err("readiness must time out");
+	assert!(started.elapsed() < Duration::from_secs(6), "cell budget was not enforced");
+	assert!(error.to_string().contains("readiness timed out"), "{error}");
+	let pid: u32 = std::fs::read_to_string(&grandchild)
+		.expect("wrapper child pid")
+		.trim()
+		.parse()
+		.expect("numeric pid");
+	let deadline = Instant::now() + Duration::from_secs(3);
+	while process_alive(pid) && Instant::now() < deadline {
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	assert!(!process_alive(pid), "failed candidate process group survived the deadline");
+	teardown(&runtime, cwd).await;
+}
+
+/// Cancelling during readiness aborts the cell and sweeps the candidate group.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn julia_readiness_cancel_kills_the_candidate_group() {
+	let Some((tool, runtime, mut ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Jl),
+		Interpreters::default(),
+		test_session(),
+		Arc::new(TestHost::default()),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let hang = cwd.join("hang");
+	std::fs::create_dir_all(&hang).expect("hang dir");
+	let grandchild = cwd.join("grandchild.pid");
+	let Some(script) = hang_script(&grandchild) else { return };
+	let executable = hang.join("julia");
+	std::fs::write(&executable, script).expect("hang script");
+	{
+		use std::os::unix::fs::PermissionsExt as _;
+		std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+	}
+	ctx.env.insert("PATH".to_string(), hang.display().to_string());
+
+	let token = ctx.cancellation_token.clone();
+	tokio::spawn(async move {
+		tokio::time::sleep(Duration::from_millis(250)).await;
+		token.cancel();
+	});
+	let result = tool
+		.execute(&json!({"language": "jl", "code": "1"}), &ctx)
+		.await
+		.expect("cancelled readiness is an abort result, not an error");
+	assert!(result.is_error, "aborted cell is reported as an error: {}", result.content);
+	let pid: u32 = std::fs::read_to_string(&grandchild)
+		.expect("wrapper child pid")
+		.trim()
+		.parse()
+		.expect("numeric pid");
+	let deadline = Instant::now() + Duration::from_secs(3);
+	while process_alive(pid) && Instant::now() < deadline {
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	assert!(!process_alive(pid), "cancelled candidate process group survived");
+	teardown(&runtime, cwd).await;
+}
+
+/// A process is still running while `/proc` reports a non-zombie state.
+#[cfg(target_os = "linux")]
+fn process_alive(pid: u32) -> bool {
+	let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+		return false;
+	};
+	stat.rsplit(')').next().and_then(|rest| rest.trim_start().chars().next()) != Some('Z')
 }

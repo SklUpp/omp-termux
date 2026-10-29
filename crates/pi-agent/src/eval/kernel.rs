@@ -197,12 +197,13 @@ impl Kernel {
 		cancellation: &CancellationToken,
 	) -> Result<(), EvalError> {
 		let token = CancellationToken::new();
-		let (combined, combined_task) = combine(cancellation.clone(), token.clone());
+		let (combined, task) = combine(cancellation.clone(), token.clone());
+		let _combined_task = AbortOnDrop(task);
 		let timeout = languages::startup_timeout(self.language);
-		let timer = tokio::spawn(async move {
+		let _timer = AbortOnDrop(tokio::spawn(async move {
 			tokio::time::sleep(timeout).await;
 			token.cancel();
-		});
+		}));
 		let env = HashMap::new();
 		let result = self
 			.execute(
@@ -219,8 +220,6 @@ impl Kernel {
 				},
 			)
 			.await;
-		timer.abort();
-		combined_task.abort();
 		match result {
 			Ok(result) if result.status == KernelStatus::Ok && !result.cancelled => Ok(()),
 			Ok(result) => {
@@ -515,6 +514,16 @@ fn cancelled_result(timed_out: bool) -> KernelExecuteResult {
 		timed_out,
 		stdin_requested: false,
 		kernel_killed: false,
+	}
+}
+
+/// Aborts its task when dropped, including when the surrounding startup future
+/// is dropped mid-flight: a bounded helper never outlives its owner.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+	fn drop(&mut self) {
+		self.0.abort();
 	}
 }
 

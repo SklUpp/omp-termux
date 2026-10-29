@@ -146,43 +146,110 @@ fn cache_key(language: EvalLanguage, cwd: &Path, interpreter: Option<&str>) -> S
 	)
 }
 
+/// Throwaway readiness probe for one candidate interpreter.
+type ProbeFn = fn(&Path) -> Vec<String>;
+
+/// Discovery result for one backend: candidates in priority order, plus how
+/// their readiness is proven (`None` means only the kernel handshake can).
+struct Discovery {
+	candidates: Vec<InterpreterRuntime>,
+	probe: Option<ProbeFn>,
+}
+
 /// Candidate runtimes, filtered env included, in priority order.
-fn candidates(
+fn discovery(
 	language: EvalLanguage,
 	cwd: &Path,
 	base_env: &HashMap<String, String>,
 	interpreter: Option<&str>,
-) -> Vec<InterpreterRuntime> {
+) -> Discovery {
 	let base = env::filter_env(language, base_env);
-	match language {
-		EvalLanguage::Py => env::enumerate_python(cwd, &base, interpreter),
-		EvalLanguage::Rb => env::enumerate_binary(cwd, &base, "ruby", interpreter),
-		EvalLanguage::Jl => env::enumerate_binary(cwd, &base, "julia", interpreter),
+	let (candidates, probe): (Vec<InterpreterRuntime>, Option<ProbeFn>) = match language {
+		EvalLanguage::Py => (
+			env::enumerate_python(cwd, &base, interpreter),
+			Some(probe_python as ProbeFn),
+		),
+		EvalLanguage::Rb => (
+			env::enumerate_binary(cwd, &base, "ruby", interpreter),
+			Some(probe_ruby as ProbeFn),
+		),
 		// Bun only. A Node fallback would change the kernel semantics; refuse
 		// instead of silently substituting a different runtime.
-		EvalLanguage::Js => env::enumerate_binary(cwd, &base, "bun", None),
-	}
+		EvalLanguage::Js => (
+			env::enumerate_binary(cwd, &base, "bun", None),
+			Some(probe_js as ProbeFn),
+		),
+		// Julia boots its whole sysimage whatever the argv, so discovery only
+		// validates paths here and the kernel handshake proves readiness.
+		EvalLanguage::Jl => (
+			match interpreter {
+				Some(interpreter) => {
+					let program = env::resolve_explicit_path(interpreter, cwd, &base);
+					vec![InterpreterRuntime::new(program, base)]
+				},
+				None => env::which_all("julia", &base)
+					.into_iter()
+					.map(|program| InterpreterRuntime::new(program, base.clone()))
+					.collect(),
+			},
+			None,
+		),
+	};
+	Discovery { candidates, probe }
 }
 
-fn probe_command(language: EvalLanguage, program: &Path) -> Vec<String> {
-	let program = program.display().to_string();
-	match language {
-		EvalLanguage::Py => vec![program, "-c".to_string(), "import sys;sys.exit(0)".to_string()],
-		EvalLanguage::Rb => vec![program, "-e".to_string(), "exit 0".to_string()],
-		EvalLanguage::Jl => vec![
-			program,
-			"--startup-file=no".to_string(),
-			"--history-file=no".to_string(),
-			"--color=no".to_string(),
-			"-e".to_string(),
-			"exit(0)".to_string(),
-		],
-		EvalLanguage::Js => vec![program, "--version".to_string()],
-	}
+fn probe_python(program: &Path) -> Vec<String> {
+	vec![program.display().to_string(), "-c".to_string(), "import sys;sys.exit(0)".to_string()]
 }
 
-/// Resolve and probe a runtime, caching successes per (language, cwd,
-/// interpreter). Failures are never cached so a mid-session install is picked up.
+fn probe_ruby(program: &Path) -> Vec<String> {
+	vec![program.display().to_string(), "-e".to_string(), "exit 0".to_string()]
+}
+
+fn probe_js(program: &Path) -> Vec<String> {
+	vec![program.display().to_string(), "--version".to_string()]
+}
+
+/// How discovery proved an interpreter.
+#[derive(Debug)]
+pub(crate) enum RuntimeResolution {
+	/// A bounded throwaway probe exited 0.
+	Probed(InterpreterRuntime),
+	/// Candidates in priority order; the caller starts the real kernel for each
+	/// and caches the first one whose handshake succeeds.
+	Handshake(Vec<InterpreterRuntime>),
+}
+
+/// Interpreter already proven for this (language, cwd, interpreter) triple.
+pub(crate) fn cached_runtime(
+	language: EvalLanguage,
+	cwd: &Path,
+	interpreter: Option<&str>,
+) -> Option<InterpreterRuntime> {
+	let key = cache_key(language, cwd, interpreter);
+	AVAILABILITY
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner())
+		.get(&key)
+		.cloned()
+}
+
+/// Record a runtime proven by a successful kernel handshake.
+pub(crate) fn remember_runtime(
+	language: EvalLanguage,
+	cwd: &Path,
+	interpreter: Option<&str>,
+	runtime: &InterpreterRuntime,
+) {
+	let key = cache_key(language, cwd, interpreter);
+	AVAILABILITY
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner())
+		.insert(key, runtime.clone());
+}
+
+/// Resolve a runtime, caching successes per (language, cwd, interpreter).
+/// Failures are never cached so a mid-session install is picked up.
 pub(crate) async fn resolve_runtime(
 	language: EvalLanguage,
 	cwd: &Path,
@@ -190,24 +257,31 @@ pub(crate) async fn resolve_runtime(
 	interpreter: Option<&str>,
 	cancellation: &CancellationToken,
 	timeout_ms: Option<u64>,
-) -> Result<InterpreterRuntime, EvalError> {
-	let key = cache_key(language, cwd, interpreter);
-	if let Some(runtime) = AVAILABILITY
-		.lock()
-		.unwrap_or_else(|poison| poison.into_inner())
-		.get(&key)
-		.cloned()
+) -> Result<RuntimeResolution, EvalError> {
+	// Julia readiness is the kernel handshake itself, so it never takes the
+	// cached shortcut here: the caller decides between reusing a live kernel and
+	// booting a bounded replacement (`cell_timeout_ms`).
+	if language != EvalLanguage::Jl
+		&& let Some(runtime) = cached_runtime(language, cwd, interpreter)
 	{
-		return Ok(runtime);
+		return Ok(RuntimeResolution::Probed(runtime));
 	}
-	let candidates = candidates(language, cwd, base_env, interpreter);
+	let Discovery { candidates, probe } = discovery(language, cwd, base_env, interpreter);
 	if candidates.is_empty() {
+		// A proven interpreter outlives PATH changes; the caller still decides
+		// whether to reuse its live kernel or boot a bounded replacement.
+		if let Some(runtime) = cached_runtime(language, cwd, interpreter) {
+			return Ok(RuntimeResolution::Handshake(vec![runtime]));
+		}
 		return Err(EvalError::Unavailable(missing_runtime_message(language)));
 	}
+	let Some(probe) = probe else {
+		return Ok(RuntimeResolution::Handshake(candidates));
+	};
 	let probes: Vec<ProbeCandidate> = candidates
 		.iter()
 		.map(|runtime| ProbeCandidate {
-			command: probe_command(language, &runtime.program),
+			command: probe(&runtime.program),
 			env: runtime.env.clone(),
 			label: runtime.label.clone(),
 		})
@@ -215,11 +289,8 @@ pub(crate) async fn resolve_runtime(
 	match probe_candidates(&probes, cwd, cancellation, timeout_ms).await {
 		CandidateProbe::Ok(index) => {
 			let runtime = candidates[index].clone();
-			AVAILABILITY
-				.lock()
-				.unwrap_or_else(|poison| poison.into_inner())
-				.insert(key, runtime.clone());
-			Ok(runtime)
+			remember_runtime(language, cwd, interpreter, &runtime);
+			Ok(RuntimeResolution::Probed(runtime))
 		},
 		CandidateProbe::Aborted => Err(EvalError::Aborted(format!(
 			"{} availability probe was cancelled",

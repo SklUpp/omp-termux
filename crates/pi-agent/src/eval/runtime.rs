@@ -7,12 +7,14 @@
 use std::{
 	collections::HashMap,
 	path::{Path, PathBuf},
+	time::Instant,
 };
 
 use tokio_util::sync::CancellationToken;
 
 use super::{
 	bridge::Bridge,
+	env::{self, InterpreterRuntime},
 	kernel::{Kernel, KernelSpawn},
 	languages,
 	output::DEFAULT_MAX_BYTES,
@@ -309,17 +311,19 @@ impl EvalRuntime {
 		&self.bridge_session_id
 	}
 
-	/// Resolve the interpreter (bounded probe, cached) and acquire/replace the
-	/// kernel for one owner/session key.
+	/// Resolve the interpreter (cached) and acquire/replace the kernel for one
+	/// owner/session key.
 	///
 	/// In `per-call` mode a fresh unregistered kernel is started for this
 	/// invocation (upstream `executePerCall`); otherwise the retained registry
 	/// slot is reused/replaced.
 	///
-	/// Probe/startup run under `cancellation` (the caller's real token) with
-	/// `probe_timeout_ms` bounding discovery only. The cell watchdog is armed by
-	/// the caller *after* this returns, so probe/startup time is not charged to
-	/// the cell and an external abort during startup is reported as aborted.
+	/// Discovery/startup run under `cancellation` (the caller's real token).
+	/// `probe_timeout_ms` bounds a throwaway probe. `cell_deadline` is the one
+	/// deadline for the whole cell, anchored at the caller's start time: Julia
+	/// readiness is the kernel startup itself, so it draws on that deadline (and
+	/// on the remainder for retries), never on the probe budget, and the cell then
+	/// executes inside whatever is left.
 	pub async fn kernel_for_session(
 		&self,
 		language: EvalLanguage,
@@ -329,11 +333,19 @@ impl EvalRuntime {
 		ambient_env: &HashMap<String, String>,
 		reset: bool,
 		probe_timeout_ms: Option<u64>,
+		cell_deadline: Option<Instant>,
 		cancellation: CancellationToken,
 	) -> Result<std::sync::Arc<Kernel>, EvalError> {
 		let interpreter = self.settings.interpreters.for_language(language);
 		let cwd = normalize_cwd(cwd);
-		let runtime = languages::resolve_runtime(
+		let endpoint = self.bridge.endpoint();
+		let extra_env = HashMap::from([
+			("PI_TOOL_BRIDGE_URL".to_string(), endpoint.url.clone()),
+			("PI_TOOL_BRIDGE_TOKEN".to_string(), endpoint.token.clone()),
+			("PI_TOOL_BRIDGE_SESSION".to_string(), self.bridge_session_id.clone()),
+		]);
+		let per_call = matches!(self.settings.kernel_mode, KernelMode::PerCall);
+		let resolution = languages::resolve_runtime(
 			language,
 			&cwd,
 			ambient_env,
@@ -342,16 +354,31 @@ impl EvalRuntime {
 			probe_timeout_ms,
 		)
 		.await?;
-		let endpoint = self.bridge.endpoint();
-		let extra_env = HashMap::from([
-			("PI_TOOL_BRIDGE_URL".to_string(), endpoint.url.clone()),
-			("PI_TOOL_BRIDGE_TOKEN".to_string(), endpoint.token.clone()),
-			("PI_TOOL_BRIDGE_SESSION".to_string(), self.bridge_session_id.clone()),
-		]);
+		let runtime = match resolution {
+			languages::RuntimeResolution::Probed(runtime) => runtime,
+			// Julia: the interpreter boot is the only readiness signal, so the
+			// first real kernel doubles as discovery and is then reused.
+			languages::RuntimeResolution::Handshake(candidates) => {
+				return self
+					.julia_kernel(
+						candidates,
+						&cwd,
+						interpreter,
+						owner,
+						session_id,
+						reset,
+						per_call,
+						cell_deadline,
+						extra_env,
+						cancellation,
+					)
+					.await;
+			},
+		};
 		// Upstream `executePerCall` never touches the session registry: each call
 		// owns a fresh kernel and shuts it down in `finally`. Sharing a registry
 		// slot made concurrent cells reset/dispose each other's kernels.
-		if matches!(self.settings.kernel_mode, KernelMode::PerCall) {
+		if per_call {
 			let spawn = KernelSpawn { language, runtime, cwd, extra_env };
 			return match Kernel::start(spawn, cancellation.clone()).await {
 				Ok(kernel) => Ok(std::sync::Arc::new(kernel)),
@@ -383,6 +410,114 @@ impl EvalRuntime {
 		}
 	}
 
+	/// Start the real Julia kernel as the readiness check.
+	///
+	/// Julia pays a full sysimage boot for any argv, so a separate probe would
+	/// boot it twice. One interpreter startup per candidate is attempted under
+	/// the single overall cell deadline (a retry keeps the remainder); the first
+	/// successful handshake is cached and, in session mode, retained, so later
+	/// cells reuse the live process and a dead-kernel retry reuses the proven
+	/// interpreter instead of re-scanning `PATH`.
+	#[allow(clippy::too_many_arguments)]
+	async fn julia_kernel(
+		&self,
+		candidates: Vec<InterpreterRuntime>,
+		cwd: &Path,
+		interpreter: Option<&str>,
+		owner: Option<&str>,
+		session_id: &str,
+		reset: bool,
+		per_call: bool,
+		cell_deadline: Option<Instant>,
+		extra_env: HashMap<String, String>,
+		cancellation: CancellationToken,
+	) -> Result<std::sync::Arc<Kernel>, EvalError> {
+		let cached = languages::cached_runtime(EvalLanguage::Jl, cwd, interpreter);
+		// Later cells reuse the retained kernel: readiness already happened, so no
+		// boot happens and no budget is spent. Reset and per-call never reuse.
+		if !per_call
+			&& !reset
+			&& let Some(runtime) = cached.as_ref()
+			&& let Some(kernel) = self.registry.live(&julia_key(runtime, owner, session_id, cwd)).await
+		{
+			return Ok(kernel);
+		}
+		// Bounded cell => readiness draws on the caller's cell deadline (a retry
+		// keeps the remaining time, never a fresh budget); unbounded cell => the
+		// existing kernel startup safety deadline, never a hidden probe cap.
+		let deadline = cell_deadline
+			.unwrap_or_else(|| Instant::now() + languages::startup_timeout(EvalLanguage::Jl));
+		if reset && !per_call {
+			// Reset retires the old process before the replacement boots, exactly
+			// like the probing path: two kernels never coexist for one slot.
+			self.registry.evict(EvalLanguage::Jl, owner, session_id, cwd).await;
+		}
+		let mut candidates = candidates;
+		if let Some(cached) = cached {
+			// Prefer the interpreter already proven for this session over a PATH
+			// re-scan that could pick a different binary mid-session.
+			candidates.retain(|runtime| runtime.program != cached.program);
+			candidates.insert(0, cached);
+		}
+		let mut failures = Vec::new();
+		for runtime in candidates {
+			if cancellation.is_cancelled() {
+				return Err(EvalError::Aborted("Julia kernel readiness was cancelled".to_string()));
+			}
+			let now = Instant::now();
+			if now >= deadline {
+				failures.push(format!("{} (cell budget exhausted)", runtime.label));
+				break;
+			}
+			if !env::is_executable(&runtime.program) {
+				failures.push(format!("{} (not executable)", runtime.label));
+				continue;
+			}
+			let spawn = KernelSpawn {
+				language: EvalLanguage::Jl,
+				runtime: runtime.clone(),
+				cwd: cwd.to_path_buf(),
+				extra_env: extra_env.clone(),
+			};
+			// The kernel owns its own process group: a failed, timed-out or
+			// cancelled attempt is swept by `Kernel`'s shutdown/drop path.
+			let started = tokio::select! {
+				() = cancellation.cancelled() => {
+					return Err(EvalError::Aborted("Julia kernel readiness was cancelled".to_string()));
+				},
+				started = tokio::time::timeout(
+					deadline.saturating_duration_since(now),
+					Kernel::start(spawn, cancellation.clone()),
+				) => started,
+			};
+			let kernel = match started {
+				Ok(Ok(kernel)) => kernel,
+				Ok(Err(error)) => {
+					if cancellation.is_cancelled() {
+						return Err(EvalError::Aborted("Julia kernel readiness was cancelled".to_string()));
+					}
+					failures.push(format!("{} ({})", runtime.label, first_line(&error.to_string())));
+					continue;
+				},
+				Err(_) => {
+					failures.push(format!("{} (readiness timed out)", runtime.label));
+					break;
+				},
+			};
+			languages::remember_runtime(EvalLanguage::Jl, cwd, interpreter, &runtime);
+			if per_call {
+				return Ok(std::sync::Arc::new(kernel));
+			}
+			let key = julia_key(&runtime, owner, session_id, cwd);
+			return Ok(self.registry.adopt(key, std::sync::Arc::new(kernel)).await);
+		}
+		Err(EvalError::Unavailable(format!(
+			"No working {} interpreter found. Tried: {}",
+			EvalLanguage::Jl.display_name(),
+			failures.join("; ")
+		)))
+	}
+
 	pub async fn dispose_owner(&self, owner: Option<&str>) {
 		self.registry.dispose_owner(owner).await;
 	}
@@ -400,6 +535,22 @@ impl EvalRuntime {
 	pub fn retained_count(&self, owner: Option<&str>) -> usize {
 		self.registry.retained_count(owner)
 	}
+}
+
+/// Retained-kernel key for one Julia interpreter.
+fn julia_key(runtime: &InterpreterRuntime, owner: Option<&str>, session_id: &str, cwd: &Path) -> KernelKey {
+	KernelKey {
+		language: EvalLanguage::Jl,
+		owner: owner.map(str::to_string),
+		session_id: session_id.to_string(),
+		cwd: cwd.to_path_buf(),
+		interpreter: Some(runtime.program.display().to_string()),
+	}
+}
+
+/// First non-empty line of a multi-line error, for one-line failure lists.
+fn first_line(text: &str) -> String {
+	text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default().to_string()
 }
 
 /// Resolve a kernel cwd against the ambient environment (no implicit HOME write).

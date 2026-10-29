@@ -62,6 +62,40 @@ impl SessionRegistry {
 		Self::default()
 	}
 
+	fn slot(&self, key: &KernelKey) -> Arc<Slot> {
+		let storage = key.storage_key();
+		let mut slots = self.slots.lock().unwrap_or_else(|poison| poison.into_inner());
+		Arc::clone(slots.entry(storage).or_insert_with(|| {
+			Arc::new(Slot {
+				key: key.clone(),
+				generation: AtomicU64::new(0),
+				kernel: AsyncMutex::new(None),
+			})
+		}))
+	}
+
+	/// Store an already-started kernel (readiness proven by its own handshake).
+	///
+	/// A live kernel for the slot wins: the newcomer is shut down so concurrent
+	/// callers never keep two kernels for one key. `reset` callers retire the old
+	/// kernel with [`Self::evict`] *before* booting the replacement.
+	pub async fn adopt(&self, key: KernelKey, kernel: Arc<Kernel>) -> Arc<Kernel> {
+		let slot = self.slot(&key);
+		let mut guard = slot.kernel.lock().await;
+		if let Some(existing) = guard.as_ref()
+			&& existing.is_alive()
+		{
+			kernel.shutdown().await;
+			return Arc::clone(existing);
+		}
+		if let Some(dead) = guard.take() {
+			slot.generation.fetch_add(1, Ordering::SeqCst);
+			dead.shutdown().await;
+		}
+		*guard = Some(Arc::clone(&kernel));
+		kernel
+	}
+
 	/// Acquire (or replace) the kernel for `key`.
 	///
 	/// `reset` destroys the current kernel first. A dead retained kernel is
@@ -74,17 +108,7 @@ impl SessionRegistry {
 		reset: bool,
 		cancellation: CancellationToken,
 	) -> Result<Arc<Kernel>, EvalError> {
-		let storage = key.storage_key();
-		let slot = {
-			let mut slots = self.slots.lock().unwrap_or_else(|poison| poison.into_inner());
-			Arc::clone(slots.entry(storage).or_insert_with(|| {
-				Arc::new(Slot {
-					key: key.clone(),
-					generation: AtomicU64::new(0),
-					kernel: AsyncMutex::new(None),
-				})
-			}))
-		};
+		let slot = self.slot(&key);
 		let mut guard = slot.kernel.lock().await;
 		if reset {
 			slot.generation.fetch_add(1, Ordering::SeqCst);
@@ -110,6 +134,43 @@ impl SessionRegistry {
 		let kernel = Arc::new(Kernel::start(spawn, cancellation).await?);
 		*guard = Some(Arc::clone(&kernel));
 		Ok(kernel)
+	}
+
+	/// Live retained kernel for `key`, without booting a replacement.
+	pub async fn live(&self, key: &KernelKey) -> Option<Arc<Kernel>> {
+		let storage = key.storage_key();
+		let slot = {
+			let slots = self.slots.lock().unwrap_or_else(|poison| poison.into_inner());
+			Arc::clone(slots.get(&storage)?)
+		};
+		let guard = slot.kernel.lock().await;
+		guard.as_ref().filter(|kernel| kernel.is_alive()).cloned()
+	}
+
+	/// Retire every retained kernel for one language/owner/session/cwd.
+	///
+	/// Used by the readiness path, which boots the replacement before it can be
+	/// adopted: the old process must be gone before the new one starts.
+	pub async fn evict(&self, language: EvalLanguage, owner: Option<&str>, session_id: &str, cwd: &Path) {
+		let removed: Vec<Arc<Slot>> = {
+			let mut slots = self.slots.lock().unwrap_or_else(|poison| poison.into_inner());
+			let keys: Vec<String> = slots
+				.iter()
+				.filter(|(_, slot)| {
+					slot.key.language == language
+						&& slot.key.owner.as_deref() == owner
+						&& slot.key.session_id == session_id
+						&& slot.key.cwd.as_path() == cwd
+				})
+				.map(|(key, _)| key.clone())
+				.collect();
+			keys.into_iter().filter_map(|key| slots.remove(&key)).collect()
+		};
+		for slot in removed {
+			if let Some(kernel) = slot.kernel.lock().await.take() {
+				kernel.shutdown().await;
+			}
+		}
 	}
 
 	/// Remove and shut down every kernel owned by `owner`.
