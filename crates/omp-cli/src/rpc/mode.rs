@@ -64,8 +64,24 @@ struct Meta {
 /// `turn_end`.
 #[derive(Default)]
 struct EventFrames {
-	text:      String,
-	turn_open: bool,
+	text:          String,
+	turn_open:     bool,
+	/// Whether an assistant `message_end` already reached the host. A retry
+	/// after that frame would deliver a second end for the same prompt.
+	message_ended: bool,
+	/// Whether any tool frame was emitted. Tool frames are replay-unsafe for the
+	/// same reason committed text is: nothing on the wire retracts them.
+	saw_tool:      bool,
+}
+
+impl EventFrames {
+	/// Upstream `#hasReplayUnsafeOutput` veto: a retry re-streams the turn from
+	/// `message_start`, so it is only safe while nothing user-visible was
+	/// emitted. Whitespace-only deltas stay replayable (thinking-only partials),
+	/// matching `turn-recovery.ts`.
+	fn replay_safe(&self) -> bool {
+		self.text.trim().is_empty() && !self.saw_tool
+	}
 }
 
 impl EventFrames {
@@ -101,6 +117,7 @@ impl EventFrames {
 				}));
 			},
 			AgentEvent::MessageEnd { message, stop_reason, api, provider, model } => {
+				self.message_ended = true;
 				sink.send(json!({
 					"type": "message_end",
 					"message": {
@@ -116,6 +133,7 @@ impl EventFrames {
 				}));
 			},
 			AgentEvent::ToolStart { id, tool, args } => {
+				self.saw_tool = true;
 				sink.send(json!({
 					"type": "tool_execution_start",
 					"toolCallId": id,
@@ -124,6 +142,7 @@ impl EventFrames {
 				}));
 			},
 			AgentEvent::ToolEnd { id, tool, result, error } => {
+				self.saw_tool = true;
 				let content = match error {
 					Some(error) => format!("{result}\n{error}"),
 					None => result.clone(),
@@ -347,8 +366,8 @@ impl RpcMode {
 		approvals.set_ask(Some(Arc::new(super::input::RpcAskChannel::new(
 			Arc::clone(&ui),
 		))));
-		let host_tools = Arc::new(Mutex::new(HostToolBridge::new(Arc::clone(&sink))));
-		let host_uris = Arc::new(Mutex::new(HostUriBridge::new(Arc::clone(&sink))));
+		let host_tools = Arc::new(HostToolBridge::new(Arc::clone(&sink)));
+		let host_uris = Arc::new(HostUriBridge::new(Arc::clone(&sink)));
 		let session = RpcSession::open(launch, approvals, host_tools, host_uris)?;
 		sink.send(super::types::ready_frame(
 			MAX_RPC_FRAME_BYTES,
@@ -363,25 +382,33 @@ impl RpcMode {
 			aborted: Arc::new(AtomicBool::new(false)),
 			registry: SubagentRegistry::new(),
 		};
-		mode.event_loop(&mut reader);
+		let read_error = mode.event_loop(&mut reader);
 		mode.finish();
-		match output.finish() {
-			Some(error) => Err(crate::Error::new(error)),
-			None => Ok(()),
-		}
+		let flush_error = output.finish();
+		read_error
+			.map(|error| crate::Error::new(format!("RPC input read failed: {error}")))
+			.or_else(|| flush_error.map(crate::Error::new))
+			.map_or(Ok(()), Err)
 	}
 
-	fn event_loop(&mut self, reader: &mut impl std::io::BufRead) {
+	/// Pump inbound frames until EOF or a fatal stdin error.
+	///
+	/// EOF is a clean shutdown. A read error is fatal: it is returned so the
+	/// caller runs the same teardown as EOF (in-flight turns and bash runs
+	/// aborted, pending host tool/URI calls and approval dialogs failed closed)
+	/// and flushes the writer — never logged and swallowed, never panicked.
+	fn event_loop(&mut self, reader: &mut impl std::io::BufRead) -> Option<std::io::Error> {
 		let mut input = RpcInput::new(reader);
 		loop {
 			match input.next() {
-				Ok(None) => return,
+				Ok(None) => return None,
 				Ok(Some(Err(error))) => {
 					// Upstream logs a malformed line and keeps reading.
 					eprintln!("warning: {error}");
 				},
 				Ok(Some(Ok(Inbound::Control(control)))) => self.handle_control(control),
 				Ok(Some(Ok(Inbound::Command(value)))) => self.handle_value(value),
+				Err(error) => return Some(error),
 			}
 		}
 	}
@@ -392,18 +419,15 @@ impl RpcMode {
 				self.ui.handle(response);
 			},
 			RpcControlFrame::HostToolResult(frame) => {
-				let bridge = self.lock_session().host_tools.clone();
-				let bridge = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+				let bridge = Arc::clone(&self.lock_session().host_tools);
 				bridge.handle_result(frame);
 			},
 			RpcControlFrame::HostToolUpdate(frame) => {
-				let bridge = self.lock_session().host_tools.clone();
-				let bridge = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+				let bridge = Arc::clone(&self.lock_session().host_tools);
 				bridge.handle_update(frame);
 			},
 			RpcControlFrame::HostUriResult(frame) => {
-				let bridge = self.lock_session().host_uris.clone();
-				let bridge = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+				let bridge = Arc::clone(&self.lock_session().host_uris);
 				bridge.handle_result(frame);
 			},
 		}
@@ -432,16 +456,8 @@ impl RpcMode {
 		self.active.abort_bash();
 		{
 			let session = self.lock_session();
-			session
-				.host_tools
-				.lock()
-				.unwrap_or_else(std::sync::PoisonError::into_inner)
-				.close("RPC session closed");
-			session
-				.host_uris
-				.lock()
-				.unwrap_or_else(std::sync::PoisonError::into_inner)
-				.close("RPC session closed");
+			session.host_tools.close("RPC session closed");
+			session.host_uris.close("RPC session closed");
 		}
 		{
 			let mut session = self.lock_session();
@@ -561,7 +577,7 @@ impl RpcMode {
 				Some(ok_data(json!({ "todoPhases": phases })))
 			},
 			RpcCommand::SetHostTools { tools, .. } => {
-				let bridge = self.lock_session().host_tools.clone();
+				let bridge = Arc::clone(&self.lock_session().host_tools);
 				Some(match bridge.set_tools(tools) {
 					Err(error) => err(error),
 					Ok(adapters) => {
@@ -580,8 +596,7 @@ impl RpcMode {
 				})
 			},
 			RpcCommand::SetHostUriSchemes { schemes, .. } => {
-				let bridge = self.lock_session().host_uris.clone();
-				let bridge = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+				let bridge = Arc::clone(&self.lock_session().host_uris);
 				Some(match bridge.set_schemes(&schemes) {
 					Err(error) => err(error),
 					Ok(schemes) => prereq(host_uris::mount_prerequisite(&schemes)),
@@ -1047,6 +1062,54 @@ fn maybe_auto_compact(session: &Arc<Mutex<RpcSession>>, sink: &Arc<dyn FrameSink
 	}
 }
 
+/// Whether a stream-failure message is transient enough to retry.
+///
+/// Mirrors upstream `isRetryableError` (`turn-recovery.ts`): only provider
+/// transport/limit failures retry. Permanent failures — auth/account, request
+/// validation, model or image rejection, context overflow (compaction owns it),
+/// the user's own max-time budget, and interrupts — are reported, never retried.
+/// Unknown text is treated as permanent, like upstream's default-deny
+/// [`AIError::retriable`].
+fn is_retryable_stream_error(error: &str) -> bool {
+	let lower = error.to_ascii_lowercase();
+	const PERMANENT: [&str; 14] = [
+		"unauthorized",
+		"forbidden",
+		"authentication",
+		"api key",
+		"permission",
+		"invalid_request",
+		"invalid request",
+		"context length",
+		"context window",
+		"context overflow",
+		"does not support",
+		"not found",
+		"interrupted",
+		"dialog stream closed unexpectedly",
+	];
+	if error == crate::deadline::TIMEOUT_MESSAGE || PERMANENT.iter().any(|needle| lower.contains(needle)) {
+		return false;
+	}
+	const TRANSIENT: [&str; 14] = [
+		"429",
+		"rate limit",
+		"overloaded",
+		"500",
+		"502",
+		"503",
+		"504",
+		"timed out",
+		"timeout",
+		"connection",
+		"reset by peer",
+		"network",
+		"stream ended before completion",
+		"upstream",
+	];
+	TRANSIENT.iter().any(|needle| lower.contains(needle))
+}
+
 /// One pumped turn: prepare, stream frames, persist, then announce the end.
 fn run_turn(
 	session: &Arc<Mutex<RpcSession>>,
@@ -1091,74 +1154,13 @@ fn run_turn(
 			let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 			guard.auto_retry
 		};
-		match runner.run(&request) {
-			Err(error) => {
-				// No event was consumed, so the prepared turn is still clean and
-				// the same request can be retried without duplicating the user
-				// entry.
-				if auto_retry
-					&& attempt < MAX_RETRY_ATTEMPTS
-					&& !aborted.load(Ordering::SeqCst)
-				{
-					attempt += 1;
-					let delay_ms = 1000u64 << (attempt - 1).min(3);
-					sink.send(json!({
-						"type": "auto_retry_start",
-						"attempt": attempt,
-						"maxAttempts": MAX_RETRY_ATTEMPTS,
-						"delayMs": delay_ms,
-						"errorMessage": error.to_string(),
-					}));
-					let token = CancellationToken::new();
-					{
-						let mut guard =
-							session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-						guard.retry_abort = Some(token.clone());
-					}
-					let mut cancelled = false;
-					for _ in 0..delay_ms.div_ceil(50) {
-						if token.is_cancelled() || aborted.load(Ordering::SeqCst) {
-							cancelled = true;
-							break;
-						}
-						thread::sleep(Duration::from_millis(50));
-					}
-					{
-						let mut guard =
-							session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-						guard.retry_abort = None;
-					}
-					if cancelled {
-						sink.send(json!({
-							"type": "auto_retry_end",
-							"success": false,
-							"attempt": attempt,
-							"finalError": error.to_string(),
-						}));
-						outcome.error = Some(error.to_string());
-						break;
-					}
-					continue;
-				}
-				if attempt > 0 {
-					sink.send(json!({
-						"type": "auto_retry_end",
-						"success": false,
-						"attempt": attempt,
-						"finalError": error.to_string(),
-					}));
-				}
-				outcome.error = Some(error.to_string());
-				break;
-			},
+		// Provider failures do not surface here: `runner.run` only rejects setup
+		// (model plan, MCP discovery, provider construction), which is permanent
+		// and must never be retried. The turn's own failures arrive as stream
+		// `Err` items, which is what the retry policy classifies.
+		let (attempt_error, message_ended, replay_safe, from_stream) = match runner.run(&request) {
+			Err(error) => (Some(error.to_string()), false, false, false),
 			Ok(events) => {
-				if attempt > 0 {
-					sink.send(json!({
-						"type": "auto_retry_end",
-						"success": true,
-						"attempt": attempt,
-					}));
-				}
 				let max_time = {
 					let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 					guard.max_time
@@ -1180,12 +1182,82 @@ fn run_turn(
 						Ok(())
 					},
 				);
-				if let Err(error) = result {
-					outcome.error = Some(error.to_string());
-				}
-				break;
+				(result.err().map(|error| error.to_string()), frames.message_ended, frames.replay_safe(), true)
 			},
+		};
+		let Some(error) = attempt_error else {
+			if attempt > 0 {
+				sink.send(json!({
+					"type": "auto_retry_end",
+					"success": true,
+					"attempt": attempt,
+				}));
+			}
+			break;
+		};
+		// Retry only a classified transient provider failure from the stream,
+		// while nothing user-visible was emitted: no assistant `message_end`, no
+		// non-whitespace delta, no tool frame. The wire has no frame that
+		// retracts any of those, so a retry would duplicate them for the same
+		// prompt (upstream `#hasReplayUnsafeOutput`). `reset_for_retry` keeps the
+		// user entry.
+		if auto_retry
+			&& from_stream
+			&& !message_ended
+			&& replay_safe
+			&& is_retryable_stream_error(&error)
+			&& attempt < MAX_RETRY_ATTEMPTS
+			&& !aborted.load(Ordering::SeqCst)
+		{
+			attempt += 1;
+			let delay_ms = 1000u64 << (attempt - 1).min(3);
+			sink.send(json!({
+				"type": "auto_retry_start",
+				"attempt": attempt,
+				"maxAttempts": MAX_RETRY_ATTEMPTS,
+				"delayMs": delay_ms,
+				"errorMessage": error,
+			}));
+			let token = CancellationToken::new();
+			{
+				let mut guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+				guard.retry_abort = Some(token.clone());
+			}
+			let mut cancelled = false;
+			for _ in 0..delay_ms.div_ceil(50) {
+				if token.is_cancelled() || aborted.load(Ordering::SeqCst) {
+					cancelled = true;
+					break;
+				}
+				thread::sleep(Duration::from_millis(50));
+			}
+			{
+				let mut guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+				guard.retry_abort = None;
+			}
+			if cancelled {
+				sink.send(json!({
+					"type": "auto_retry_end",
+					"success": false,
+					"attempt": attempt,
+					"finalError": error,
+				}));
+				outcome.error = Some(error);
+				break;
+			}
+			prepared.reset_for_retry(&input, &request.parts);
+			continue;
 		}
+		if attempt > 0 {
+			sink.send(json!({
+				"type": "auto_retry_end",
+				"success": false,
+				"attempt": attempt,
+				"finalError": error,
+			}));
+		}
+		outcome.error = Some(error);
+		break;
 	}
 	outcome.aborted = aborted.load(Ordering::SeqCst);
 	{
@@ -1194,4 +1266,37 @@ fn run_turn(
 	}
 	active.end();
 	outcome
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+	use super::is_retryable_stream_error;
+
+	#[test]
+	fn transient_provider_failures_retry() {
+		for error in [
+			"pi-agent run failed: 503 Service Unavailable",
+			"pi-agent run failed: 429 rate limit exceeded",
+			"pi-agent run failed: connection reset by peer",
+			"pi-agent run failed: stream ended before completion",
+		] {
+			assert!(is_retryable_stream_error(error), "{error} should retry");
+		}
+	}
+
+	#[test]
+	fn permanent_failures_never_retry() {
+		for error in [
+			"pi-agent run failed: 401 Unauthorized: invalid api key",
+			"pi-agent run failed: 403 Forbidden",
+			"pi-agent run failed: 400 invalid_request_error",
+			"pi-agent run failed: context length exceeded",
+			"pi-agent run failed: model does not support image input",
+			crate::deadline::TIMEOUT_MESSAGE,
+			"interrupted",
+			"pi-agent run failed: something nobody classified",
+		] {
+			assert!(!is_retryable_stream_error(error), "{error} must not retry");
+		}
+	}
 }

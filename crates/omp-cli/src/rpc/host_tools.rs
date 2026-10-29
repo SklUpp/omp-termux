@@ -156,10 +156,11 @@ impl HostToolBridge {
 
 	/// Resolve an inbound `host_tool_update`; `false` when the id is unknown.
 	pub fn handle_update(&self, frame: RpcHostToolUpdate) -> bool {
-		let Some(pending) = self.lock_pending().get(&frame.id) else {
+		let pending = self.lock_pending();
+		let Some(call) = pending.get(&frame.id) else {
 			return false;
 		};
-		pending.tx.send(HostReply::Update(frame.partial_result)).is_ok()
+		call.tx.send(HostReply::Update(frame.partial_result)).is_ok()
 	}
 
 	/// Fail every pending call and every future call (peer disconnected).
@@ -169,7 +170,8 @@ impl HostToolBridge {
 			*closed = Some(message.to_string());
 		}
 		drop(closed);
-		let pending: Vec<PendingCall> = self.lock_pending().drain().map(|(_, call)| call).collect();
+		let pending: Vec<PendingCall> =
+			std::mem::take(&mut *self.lock_pending()).into_values().collect();
 		for call in pending {
 			let _ = call.tx.send(HostReply::Closed(message.to_string()));
 		}
@@ -394,9 +396,10 @@ mod tests {
 	fn duplicate_names_are_rejected() {
 		let sink = Arc::new(TestSink::default());
 		let bridge = Arc::new(HostToolBridge::new(sink));
-		let error = bridge
-			.set_tools(vec![definition("a"), definition("a")])
-			.expect_err("duplicate");
+		let error = match bridge.set_tools(vec![definition("a"), definition("a")]) {
+			Ok(_) => panic!("duplicate host tool names must be rejected"),
+			Err(error) => error,
+		};
 		assert_eq!(error, "Duplicate host tool name: a");
 	}
 

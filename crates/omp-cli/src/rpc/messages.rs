@@ -299,8 +299,8 @@ mod tests {
 		assert_eq!(mismatch.message, "RPC message snapshot does not match current messages");
 		assert_eq!(mismatch.code, None);
 
-		let snapshot = snapshot(messages.len());
-		let first = page_messages(&messages, &snapshot, (None, Some(1))).expect("first");
+		let current_snapshot = snapshot(messages.len());
+		let first = page_messages(&messages, &current_snapshot, (None, Some(1))).expect("first");
 		let cursor = first.next_cursor.expect("cursor");
 		let mut grown = messages.clone();
 		grown.push(message("user", 9));

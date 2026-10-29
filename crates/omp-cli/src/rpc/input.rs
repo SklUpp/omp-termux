@@ -17,7 +17,11 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use serde_json::Value;
+use pi_agent::tools::ask::{
+	AskAnswer, AskOutcome, AskQuestion, CHAT_ABOUT_THIS_OPTION, OTHER_OPTION, display_label,
+	strip_recommended_suffix,
+};
+use serde_json::{Value, json};
 
 use super::{
 	frame::{FrameLines, RpcFrameDecoder, RpcFrameEncoder},
@@ -263,7 +267,7 @@ impl ExtensionUiBridge {
 	/// Fail every pending dialog (abort, EOF, shutdown) so callers fail closed.
 	pub fn cancel_all(&self) {
 		let pending: Vec<(String, Sender<RpcExtensionUiResponse>)> =
-			self.lock_pending().drain().collect();
+			std::mem::take(&mut *self.lock_pending()).into_iter().collect();
 		for (id, sender) in pending {
 			let _ = sender.send(RpcExtensionUiResponse {
 				id,
@@ -495,7 +499,7 @@ mod tests {
 			}
 		}
 		let ui = Arc::new(ExtensionUiBridge::new(Arc::new(TestSink(Mutex::new(tx)))));
-		let mut input = RpcApprovalInput::new(Arc::clone(&ui), Duration::from_secs(5));
+		let mut input = RpcApprovalInput::new(Arc::clone(&ui), Some(Duration::from_secs(5)));
 		let handle = thread::spawn(move || {
 			let mut line = String::new();
 			input.read_line(&mut line).expect("read");
@@ -513,7 +517,7 @@ mod tests {
 		assert_eq!(handle.join().expect("join"), "yes\n");
 
 		// A cancelled dialog is a denial, never an approval.
-		let mut input = RpcApprovalInput::new(Arc::clone(&ui), Duration::from_secs(5));
+		let mut input = RpcApprovalInput::new(Arc::clone(&ui), Some(Duration::from_secs(5)));
 		let handle = thread::spawn(move || {
 			let mut line = String::new();
 			input.read_line(&mut line).expect("read");
@@ -528,15 +532,22 @@ mod tests {
 	fn shutdown_drains_tracked_tasks() {
 		let mut coordinator = ShutdownCoordinator::new();
 		let marker = Arc::new(Mutex::new(Vec::new()));
+		// Tasks park until every one of them is tracked, so none can finish (and
+		// be reaped by `track`) before `drain` owns all three handles.
+		let mut releases = Vec::new();
 		for index in 0..3 {
 			let marker = Arc::clone(&marker);
+			let (release, wait) = mpsc::channel::<()>();
+			releases.push(release);
 			coordinator.track(thread::spawn(move || {
+				let _ = wait.recv();
 				marker.lock().expect("marker").push(index);
 			}));
 		}
+		drop(releases);
 		coordinator.begin_close();
 		assert!(coordinator.is_closing());
-		assert_eq!(coordinator.drain(), 3);
+		assert_eq!(coordinator.drain(), 3, "every tracked task is awaited by drain");
 		let mut tasks = marker.lock().expect("marker").clone();
 		tasks.sort_unstable();
 		assert_eq!(tasks, vec![0, 1, 2]);
@@ -551,68 +562,273 @@ pub struct RpcAskChannel {
 	ui: Arc<ExtensionUiBridge>,
 }
 
+/// Label for the runtime-added multi-select submit option
+/// (upstream `getDoneOptionLabel`, minus terminal styling).
+const DONE_SELECTING_LABEL: &str = "Done selecting";
+
 impl RpcAskChannel {
 	pub fn new(ui: Arc<ExtensionUiBridge>) -> Self {
 		Self { ui }
 	}
+
+	/// Wire labels for one question, matching upstream
+	/// `getExtensionUISelectOptionLabel`: positional strings with the
+	/// `(Recommended)` suffix on the marked option.
+	fn labels(question: &AskQuestion) -> Vec<String> {
+		question
+			.options
+			.iter()
+			.enumerate()
+			.map(|(index, option)| display_label(option, index, question.recommended))
+			.collect()
+	}
+
+	/// Positional `optionDetails`, aligned 1:1 with [`Self::labels`]. Options
+	/// without a description become `{}` so indices stay aligned; labels the
+	/// runtime appends (custom input, done) get `{}` too.
+	fn details(question: &AskQuestion, extra: usize) -> Vec<Value> {
+		let mut details: Vec<Value> = question
+			.options
+			.iter()
+			.map(|option| match option.description.as_deref().map(str::trim) {
+				Some(description) if !description.is_empty() => json!({ "description": description }),
+				_ => json!({}),
+			})
+			.collect();
+		details.resize(details.len() + extra, json!({}));
+		details
+	}
+
+	fn title(question: &AskQuestion) -> String {
+		question.header.clone().unwrap_or_else(|| question.question.clone())
+	}
+
+	/// One `select` dialog; `None` means cancelled or timed out.
+	fn select(&self, title: String, options: Vec<String>, option_details: Vec<Value>) -> Option<String> {
+		let response = self.ui.request(
+			json!({
+				"method": "select",
+				"title": title,
+				"options": options,
+				"optionDetails": option_details,
+			}),
+			None,
+		)?;
+		if response.cancelled {
+			return None;
+		}
+		response.value
+	}
+
+	/// Free-text answer through the protocol's `editor` dialog.
+	fn custom_input(&self, question: &AskQuestion) -> Option<String> {
+		let response = self.ui.request(
+			json!({ "method": "editor", "title": Self::title(question) }),
+			None,
+		)?;
+		if response.cancelled {
+			return None;
+		}
+		response.value
+	}
+
+	/// Map one chosen label back to the raw option label (`(Recommended)` is
+	/// display-only) or to free text.
+	fn resolve(question: &AskQuestion, value: &str) -> Option<String> {
+		let raw = strip_recommended_suffix(value);
+		question
+			.options
+			.iter()
+			.find(|option| option.label == raw)
+			.map(|option| option.label.clone())
+	}
+}
+
+/// One question's outcome, before it becomes an [`AskOutcome`].
+enum AskFlow {
+	Answer(AskAnswer),
+	Chat,
+	Cancelled,
 }
 
 #[async_trait::async_trait]
 impl pi_agent::tools::ask::AskChannel for RpcAskChannel {
 	async fn ask(
 		&self,
-		questions: &[pi_agent::tools::ask::AskQuestion],
+		questions: &[AskQuestion],
 		cancel: tokio_util::sync::CancellationToken,
-	) -> pi_agent::tools::ask::AskOutcome {
-		use pi_agent::tools::ask::{
-			AskAnswer, AskOutcome, CHAT_ABOUT_THIS_OPTION,
-		};
+	) -> AskOutcome {
 		let mut answers = Vec::new();
 		for question in questions {
 			if cancel.is_cancelled() {
 				return AskOutcome::Aborted;
 			}
-			let options: Vec<Value> = question
-				.options
-				.iter()
-				.map(|option| {
-					let mut value = serde_json::json!({ "label": option.label });
-					if let Some(description) = &option.description {
-						value["description"] = serde_json::json!(description);
-					}
-					if let Some(preview) = &option.preview {
-						value["preview"] = serde_json::json!(preview);
-					}
-					value
-				})
-				.collect();
-			let mut frame = serde_json::json!({
-				"method": "select",
-				"title": question.header.clone().unwrap_or_else(|| question.question.clone()),
-				"message": question.question,
-				"options": options,
-				"multi": question.multi,
-			});
-			if let Some(recommended) = question.recommended {
-				frame["recommended"] = serde_json::json!(recommended);
+			match self.ask_question(question, CHAT_ABOUT_THIS_OPTION) {
+				AskFlow::Answer(answer) => answers.push(answer),
+				AskFlow::Chat => return AskOutcome::ChatRedirect,
+				AskFlow::Cancelled => return AskOutcome::Cancelled,
 			}
-			let Some(response) = self.ui.request(frame, None) else {
-				return AskOutcome::Cancelled;
-			};
-			let Some(value) = response.value else {
-				return AskOutcome::Cancelled;
-			};
-			if value == CHAT_ABOUT_THIS_OPTION {
-				return AskOutcome::ChatRedirect;
-			}
-			let mut answer = AskAnswer { id: question.id.clone(), ..Default::default() };
-			if question.options.iter().any(|option| option.label == value) {
-				answer.selected_options.push(value);
-			} else {
-				answer.custom_input = Some(value);
-			}
-			answers.push(answer);
 		}
 		AskOutcome::Answered(answers)
+	}
+}
+
+impl RpcAskChannel {
+	/// One question over the real protocol.
+	///
+	/// Single-select is one dialog. Multi-select is repeated single selections —
+	/// the wire `select` returns exactly one label — using upstream's checkbox
+	/// loop: the runtime appends `Other (type your own)` (free text through the
+	/// `editor` dialog) and, once something is selected, `Done selecting`.
+	/// Selections are echoed in the title (`(2 selected) `) because the protocol
+	/// has no checked-state field, and re-selecting a chosen label toggles it
+	/// off, keeping multi semantics without inventing wire fields.
+	fn ask_question(&self, question: &AskQuestion, chat_label: &str) -> AskFlow {
+		let title = Self::title(question);
+		let mut selected: Vec<String> = Vec::new();
+		let mut custom_input: Option<String> = None;
+		if !question.multi {
+			// Upstream always appends the custom-input option, so free text is
+			// reachable through a compliant host (`tools/ask.ts`).
+			let mut options = Self::labels(question);
+			options.push(OTHER_OPTION.to_string());
+			let value = self.select(title.clone(), options, Self::details(question, 1));
+			let Some(value) = value else {
+				return AskFlow::Cancelled;
+			};
+			if value == chat_label {
+				return AskFlow::Chat;
+			}
+			if value == OTHER_OPTION {
+				return match self.custom_input(question) {
+					Some(text) => AskFlow::Answer(AskAnswer {
+						id: question.id.clone(),
+						custom_input: Some(text),
+						..Default::default()
+					}),
+					None => AskFlow::Cancelled,
+				};
+			}
+			let mut answer = AskAnswer { id: question.id.clone(), ..Default::default() };
+			match Self::resolve(question, &value) {
+				Some(label) => answer.selected_options.push(label),
+				None => answer.custom_input = Some(value),
+			}
+			return AskFlow::Answer(answer);
+		}
+		loop {
+			let mut options = Self::labels(question);
+			options.push(OTHER_OPTION.to_string());
+			let mut extra = 1;
+			if !selected.is_empty() {
+				options.push(DONE_SELECTING_LABEL.to_string());
+				extra += 1;
+			}
+			let prefix = if selected.is_empty() {
+				String::new()
+			} else {
+				format!("({} selected) ", selected.len())
+			};
+			let Some(value) = self.select(
+				format!("{prefix}{title}"),
+				options,
+				Self::details(question, extra),
+			) else {
+				return AskFlow::Cancelled;
+			};
+			if value == DONE_SELECTING_LABEL {
+				break;
+			}
+			if value == chat_label {
+				return AskFlow::Chat;
+			}
+			if value == OTHER_OPTION {
+				// An editor dismissed without text returns to the checkbox loop
+				// (upstream `tools/ask.ts`), it does not cancel the question.
+				if let Some(text) = self.custom_input(question) {
+					custom_input = Some(text);
+					break;
+				}
+				continue;
+			}
+			match Self::resolve(question, &value) {
+				Some(label) => {
+					match selected.iter().position(|chosen| *chosen == label) {
+						Some(index) => {
+							selected.remove(index);
+						},
+						None => selected.push(label),
+					}
+				},
+				None => {
+					// A host may answer free text without the runtime having
+					// offered `Other`; keep it as the custom answer.
+					custom_input = Some(value);
+					break;
+				},
+			}
+		}
+		AskFlow::Answer(AskAnswer {
+			id: question.id.clone(),
+			selected_options: selected,
+			custom_input,
+			..Default::default()
+		})
+	}
+}
+
+#[cfg(test)]
+mod ask_wire_tests {
+	use super::*;
+	use pi_agent::tools::ask::{AskOption, AskQuestion, RECOMMENDED_SUFFIX};
+
+	fn question() -> AskQuestion {
+		AskQuestion {
+			id:         "q1".to_string(),
+			question:   "Ship it?".to_string(),
+			header:     None,
+			options:    vec![
+				AskOption {
+					label:       "Yes".to_string(),
+					description: Some("  push to production  ".to_string()),
+					preview:     None,
+				},
+				AskOption { label: "No".to_string(), description: None, preview: None },
+			],
+			multi:      false,
+			recommended: Some(0),
+		}
+	}
+
+	#[test]
+	fn select_labels_and_option_details_stay_aligned() {
+		let question = question();
+		let labels = RpcAskChannel::labels(&question);
+		assert_eq!(
+			labels,
+			vec![format!("Yes{RECOMMENDED_SUFFIX}"), "No".to_string()],
+			"recommended suffix is display-only and positional"
+		);
+		let details = RpcAskChannel::details(&question, 0);
+		assert_eq!(details.len(), labels.len(), "optionDetails must align with options");
+		assert_eq!(details[0], json!({ "description": "push to production" }));
+		assert_eq!(details[1], json!({}), "an option without a description keeps its slot");
+		// Runtime-appended labels (`Other`, `Done selecting`) get empty entries.
+		assert_eq!(RpcAskChannel::details(&question, 2).len(), labels.len() + 2);
+	}
+
+	#[test]
+	fn chosen_labels_map_back_to_raw_option_labels() {
+		let question = question();
+		assert_eq!(
+			RpcAskChannel::resolve(&question, &format!("Yes{RECOMMENDED_SUFFIX}")),
+			Some("Yes".to_string())
+		);
+		assert_eq!(RpcAskChannel::resolve(&question, "No"), Some("No".to_string()));
+		assert_eq!(
+			RpcAskChannel::resolve(&question, "something else"),
+			None,
+			"free text becomes custom_input, never a selected option"
+		);
 	}
 }

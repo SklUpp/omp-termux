@@ -19,7 +19,7 @@ use std::{
 use pi_agent::{
 	CancellationToken, TurnAck,
 	state::{ContentPart as AgentContentPart, Message},
-	tools::todo::TodoPhase,
+	tools::{task_catalog::EFFORT_SELECTORS, todo::TodoPhase},
 };
 use serde_json::{Value, json};
 
@@ -57,7 +57,7 @@ pub struct Prerequisite {
 }
 
 impl Prerequisite {
-	fn new(code: &'static str, message: impl Into<String>) -> Self {
+	pub(super) fn new(code: &'static str, message: impl Into<String>) -> Self {
 		Self { code, message: message.into() }
 	}
 }
@@ -214,13 +214,13 @@ impl ActiveTurn {
 		self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 	}
 
-	fn begin(&self, token: CancellationToken, steer: Option<SteerFn>) {
+	pub(super) fn begin(&self, token: CancellationToken, steer: Option<SteerFn>) {
 		let mut guard = self.lock();
 		guard.cancel = Some(token);
 		guard.steer = steer;
 	}
 
-	fn end(&self) {
+	pub(super) fn end(&self) {
 		let mut guard = self.lock();
 		guard.cancel = None;
 		guard.steer = None;
@@ -279,8 +279,8 @@ pub struct RpcSession {
 	pub(crate) last_assistant_text: Option<String>,
 	pub(crate) tokens_per_second: Option<f64>,
 	pub(crate) steer: Option<SteerFn>,
-	pub(crate) host_tools: Arc<Mutex<HostToolBridge>>,
-	pub(crate) host_uris: Arc<Mutex<HostUriBridge>>,
+	pub(crate) host_tools: Arc<HostToolBridge>,
+	pub(crate) host_uris: Arc<HostUriBridge>,
 	pub(crate) subagent_level: SubagentSubscriptionLevel,
 	pub(crate) protocol_version: u8,
 }
@@ -290,8 +290,8 @@ impl RpcSession {
 	pub fn open(
 		launch: RpcLaunch,
 		approvals: Approvals,
-		host_tools: Arc<Mutex<HostToolBridge>>,
-		host_uris: Arc<Mutex<HostUriBridge>>,
+		host_tools: Arc<HostToolBridge>,
+		host_uris: Arc<HostUriBridge>,
 	) -> Result<Self> {
 		let RpcLaunch {
 			runner,
@@ -555,7 +555,13 @@ impl RpcSession {
 	/// request on the branch reported usage.
 	#[must_use]
 	pub fn context_usage(&self) -> Option<Value> {
-		let tokens = self.store.latest_context_tokens()?;
+		let tokens = match self.store.latest_context_tokens() {
+			Some(tokens) => tokens,
+			// `--no-session` never appends to the store, so read the last
+			// assistant usage mirrored from the loop: the reported occupancy,
+			// never a zero stand-in.
+			None => self.in_memory_context_tokens()?,
+		};
 		let limit = self.context_limit()?;
 		Some(json!({
 			"tokens": tokens,
@@ -566,6 +572,38 @@ impl RpcSession {
 				(tokens as f64 / limit as f64) * 100.0
 			},
 		}))
+	}
+
+	/// Occupancy of the newest reported request in the in-memory mirror.
+	///
+	/// Same formula as [`SessionStore::latest_context_tokens`] (`contextTokens`,
+	/// then the prompt counters, then `totalTokens`), minus the provider-side
+	/// orchestration subtraction that only TS-written logs carry. `None` when no
+	/// mirrored assistant message reported usage.
+	fn in_memory_context_tokens(&self) -> Option<u64> {
+		self
+			.in_memory_messages
+			.as_ref()?
+			.iter()
+			.rev()
+			.filter(|message| message.role == pi_agent::Role::Assistant)
+			.find_map(|message| message.usage.as_ref())
+			.map(|usage| {
+				let usage = session::Usage::from(*usage);
+				if let Some(context) = usage.context_tokens {
+					return context;
+				}
+				let prompt = usage.input + usage.cache_read + usage.cache_write;
+				if prompt > 0 {
+					return prompt;
+				}
+				let total = usage.total_tokens;
+				if total > 0 {
+					total
+				} else {
+					usage.input + usage.output + usage.cache_read + usage.cache_write
+				}
+			})
 	}
 
 	fn context_limit(&self) -> Option<usize> {
@@ -800,7 +838,7 @@ impl RpcSession {
 		let Some(parsed) = runtime::parse_cli_thinking(level) else {
 			return Err(Error::new(format!(
 				"Unknown thinking level: {level} (valid: {}, auto)",
-				runtime::EFFORT_SELECTORS.join(", ")
+				EFFORT_SELECTORS.join(", ")
 			)));
 		};
 		if let runtime::CliThinking::Effort(effort) = parsed {
@@ -1148,7 +1186,7 @@ impl RpcSession {
 			} else {
 				TurnBuilder::new_with_parts(input.text.clone(), request.parts.clone())
 			},
-			parent_id: user_id,
+			parent_id: Some(user_id),
 			in_memory_before,
 			started: Instant::now(),
 			model_fallback: self.model.clone(),
@@ -1553,6 +1591,22 @@ pub struct PreparedTurn {
 	pub aborted:    bool,
 }
 
+impl PreparedTurn {
+	/// Discard everything a failed attempt streamed so the retry starts a clean
+	/// assistant turn. The user entry (`parent_id`, `wire_user_message`) and the
+	/// in-memory boundary stay, so the retry cannot duplicate the prompt.
+	pub fn reset_for_retry(&mut self, input: &TurnInput, parts: &[ContentPart]) {
+		self.builder = if parts.is_empty() {
+			TurnBuilder::new(input.text.clone())
+		} else {
+			TurnBuilder::new_with_parts(input.text.clone(), parts.to_vec())
+		};
+		self.tool_names.clear();
+		self.started = Instant::now();
+		self.aborted = false;
+	}
+}
+
 /// Result of one pumped turn.
 #[derive(Debug, Clone, Default)]
 pub struct TurnOutcome {
@@ -1669,7 +1723,13 @@ impl RpcSession {
 		let result = self.summarize(compaction_prompt(custom.as_deref()));
 		self.is_compacting = false;
 		let summary = result?;
-		let first_kept = self.store.leaf_id().map_or_else(String::new, str::to_string);
+		// Upstream `prepareCompaction`: prompt-side occupancy of the newest
+		// reported request; 0 only when the branch never reported usage.
+		let tokens_before = self
+			.store
+			.latest_context_tokens()
+			.or_else(|| self.in_memory_context_tokens())
+			.unwrap_or(0);
 		let messages_removed = self.messages.len();
 		let summary_message = runtime::user_message_from_parts(&summary, &[])
 			.map_err(|err| Error::new(err.to_string()))?;
@@ -1688,23 +1748,29 @@ impl RpcSession {
 			"timestamp": now_ms(),
 		})];
 		self.last_assistant_text = None;
+		// The rewrite retains no prior entry: the rebuilt context starts at this
+		// compaction entry, so its id is the real `firstKeptEntryId` (same
+		// convention as the importer, `foreign_session.rs` compaction entries).
+		// An empty id only when the log is disabled or the append failed.
+		let mut first_kept = String::new();
 		if self.store.enabled() {
-			if let Err(err) = self.store.append_custom_message(
+			match self.store.append_custom_message(
 				"compaction",
 				&summary,
 				false,
 				json!({
-					"firstKeptEntryId": first_kept,
+					"tokensBefore": tokens_before,
 					"messagesRemoved": messages_removed,
 				}),
 			) {
-				eprintln!("warning: {err}");
+				Ok(id) => first_kept = id,
+				Err(err) => eprintln!("warning: {err}"),
 			}
 		}
 		Ok(json!({
 			"summary": summary,
 			"firstKeptEntryId": first_kept,
-			"messagesRemoved": messages_removed,
+			"tokensBefore": tokens_before,
 		}))
 	}
 

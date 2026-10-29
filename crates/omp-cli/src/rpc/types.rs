@@ -76,6 +76,13 @@ pub enum SubagentSubscriptionLevel {
 	Events,
 }
 
+impl Default for SubagentSubscriptionLevel {
+	/// Upstream `#subscriptionLevel = "off"` (`rpc-subagents.ts:113`).
+	fn default() -> Self {
+		Self::Off
+	}
+}
+
 impl SubagentSubscriptionLevel {
 	#[must_use]
 	pub fn as_str(self) -> &'static str {

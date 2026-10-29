@@ -144,7 +144,7 @@ impl HostUriBridge {
 		}
 		drop(closed);
 		let pending: Vec<PendingUriCall> =
-			self.lock_pending().drain().map(|(_, call)| call).collect();
+			std::mem::take(&mut *self.lock_pending()).into_values().collect();
 		for call in pending {
 			let _ = call.tx.send(UriReply::Closed(message.to_string()));
 		}
