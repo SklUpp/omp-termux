@@ -2505,7 +2505,18 @@ mod tests {
 	#[test]
 	fn whole_numbers_below_the_i64_boundary_stay_integers() {
 		let def = def("compaction.idleTimeoutSeconds");
-		assert_eq!(parse_value(def, "9223372036854775807").expect("max"), Value::Int(i64::MAX));
+		// 2^63 - 1024 is the largest whole value f64 still represents exactly,
+		// so it stays an integer.
+		assert_eq!(
+			parse_value(def, "9223372036854774784").expect("2^63 - 1024"),
+			Value::Int(9_223_372_036_854_774_784)
+		);
+		// JavaScript `Number("9223372036854775807")` rounds up to 2^63, so the
+		// parser must match that (float), not saturate to `i64::MAX`.
+		assert_eq!(
+			parse_value(def, "9223372036854775807").expect("i64::MAX rounds"),
+			Value::Float(9_223_372_036_854_775_808.0)
+		);
 		assert_eq!(
 			parse_value(def, "9223372036854775808").expect("2^63"),
 			Value::Float(9_223_372_036_854_775_808.0)
@@ -2567,8 +2578,12 @@ mod tests {
 		// Any other setting is left exactly as stored.
 		assert_eq!(effective_value(&merged, def("autoResume"), cwd), Some(Value::Bool(true)));
 
+		// Prefixes are ancestors (or the cwd itself), never descendants, matching
+		// `path.relative(prefix, cwd)` in settings.ts:287.
 		assert!(path_matches_prefix(cwd, "/work"));
-		assert!(path_matches_prefix(cwd, "/work/project/nested"));
+		assert!(path_matches_prefix(cwd, "/work/project"));
+		assert!(path_matches_prefix(cwd, "/work/other/../project"));
+		assert!(!path_matches_prefix(cwd, "/work/project/nested"));
 		assert!(!path_matches_prefix(cwd, "/work/other"));
 		assert!(!path_matches_prefix(cwd, "/elsewhere"));
 	}
