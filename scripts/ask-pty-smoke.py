@@ -102,6 +102,43 @@ def final_events(text):
     return "".join([chunk({"content": text}), chunk(finish="stop")])
 
 
+def completion_from_events(events: str) -> dict:
+    """Fold the fixture's SSE deltas into one non-streaming chat completion.
+
+    Root turns stream (event sink), but child agents run without one and call
+    `complete()`, whose request sets `stream: false` and parses a plain JSON
+    body. The fixture must answer that shape instead of SSE.
+    """
+    content = ""
+    role = "assistant"
+    calls: dict[int, dict] = {}
+    for line in events.splitlines():
+        if not line.startswith("data: "):
+            continue
+        data = line[len("data: ") :].strip()
+        if not data or data == "[DONE]":
+            continue
+        payload = json.loads(data)
+        for choice in payload.get("choices") or []:
+            delta = choice.get("delta") or {}
+            role = delta.get("role") or role
+            content += delta.get("content") or ""
+            for call in delta.get("tool_calls") or []:
+                slot = calls.setdefault(
+                    call.get("index", 0),
+                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                )
+                slot["id"] = call.get("id") or slot["id"]
+                slot["type"] = call.get("type") or slot["type"]
+                function = call.get("function") or {}
+                slot["function"]["name"] += function.get("name") or ""
+                slot["function"]["arguments"] += function.get("arguments") or ""
+    message = {"role": role, "content": content}
+    if calls:
+        message["tool_calls"] = [calls[index] for index in sorted(calls)]
+    return {"choices": [{"index": 0, "message": message, "finish_reason": "stop"}]}
+
+
 class Fixture(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     bodies: list[dict] = []
@@ -111,18 +148,24 @@ class Fixture(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
         try:
-            self.bodies.append(json.loads(body))
+            request_body = json.loads(body)
         except json.JSONDecodeError:
-            self.bodies.append({"raw": body.decode(errors="replace")})
+            request_body = {"raw": body.decode(errors="replace")}
+        self.bodies.append(request_body)
         index = min(len(self.bodies) - 1, len(self.responses) - 1)
         handler = self.responses[index]
         try:
-            events = handler(self.bodies[-1])
+            events = handler(request_body)
         except TypeError:
             events = handler()
-        payload = ("".join(events) + "data: [DONE]\n\n").encode()
+        if request_body.get("stream") is True:
+            payload = ("".join(events) + "data: [DONE]\n\n").encode()
+            content_type = "text/event-stream"
+        else:
+            payload = json.dumps(completion_from_events(events)).encode()
+            content_type = "application/json"
         self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Type", content_type)
         self.send_header("Connection", "close")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -487,7 +530,7 @@ def scenario_async_delegation(binary: str) -> int:
             for b in bodies
             if b["messages"]
             and b["messages"][-1].get("role") == "user"
-            and b["messages"][-1].get("content") == "produce child result"
+            and "produce child result" in (b["messages"][-1].get("content") or "")
         ]
         if len(child_requests) != 1:
             return fail(f"expected one child request, saw {len(child_requests)}")

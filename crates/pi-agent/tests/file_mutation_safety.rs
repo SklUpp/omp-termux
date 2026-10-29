@@ -16,7 +16,7 @@ use std::{
 };
 
 use pi_agent::{
-	AgentContext, ToolError,
+	AgentContext, Tool, ToolError,
 	tools::{
 		AstEditTool, PendingStore,
 		edit_variants::{EditMode, execute},
