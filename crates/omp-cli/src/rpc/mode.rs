@@ -7,6 +7,7 @@
 //! loop, the turn pump and the extension-UI roundtrip keep their order.
 
 use std::{
+	os::unix::process::CommandExt,
 	path::Path,
 	process::{Command, Stdio},
 	sync::{
@@ -27,18 +28,19 @@ use crate::{
 };
 
 use super::{
-	frame::FrameSink,
+	frame::{MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES},
 	host_tools::{self, HostToolBridge},
 	host_uris::{self, HostUriBridge},
 	input::{ExtensionUiBridge, Inbound, Output, RpcInput, ShutdownCoordinator},
 	messages::{self, MessageSnapshot},
 	session::{
-		ActiveTurn, InterruptMode, Prerequisite, QueueMode, RpcLaunch, RpcSession, TurnAdvance,
+		ActiveTurn, FrameSink, Prerequisite, RpcLaunch, RpcSession, SteeringMessage, TurnAdvance,
 		TurnInput, TurnOutcome,
 	},
 	subagents::{self, SubagentRegistry},
 	types::{
-		RpcCommand, RpcControlFrame, RpcResponse, StreamingBehavior, SubagentSubscriptionLevel,
+		InterruptMode, RpcCommand, RpcControlFrame, RpcResponse, StreamingBehavior,
+		SubagentSubscriptionLevel,
 	},
 };
 
@@ -98,7 +100,7 @@ impl EventFrames {
 					"assistantMessageEvent": { "type": "text_delta", "delta": delta },
 				}));
 			},
-			AgentEvent::MessageEnd { stop_reason, api, provider, model, .. } => {
+			AgentEvent::MessageEnd { message, stop_reason, api, provider, model } => {
 				sink.send(json!({
 					"type": "message_end",
 					"message": {
@@ -108,6 +110,7 @@ impl EventFrames {
 						"provider": provider.as_deref().or(meta.provider.as_deref()),
 						"model": model.as_deref().or(meta.model.as_deref()),
 						"stopReason": stop_reason.as_deref().map(canonical_stop_reason),
+						"usage": crate::session::reported_usage(message),
 						"timestamp": now_ms(),
 					},
 				}));
@@ -153,11 +156,11 @@ fn bash_payload(result: &BashResult) -> Value {
 	let mut value = json!({
 		"output": result.output,
 		"cancelled": result.cancelled,
-		"truncated": false,
+		"truncated": result.truncated,
 		"totalLines": result.total_lines,
 		"totalBytes": result.total_bytes,
-		"outputLines": result.total_lines,
-		"outputBytes": result.total_bytes,
+		"outputLines": result.output_lines,
+		"outputBytes": result.output_bytes,
 	});
 	if let Some(code) = result.exit_code {
 		value["exitCode"] = json!(code);
@@ -167,11 +170,14 @@ fn bash_payload(result: &BashResult) -> Value {
 
 /// One finished `bash` run. `output` is the combined stream in arrival order.
 struct BashResult {
-	output:      String,
-	exit_code:   Option<i32>,
-	cancelled:   bool,
-	total_lines: usize,
-	total_bytes: usize,
+	output:       String,
+	exit_code:    Option<i32>,
+	cancelled:    bool,
+	truncated:    bool,
+	total_lines:  usize,
+	total_bytes:  usize,
+	output_lines: usize,
+	output_bytes: usize,
 }
 
 fn count_lines(text: &str) -> usize {
@@ -179,6 +185,51 @@ fn count_lines(text: &str) -> usize {
 		return 0;
 	}
 	text.lines().count() + usize::from(text.ends_with('\n'))
+}
+
+const MAX_BASH_OUTPUT_BYTES: usize = 1024 * 1024;
+
+struct BashCapture {
+	kept:        Vec<u8>,
+	total_bytes: usize,
+	total_lines: usize,
+	truncated:   bool,
+}
+
+fn read_capped(mut stdout: std::process::ChildStdout) -> BashCapture {
+	use std::io::Read;
+	let mut kept = Vec::new();
+	let mut total_bytes = 0usize;
+	let mut newlines = 0usize;
+	let mut last_newline = true;
+	let mut chunk = [0u8; 8192];
+	loop {
+		let read = match stdout.read(&mut chunk) {
+			Ok(0) => break,
+			Ok(read) => read,
+			Err(_) => break,
+		};
+		total_bytes += read;
+		for byte in &chunk[..read] {
+			if *byte == b'\n' {
+				newlines += 1;
+				last_newline = true;
+			} else {
+				last_newline = false;
+			}
+		}
+		if kept.len() < MAX_BASH_OUTPUT_BYTES {
+			let room = MAX_BASH_OUTPUT_BYTES - kept.len();
+			kept.extend_from_slice(&chunk[..read.min(room)]);
+		}
+	}
+	let total_lines = newlines + usize::from(!last_newline && total_bytes > 0);
+	BashCapture {
+		truncated: total_bytes > kept.len(),
+		kept,
+		total_bytes,
+		total_lines,
+	}
 }
 
 /// Run a shell command, killing it when the token is cancelled.
@@ -194,6 +245,9 @@ fn exec_bash(command: &str, cwd: &Path, token: &CancellationToken) -> BashResult
 		.stdin(Stdio::null())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
+		// Own process group so `abort_bash` kills the whole pipeline, not just
+		// the shell that `Command::kill` reaches.
+		.process_group(0)
 		.spawn()
 	{
 		Ok(child) => child,
@@ -203,21 +257,17 @@ fn exec_bash(command: &str, cwd: &Path, token: &CancellationToken) -> BashResult
 				output: message.clone(),
 				exit_code: None,
 				cancelled: false,
+				truncated: false,
 				total_lines: 1,
 				total_bytes: message.len(),
+				output_lines: 1,
+				output_bytes: message.len(),
 			};
 		},
 	};
+	let child_pid = child.id();
 	let stdout = child.stdout.take();
-	let reader = stdout.map(|stdout| {
-		thread::spawn(move || {
-			use std::io::Read;
-			let mut buffer = Vec::new();
-			let mut handle = stdout;
-			let _ = handle.read_to_end(&mut buffer);
-			buffer
-		})
-	});
+	let reader = stdout.map(|stdout| thread::spawn(move || read_capped(stdout)));
 	let mut cancelled = false;
 	let status = loop {
 		match child.try_wait() {
@@ -227,18 +277,30 @@ fn exec_bash(command: &str, cwd: &Path, token: &CancellationToken) -> BashResult
 		}
 		if token.is_cancelled() {
 			cancelled = true;
+			// Negative pid targets the group created by `process_group(0)`.
+			unsafe {
+				libc::kill(-(child_pid as i32), libc::SIGKILL);
+			}
 			let _ = child.kill();
 			break child.wait().ok();
 		}
 		thread::sleep(Duration::from_millis(15));
 	};
-	let output = reader
+	let capture = reader
 		.and_then(|handle| handle.join().ok())
-		.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-		.unwrap_or_default();
+		.unwrap_or(BashCapture {
+			kept:        Vec::new(),
+			total_bytes: 0,
+			total_lines: 0,
+			truncated:   false,
+		});
+	let output = String::from_utf8_lossy(&capture.kept).into_owned();
 	BashResult {
-		total_lines: count_lines(&output),
-		total_bytes: output.len(),
+		output_lines: count_lines(&output),
+		output_bytes: capture.kept.len(),
+		total_lines: capture.total_lines,
+		total_bytes: capture.total_bytes,
+		truncated: capture.truncated,
 		output,
 		exit_code: status.and_then(|status| status.code()),
 		cancelled,
@@ -257,10 +319,12 @@ pub struct RpcMode {
 }
 
 impl RpcMode {
-	/// Open the session, announce nothing and drive stdin until EOF.
+	/// Announce the transport bounds, open the session and drive stdin until
+	/// EOF.
 	///
-	/// The caller sends the `ready` frame (`types::ready_frame`) before this
-	/// returns, because the frame bounds are transport policy.
+	/// The `ready` frame is written here, through the same [`Output`] writer as
+	/// every later frame, so a caller must never write to stdout itself: two
+	/// writers would race the negotiated protocol state and frame order.
 	pub fn run(
 		launch: RpcLaunch,
 		mut reader: impl std::io::BufRead,
@@ -268,10 +332,28 @@ impl RpcMode {
 	) -> crate::Result<()> {
 		let output = Arc::new(Output::spawn(writer));
 		let sink: Arc<dyn FrameSink> = output.clone();
+		// The extension-UI bridge exists before the approval surface, so every
+		// permission prompt is an `extension_ui_request` answered by the host
+		// instead of a read of the process terminal.
+		let ui = Arc::new(ExtensionUiBridge::new(Arc::clone(&sink)));
+		let approval_input: crate::approve::ApprovalInput = Arc::new(Mutex::new(Box::new(
+			super::input::RpcApprovalInput::new(Arc::clone(&ui), None),
+		)));
+		let mut approvals = crate::approve::Approvals::new(
+			launch.approval_mode,
+			launch.allow.iter().cloned(),
+		)
+		.with_input(Some(approval_input));
+		approvals.set_ask(Some(Arc::new(super::input::RpcAskChannel::new(
+			Arc::clone(&ui),
+		))));
 		let host_tools = Arc::new(Mutex::new(HostToolBridge::new(Arc::clone(&sink))));
 		let host_uris = Arc::new(Mutex::new(HostUriBridge::new(Arc::clone(&sink))));
-		let ui = Arc::new(ExtensionUiBridge::new(Arc::clone(&sink)));
-		let session = RpcSession::open(launch, host_tools, host_uris)?;
+		let session = RpcSession::open(launch, approvals, host_tools, host_uris)?;
+		sink.send(super::types::ready_frame(
+			MAX_RPC_FRAME_BYTES,
+			MAX_RPC_REASSEMBLED_BYTES,
+		));
 		let mut mode = Self {
 			session: Arc::new(Mutex::new(session)),
 			sink: output.clone(),
@@ -347,6 +429,20 @@ impl RpcMode {
 		self.ui.cancel_all();
 		self.aborted.store(true, Ordering::SeqCst);
 		self.active.abort();
+		self.active.abort_bash();
+		{
+			let session = self.lock_session();
+			session
+				.host_tools
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+				.close("RPC session closed");
+			session
+				.host_uris
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+				.close("RPC session closed");
+		}
 		{
 			let mut session = self.lock_session();
 			session.is_streaming = false;
@@ -422,7 +518,7 @@ impl RpcMode {
 					));
 				}
 				Some(match self.lock_session().new_session(parent_session.as_deref()) {
-					Ok(()) => ok(),
+					Ok(()) => ok_data(json!({ "cancelled": false })),
 					Err(error) => err(error.to_string()),
 				})
 			},
@@ -435,14 +531,17 @@ impl RpcMode {
 				))
 			},
 			RpcCommand::SetFastMode { enabled, .. } => {
-				if enabled {
-					Some(err(
+				let supported = self.lock_session().set_fast_mode(enabled);
+				if enabled && !supported {
+					return Some(err(
 						"Fast mode is unavailable for the current model.".to_string(),
-					))
-				} else {
-					self.lock_session().fast_mode = false;
-					Some(ok_data(json!({ "enabled": false, "active": false })))
+					));
 				}
+				let session = self.lock_session();
+				Some(ok_data(json!({
+					"enabled": session.fast_mode_enabled(),
+					"active": session.fast_mode_active(),
+				})))
 			},
 			RpcCommand::GetAvailableCommands { .. } => Some(ok_data(json!({
 				"commands": self
@@ -463,7 +562,6 @@ impl RpcMode {
 			},
 			RpcCommand::SetHostTools { tools, .. } => {
 				let bridge = self.lock_session().host_tools.clone();
-				let bridge = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 				Some(match bridge.set_tools(tools) {
 					Err(error) => err(error),
 					Ok(adapters) => {
@@ -506,6 +604,7 @@ impl RpcMode {
 			},
 			RpcCommand::GetSubagentMessages { subagent_id, session_file, from_byte, .. } => {
 				Some(self.subagent_messages(
+					id_ref,
 					subagent_id.as_deref(),
 					session_file.as_deref(),
 					from_byte,
@@ -513,7 +612,8 @@ impl RpcMode {
 			},
 
 			RpcCommand::SetModel { provider, model_id, .. } => {
-				Some(match self.lock_session().set_model(&provider, &model_id) {
+				let result = self.lock_session().set_model(&provider, &model_id);
+				Some(match result {
 					Err(error) => err(error.to_string()),
 					Ok(()) => match self.lock_session().model_object() {
 						Some(model) => ok_data(model),
@@ -566,49 +666,28 @@ impl RpcMode {
 				}
 				Some(match self.lock_session().compact(custom_instructions) {
 					Err(error) => err(error.to_string()),
-					Ok(result) => {
-						self.sink.send(json!({
-							"type": "session_compact",
-							"summary": result["summary"].clone(),
-							"firstKeptEntryId": result["firstKeptEntryId"].clone(),
-							"messagesRemoved": result["messagesRemoved"].clone(),
-						}));
-						ok_data(result)
-					},
+					Ok(result) => ok_data(result),
 				})
 			},
+			// Both settings are policy the native turn loop owns: the flag is
+			// forwarded on `RunRequest` (parent seam) and the loop emits
+			// `auto_compaction_start/end` / `auto_retry_start/end`, which RPC
+			// relays. RPC never runs a second compaction or retry loop.
 			RpcCommand::SetAutoCompaction { enabled, .. } => {
-				if enabled {
-					Some(RpcResponse::error_code(
-						id_ref,
-						kind,
-						"Automatic compaction is unavailable: this build does not surface \
-						 provider usage to gate the threshold (native seam: usage on turn \
-						 events; RPC then gates compaction the way upstream does)",
-						"auto_compaction_unavailable",
-					))
-				} else {
-					self.lock_session().auto_compaction = false;
-					Some(ok())
-				}
+				self.lock_session().auto_compaction = enabled;
+				Some(ok())
 			},
 
 			RpcCommand::SetAutoRetry { enabled, .. } => {
-				if enabled {
-					Some(RpcResponse::error_code(
-						id_ref,
-						kind,
-						"Automatic retry is unavailable: the native agent loop performs no \
-						 provider retries and emits no retry events (native seam: retry \
-						 orchestration with auto_retry_start/end frames)",
-						"auto_retry_unavailable",
-					))
-				} else {
-					self.lock_session().auto_retry = false;
-					Some(ok())
-				}
+				self.lock_session().auto_retry = enabled;
+				Some(ok())
 			},
-			RpcCommand::AbortRetry { .. } => Some(ok()),
+			RpcCommand::AbortRetry { .. } => {
+				if let Some(token) = self.lock_session().retry_abort.take() {
+					token.cancel();
+				}
+				Some(ok())
+			},
 
 			RpcCommand::Bash { command, .. } => {
 				self.spawn_bash(command, id);
@@ -633,7 +712,7 @@ impl RpcMode {
 					));
 				}
 				Some(match self.lock_session().switch_session(Path::new(&session_path)) {
-					Ok(()) => ok(),
+					Ok(()) => ok_data(json!({ "cancelled": false })),
 					Err(error) => err(error.to_string()),
 				})
 			},
@@ -679,7 +758,7 @@ impl RpcMode {
 				Some(ok_data(json!({ "messages": messages })))
 			},
 			RpcCommand::GetMessagesPage { cursor, limit, .. } => {
-				Some(self.messages_page(cursor.as_deref(), limit))
+				Some(self.messages_page(id_ref, cursor.as_deref(), limit))
 			},
 
 			RpcCommand::GetLoginProviders { .. } => Some(RpcResponse::error_code(
@@ -750,21 +829,13 @@ impl RpcMode {
 			self.start_turn(input, prompt_id);
 			return response;
 		}
-		if !input.images.is_empty() {
-			return RpcResponse::error_code(
-				id_ref,
-				"steer",
-				"Steering with images is unavailable: the native steering channel carries text \
-				 only; send the message as a follow_up instead",
-				"steer_images_unavailable",
-			);
-		}
+		let message = SteeringMessage { text: input.text.clone(), images: input.images.clone() };
 		match self.lock_session().interrupt_mode {
 			InterruptMode::Wait => {
 				self.lock_session().queue_follow_up(input);
 				RpcResponse::success(id_ref, "steer")
 			},
-			InterruptMode::Immediate => match self.active.steer(&input.text) {
+			InterruptMode::Immediate => match self.active.steer(&message) {
 				Ok(()) => RpcResponse::success(id_ref, "steer"),
 				Err(prerequisite) => {
 					RpcResponse::error_code(id_ref, "steer", prerequisite.message, prerequisite.code)
@@ -801,9 +872,20 @@ impl RpcMode {
 			.name("omp-rpc-turn".to_string())
 			.spawn(move || {
 				let mut next = Some((first, prompt_id));
+				sink.send(json!({ "type": "agent_start" }));
 				while let Some((input, prompt_id)) = next {
 					aborted.store(false, Ordering::SeqCst);
-					run_turn(&session, &sink, &active, &aborted, input, prompt_id);
+					let outcome =
+						run_turn(&session, &sink, &active, &aborted, input, prompt_id.clone());
+					if let Some(error) = &outcome.error {
+						sink.send(
+							RpcResponse::error(prompt_id.as_deref(), "prompt", error.clone())
+								.into_value(),
+						);
+					}
+					if outcome.error.is_none() && !outcome.aborted {
+						maybe_auto_compact(&session, &sink);
+					}
 					next = match session
 						.lock()
 						.unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -813,6 +895,18 @@ impl RpcMode {
 						TurnAdvance::Idle => None,
 					};
 				}
+				// One `agent_end` closes the agent run; queued follow-ups were
+				// already drained above, so `willContinue` is false.
+				let messages = session
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner)
+					.wire_messages()
+					.to_vec();
+				sink.send(json!({
+					"type": "agent_end",
+					"messages": messages,
+					"willContinue": false,
+				}));
 			})
 			.expect("spawn rpc turn thread");
 		self.shutdown.track(handle);
@@ -821,7 +915,7 @@ impl RpcMode {
 	// ------------------------------------------------------------------- bash --
 
 	fn spawn_bash(&mut self, command: String, id: Option<String>) {
-		let token = self.active.register_bash();
+		let (bash_id, token) = self.active.register_bash();
 		let cwd = self.lock_session().cwd.clone();
 		let sink: Arc<dyn FrameSink> = self.sink.clone();
 		let active = Arc::clone(&self.active);
@@ -829,7 +923,7 @@ impl RpcMode {
 			.name("omp-rpc-bash".to_string())
 			.spawn(move || {
 				let result = exec_bash(&command, &cwd, &token);
-				active.clear_bash();
+				active.clear_bash(bash_id);
 				sink.send(
 					RpcResponse::success_data(id.as_deref(), "bash", bash_payload(&result))
 						.into_value(),
@@ -841,10 +935,15 @@ impl RpcMode {
 
 	// --------------------------------------------------------------- messages --
 
-	fn messages_page(&mut self, cursor: Option<&str>, limit: Option<i64>) -> RpcResponse {
+	fn messages_page(
+		&mut self,
+		id: Option<&str>,
+		cursor: Option<&str>,
+		limit: Option<i64>,
+	) -> RpcResponse {
 		if self.active.is_streaming() || self.lock_session().is_compacting {
 			return RpcResponse::error_code(
-				None,
+				id,
 				"get_messages_page",
 				"Cannot page messages while the session is streaming or compacting",
 				"session_busy",
@@ -857,21 +956,22 @@ impl RpcMode {
 			message_count: session.wire_messages().len(),
 		};
 		match messages::page_messages(session.wire_messages(), &snapshot, (cursor, limit)) {
-			Ok(page) => RpcResponse::success_data(None, "get_messages_page", page.to_wire()),
+			Ok(page) => RpcResponse::success_data(id, "get_messages_page", page.to_wire()),
 			Err(error) => match error.code {
 				Some(code) => RpcResponse::error_code(
-					None,
+					id,
 					"get_messages_page",
 					error.message,
 					code.as_str(),
 				),
-				None => RpcResponse::error(None, "get_messages_page", error.message),
+				None => RpcResponse::error(id, "get_messages_page", error.message),
 			},
 		}
 	}
 
 	fn subagent_messages(
 		&self,
+		id: Option<&str>,
 		subagent_id: Option<&str>,
 		session_file: Option<&str>,
 		from_byte: Option<i64>,
@@ -881,7 +981,7 @@ impl RpcMode {
 			&& session_file.is_none()
 		{
 			return RpcResponse::error_code(
-				None,
+				id,
 				"get_subagent_messages",
 				subagents::event_bus_prerequisite().message,
 				subagents::event_bus_prerequisite().code,
@@ -890,14 +990,60 @@ impl RpcMode {
 		let from_byte = from_byte.unwrap_or(0).max(0);
 		let file = match self.registry.resolve_session_file(subagent_id, session_file) {
 			Ok(file) => file,
-			Err(error) => return RpcResponse::error(None, "get_subagent_messages", error),
+			Err(error) => return RpcResponse::error(id, "get_subagent_messages", error),
 		};
 		match subagents::read_transcript(&file, from_byte) {
-			Ok(slice) => {
-				RpcResponse::success_data(None, "get_subagent_messages", slice.to_wire())
-			},
-			Err(error) => RpcResponse::error(None, "get_subagent_messages", error),
+			Ok(slice) => RpcResponse::success_data(id, "get_subagent_messages", slice.to_wire()),
+			Err(error) => RpcResponse::error(id, "get_subagent_messages", error),
 		}
+	}
+}
+
+/// Post-turn auto-compaction against persisted context usage.
+///
+/// ponytail: 90% of the advertised window until the compaction-settings seam
+/// (threshold tokens/percent) lands; the summary itself is the real model path
+/// (`RpcSession::compact`), never a stub.
+fn maybe_auto_compact(session: &Arc<Mutex<RpcSession>>, sink: &Arc<dyn FrameSink>) {
+	let (enabled, percent, busy) = {
+		let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		(
+			guard.auto_compaction,
+			guard
+				.context_usage()
+				.and_then(|usage| usage["percent"].as_f64()),
+			guard.is_compacting,
+		)
+	};
+	if !enabled || busy || percent.map_or(true, |percent| percent < 90.0) {
+		return;
+	}
+	sink.send(json!({
+		"type": "auto_compaction_start",
+		"reason": "threshold",
+		"action": "context-full",
+	}));
+	let result = {
+		let mut guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		guard.compact(None)
+	};
+	match result {
+		Ok(value) => sink.send(json!({
+			"type": "auto_compaction_end",
+			"action": "context-full",
+			"result": value,
+			"aborted": false,
+			"willRetry": false,
+			"errorMessage": null,
+		})),
+		Err(error) => sink.send(json!({
+			"type": "auto_compaction_end",
+			"action": "context-full",
+			"result": null,
+			"aborted": false,
+			"willRetry": false,
+			"errorMessage": error.to_string(),
+		})),
 	}
 }
 
@@ -908,9 +1054,8 @@ fn run_turn(
 	active: &Arc<ActiveTurn>,
 	aborted: &Arc<AtomicBool>,
 	input: TurnInput,
-	prompt_id: Option<String>,
-) {
-	let id_ref = prompt_id.as_deref();
+	_prompt_id: Option<String>,
+) -> TurnOutcome {
 	let prepared = {
 		let mut guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 		guard.prepare_turn(&input)
@@ -918,10 +1063,7 @@ fn run_turn(
 	let (request, mut prepared) = match prepared {
 		Ok(pair) => pair,
 		Err(error) => {
-			sink.send(
-				RpcResponse::error(id_ref, "prompt", error.to_string()).into_value(),
-			);
-			return;
+			return TurnOutcome { error: Some(error.to_string()), ..TurnOutcome::default() };
 		},
 	};
 	let (meta, steer) = {
@@ -936,40 +1078,114 @@ fn run_turn(
 		)
 	};
 	active.begin(prepared.token.clone(), steer);
-	sink.send(json!({ "type": "agent_start" }));
 
 	let runner = {
 		let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 		Arc::clone(&guard.runner)
 	};
 	let mut outcome = TurnOutcome::default();
-	match runner.run(&request) {
-		Err(error) => outcome.error = Some(error.to_string()),
-		Ok(events) => {
-			let max_time = {
-				let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-				guard.max_time
-			};
-			let deadline = Deadline::new(max_time);
-			let mut frames = EventFrames::default();
-			let result = deadline::drive(
-				events,
-				deadline,
-				|| prepared.started.elapsed(),
-				|event| {
+	let mut attempt = 0u32;
+	const MAX_RETRY_ATTEMPTS: u32 = 3;
+	loop {
+		let auto_retry = {
+			let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+			guard.auto_retry
+		};
+		match runner.run(&request) {
+			Err(error) => {
+				// No event was consumed, so the prepared turn is still clean and
+				// the same request can be retried without duplicating the user
+				// entry.
+				if auto_retry
+					&& attempt < MAX_RETRY_ATTEMPTS
+					&& !aborted.load(Ordering::SeqCst)
+				{
+					attempt += 1;
+					let delay_ms = 1000u64 << (attempt - 1).min(3);
+					sink.send(json!({
+						"type": "auto_retry_start",
+						"attempt": attempt,
+						"maxAttempts": MAX_RETRY_ATTEMPTS,
+						"delayMs": delay_ms,
+						"errorMessage": error.to_string(),
+					}));
+					let token = CancellationToken::new();
 					{
 						let mut guard =
 							session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-						guard.observe_event(&mut prepared, event);
-						frames.emit(event, sink.as_ref(), &meta, &guard);
+						guard.retry_abort = Some(token.clone());
 					}
-					Ok(())
-				},
-			);
-			if let Err(error) = result {
+					let mut cancelled = false;
+					for _ in 0..delay_ms.div_ceil(50) {
+						if token.is_cancelled() || aborted.load(Ordering::SeqCst) {
+							cancelled = true;
+							break;
+						}
+						thread::sleep(Duration::from_millis(50));
+					}
+					{
+						let mut guard =
+							session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+						guard.retry_abort = None;
+					}
+					if cancelled {
+						sink.send(json!({
+							"type": "auto_retry_end",
+							"success": false,
+							"attempt": attempt,
+							"finalError": error.to_string(),
+						}));
+						outcome.error = Some(error.to_string());
+						break;
+					}
+					continue;
+				}
+				if attempt > 0 {
+					sink.send(json!({
+						"type": "auto_retry_end",
+						"success": false,
+						"attempt": attempt,
+						"finalError": error.to_string(),
+					}));
+				}
 				outcome.error = Some(error.to_string());
-			}
-		},
+				break;
+			},
+			Ok(events) => {
+				if attempt > 0 {
+					sink.send(json!({
+						"type": "auto_retry_end",
+						"success": true,
+						"attempt": attempt,
+					}));
+				}
+				let max_time = {
+					let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+					guard.max_time
+				};
+				let deadline = Deadline::new(max_time);
+				let started = prepared.started;
+				let mut frames = EventFrames::default();
+				let result = deadline::drive(
+					events,
+					deadline,
+					|| started.elapsed(),
+					|event| {
+						{
+							let mut guard =
+								session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+							guard.observe_event(&mut prepared, event);
+							frames.emit(event, sink.as_ref(), &meta, &guard);
+						}
+						Ok(())
+					},
+				);
+				if let Err(error) = result {
+					outcome.error = Some(error.to_string());
+				}
+				break;
+			},
+		}
 	}
 	outcome.aborted = aborted.load(Ordering::SeqCst);
 	{
@@ -977,17 +1193,5 @@ fn run_turn(
 		guard.finish_turn(&mut prepared, &outcome);
 	}
 	active.end();
-
-	let (messages, will_continue) = {
-		let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-		(guard.wire_messages().to_vec(), guard.has_queued())
-	};
-	sink.send(json!({
-		"type": "agent_end",
-		"messages": messages,
-		"willContinue": will_continue,
-	}));
-	if let Some(error) = outcome.error {
-		sink.send(RpcResponse::error(id_ref, "prompt", error).into_value());
-	}
+	outcome
 }

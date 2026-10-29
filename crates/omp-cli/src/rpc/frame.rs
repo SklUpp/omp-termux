@@ -224,19 +224,36 @@ impl Iterator for FrameLines {
 
 fn chunk_lines(payload: String, chunk_id: String) -> FrameLines {
 	let byte_size = payload.len();
-	if byte_size > MAX_RPC_REASSEMBLED_BYTES {
-		// No legal encoding exists for this payload. Report it instead of
-		// truncating, then still terminate the turn so the client cannot hang
-		// waiting for `agent_end`.
-		let error = json!({
-			"type": "rpc_frame_error",
-			"error": "RPC frame exceeded the reassembled transport limit",
-		});
-		let agent_end = overflow_frame(&json!({ "type": "agent_end", "messageCount": 0 }));
-		return FrameLines::Single(Some(format!("{error}\n{agent_end}\n")));
-	}
 	let count = byte_size.div_ceil(RPC_CHUNK_PAYLOAD_BYTES);
 	FrameLines::Chunked { payload: payload.into_bytes(), chunk_id, index: 0, count, byte_size }
+}
+
+/// No legal encoding exists for this payload. Report it instead of truncating;
+/// a terminal `agent_end` keeps its own count so the client never sees a
+/// fabricated zero or a second turn terminator.
+fn reassembled_overflow_lines(frame: &Value) -> String {
+	let error = json!({
+		"type": "rpc_frame_error",
+		"error": "RPC frame exceeded the reassembled transport limit",
+	});
+	let mut text = format!("{error}\n");
+	if frame.get("type").and_then(Value::as_str) == Some("agent_end") {
+		let count = frame
+			.get("messageCount")
+			.and_then(Value::as_u64)
+			.or_else(|| frame.get("messages").and_then(Value::as_array).map(|m| m.len() as u64));
+		// Only a real count may terminate the turn; an unreadable `agent_end`
+		// stays an explicit frame error rather than a fabricated success.
+		if let Some(count) = count {
+			let terminator = overflow_frame(&json!({
+				"type": "agent_end",
+				"messageCount": count,
+				"willContinue": false,
+			}));
+			text.push_str(&format!("{terminator}\n"));
+		}
+	}
+	text
 }
 
 /// Stateful encoder that remembers which messages the client already streamed.
@@ -284,7 +301,9 @@ impl RpcFrameEncoder {
 			let compacted = compact_terminal_frame(frame, &self.streamed_messages);
 			let compacted_json =
 				if compacted == *frame { encoded.clone() } else { compacted.to_string() };
-			if serialized_frame_bytes(&compacted_json) > MAX_RPC_FRAME_BYTES {
+			if serialized_frame_bytes(&compacted_json) > MAX_RPC_REASSEMBLED_BYTES {
+				FrameLines::Single(Some(reassembled_overflow_lines(frame)))
+			} else if serialized_frame_bytes(&compacted_json) > MAX_RPC_FRAME_BYTES {
 				self.chunk_counter += 1;
 				chunk_lines(compacted_json, format!("rpc-{}", self.chunk_counter))
 			} else {
@@ -572,7 +591,7 @@ mod tests {
 	fn v2_chunks_and_decodes_round_trip() {
 		let mut encoder = RpcFrameEncoder::new();
 		encoder.set_protocol_version(2).expect("v2");
-		let payload = big_text(RPC_CHUNK_PAYLOAD_BYTES * 2 + 123);
+		let payload = big_text(MAX_RPC_FRAME_BYTES + 1024);
 		let frame = json!({ "type": "notice", "level": "info", "message": payload });
 		let lines: Vec<String> = encoder.encode_frames(&frame).collect();
 		assert!(lines.len() >= 3, "chunked into {}", lines.len());
@@ -595,8 +614,13 @@ mod tests {
 	fn v2_compacts_agent_end_against_streamed_messages() {
 		let mut encoder = RpcFrameEncoder::new();
 		encoder.set_protocol_version(2).expect("v2");
-		let assistant = json!({ "role": "assistant", "content": "hi", "timestamp": 1 });
-		// The client already received this message through `message_end`.
+		// The oversized streamed message is what pushes the raw `agent_end`
+		// over the frame bound; compaction drops it and keeps the small tail.
+		let assistant = json!({
+			"role": "assistant",
+			"content": big_text(MAX_RPC_FRAME_BYTES + 10),
+			"timestamp": 1
+		});
 		let _: Vec<String> = encoder
 			.encode_frames(&json!({ "type": "message_end", "message": assistant.clone() }))
 			.collect();
@@ -605,6 +629,7 @@ mod tests {
 		let lines: Vec<String> = encoder
 			.encode_frames(&json!({ "type": "agent_end", "messages": messages }))
 			.collect();
+		assert_eq!(lines.len(), 1, "compacted frame must fit one line");
 		let parsed: Value = serde_json::from_str(lines[0].trim_end()).expect("json");
 		assert_eq!(parsed["type"], json!("agent_end"));
 		assert_eq!(parsed["messages"].as_array().expect("messages").len(), 1);

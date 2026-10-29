@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use crate::{
 	Error, Result,
 	agent::{AgentRunner, Event as AgentEvent, RunRequest},
-	approve::Approvals,
+	approve::{ApprovalMode, Approvals},
 	catalog::Catalog,
 	config::Config,
 	output::{self, OutputMode},
@@ -72,10 +72,32 @@ pub trait FrameSink: Send + Sync {
 	}
 }
 
+/// One steering message carrying the exact user parts the client sent.
+///
+/// The native steering channel injects a message into the live conversation, so
+/// images travel with it instead of being rejected. The runner owner converts
+/// these parts to `pi_agent` content parts when the seam lands
+/// (`PiAgentRunner::steer(&SteeringMessage)` -> `SignalDispatcher` active turn
+/// `SteeringEvent::InjectMessage(SteeringMessage)`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SteeringMessage {
+	pub text:   String,
+	pub images: Vec<RpcImage>,
+}
+
 /// Steer hook supplied by the runner owner once `PiAgentRunner::steer` exists.
-pub type SteerFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+pub type SteerFn = Arc<dyn Fn(&SteeringMessage) -> bool + Send + Sync>;
 
 /// Everything one RPC process needs that the CLI entry point has already resolved.
+///
+/// The approval surface is a *recipe*, not a built [`Approvals`]: [`RpcMode`]
+/// constructs the [`ExtensionUiBridge`] first and installs it as both the
+/// approval input and the `ask` channel before the session opens, so a headless
+/// host answers permission prompts over `extension_ui_request` and never reads
+/// the process terminal.
+///
+/// [`RpcMode`]: super::mode::RpcMode
+/// [`ExtensionUiBridge`]: super::input::ExtensionUiBridge
 pub struct RpcLaunch {
 	pub runner:   Arc<dyn AgentRunner>,
 	pub config:   Config,
@@ -83,7 +105,8 @@ pub struct RpcLaunch {
 	pub prompts:  Prompts,
 	pub skills:   Vec<Skill>,
 	pub catalog:  Arc<Catalog>,
-	pub approvals: Approvals,
+	pub approval_mode: ApprovalMode,
+	pub allow:    Vec<String>,
 	pub model:    Option<String>,
 	pub provider: Option<String>,
 	pub api_key:  Option<String>,
@@ -106,9 +129,10 @@ pub struct ActiveTurn {
 
 #[derive(Default)]
 struct ActiveState {
-	cancel: Option<CancellationToken>,
-	steer:  Option<SteerFn>,
-	bash:   Option<CancellationToken>,
+	cancel:      Option<CancellationToken>,
+	steer:       Option<SteerFn>,
+	bash:        std::collections::BTreeMap<u64, CancellationToken>,
+	next_bash_id: u64,
 }
 
 impl ActiveTurn {
@@ -134,8 +158,8 @@ impl ActiveTurn {
 		self.lock().steer.clone()
 	}
 
-	/// Inject a steering message into the live turn.
-	pub fn steer(&self, message: &str) -> std::result::Result<(), Prerequisite> {
+	/// Inject a steering message (text and images) into the live turn.
+	pub fn steer(&self, message: &SteeringMessage) -> std::result::Result<(), Prerequisite> {
 		let guard = self.lock();
 		if guard.cancel.is_none() {
 			return Err(Prerequisite::new(
@@ -160,26 +184,30 @@ impl ActiveTurn {
 		}
 	}
 
-	pub fn register_bash(&self) -> CancellationToken {
+	pub fn register_bash(&self) -> (u64, CancellationToken) {
 		let token = CancellationToken::new();
-		self.lock().bash = Some(token.clone());
-		token
+		let mut guard = self.lock();
+		guard.next_bash_id += 1;
+		let id = guard.next_bash_id;
+		guard.bash.insert(id, token.clone());
+		(id, token)
 	}
 
-	pub fn clear_bash(&self) {
-		self.lock().bash = None;
+	pub fn clear_bash(&self, id: u64) {
+		self.lock().bash.remove(&id);
 	}
 
+	/// Cancel every live bash run; a second concurrent run must not make the
+	/// first uncancellable.
 	#[must_use]
 	pub fn abort_bash(&self) -> bool {
 		let guard = self.lock();
-		match guard.bash.as_ref() {
-			Some(token) => {
-				token.cancel();
-				true
-			},
-			None => false,
+		let mut cancelled = false;
+		for token in guard.bash.values() {
+			token.cancel();
+			cancelled = true;
 		}
+		cancelled
 	}
 
 	fn lock(&self) -> MutexGuard<'_, ActiveState> {
@@ -246,7 +274,8 @@ pub struct RpcSession {
 	pub(crate) queued: VecDeque<TurnInput>,
 	pub(crate) todo_phases: Vec<TodoPhase>,
 	pub(crate) session_name: Option<String>,
-	pub(crate) fast_mode: bool,
+	/// Per-provider-family priority selection (TS `ServiceTierByFamily`).
+	pub(crate) priority_families: std::collections::BTreeMap<String, bool>,
 	pub(crate) last_assistant_text: Option<String>,
 	pub(crate) tokens_per_second: Option<f64>,
 	pub(crate) steer: Option<SteerFn>,
@@ -258,7 +287,12 @@ pub struct RpcSession {
 
 impl RpcSession {
 	/// Open the session described by the launch inputs.
-	pub fn open(launch: RpcLaunch, host_tools: Arc<Mutex<HostToolBridge>>, host_uris: Arc<Mutex<HostUriBridge>>) -> Result<Self> {
+	pub fn open(
+		launch: RpcLaunch,
+		approvals: Approvals,
+		host_tools: Arc<Mutex<HostToolBridge>>,
+		host_uris: Arc<Mutex<HostUriBridge>>,
+	) -> Result<Self> {
 		let RpcLaunch {
 			runner,
 			config,
@@ -266,7 +300,8 @@ impl RpcSession {
 			prompts,
 			skills,
 			catalog,
-			approvals,
+			approval_mode: _,
+			allow: _,
 			model,
 			provider,
 			api_key,
@@ -312,6 +347,10 @@ impl RpcSession {
 			.title_slot()
 			.map(|slot| slot.title.clone())
 			.or_else(|| store.header().and_then(|header| header.title.clone()));
+		let last_assistant_text = history
+			.last()
+			.map(|turn| turn.assistant.clone())
+			.filter(|text| !text.is_empty());
 		let mut checkpoint_host = CheckpointHost::new();
 		checkpoint_host.rehydrate(&store);
 		let todo_phases = store.latest_todo_phases();
@@ -351,11 +390,8 @@ impl RpcSession {
 			queued: VecDeque::new(),
 			todo_phases,
 			session_name,
-			fast_mode: false,
-			last_assistant_text: history
-				.last()
-				.map(|turn| turn.assistant.clone())
-				.filter(|text| !text.is_empty()),
+			priority_families: std::collections::BTreeMap::new(),
+			last_assistant_text,
 			tokens_per_second: None,
 			steer,
 			host_tools,
@@ -474,9 +510,9 @@ impl RpcSession {
 			auto_compaction_enabled: self.auto_compaction,
 			queued_message_count: self.queued.len(),
 			todo_phases: serde_json::to_value(&self.todo_phases).unwrap_or_else(|_| json!([])),
-			fast_mode_enabled: self.fast_mode,
+			fast_mode_enabled: self.fast_mode_enabled(),
 			tokens_per_second: self.tokens_per_second,
-			fast_mode_active: false,
+			fast_mode_active: self.fast_mode_active(),
 			message_count: self.messages.len(),
 			system_prompt,
 			dump_tools: self.dump_tools(),
@@ -510,29 +546,25 @@ impl RpcSession {
 		)
 	}
 
-	/// Context usage is only reported when the session recorded real token
-	/// counts; the provider stream does not surface usage yet, so an
-	/// unreported session returns `None` instead of an invented number.
+	/// Context occupancy of the newest provider request on the active branch.
+	///
+	/// Reads the persisted prompt-side counters (`input + cacheRead +
+	/// cacheWrite`, `totalTokens` fallback) through
+	/// [`SessionStore::latest_context_tokens`]; it never sums events, so a turn
+	/// with several provider requests cannot double-count. `None` means no
+	/// request on the branch reported usage.
 	#[must_use]
 	pub fn context_usage(&self) -> Option<Value> {
-		let mut input = 0u64;
-		let mut output = 0u64;
-		let mut seen = false;
-		for entry in self.store.messages() {
-			if let Some(usage) = &entry.message.usage {
-				seen = true;
-				input = input.saturating_add(usage.input);
-				output = output.saturating_add(usage.output);
-			}
-		}
-		if !seen {
-			return None;
-		}
+		let tokens = self.store.latest_context_tokens()?;
 		let limit = self.context_limit()?;
 		Some(json!({
-			"tokens": input.saturating_add(output),
+			"tokens": tokens,
 			"contextWindow": limit,
-			"percent": if limit == 0 { 0.0 } else { ((input + output) as f64 / limit as f64) * 100.0 },
+			"percent": if limit == 0 {
+				0.0
+			} else {
+				(tokens as f64 / limit as f64) * 100.0
+			},
 		}))
 	}
 
@@ -563,26 +595,37 @@ impl RpcSession {
 		self.store.file().map(|path| path.display().to_string())
 	}
 
-	/// `get_session_stats` payload. Token figures appear only when the session
-	/// recorded them.
+	/// `get_session_stats` payload. Token totals come from the store's
+	/// cumulative usage index (one contribution per persisted assistant entry);
+	/// reasoning/cost/premium figures are read from the same persisted usage
+	/// objects without touching the token totals.
 	#[must_use]
 	pub fn stats(&self) -> Value {
-		let mut input = 0u64;
-		let mut output = 0u64;
-		let mut cache_read = 0u64;
-		let mut cache_write = 0u64;
-		let mut seen = false;
+		let usage = self.store.session_usage();
+		let mut reasoning = 0u64;
+		let mut cost = 0.0f64;
+		let mut premium_requests = 0u64;
 		for entry in self.store.messages() {
-			if let Some(usage) = &entry.message.usage {
-				seen = true;
-				input = input.saturating_add(usage.input);
-				output = output.saturating_add(usage.output);
-				cache_read = cache_read.saturating_add(usage.cache_read);
-				cache_write = cache_write.saturating_add(usage.cache_write);
+			if entry.message.role != "assistant" {
+				continue;
 			}
+			let Some(usage) = &entry.message.usage else {
+				continue;
+			};
+			reasoning = reasoning.saturating_add(usage.reasoning_tokens.unwrap_or(0));
+			if let Some(entry_cost) = &usage.cost {
+				cost += entry_cost.total;
+			}
+			premium_requests = premium_requests.saturating_add(
+				usage
+					.extra
+					.get("premiumRequests")
+					.and_then(Value::as_u64)
+					.unwrap_or(0),
+			);
 		}
 		let mut stats = json!({
-			"messageCount": self.messages.len(),
+			"sessionId": self.session_id(),
 			"userMessages": self
 				.messages
 				.iter()
@@ -600,26 +643,102 @@ impl RpcSession {
 				.flatten()
 				.filter(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"))
 				.count(),
-			"sessionId": self.session_id(),
+			"toolResults": self
+				.messages
+				.iter()
+				.filter(|message| message.get("role").and_then(Value::as_str) == Some("toolResult"))
+				.count(),
+			"totalMessages": self.messages.len(),
+			"tokens": {
+				"input": usage.input,
+				"output": usage.output,
+				"reasoning": reasoning,
+				"cacheRead": usage.cache_read,
+				"cacheWrite": usage.cache_write,
+				"total": usage.total_tokens,
+			},
+			"premiumRequests": premium_requests,
+			"cost": cost,
 		});
 		if let Some(file) = self.store_file_string() {
 			stats["sessionFile"] = json!(file);
 		}
-		if seen {
-			stats["tokens"] = json!({
-				"input": input,
-				"output": output,
-				"cacheRead": cache_read,
-				"cacheWrite": cache_write,
-				"total": input.saturating_add(output),
-			});
-		} else {
-			stats["usageUnavailable"] = json!(
-				"provider stream reports no token usage in this build; native seam: surface Usage on \
-				 provider MessageEnd"
-			);
+		if let Some(context) = self.context_usage() {
+			stats["contextUsage"] = context;
 		}
 		stats
+	}
+
+	// ------------------------------------------------------------ fast mode --
+
+	/// Provider family whose service-tier knob governs the active model, or
+	/// `None` when the model exposes no serving-priority control.
+	///
+	/// Port of TS `serviceTierFamily` (`packages/ai/src/types.ts`): OpenRouter
+	/// ids are classified by namespace, `anthropic-messages` models belong to
+	/// the Anthropic family on any provider, and custom OpenAI-compatible relays
+	/// serving OpenAI ids are OpenAI family unless the provider owns a separate
+	/// control (Fireworks) or rejects the field (GitHub Copilot).
+	fn service_tier_family(&self) -> Option<&'static str> {
+		let (provider, api, id) = self.active_model_parts()?;
+		service_tier_family(&provider, api.as_deref(), &id)
+	}
+
+	/// Whether the user selected priority for the active model's family
+	/// (TS `isFastModeEnabled`).
+	#[must_use]
+	pub fn fast_mode_enabled(&self) -> bool {
+		self
+			.service_tier_family()
+			.is_some_and(|family| self.priority_families.get(family).copied().unwrap_or(false))
+	}
+
+	/// Whether priority will actually be realized on the wire for the active
+	/// model (TS `isFastModeActive`). Until the runner forwards
+	/// `RunRequest.service_tier`, the selection is stored but not realized, so
+	/// this stays `false` instead of claiming a wire effect that did not happen.
+	#[must_use]
+	pub fn fast_mode_active(&self) -> bool {
+		let Some((provider, api, id)) = self.active_model_parts() else {
+			return false;
+		};
+		self.fast_mode_enabled() && realizes_priority(&provider, api.as_deref(), &id)
+	}
+
+	/// Apply `set_fast_mode`; returns whether the model has a service-tier knob
+	/// (TS `setFastMode` return value).
+	pub fn set_fast_mode(&mut self, enabled: bool) -> bool {
+		let Some(family) = self.service_tier_family() else {
+			return false;
+		};
+		if enabled {
+			self.priority_families.insert(family.to_string(), true);
+		} else {
+			self.priority_families.remove(family);
+		}
+		true
+	}
+
+	/// Provider, wire api and bare model id of the active selection.
+	fn active_model_parts(&self) -> Option<(String, Option<String>, String)> {
+		let raw = self.model.as_deref()?;
+		let (base, _) = runtime::split_effort(raw);
+		let provider = self
+			.provider
+			.clone()
+			.or_else(|| self.catalog.provider_of(base).map(str::to_string))?;
+		let api = self
+			.catalog
+			.connections
+			.get(&provider)
+			.and_then(|connection| connection.api.clone())
+			.or_else(|| {
+				self.config
+					.providers
+					.get(&provider)
+					.and_then(|connection| connection.api.clone())
+			});
+		Some((provider, api, base.to_string()))
 	}
 
 	// --------------------------------------------------------------- models --
@@ -672,7 +791,7 @@ impl RpcSession {
 		let provider = next.get("provider").and_then(Value::as_str)?.to_string();
 		let id = next.get("id").and_then(Value::as_str)?.to_string();
 		self.set_model(&provider, &id).ok()?;
-		Some(json!({ "model": next, "thinkingLevel": self.thinking_level }))
+		Some(json!({ "model": next, "thinkingLevel": self.thinking_level, "isScoped": false }))
 	}
 
 	/// Set an explicit thinking level. The level must be a valid selector and,
@@ -703,11 +822,12 @@ impl RpcSession {
 		Ok(())
 	}
 
-	/// Cycle `off` -> advertised efforts -> `off`.
+	/// Cycle `off` -> advertised efforts -> `off`. `Value::Null` means the
+	/// model advertises no levels (upstream answers `null`, not an error).
 	pub fn cycle_thinking_level(&mut self) -> Result<Value> {
 		let efforts = self.available_efforts().unwrap_or_default();
 		if efforts.is_empty() {
-			return Err(Error::new("Model does not support thinking levels".to_string()));
+			return Ok(Value::Null);
 		}
 		let mut levels = vec!["off".to_string()];
 		levels.extend(efforts);
@@ -718,7 +838,7 @@ impl RpcSession {
 			.map_or(0, |index| (index + 1) % levels.len());
 		let level = levels[next].clone();
 		self.set_thinking_level(&level)?;
-		Ok(json!({ "thinkingLevel": self.thinking_level }))
+		Ok(json!({ "level": self.thinking_level }))
 	}
 
 	// ------------------------------------------------------------- sessions --
@@ -741,12 +861,15 @@ impl RpcSession {
 			return Err(Error::new("cannot start a new session from a legacy v1 log"));
 		}
 		if let Some(parent) = parent_session {
-			// Header lineage is written by the store at creation; there is no native
-			// hook to stamp `parentSession` after the fact, so the value is reported
-			// as a prerequisite instead of being silently dropped.
+			// `SessionHeader.parent_session` exists, but `SessionStore::open`
+			// builds the header from `SessionOptions`, which has no lineage
+			// field. The exact seam is `SessionOptions.parent_session:
+			// Option<String>` copied into the header at creation; until then the
+			// value is reported instead of silently dropped.
 			eprintln!(
 				"warning: parentSession lineage is not persisted by this build (native seam: \
-				 SessionStore parent_session support); continuing without it: {parent}"
+				 SessionOptions.parent_session -> SessionHeader.parent_session); continuing \
+				 without it: {parent}"
 			);
 		}
 		self.store = store;
@@ -1222,12 +1345,15 @@ impl RpcSession {
 			.unwrap_or_default();
 
 		let canon_stop = session::canonical_stop_reason(stop_reason);
+		// One persisted usage per assistant message: `TurnEnd` repeats the same
+		// message snapshot as `MessageEnd`, so the usage is read here only and
+		// never added on the event stream.
 		let mut asst_msg = SessionMessage::assistant(
 			content,
 			asst_api,
 			asst_provider,
 			asst_model,
-			None,
+			session::reported_usage(message),
 			canon_stop,
 			now_ms,
 		);
@@ -1279,7 +1405,7 @@ impl RpcSession {
 				eprintln!("warning: {err}");
 			}
 			let _ = self.checkpoint_host.note_persisted_tool_results(&self.store, &valid);
-			if let Err(err) = self.checkpoint_host.persist_active_reminder(&self.store) {
+			if let Err(err) = self.checkpoint_host.persist_active_reminder(&mut self.store) {
 				eprintln!("warning: {err}");
 			}
 		} else if !self.store.enabled() {
@@ -1298,6 +1424,111 @@ impl RpcSession {
 			let _ = reply.send(pi_agent::TurnAckDecision::default());
 		}
 	}
+}
+
+fn is_openai_service_tier_api(api: Option<&str>) -> bool {
+	matches!(
+		api,
+		Some("openai-completions" | "openai-responses" | "openai-codex-responses")
+	)
+}
+
+/// Port of TS `isOpenAIModelId` (`packages/catalog/src/identity/family.ts`).
+///
+/// Boundary-delimited family prefixes only; a substring match such as
+/// `my-gpt-tool` is not an OpenAI model. This is a prefix test rather than the
+/// upstream regex, which is equivalent for catalog ids.
+fn is_openai_model_id(id: &str) -> bool {
+	let lower = id.to_ascii_lowercase();
+	if lower.contains("openai/") {
+		return true;
+	}
+	for segment in lower.split('/') {
+		for prefix in ["gpt-", "gpt.", "chatgpt-", "chatgpt.", "codex-", "codex."] {
+			if segment.starts_with(prefix) {
+				return true;
+			}
+		}
+		for sku in ["o1", "o3", "o4"] {
+			if segment == sku
+				|| segment.starts_with(&format!("{sku}-"))
+				|| segment.starts_with(&format!("{sku}."))
+			{
+				return true;
+			}
+		}
+	}
+	false
+}
+
+fn excludes_inferred_openai_service_tier(provider: &str) -> bool {
+	matches!(provider, "fireworks" | "github-copilot")
+}
+
+fn is_openai_service_tier_model(provider: &str, api: Option<&str>, id: &str) -> bool {
+	!excludes_inferred_openai_service_tier(provider)
+		&& is_openai_service_tier_api(api)
+		&& is_openai_model_id(id)
+}
+
+/// Port of TS `serviceTierFamily` (`packages/ai/src/types.ts`).
+fn service_tier_family(provider: &str, api: Option<&str>, id: &str) -> Option<&'static str> {
+	if provider == "openrouter" {
+		let lower = id.to_ascii_lowercase();
+		if lower.starts_with("anthropic/") {
+			return Some("anthropic");
+		}
+		if lower.starts_with("google/") {
+			return Some("google");
+		}
+		if lower.starts_with("openai/") {
+			return Some("openai");
+		}
+		return None;
+	}
+	if matches!(provider, "openai" | "openai-codex") {
+		return Some("openai");
+	}
+	if api == Some("anthropic-messages") {
+		return Some("anthropic");
+	}
+	if matches!(provider, "google" | "google-vertex") {
+		return Some("google");
+	}
+	if is_openai_service_tier_model(provider, api, id) {
+		return Some("openai");
+	}
+	None
+}
+
+fn should_send_service_tier(provider: &str, api: Option<&str>, id: &str) -> bool {
+	if matches!(provider, "openai" | "openai-codex") {
+		return true;
+	}
+	if provider == "openrouter" {
+		return true;
+	}
+	if is_openai_service_tier_model(provider, api, id) {
+		return true;
+	}
+	matches!(provider, "google" | "google-vertex" | "fireworks")
+}
+
+/// Port of TS `realizesPriorityServiceTier`: whether `priority` reaches the
+/// provider wire for this model. Bedrock/Vertex Claude and OpenRouter Anthropic
+/// models silently drop it, so they report inactive.
+fn realizes_priority(provider: &str, api: Option<&str>, id: &str) -> bool {
+	if provider == "anthropic" {
+		return true;
+	}
+	if provider == "openrouter" {
+		let family = service_tier_family(provider, api, id);
+		return matches!(family, Some("openai" | "google"));
+	}
+	if api == Some("anthropic-messages") {
+		return false;
+	}
+	should_send_service_tier(provider, api, id)
 }
 
 fn clean_title(name: &str) -> String {
@@ -1338,12 +1569,30 @@ pub enum TurnAdvance {
 }
 
 impl RpcSession {
-	/// Pop the next queued message according to the follow-up mode.
+	/// Pop the next queued turn according to the follow-up mode.
+	///
+	/// `all` batches every queued message into one native turn (the runner takes
+	/// a single prompt + parts, so texts are joined and images concatenated);
+	/// `one-at-a-time` returns exactly one message.
 	pub fn next_queued(&mut self) -> TurnAdvance {
-		match self.queued.pop_front() {
-			Some(input) => TurnAdvance::Run(input),
-			None => TurnAdvance::Idle,
+		let mode = self.follow_up_mode;
+		let batch = self.take_queued(mode);
+		if batch.is_empty() {
+			return TurnAdvance::Idle;
 		}
+		if batch.len() == 1 {
+			return TurnAdvance::Run(batch.into_iter().next().expect("one message"));
+		}
+		let mut text = String::new();
+		let mut images = Vec::new();
+		for input in batch {
+			if !text.is_empty() {
+				text.push_str("\n\n");
+			}
+			text.push_str(&input.text);
+			images.extend(input.images);
+		}
+		TurnAdvance::Run(TurnInput { text, images })
 	}
 
 	/// Whether messages are waiting for the current turn to finish.
@@ -1424,7 +1673,15 @@ impl RpcSession {
 		let messages_removed = self.messages.len();
 		let summary_message = runtime::user_message_from_parts(&summary, &[])
 			.map_err(|err| Error::new(err.to_string()))?;
-		self.history_messages = Some(vec![summary_message]);
+		if self.store.enabled() {
+			self.history_messages = Some(vec![summary_message]);
+		} else {
+			// No-session mode sends `in_memory_messages`, not `history_messages`;
+			// the compacted summary must replace the pre-compaction history or
+			// the next turn still sends it.
+			self.history_messages = None;
+			self.in_memory_messages = Some(vec![summary_message]);
+		}
 		self.messages = vec![json!({
 			"role": "user",
 			"content": [{ "type": "text", "text": summary }],
@@ -1467,7 +1724,15 @@ impl RpcSession {
 		self.new_session(None)?;
 		let summary_message = runtime::user_message_from_parts(&summary, &[])
 			.map_err(|err| Error::new(err.to_string()))?;
-		self.history_messages = Some(vec![summary_message]);
+		if self.store.enabled() {
+			self.history_messages = Some(vec![summary_message]);
+		} else {
+			// No-session mode sends `in_memory_messages`, not `history_messages`;
+			// the compacted summary must replace the pre-compaction history or
+			// the next turn still sends it.
+			self.history_messages = None;
+			self.in_memory_messages = Some(vec![summary_message]);
+		}
 		self.messages = vec![json!({
 			"role": "user",
 			"content": [{ "type": "text", "text": summary }],

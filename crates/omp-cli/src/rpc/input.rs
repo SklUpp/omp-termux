@@ -142,7 +142,14 @@ impl<R: BufRead> RpcInput<R> {
 			if self.reader.read_until(b'\n', &mut self.line)? == 0 {
 				return Ok(None);
 			}
-			let text = String::from_utf8_lossy(&self.line);
+			let text = match std::str::from_utf8(&self.line) {
+				Ok(text) => text,
+				Err(error) => {
+					return Ok(Some(Err(format!(
+						"Failed to parse command: invalid UTF-8 ({error})"
+					))));
+				},
+			};
 			let trimmed = text.trim();
 			if trimmed.is_empty() {
 				continue;
@@ -190,16 +197,25 @@ impl ExtensionUiBridge {
 		message: &str,
 		timeout: Option<Duration>,
 	) -> Option<bool> {
+		let response = self.request(
+			serde_json::json!({ "method": "confirm", "title": title, "message": message }),
+			timeout,
+		)?;
+		response.confirmed
+	}
+
+	/// Send one `extension_ui_request` and wait for its response. `None` on
+	/// cancel, timeout, shutdown or an unknown reply.
+	pub fn request(
+		&self,
+		mut frame: serde_json::Value,
+		timeout: Option<Duration>,
+	) -> Option<RpcExtensionUiResponse> {
 		let id = format!("ui-{}-{}", std::process::id(), self.next_id.fetch_add(1, Ordering::Relaxed));
 		let (tx, rx) = mpsc::channel();
 		self.lock_pending().insert(id.clone(), tx);
-		let mut frame = serde_json::json!({
-			"type": "extension_ui_request",
-			"id": id,
-			"method": "confirm",
-			"title": title,
-			"message": message,
-		});
+		frame["type"] = serde_json::json!("extension_ui_request");
+		frame["id"] = serde_json::json!(id);
 		if let Some(timeout) = timeout {
 			frame["timeout"] = serde_json::json!(timeout.as_millis() as u64);
 		}
@@ -212,11 +228,7 @@ impl ExtensionUiBridge {
 					let remaining = deadline.saturating_duration_since(Instant::now());
 					match rx.recv_timeout(remaining) {
 						Ok(response) => response,
-						Err(mpsc::RecvTimeoutError::Timeout) => {
-							self.lock_pending().remove(&id);
-							return None;
-						},
-						Err(mpsc::RecvTimeoutError::Disconnected) => {
+						Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
 							self.lock_pending().remove(&id);
 							return None;
 						},
@@ -236,7 +248,7 @@ impl ExtensionUiBridge {
 			if response.cancelled {
 				return None;
 			}
-			return response.confirmed;
+			return Some(response);
 		}
 	}
 
@@ -529,5 +541,78 @@ mod tests {
 		tasks.sort_unstable();
 		assert_eq!(tasks, vec![0, 1, 2]);
 		assert_eq!(coordinator.drain(), 0);
+	}
+}
+
+/// `ask` tool surface over `extension_ui_request` `select` dialogs.
+///
+/// Installed before tools mount, so headless `ask` never aborts or reads stdin.
+pub struct RpcAskChannel {
+	ui: Arc<ExtensionUiBridge>,
+}
+
+impl RpcAskChannel {
+	pub fn new(ui: Arc<ExtensionUiBridge>) -> Self {
+		Self { ui }
+	}
+}
+
+#[async_trait::async_trait]
+impl pi_agent::tools::ask::AskChannel for RpcAskChannel {
+	async fn ask(
+		&self,
+		questions: &[pi_agent::tools::ask::AskQuestion],
+		cancel: tokio_util::sync::CancellationToken,
+	) -> pi_agent::tools::ask::AskOutcome {
+		use pi_agent::tools::ask::{
+			AskAnswer, AskOutcome, CHAT_ABOUT_THIS_OPTION,
+		};
+		let mut answers = Vec::new();
+		for question in questions {
+			if cancel.is_cancelled() {
+				return AskOutcome::Aborted;
+			}
+			let options: Vec<Value> = question
+				.options
+				.iter()
+				.map(|option| {
+					let mut value = serde_json::json!({ "label": option.label });
+					if let Some(description) = &option.description {
+						value["description"] = serde_json::json!(description);
+					}
+					if let Some(preview) = &option.preview {
+						value["preview"] = serde_json::json!(preview);
+					}
+					value
+				})
+				.collect();
+			let mut frame = serde_json::json!({
+				"method": "select",
+				"title": question.header.clone().unwrap_or_else(|| question.question.clone()),
+				"message": question.question,
+				"options": options,
+				"multi": question.multi,
+			});
+			if let Some(recommended) = question.recommended {
+				frame["recommended"] = serde_json::json!(recommended);
+			}
+			let Some(response) = self.ui.request(frame, None) else {
+				return AskOutcome::Cancelled;
+			};
+			let Some(value) = response.value else {
+				return AskOutcome::Cancelled;
+			};
+			if value == CHAT_ABOUT_THIS_OPTION {
+				return AskOutcome::ChatRedirect;
+			}
+			let mut answer = AskAnswer { id: question.id.clone(), ..Default::default() };
+			if question.options.iter().any(|option| option.label == value) {
+				answer.selected_options.push(value);
+			} else {
+				answer.custom_input = Some(value);
+			}
+			answers.push(answer);
+		}
+		AskOutcome::Answered(answers)
 	}
 }

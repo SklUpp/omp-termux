@@ -335,6 +335,7 @@ pub enum RpcCommand {
 		id:           Option<String>,
 		session_path: String,
 	},
+	#[serde(rename_all = "camelCase")]
 	Branch {
 		#[serde(default)]
 		id:       Option<String>,
@@ -382,6 +383,7 @@ pub enum RpcCommand {
 		#[serde(default)]
 		id: Option<String>,
 	},
+	#[serde(rename_all = "camelCase")]
 	Login {
 		#[serde(default)]
 		id:          Option<String>,
@@ -578,21 +580,24 @@ pub fn ready_frame(max_frame_bytes: usize, max_reassembled_bytes: usize) -> Valu
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcSessionState {
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub model:                    Option<Value>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub thinking_level:           Option<String>,
 	pub is_streaming:             bool,
 	pub is_compacting:            bool,
 	pub steering_mode:            &'static str,
 	pub follow_up_mode:           &'static str,
 	pub interrupt_mode:           &'static str,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub session_file:             Option<String>,
 	pub session_id:               String,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub session_name:             Option<String>,
 	pub auto_compaction_enabled:  bool,
 	pub queued_message_count:     usize,
 	pub todo_phases:              Value,
 	pub fast_mode_enabled:        bool,
-	#[serde(skip_serializing_if = "Option::is_none")]
 	pub tokens_per_second:        Option<f64>,
 	pub fast_mode_active:         bool,
 	pub message_count:            usize,
@@ -803,11 +808,13 @@ mod tests {
 			"get_branch_messages", "get_last_assistant_text", "set_session_name", "handoff",
 			"get_messages", "get_messages_page", "get_login_providers", "login",
 		];
-		// The TypeScript union has 43 members; the guard is the count, so a new
+		// The TypeScript union has 42 members; the guard is the count, so a new
 		// upstream command cannot be silently dropped here.
-		assert_eq!(types.len(), 43);
+		assert_eq!(types.len(), 42);
 		for kind in types {
 			let mut frame = json!({ "type": kind });
+			let level = if kind == "set_subagent_subscription" { "events" } else { "high" };
+			let mode = if kind == "set_interrupt_mode" { "immediate" } else { "all" };
 			// Fill the required fields the command needs to deserialize.
 			for (field, value) in [
 				("message", json!("m")),
@@ -818,8 +825,8 @@ mod tests {
 				("providerId", json!("p")),
 				("sessionPath", json!("/tmp/s.jsonl")),
 				("entryId", json!("e")),
-				("level", json!("high")),
-				("mode", json!("all")),
+				("level", json!(level)),
+				("mode", json!(mode)),
 				("enabled", json!(false)),
 				("phases", json!([])),
 				("tools", json!([])),
