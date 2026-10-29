@@ -41,7 +41,8 @@ jobs:
         run: cargo test --locked -p pi-agent -p omp-cli
       # Read-only evidence capture after a real suite failure. This step never
       # installs, warms caches, retries the suite or changes its verdict; it only
-      # records Julia provenance, host load and one bounded probe measurement so
+      # records Julia provenance, host load and a paired bounded probe (inherited
+      # env vs the eval runtime's filtered env, same fresh cwd and null stdio) so
       # the timeout root cause can be diagnosed from the same failing run.
       - name: Julia probe diagnostics (read-only, bounded)
         if: failure()
@@ -49,10 +50,12 @@ jobs:
         run: |
           python3 - <<'PY'
           import os
+          import re
           import selectors
           import shutil
           import signal
           import subprocess
+          import tempfile
           import time
           import traceback
 
@@ -93,7 +96,7 @@ jobs:
                   pass
 
 
-          def run(label, cmd, timeout=CMD_TIMEOUT):
+          def run(label, cmd, timeout=CMD_TIMEOUT, env=None, cwd=None, null_output=False):
               print(f"=== {label}: {' '.join(cmd)}", flush=True)
               cpu_before = child_cpu()
               start = time.perf_counter()
@@ -101,8 +104,10 @@ jobs:
                   proc = subprocess.Popen(
                       cmd,
                       stdin=subprocess.DEVNULL,
-                      stdout=subprocess.PIPE,
-                      stderr=subprocess.PIPE,
+                      stdout=subprocess.DEVNULL if null_output else subprocess.PIPE,
+                      stderr=subprocess.DEVNULL if null_output else subprocess.PIPE,
+                      env=env,
+                      cwd=cwd,
                       start_new_session=True,
                   )
               except OSError as exc:
@@ -111,8 +116,10 @@ jobs:
               # Drain both pipes without buffering them whole: only the first
               # OUT_LIMIT bytes per stream are kept, the rest is counted and
               # discarded, so a runaway writer cannot exhaust runner memory.
-              heads = {proc.stdout: bytearray(), proc.stderr: bytearray()}
-              totals = {proc.stdout: 0, proc.stderr: 0}
+              # Null stdio has no streams to drain, matching the Rust probe.
+              streams = () if null_output else (proc.stdout, proc.stderr)
+              heads = {stream: bytearray() for stream in streams}
+              totals = {stream: 0 for stream in streams}
               live = set(heads)
               deadline = start + timeout
               timed_out = False
@@ -157,7 +164,7 @@ jobs:
                           proc.wait(timeout=REAP_GRACE)
                       except subprocess.TimeoutExpired:
                           print("reap-timeout: still alive after SIGKILL", flush=True)
-                  for stream in (proc.stdout, proc.stderr):
+                  for stream in streams:
                       residual(stream, heads, totals)
               wall = time.perf_counter() - start
               cpu = child_cpu() - cpu_before
@@ -166,17 +173,61 @@ jobs:
                   flush=True,
               )
               for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr)):
-                  head = heads.get(stream, b"").decode("utf-8", "replace")
+                  if stream not in totals:
+                      continue
+                  head = heads[stream].decode("utf-8", "replace")
                   print(f"{name}[{totals[stream]}]: {head!r}", flush=True)
 
 
-          def safe(label, cmd, timeout=CMD_TIMEOUT):
+          def safe(label, cmd, timeout=CMD_TIMEOUT, env=None, cwd=None, null_output=False):
               # One broken command must not cancel the remaining measurements.
               try:
-                  run(label, cmd, timeout)
+                  run(label, cmd, timeout, env=env, cwd=cwd, null_output=null_output)
               except Exception:
                   print(f"run-error: {label}", flush=True)
                   traceback.print_exc()
+
+
+          # Deliberate diagnostic copy of crates/pi-agent/src/eval/env.rs
+          # (COMMON_ALLOW, JL_ALLOW, SHARED_DENY, allow_for(Jl) prefixes and
+          # SECRET_PATTERN). It only reproduces the Rust probe's child env here;
+          # product code stays the single source of truth. Nothing derived from
+          # the environment is printed: only exit/timeout/wall/cpu per command.
+          ENV_ALLOW = frozenset(
+              """
+              PATH HOME USER USERNAME LOGNAME SHELL LANG LC_ALL LC_CTYPE LC_MESSAGES TERM
+              TERM_PROGRAM TERM_PROGRAM_VERSION TMPDIR TEMP TMP XDG_CACHE_HOME XDG_CONFIG_HOME
+              XDG_DATA_HOME XDG_RUNTIME_DIR SSH_AUTH_SOCK SSH_AGENT_PID SSH_CONNECTION SSH_CLIENT
+              SSH_TTY LD_LIBRARY_PATH DYLD_LIBRARY_PATH TZ SYSTEMROOT WINDIR COMSPEC PATHEXT
+              DISPLAY XAUTHORITY
+              """.split()
+          )
+          ENV_DENY = frozenset(
+              """
+              OPENAI_API_KEY ANTHROPIC_API_KEY GOOGLE_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY
+              PERPLEXITY_API_KEY PERPLEXITY_COOKIES EXA_API_KEY AZURE_OPENAI_API_KEY MISTRAL_API_KEY
+              PI_API_KEY PI_TOKEN PI_PASSWORD PI_SESSION PI_TOOL_BRIDGE_TOKEN
+              """.split()
+          )
+          ENV_PREFIXES = ("LC_", "XDG_", "PI_", "JULIA_", "OPENBLAS_", "MKL_")
+          ENV_SECRET = re.compile(
+              r"(?i)API[_-]?KEY|APIKEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL"
+              r"|ACCESS[_-]?KEY|PRIVATE[_-]?KEY"
+          )
+
+
+          def jl_env(env):
+              # Deny wins, the allow list keeps the original key spelling, and
+              # secret-shaped names are rejected even under an allow prefix.
+              return {
+                  key: value
+                  for key, value in env.items()
+                  if key not in ENV_DENY
+                  and (
+                      key in ENV_ALLOW
+                      or (not ENV_SECRET.search(key) and key.startswith(ENV_PREFIXES))
+                  )
+              }
 
 
           try:
@@ -201,15 +252,30 @@ jobs:
                   "version",
                   [julia, "--startup-file=no", "--history-file=no", "--color=no", "--version"],
               )
-              # Same argv as the Rust availability probe
-              # (crates/pi-agent/src/eval/languages.rs probe_command), measured once.
-              # Fidelity caveat: that probe spawns with a filtered env and its own cwd,
-              # while this step inherits the workflow env, so the timing here is
-              # indicative provenance evidence, not a byte-exact reproduction.
-              safe(
-                  "probe",
-                  [julia, "--startup-file=no", "--history-file=no", "--color=no", "-e", "exit(0)"],
-              )
+              # Paired probes: identical argv, one fresh empty cwd and null stdio,
+              # differing only in environment. The first inherits this step's env
+              # (what the old single probe measured); the second gets the filtered
+              # clone an eval cell's Julia probe would actually see. Equal cwd and
+              # stdio remove the cwd and pipe-blocking confounds, so a wall-time gap
+              # between the two points at env filtering rather than at I/O.
+              # Same argv as crates/pi-agent/src/eval/languages.rs probe_command.
+              probe_argv = [
+                  julia,
+                  "--startup-file=no",
+                  "--history-file=no",
+                  "--color=no",
+                  "-e",
+                  "exit(0)",
+              ]
+              with tempfile.TemporaryDirectory(prefix="omp-jl-probe-") as probe_cwd:
+                  safe("probe-inherited-env", probe_argv, cwd=probe_cwd, null_output=True)
+                  safe(
+                      "probe-filtered-env",
+                      probe_argv,
+                      env=jl_env(dict(os.environ)),
+                      cwd=probe_cwd,
+                      null_output=True,
+                  )
           except Exception:  # script bug: print traceback, keep the suite's verdict
               traceback.print_exc()
           PY
