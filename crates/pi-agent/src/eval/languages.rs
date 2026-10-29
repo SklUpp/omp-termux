@@ -169,7 +169,14 @@ fn probe_command(language: EvalLanguage, program: &Path) -> Vec<String> {
 	match language {
 		EvalLanguage::Py => vec![program, "-c".to_string(), "import sys;sys.exit(0)".to_string()],
 		EvalLanguage::Rb => vec![program, "-e".to_string(), "exit 0".to_string()],
-		EvalLanguage::Jl => vec![program, "-e".to_string(), "exit(0)".to_string()],
+		EvalLanguage::Jl => vec![
+			program,
+			"--startup-file=no".to_string(),
+			"--history-file=no".to_string(),
+			"--color=no".to_string(),
+			"-e".to_string(),
+			"exit(0)".to_string(),
+		],
 		EvalLanguage::Js => vec![program, "--version".to_string()],
 	}
 }
