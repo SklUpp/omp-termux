@@ -63,7 +63,7 @@ fn tool_end_text(result: &str, error: Option<&str>) -> String {
 	if result.is_empty() {
 		return error.to_string();
 	}
-	if result.trim_end().ends_with(error) {
+	if result == error {
 		return result.to_string();
 	}
 	format!("{result}\n{error}")
@@ -1819,6 +1819,10 @@ mod tool_end_text_tests {
 		assert_eq!(
 			tool_end_text("exit code 1", Some("command not found: nope")),
 			"exit code 1\ncommand not found: nope"
+		);
+		assert_eq!(
+			tool_end_text("context: denied", Some("denied")),
+			"context: denied\ndenied"
 		);
 	}
 }

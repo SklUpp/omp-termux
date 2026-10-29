@@ -2768,16 +2768,26 @@ mod display_tests {
 
 	#[tokio::test]
 	async fn immutable_sources_never_fabricate_anchors() {
-		// Internal reads are not ported yet, so the immutable path ends in the
-		// honest unsupported error; what matters is that no hashline header or
-		// numbering is invented for a source no edit could ever target.
+		// `artifact://`, `agent://` and `memory://` have no edit path, so even in
+		// hashline mode a mounted handler's read must not emit anchors: line
+		// numbers stay, the `[path#TAG]` header and the snapshot record do not.
 		let dir = TempDir::new("immutable");
-		let (tool, sink) = configured(EditMode::Hashline, true, true);
+		let sink = Arc::new(TestSink::default());
+		let router = Arc::new(InternalUrlRouter::new());
+		for scheme in ["artifact", "agent", "memory"] {
+			router.register(Arc::new(ImmutableHandler(scheme))).expect("register");
+		}
+		let tool = ReadTool::with_snapshot_sink(sink.clone())
+			.with_display_inputs(FileDisplayInputs::new(EditMode::Hashline, true, true))
+			.with_internal_urls(router, Arc::new(UrlScope::default()));
 		for path in ["artifact://x", "agent://x", "memory://x"] {
 			let result = read_with(&tool, &dir, path).await;
-			assert!(result.is_error, "{}", result.content);
-			assert!(result.content.contains("Internal resource reads are not supported"), "{}", result.content);
+			assert!(!result.is_error, "{}", result.content);
+			assert_eq!(result.content, "1|alpha\n2|beta");
+			assert!(!result.content.starts_with('['), "{}", result.content);
 			assert!(!result.content.contains("0A1B"), "{}", result.content);
+			let details = result.details.expect("details");
+			assert_eq!(details["internalUrl"]["immutable"], json!(true));
 		}
 		assert!(sink.files.lock().expect("files").is_empty());
 	}
@@ -2849,10 +2859,13 @@ mod display_tests {
 		assert!(numbered.content.contains("2|l2"), "{}", numbered.content);
 		assert!(numbered.content.contains("3|l3"), "{}", numbered.content);
 
-		let multi = read_with(&tool, &dir, "artifact://doc:raw:1,4-5").await;
-		assert!(multi.content.starts_with("l1"), "{}", multi.content);
-		assert!(multi.content.contains("\u{2026}"), "{}", multi.content);
-		assert!(multi.content.contains("l4\nl5"), "{}", multi.content);
+		let multi = read_with(&tool, &dir, "artifact://doc:raw:1-1,4-5").await;
+		assert_eq!(multi.content, "l1\n\n\u{2026}\n\nl4\nl5");
+
+		// A bare `:N` is open-ended (`docs/tools/read.md`), so `:1,4-5` merges
+		// into one 1-EOF range instead of rendering a multi-range body.
+		let open_ended = read_with(&tool, &dir, "artifact://doc:raw:1,4-5").await;
+		assert_eq!(open_ended.content, "l1\nl2\nl3\nl4\nl5\nl6");
 
 		let past_end = read_with(&tool, &dir, "artifact://doc:9").await;
 		assert!(!past_end.is_error);
@@ -2911,6 +2924,28 @@ mod display_tests {
 
 	struct StaticHandler {
 		immutable: bool,
+	}
+
+	/// Registered by name so one router can mount all anchorless built-ins.
+	struct ImmutableHandler(&'static str);
+
+	#[async_trait::async_trait]
+	impl ProtocolHandler for ImmutableHandler {
+		fn scheme(&self) -> &str {
+			self.0
+		}
+
+		fn immutable(&self) -> bool {
+			true
+		}
+
+		async fn resolve(
+			&self,
+			url: &InternalUrl,
+			_context: &ResolveContext,
+		) -> Result<InternalResource, String> {
+			Ok(InternalResource::text(&url.href, "alpha\nbeta".to_string()))
+		}
 	}
 
 	#[async_trait::async_trait]
