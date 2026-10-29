@@ -14,7 +14,7 @@ use pi_agent::{
 	BackgroundResultSink,
 	loop_module::{AgentLoop, AgentError},
 	mailbox::{IrcMessage, MAIN_AGENT_ID, Mailbox},
-	provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
+	provider::{ChunkStream, ModelProvider, ProviderError, StreamChunk, ToolChoice},
 	state::{AgentConfig, AgentContext, Message},
 	supervisor::{
 		ChildStatus, DelegationLimits, MAX_OUTSTANDING_RESULTS, Supervisor,
@@ -58,14 +58,46 @@ impl ModelProvider for TestProvider {
 		Ok(Message::assistant(self.reply.clone()))
 	}
 
+	/// Background children forward child events, so the loop streams. Mirror
+	/// `complete` exactly: capture, announce entry, then hold the gate.
 	async fn stream(
 		&self,
-		_messages: &[Message],
+		messages: &[Message],
 		_tools: &[serde_json::Value],
 		_tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
-		Err(ProviderError::Protocol("stream unused in test".to_string()))
+		if let Some(captured) = &self.captured {
+			captured.lock().unwrap().extend_from_slice(messages);
+		}
+		if let Some(entered) = &self.entered {
+			entered.notify_one();
+		}
+		if let Some(gate) = &self.gate {
+			let _permit = gate.acquire().await.map_err(|_| {
+				ProviderError::Protocol("gate closed".to_string())
+			})?;
+		}
+		Ok(text_stream(&self.reply))
 	}
+}
+
+/// One assistant turn as a two-chunk SSE: the reply text, then the done frame.
+fn text_stream(reply: &str) -> ChunkStream {
+	let items: Vec<Result<StreamChunk, ProviderError>> = vec![
+		Ok(StreamChunk {
+			content: Some(reply.to_string()),
+			tool_call_deltas: Vec::new(),
+			usage: None,
+			is_done: false,
+		}),
+		Ok(StreamChunk {
+			content: None,
+			tool_call_deltas: Vec::new(),
+			usage: None,
+			is_done: true,
+		}),
+	];
+	Box::pin(futures::stream::iter(items))
 }
 
 fn provider(reply: &str) -> Arc<TestProvider> {
@@ -415,13 +447,24 @@ impl ModelProvider for ScriptedProvider {
 		Ok(Message::assistant("nested-output".to_string()))
 	}
 
+	/// Same script as `complete`: the first call hangs holding the parent job's
+	/// permit; later calls (the nested child) answer immediately.
 	async fn stream(
 		&self,
 		_messages: &[Message],
 		_tools: &[serde_json::Value],
 		_tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
-		Err(ProviderError::Protocol("stream unused in test".to_string()))
+		if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+			self.entered.notify_one();
+			let _permit = self
+				.release
+				.acquire()
+				.await
+				.map_err(|_| ProviderError::Protocol("release closed".to_string()))?;
+			return Ok(text_stream("parent-output"));
+		}
+		Ok(text_stream("nested-output"))
 	}
 }
 
