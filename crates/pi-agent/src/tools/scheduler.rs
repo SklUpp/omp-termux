@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use futures::future::join_all;
 
-use super::{ToolError, registry::ToolRegistry};
+use super::{
+	ToolError,
+	registry::{ToolRegistry, excluded_tool_reason},
+};
 use crate::state::{AgentContext, ToolApprover, ToolCall, ToolResult};
 /// Scheduler partitions a tool batch into concurrent non-exclusive runs and
 /// sequential exclusive ones, preserving call order in the results.
@@ -56,12 +59,21 @@ impl ToolScheduler {
 
 	async fn run_single(&self, call: &ToolCall, ctx: &AgentContext) -> ToolResult {
 		let Some(tool) = self.registry.get(&call.name) else {
+			// A known-but-excluded tool carries a machine-readable boundary marker
+			// in `details`; unknown names keep the empty diagnostic shape.
+			let details = excluded_tool_reason(&call.name).map(|reason| {
+				serde_json::json!({
+					"code": "platform_boundary",
+					"tool": &call.name,
+					"reason": reason,
+				})
+			});
 			return ToolResult {
 				tool_call_id: call.id.clone(),
 				content: self.registry.missing_tool_diagnostic(&call.name),
 				is_error: true,
 				terminate: false,
-				details: None,
+				details,
 			};
 		};
 
@@ -152,6 +164,17 @@ mod tests {
 		}
 	}
 
+	/// Counts approval prompts so a test can prove none was asked.
+	struct CountingApprover(Arc<std::sync::atomic::AtomicUsize>);
+
+	#[async_trait]
+	impl ToolApprover for CountingApprover {
+		async fn approve(&self, _name: &str, _args: &serde_json::Value) -> Result<(), String> {
+			self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			Ok(())
+		}
+	}
+
 	fn temp_dir(label: &str) -> PathBuf {
 		static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 		let path = std::env::temp_dir().join(format!(
@@ -175,6 +198,43 @@ mod tests {
 		let mut registry = ToolRegistry::new();
 		registry.register(Arc::new(BashTool::new()));
 		ToolScheduler::with_approver(registry, approver)
+	}
+
+	#[tokio::test]
+	async fn excluded_tool_never_prompts_or_runs() {
+		let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let scheduler = ToolScheduler::with_approver(
+			ToolRegistry::new(),
+			Arc::new(CountingApprover(approvals.clone())),
+		);
+		let ctx = AgentContext::new(temp_dir("computer-boundary"));
+		let calls = vec![ToolCall {
+			id:        "call_1".to_string(),
+			name:      "computer".to_string(),
+			arguments: json!({ "action": "screenshot" }),
+		}];
+
+		let results = scheduler.execute_batch(&calls, &ctx).await;
+		assert_eq!(results.len(), 1);
+		assert!(results[0].is_error, "an excluded tool must not succeed");
+		assert!(
+			results[0].content.contains("excluded by the platform boundary"),
+			"{}",
+			results[0].content
+		);
+		let details = results[0].details.as_ref().expect("typed boundary details");
+		assert_eq!(details["code"], "platform_boundary");
+		assert_eq!(details["tool"], "computer");
+		assert_eq!(
+			details["reason"].as_str(),
+			excluded_tool_reason("computer"),
+			"details must reuse the exclusion table"
+		);
+		assert_eq!(
+			approvals.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"an excluded tool must not ask for approval"
+		);
 	}
 
 	#[tokio::test]

@@ -11,7 +11,7 @@ use omp_cli::{
 	agent::{self, AgentRunner, RunRequest},
 	agents,
 	approve::Approvals,
-	args::{Cli, Command},
+	args::{Command, parse_cli, refused_verb_message},
 	catalog::Catalog,
 	completions,
 	config::Config,
@@ -102,6 +102,13 @@ fn run() -> std::result::Result<(), CliError> {
 	// `--system-prompt --profile` stays literal and invalid OMP_PROFILE errors
 	// even for `--help`.
 	let bootstrap = profile::extract_cli_flags(std::env::args_os().collect())?;
+	// A known upstream verb this binary does not run must fail here, before the
+	// profile, config, session, provider, or JS runtime starts. Without this
+	// guard clap accepts `omp acp` as the positional prompt "acp" and the agent
+	// runtime treats a command as text, which looks like a successful launch.
+	if let Some(message) = refused_verb_message(&bootstrap.argv) {
+		return Err(CliError::usage(message));
+	}
 	let profile = profile::resolve_cli(bootstrap.profile.as_deref())?;
 	profile::activate(profile.as_deref());
 	// Hidden worker dispatch before clap/config/session boot: the broker worker
@@ -121,7 +128,7 @@ fn run() -> std::result::Result<(), CliError> {
 	}
 	// Share this profile's exact runtime scope with `pi-agent` broker clients.
 	daemon_broker::share_runtime_root(&dirs::agent_dir());
-	let cli = Cli::parse_from(bootstrap.argv.iter().cloned());
+	let cli = parse_cli(bootstrap.argv);
 	if let Some(alias_name) = &bootstrap.alias {
 		let result = profile::install_alias(alias_name, profile.as_deref())?;
 		print!(
@@ -167,7 +174,7 @@ fn run() -> std::result::Result<(), CliError> {
 			agents::print_unpack(&summary, *json)?;
 			return Ok(());
 		},
-		Some(Command::Models { action, pattern, json, extension, config, .. }) => {
+		Some(Command::Models { action, pattern, json, extension, no_extensions, config }) => {
 			let base = match &cli.cwd {
 				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
 				None => std::env::current_dir()?,
@@ -179,6 +186,7 @@ fn run() -> std::result::Result<(), CliError> {
 				pattern: pattern.clone(),
 				json: *json,
 				extensions: extension.clone(),
+				no_extensions: *no_extensions,
 				config: cli.config.iter().chain(config).cloned().collect(),
 			};
 			let stdout = io::stdout();

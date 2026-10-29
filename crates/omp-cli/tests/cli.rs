@@ -175,6 +175,209 @@ fn bad_max_time_is_a_usage_error() {
 	assert!(stderr.contains("Invalid --max-time value"), "stderr was {stderr:?}");
 }
 
+#[test]
+fn known_verbs_are_refused_without_starting_a_runtime() {
+	let root = std::env::temp_dir().join(format!("omp-cli-verb-refusal-{}", std::process::id()));
+	let share = root.join("share");
+	std::fs::create_dir_all(&share).expect("share dir");
+	let agent = root.join("config/agent");
+	let run = |args: &[&str]| {
+		omp()
+			.args(args)
+			.env("PI_CONFIG_DIR", root.join("config"))
+			.env("PI_CODING_AGENT_DIR", &agent)
+			.env("OMP_SHARE_DIR", &share)
+			.stdin(Stdio::null())
+			.output()
+			.expect("run omp")
+	};
+
+	let missing = run(&["acp"]);
+	assert_eq!(missing.status.code(), Some(i32::from(EXIT_USAGE)));
+	let stderr = String::from_utf8(missing.stderr).expect("utf8");
+	assert!(stderr.contains("`omp acp` is not implemented"), "stderr was {stderr:?}");
+	assert!(missing.stdout.is_empty());
+
+	let excluded = run(&["plugin", "list"]);
+	assert_eq!(excluded.status.code(), Some(i32::from(EXIT_USAGE)));
+	let stderr = String::from_utf8(excluded.stderr).expect("utf8");
+	assert!(
+		stderr.contains("outside the approved boundary"),
+		"stderr was {stderr:?}"
+	);
+	assert!(excluded.stdout.is_empty());
+
+	// The refusal path starts nothing: no agent directory, no session log.
+	assert!(!agent.exists(), "refusal must not create the agent directory");
+	assert!(
+		std::fs::read_dir(&share).expect("share dir").next().is_none(),
+		"refusal must not write to the share dir"
+	);
+
+	// Only a leading help/version request stays with clap's own actions.
+	let help = run(&["--help"]);
+	assert_eq!(help.status.code(), Some(i32::from(EXIT_SUCCESS)));
+	assert!(
+		String::from_utf8_lossy(&help.stdout).contains("--print"),
+		"stdout: {}",
+		String::from_utf8_lossy(&help.stdout)
+	);
+	let version = run(&["--version"]);
+	assert_eq!(version.status.code(), Some(i32::from(EXIT_SUCCESS)));
+	assert!(
+		String::from_utf8_lossy(&version.stdout).contains(env!("CARGO_PKG_VERSION")),
+		"stdout: {}",
+		String::from_utf8_lossy(&version.stdout)
+	);
+	// `launch` keeps the root help and version: the escape hatch does not fork the
+	// user-facing surface, wherever the request sits in the leading flags.
+	for args in [vec!["launch", "--help"], vec!["--help", "launch"]] {
+		let help = run(&args);
+		assert_eq!(help.status.code(), Some(i32::from(EXIT_SUCCESS)), "{args:?}");
+		assert!(
+			String::from_utf8_lossy(&help.stdout).contains("--print"),
+			"{args:?} must print the root help: {}",
+			String::from_utf8_lossy(&help.stdout)
+		);
+	}
+	for args in [vec!["launch", "--version"], vec!["--version", "launch"]] {
+		let version = run(&args);
+		assert_eq!(version.status.code(), Some(i32::from(EXIT_SUCCESS)), "{args:?}");
+		assert!(
+			String::from_utf8_lossy(&version.stdout).contains(env!("CARGO_PKG_VERSION")),
+			"{args:?}: {}",
+			String::from_utf8_lossy(&version.stdout)
+		);
+	}
+	// A help token after a verb is not a help request: there is no help for a
+	// command this build does not have.
+	let trailing_help = run(&["acp", "--help"]);
+	assert_eq!(trailing_help.status.code(), Some(i32::from(EXIT_USAGE)));
+	assert!(
+		String::from_utf8_lossy(&trailing_help.stderr).contains("`omp acp` is not implemented"),
+		"stderr: {}",
+		String::from_utf8_lossy(&trailing_help.stderr)
+	);
+
+	// `--` keeps the same word as literal prompt text: it reaches the runtime and
+	// fails on the missing model config, not on the verb guard.
+	let literal = run(&["--print", "--", "acp"]);
+	assert_eq!(literal.status.code(), Some(i32::from(EXIT_FAILURE)));
+	let stderr = String::from_utf8(literal.stderr).expect("utf8");
+	assert!(stderr.contains("no model"), "stderr was {stderr:?}");
+
+	// A `launch` remainder is prompt text for any word — including subcommands and
+	// refused verbs — and flags keep parsing on both sides of the operand.
+	for args in [
+		vec!["launch", "--print", "repl"],
+		vec!["launch", "--print", "models"],
+		vec!["launch", "--print", "acp"],
+		vec!["launch", "repl", "--print"],
+	] {
+		let output = run(&args);
+		assert_eq!(output.status.code(), Some(i32::from(EXIT_FAILURE)), "{args:?}");
+		let stderr = String::from_utf8(output.stderr).expect("utf8");
+		assert!(stderr.contains("no model"), "{args:?}: {stderr:?}");
+	}
+	std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn models_no_extensions_is_honored_instead_of_silently_dropped() {
+	let root = std::env::temp_dir().join(format!("omp-cli-models-noext-{}", std::process::id()));
+	let share = root.join("share");
+	let work = root.join("work");
+	let agent = root.join("config/agent");
+	std::fs::create_dir_all(&share).expect("share dir");
+	std::fs::create_dir_all(&work).expect("work dir");
+	std::fs::create_dir_all(&agent).expect("agent dir");
+	// Keyless provider in the agent catalog: listing needs neither network nor key.
+	std::fs::write(
+		agent.join("models.yml"),
+		"providers:\n  local:\n    baseUrl: http://127.0.0.1:20128/v1\n    api: \
+		 openai-completions\n    auth: none\n    models:\n      - id: llama3\n",
+	)
+	.expect("models.yml");
+	let run = |args: &[&str]| {
+		omp()
+			.arg("--cwd")
+			.arg(&work)
+			.args(args)
+			.env("PI_CONFIG_DIR", root.join("config"))
+			.env("PI_CODING_AGENT_DIR", &agent)
+			.env("OMP_SHARE_DIR", &share)
+			.stdin(Stdio::null())
+			.output()
+			.expect("run omp")
+	};
+
+	let plain = run(&["models", "--json"]);
+	assert_eq!(
+		plain.status.code(),
+		Some(i32::from(EXIT_SUCCESS)),
+		"stderr: {}",
+		String::from_utf8_lossy(&plain.stderr)
+	);
+	assert!(String::from_utf8_lossy(&plain.stdout).contains("llama3"));
+
+	// Headless builds never discover extensions, so the flag's request already
+	// holds: it must be accepted and produce the same file-backed listing.
+	let flagged = run(&["models", "--no-extensions", "--json"]);
+	assert_eq!(
+		flagged.status.code(),
+		Some(i32::from(EXIT_SUCCESS)),
+		"stderr: {}",
+		String::from_utf8_lossy(&flagged.stderr)
+	);
+	assert_eq!(flagged.stdout, plain.stdout);
+
+	// An explicit extension path is still a hard prerequisite failure: the flag
+	// may not downgrade an explicit request into a silent skip.
+	let explicit = run(&["models", "--no-extensions", "-e", "ext.ts"]);
+	assert_eq!(explicit.status.code(), Some(i32::from(EXIT_FAILURE)));
+	let stderr = String::from_utf8(explicit.stderr).expect("utf8");
+	assert!(stderr.contains("extension runtime"), "stderr was {stderr:?}");
+	assert!(explicit.stdout.is_empty());
+	std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn excluded_tool_in_tools_selection_is_refused_with_the_boundary_reason() {
+	let root = std::env::temp_dir().join(format!("omp-cli-tools-boundary-{}", std::process::id()));
+	let share = root.join("share");
+	let work = root.join("work");
+	let agent = root.join("config/agent");
+	std::fs::create_dir_all(&share).expect("share dir");
+	std::fs::create_dir_all(&work).expect("work dir");
+	std::fs::create_dir_all(&agent).expect("agent dir");
+	std::fs::write(
+		agent.join("models.yml"),
+		"providers:\n  local:\n    baseUrl: http://127.0.0.1:20128/v1\n    api: \
+		 openai-completions\n    auth: none\n    models:\n      - id: llama3\n",
+	)
+	.expect("models.yml");
+	let output = omp()
+		.args(["--print", "--model", "local/llama3", "--tools", "read,computer"])
+		.arg("--cwd")
+		.arg(&work)
+		.arg("hi")
+		.env("PI_CONFIG_DIR", root.join("config"))
+		.env("PI_CODING_AGENT_DIR", &agent)
+		.env("OMP_SHARE_DIR", &share)
+		.stdin(Stdio::null())
+		.output()
+		.expect("run omp");
+	std::fs::remove_dir_all(&root).ok();
+	assert_eq!(output.status.code(), Some(i32::from(EXIT_FAILURE)));
+	let stderr = String::from_utf8(output.stderr).expect("utf8");
+	assert!(stderr.contains("`computer`"), "stderr was {stderr:?}");
+	assert!(
+		stderr.contains("excluded by the platform boundary"),
+		"stderr was {stderr:?}"
+	);
+	assert!(output.stdout.is_empty());
+}
+
 /// Scripted runner: proves `agent::install` is a real seam and that its event
 /// stream round-trips through the session log. No network, no model.
 struct ScriptedRunner;

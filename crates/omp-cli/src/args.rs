@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::approve::ApprovalMode;
 use crate::output::OutputMode;
@@ -14,15 +14,10 @@ use crate::output::OutputMode;
 /// Milliseconds in the supported duration units.
 const DURATION_UNITS: [(char, f64); 3] = [('s', 1.0), ('m', 60.0), ('h', 3_600.0)];
 
-#[derive(Debug, Parser)]
-#[command(
-	name = "omp",
-	version,
-	about = "oh-my-pi headless coding agent",
-	long_about = None,
-	disable_help_subcommand = true
-)]
-struct RawCli {
+/// Every option of the launch surface, shared by the two parsing surfaces:
+/// `RawCli` (root, with subcommands) and `LaunchCli` (no subcommands).
+#[derive(Debug, Args)]
+struct LaunchArgs {
 	/// Prompt text; repeated positionals run as sequential turns.
 	#[arg(value_name = "PROMPT")]
 	prompt: Vec<String>,
@@ -165,9 +160,32 @@ struct RawCli {
 	/// Internal marker inserted by the profile bootstrap; never user-facing.
 	#[arg(long = "omp-profile-boundary", hide = true)]
 	profile_boundary: bool,
+}
+
+/// Root parsing surface: the launch options plus the optional subcommand.
+#[derive(Debug, Parser)]
+#[command(
+	name = "omp",
+	version,
+	about = "oh-my-pi headless coding agent",
+	long_about = None,
+	disable_help_subcommand = true
+)]
+struct RawCli {
+	#[command(flatten)]
+	launch: LaunchArgs,
 
 	#[command(subcommand)]
 	command: Option<Command>,
+}
+
+/// The `launch` surface: the same options with no subcommands at all, so every
+/// operand is prompt text and nothing can dispatch.
+#[derive(Debug, Parser)]
+#[command(name = "omp", version)]
+struct LaunchCli {
+	#[command(flatten)]
+	launch: LaunchArgs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,7 +308,7 @@ pub fn parse_file_arg(token: &str) -> String {
 }
 
 impl Cli {
-	fn from_raw(raw: RawCli) -> Self {
+	fn from_launch(raw: LaunchArgs, command: Option<Command>) -> Self {
 		let _ = raw.profile_boundary;
 		let mut prompt = Vec::new();
 		let mut file_args = Vec::new();
@@ -341,7 +359,7 @@ impl Cli {
 			no_session: raw.no_session,
 			no_skills: raw.no_skills,
 			skills: raw.skills,
-			command: raw.command,
+			command,
 		}
 	}
 }
@@ -359,12 +377,12 @@ impl CommandFactory for Cli {
 impl FromArgMatches for Cli {
 	fn from_arg_matches(matches: &clap::ArgMatches) -> std::result::Result<Self, clap::Error> {
 		let raw = RawCli::from_arg_matches(matches)?;
-		Ok(Self::from_raw(raw))
+		Ok(Self::from_launch(raw.launch, raw.command))
 	}
 
 	fn from_arg_matches_mut(matches: &mut clap::ArgMatches) -> std::result::Result<Self, clap::Error> {
 		let raw = RawCli::from_arg_matches_mut(matches)?;
-		Ok(Self::from_raw(raw))
+		Ok(Self::from_launch(raw.launch, raw.command))
 	}
 
 	fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> std::result::Result<(), clap::Error> {
@@ -384,6 +402,316 @@ impl FromArgMatches for Cli {
 }
 
 impl Parser for Cli {}
+
+/// Known upstream verbs (`packages/coding-agent/src/cli-commands.ts`) that this
+/// binary refuses before prompt assembly because they are approved exclusions.
+/// The reason is user-facing: an excluded verb must not read like a typo.
+const EXCLUDED_VERBS: [(&str, &str); 6] = [
+	("git", "the full-screen git TUI is outside the approved boundary; run `git` directly"),
+	("install", "plugin and extension installation is outside the approved boundary"),
+	("join", "the full-screen join TUI and live WebRTC are outside the approved boundary"),
+	("plugin", "plugin and extension execution is outside the approved boundary"),
+	(
+		"shell",
+		"the interactive full-screen shell is outside the approved boundary; run `bash` directly",
+	),
+	("update", "there is no Android release target to update"),
+];
+
+/// Known upstream verbs this binary does not implement yet, including the
+/// upstream registry aliases `img`, `wt`, and `q`.
+const MISSING_VERBS: [&str; 30] = [
+	"acp",
+	"auth-broker",
+	"auth-gateway",
+	"bench",
+	"browser-relay",
+	"cleanse",
+	"commit",
+	"compress",
+	"config",
+	"dry-balance",
+	"gc",
+	"gallery",
+	"grievances",
+	"images",
+	"img",
+	"if-bench",
+	"say",
+	"share",
+	"setup",
+	"render",
+	"ssh",
+	"stats",
+	"usage",
+	"tiny-models",
+	"token",
+	"ttsr",
+	"worktree",
+	"wt",
+	"search",
+	"q",
+];
+
+/// Refusal for a known upstream verb that would otherwise be absorbed as prompt
+/// text, or `None` when argv is not such an invocation.
+///
+/// `omp acp` currently parses as the prompt "acp": there is no such clap
+/// subcommand, so `main` falls through to the agent runtime and starts config,
+/// session, provider, and tool setup for text the user meant as a command.
+/// Scanning mirrors the TypeScript `leadingSubcommandIndex`: leading launch flags
+/// and the values they consume are skipped (the value category comes from the
+/// clap definition, so it cannot drift from the real surface, including combined
+/// short flags and attached values), the scan stops at `--` and at `-` (POSIX
+/// literal operands), and only exact verb matches refuse. Help and version
+/// requests stay with clap's own actions, and arbitrary prompt text — including a
+/// first word that merely resembles a verb — passes through untouched.
+pub fn refused_verb_message(argv: &[std::ffi::OsString]) -> Option<String> {
+	let command = RawCli::command();
+	if requests_help_or_version(&command, argv, 1) {
+		return None;
+	}
+	let verb = verb_slot(&command, argv)?;
+	if let Some((_, reason)) = EXCLUDED_VERBS.iter().find(|(name, _)| *name == verb) {
+		return Some(format!(
+			"`omp {verb}` is excluded from this build: {reason}. Nothing was started. Pass `--` \
+			 before it to send the word as prompt text: `omp -- {verb}`."
+		));
+	}
+	if MISSING_VERBS.contains(&verb) {
+		return Some(format!(
+			"`omp {verb}` is not implemented in this binary yet; nothing was started. Run `omp \
+			 --help` for the commands it does provide, or pass `--` before it to send the word as \
+			 prompt text: `omp -- {verb}`."
+		));
+	}
+	None
+}
+
+/// Leading `--help`/`-h`/`--version`/`-V` (also inside a leading short-flag
+/// cluster such as `-ph`) belong to clap's help and version actions, so a known
+/// verb after them is not refused. The scan stops at the first operand: once a
+/// verb or prompt leads, a later `--help` is not a help request (`omp acp --help`
+/// refuses `acp`, which this build cannot help with).
+///
+/// Flag values are skipped with the same clap-derived contract as the verb scan:
+/// a `--help` used as a value (`--system-prompt --help`, `-rh`) is not a request,
+/// so the verb after it still refuses, while a later token can still be one
+/// (`-rh --help acp` shows help).
+fn requests_help_or_version(
+	command: &clap::Command,
+	argv: &[std::ffi::OsString],
+	mut index: usize,
+) -> bool {
+	while index < argv.len() {
+		let Some(text) = argv[index].to_str() else {
+			return false;
+		};
+		if text == "--" || text == "-" || !text.starts_with('-') {
+			return false; // the leading flag region is over
+		}
+		if text == "--help" || text == "--version" {
+			return true;
+		}
+		// An attached cluster value ends that flag, not the scan: a later token can
+		// still be the help request (`-rh --help acp`).
+		if !text.starts_with("--") && short_cluster_help(command, text) {
+			return true;
+		}
+		let next = argv.get(index + 1).and_then(|next| next.to_str());
+		index += if flag_consumes_value(command, text, next) { 2 } else { 1 };
+	}
+	false
+}
+
+/// Whether one short-flag token (`-ph`, `-rh`) carries a help/version switch.
+/// A switch behind a value-taking flag is that flag's value, not a request
+/// (`-rh` is `--resume h`).
+fn short_cluster_help(command: &clap::Command, flag: &str) -> bool {
+	for short in flag.trim_start_matches('-').chars() {
+		let Some(arg) = short_flag(command, short) else {
+			return false;
+		};
+		if !matches!(flag_value_kind(arg), FlagValueKind::Valueless) {
+			return false;
+		}
+		if short == 'h' || short == 'V' {
+			return true;
+		}
+	}
+	false
+}
+
+/// Parse argv, giving a leading exact `launch` command its own surface.
+///
+/// `launch` is the TypeScript default command: every token after it is launch
+/// surface, so its first operand is prompt text and can never dispatch as a
+/// subcommand (`omp launch repl` prompts `repl`, `omp launch acp` prompts `acp`
+/// instead of refusing it). That surface is [`LaunchCli`]: the same [`LaunchArgs`]
+/// options flattened into a command that declares no subcommands at all, so
+/// globals before `launch`, flags around the operand, flag values, and literal
+/// `--` all keep their exact meaning. A help/version request in the leading flag
+/// region, or at the head of the launch remainder, stays on the root surface so
+/// clap prints the real help text (`omp launch --help`, `omp --help launch`).
+///
+/// Without a leading `launch` this is exactly [`Cli::parse_from`].
+pub fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
+	let command = RawCli::command();
+	if requests_help_or_version(&command, &argv, 1) {
+		return parse_matches(command, argv);
+	}
+	let launch = launch_slot(&command, &argv);
+	if let Some(index) = launch {
+		if requests_help_or_version(&command, &argv, index + 1) {
+			let mut root_argv = Vec::with_capacity(argv.len() - 1);
+			root_argv.extend_from_slice(&argv[..index]);
+			root_argv.extend_from_slice(&argv[index + 1..]);
+			return parse_matches(command, root_argv);
+		}
+		let mut launch_argv = Vec::with_capacity(argv.len() - 1);
+		launch_argv.extend_from_slice(&argv[..index]);
+		launch_argv.extend_from_slice(&argv[index + 1..]);
+		return parse_launch(launch_argv);
+	}
+	parse_matches(command, argv)
+}
+
+/// Exact leading `launch` command slot, or `None`.
+fn launch_slot(command: &clap::Command, argv: &[std::ffi::OsString]) -> Option<usize> {
+	let index = verb_slot_index(command, argv)?;
+	(argv[index].to_str()? == "launch").then_some(index)
+}
+
+/// Parse the launch surface: the shared options, no subcommand slot.
+fn parse_launch(argv: Vec<std::ffi::OsString>) -> Cli {
+	let matches = LaunchCli::command()
+		.try_get_matches_from(argv)
+		.unwrap_or_else(|error| error.exit());
+	let launch = LaunchCli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+	Cli::from_launch(launch.launch, None)
+}
+
+fn parse_matches(command: clap::Command, argv: Vec<std::ffi::OsString>) -> Cli {
+	let matches = command
+		.try_get_matches_from(argv)
+		.unwrap_or_else(|error| error.exit());
+	Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
+/// Text of the first positional token on the launch surface, if any.
+fn verb_slot<'a>(command: &clap::Command, argv: &'a [std::ffi::OsString]) -> Option<&'a str> {
+	verb_slot_index(command, argv).and_then(|index| argv[index].to_str())
+}
+
+/// Index of the first positional token on the launch surface, skipping flags and
+/// the values they consume.
+fn verb_slot_index(command: &clap::Command, argv: &[std::ffi::OsString]) -> Option<usize> {
+	positional_index(command, argv, 1)
+}
+
+/// Index of the first positional token at or after `start`.
+fn positional_index(
+	command: &clap::Command,
+	argv: &[std::ffi::OsString],
+	mut index: usize,
+) -> Option<usize> {
+	while index < argv.len() {
+		let text = argv[index].to_str()?;
+		if text == "--" || text == "-" {
+			return None;
+		}
+		if !text.starts_with('-') {
+			return Some(index);
+		}
+		let next = argv.get(index + 1).and_then(|next| next.to_str());
+		index += if flag_consumes_value(command, text, next) { 2 } else { 1 };
+	}
+	None
+}
+
+/// How a flag on the clap surface treats the token after it.
+enum FlagValueKind {
+	/// Boolean switch: consumes nothing.
+	Valueless,
+	/// `num_args(0..=1)` such as `--resume [<selector>]`: consumes a value-like token.
+	Optional,
+	/// Required value: consumes the next token even when it looks like a flag.
+	Always,
+}
+
+/// Whether a flag consumes the next token.
+///
+/// The category comes from the clap definition. Unknown flags are clap's error,
+/// but a value-like successor is still protected so it cannot be mistaken for a
+/// verb.
+fn flag_consumes_value(command: &clap::Command, flag: &str, next: Option<&str>) -> bool {
+	let value_like = next.is_some_and(|next| !next.starts_with('-'));
+	if flag.contains('=') {
+		return false; // inline `--flag=value`
+	}
+	if let Some(long) = flag.strip_prefix("--") {
+		let Some(arg) = long_flag(command, long) else {
+			return value_like;
+		};
+		return match flag_value_kind(arg) {
+			FlagValueKind::Valueless => false,
+			FlagValueKind::Optional => value_like,
+			FlagValueKind::Always => true,
+		};
+	}
+	let Some(body) = flag.strip_prefix('-') else {
+		return value_like;
+	};
+	// Combined short flags: valueless flags continue the cluster; the first
+	// value-taking one takes the rest of the cluster as its attached value
+	// (`-rc` is `--resume c`), otherwise it takes the next token (`-pr acp`).
+	let mut chars = body.chars();
+	while let Some(short) = chars.next() {
+		let Some(arg) = short_flag(command, short) else {
+			return value_like;
+		};
+		let kind = flag_value_kind(arg);
+		if matches!(kind, FlagValueKind::Valueless) {
+			continue;
+		}
+		if !chars.as_str().is_empty() {
+			return false;
+		}
+		return matches!(kind, FlagValueKind::Always) || value_like;
+	}
+	false
+}
+
+/// Flag on the clap surface named `name`, through its long name or any alias.
+fn long_flag<'a>(command: &'a clap::Command, name: &str) -> Option<&'a clap::Arg> {
+	command.get_arguments().find(|arg| {
+		arg.get_long().is_some_and(|long| long == name)
+			|| arg.get_all_aliases().into_iter().flatten().any(|alias| alias == name)
+	})
+}
+
+/// Flag on the clap surface named `short`, through its short name or any alias.
+fn short_flag(command: &clap::Command, short: char) -> Option<&clap::Arg> {
+	command.get_arguments().find(|arg| {
+		arg.get_short().is_some_and(|name| name == short)
+			|| arg.get_all_short_aliases().into_iter().flatten().any(|alias| alias == short)
+	})
+}
+
+fn flag_value_kind(arg: &clap::Arg) -> FlagValueKind {
+	match arg.get_action() {
+		clap::ArgAction::SetTrue
+		| clap::ArgAction::SetFalse
+		| clap::ArgAction::Count
+		| clap::ArgAction::Help
+		| clap::ArgAction::Version => FlagValueKind::Valueless,
+		clap::ArgAction::Set => match arg.get_num_args() {
+			Some(range) if range.min_values() == 0 => FlagValueKind::Optional,
+			_ => FlagValueKind::Always,
+		},
+		_ => FlagValueKind::Always,
+	}
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
@@ -864,5 +1192,145 @@ mod tests {
 		for invalid in ["0", "-3", "abc", "1d", ""] {
 			assert!(parse_max_time(invalid).is_err(), "{invalid} must fail");
 		}
+	}
+
+	fn refusal(args: &[&str]) -> Option<String> {
+		let mut argv = vec![std::ffi::OsString::from("omp")];
+		argv.extend(args.iter().map(|arg| std::ffi::OsString::from(*arg)));
+		refused_verb_message(&argv)
+	}
+
+	#[test]
+	fn known_missing_verbs_are_refused_not_absorbed_as_prompts() {
+		for verb in ["acp", "config", "browser-relay", "auth-broker", "img", "wt", "q"] {
+			let message = refusal(&[verb]).unwrap_or_else(|| panic!("{verb} must be refused"));
+			assert!(message.contains(&format!("`omp {verb}`")), "{message}");
+			assert!(message.contains("not implemented"), "{message}");
+			assert!(message.contains("Nothing was started"), "{message}");
+			assert!(message.contains("omp --help"), "{message}");
+			assert!(!message.contains("excluded"), "{verb} is missing, not excluded: {message}");
+		}
+	}
+
+	#[test]
+	fn excluded_verbs_report_the_boundary_reason() {
+		for (verb, reason) in EXCLUDED_VERBS {
+			let message = refusal(&[verb]).unwrap_or_else(|| panic!("{verb} must be refused"));
+			assert!(message.contains(&format!("`omp {verb}` is excluded")), "{message}");
+			assert!(message.contains(reason), "{message}");
+			assert!(!message.contains("not implemented"), "{message}");
+		}
+	}
+
+	#[test]
+	fn registered_subcommands_are_never_refused() {
+		for verb in crate::profile::SUBCOMMANDS {
+			assert_eq!(refusal(&[verb]), None, "`omp {verb}` must reach its own dispatch");
+			assert_eq!(refusal(&["--print", verb]), None, "`omp --print {verb}` too");
+		}
+	}
+
+	#[test]
+	fn arbitrary_prompts_and_literal_operands_are_never_refused() {
+		// Genuine prompts, including one that starts with a verb-like word.
+		assert_eq!(refusal(&["fix", "the", "build"]), None);
+		assert_eq!(refusal(&["please", "share", "the", "log"]), None);
+		assert_eq!(refusal(&["-"]), None);
+		assert_eq!(refusal(&["-", "acp"]), None);
+		// POSIX end-of-options: everything after `--` is literal prompt text.
+		assert_eq!(refusal(&["--", "acp"]), None);
+		assert_eq!(refusal(&["--", "plugin", "list"]), None);
+		// Released app prompts from real invocations still run.
+		assert_eq!(refusal(&["--print", "summarize", "the", "diff"]), None);
+	}
+
+	#[test]
+	fn leading_flags_do_not_hide_or_capture_a_verb() {
+		// Flag values are values, not verbs.
+		assert_eq!(refusal(&["--model", "acp"]), None);
+		assert_eq!(refusal(&["--system-prompt", "acp", "hello"]), None);
+		assert_eq!(refusal(&["--resume", "acp"]), None);
+		assert_eq!(refusal(&["--model=acp", "hello"]), None);
+		// A leading valueless flag does not turn the following verb into a prompt.
+		assert!(refusal(&["--no-tools", "acp"]).is_some());
+		assert!(refusal(&["-p", "config"]).is_some());
+		assert!(refusal(&["-c", "acp"]).is_some());
+		// Combined short flags: valueless ones keep the verb in the command slot…
+		assert!(refusal(&["-pc", "acp"]).is_some());
+		assert!(refusal(&["-cp", "acp"]).is_some());
+		// …while a value-taking flag at the tail consumes the next token, and the
+		// attached form (`-rc` = resume "c") consumes only the cluster tail.
+		assert_eq!(refusal(&["-pr", "acp"]), None);
+		assert!(refusal(&["-rc", "acp"]).is_some());
+		// A recognized subcommand keeps its own dispatch.
+		assert_eq!(refusal(&["models", "acp"]), None);
+		assert_eq!(refusal(&["read", "acp"]), None);
+	}
+
+	#[test]
+	fn leading_help_and_version_keep_clap_actions() {
+		for args in [
+			vec!["--help", "acp"],
+			vec!["-h", "acp"],
+			vec!["--version", "acp"],
+			vec!["-V", "acp"],
+			vec!["-ph", "acp"],
+			vec!["--model", "m", "--help", "acp"],
+		] {
+			assert_eq!(refusal(&args), None, "{args:?} stays a leading help/version request");
+		}
+		// Once an operand leads, a later `--help` does not rescue the verb: this
+		// build cannot help with a command it does not have.
+		assert!(refusal(&["acp", "--help"]).is_some());
+		assert!(refusal(&["--print", "acp", "--help"]).is_some());
+		// A help character consumed as a flag value is not a request.
+		assert!(refusal(&["-rh", "acp"]).is_some());
+		assert!(refusal(&["--system-prompt", "--help", "acp"]).is_some());
+		assert!(refusal(&["--resume=--help", "acp"]).is_some());
+		// An attached cluster value ends that flag, not the scan: a later `--help`
+		// is still the leading help request.
+		assert_eq!(refusal(&["-rh", "--help", "acp"]), None);
+		assert_eq!(refusal(&["-rc", "--help", "acp"]), None);
+		assert!(refusal(&["-rc", "acp"]).is_some());
+	}
+
+	#[test]
+	fn a_leading_launch_command_parses_its_own_surface() {
+		fn parse(args: &[&str]) -> Cli {
+			let mut argv = vec![std::ffi::OsString::from("omp")];
+			argv.extend(args.iter().map(|arg| std::ffi::OsString::from(*arg)));
+			parse_cli(argv)
+		}
+		let prompt = parse(&["launch", "fix", "the", "build"]);
+		assert!(prompt.command.is_none());
+		assert_eq!(prompt.prompt, ["fix", "the", "build"]);
+		// A subcommand or refused verb as the launch operand is prompt text.
+		for operand in ["repl", "read", "models", "acp", "plugin", "git"] {
+			let parsed = parse(&["launch", operand]);
+			assert!(parsed.command.is_none(), "{operand} must not dispatch");
+			assert_eq!(parsed.prompt, [operand]);
+		}
+		// Globals before the command word and flags around the operand keep parsing.
+		let after = parse(&["launch", "hello", "--print"]);
+		assert!(after.command.is_none());
+		assert!(after.print);
+		assert_eq!(after.prompt, ["hello"]);
+		let before = parse(&["--print", "launch", "hello"]);
+		assert!(before.print);
+		assert_eq!(before.prompt, ["hello"]);
+		// Flag values stay values, and literal `--` keeps its meaning.
+		let value = parse(&["launch", "--model", "repl", "hello"]);
+		assert_eq!(value.model.as_deref(), Some("repl"));
+		assert_eq!(value.prompt, ["hello"]);
+		let literal = parse(&["launch", "--", "repl", "--print"]);
+		assert!(!literal.print);
+		assert_eq!(literal.prompt, ["repl", "--print"]);
+		// Only the leading slot is the command: a later `launch` is a prompt word,
+		// and a real subcommand before it still dispatches.
+		assert_eq!(parse(&["hello", "launch"]).prompt, ["hello", "launch"]);
+		assert!(matches!(
+			parse(&["models", "launch"]).command,
+			Some(Command::Models { .. })
+		));
 	}
 }

@@ -33,6 +33,7 @@ use pi_agent::{
 			normalize_edit_mode, resolve_edit_mode,
 		},
 		read::FileDisplayInputs,
+		registry::excluded_tool_reason,
 	},
 	tools::task_catalog::{
 		AgentCatalog, ChildModel, ChildModelFactory, EFFORT_SELECTORS, parse_effort_prefix,
@@ -1601,6 +1602,15 @@ fn allowed_tools(request: &RunRequest, _has_mcp_tools: bool) -> Result<Vec<&'sta
 		.map(|(name, _)| *name)
 		.collect();
 	if let Some(allowed) = &request.config.tools {
+		// An excluded upstream tool must state the boundary instead of vanishing
+		// from the selected set; the table is the dispatcher's, not a copy.
+		for name in allowed {
+			if let Some(reason) = excluded_tool_reason(name) {
+				return Err(Error::new(format!(
+					"tool `{name}` is excluded by the platform boundary: {reason}"
+				)));
+			}
+		}
 		tools.retain(|name| allowed.iter().any(|a| a == *name));
 		if allowed.iter().any(|tool| tool == "ask") && !ask_available {
 			return Err(Error::new(
@@ -3037,6 +3047,22 @@ mod tests {
 
 	fn yolo() -> Approvals {
 		Approvals::new(ApprovalMode::Yolo, Vec::new())
+	}
+
+	#[test]
+	fn excluded_tool_in_tools_selection_reports_the_boundary() {
+		let mut request = request(yolo());
+		request.config.tools = Some(vec!["read".to_string(), "computer".to_string()]);
+		let error = allowed_tools(&request, false).expect_err("computer is excluded");
+		let message = error.to_string();
+		assert!(message.contains("`computer`"), "{message}");
+		assert!(message.contains("excluded by the platform boundary"), "{message}");
+		assert!(message.contains("no desktop backend"), "{message}");
+
+		// A supported selection still resolves, sorted and ask-filtered.
+		request.config.tools = Some(vec!["read".to_string(), "grep".to_string()]);
+		let tools = allowed_tools(&request, false).expect("selection");
+		assert_eq!(tools, ["grep", "read"]);
 	}
 
 	#[test]

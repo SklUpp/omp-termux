@@ -4,6 +4,25 @@ use serde_json::Value;
 
 use super::{Tool, builtin_tools};
 
+/// Model-facing tool ids that are known upstream tools excluded by the approved
+/// platform boundary — not typos and not missing ports. Dispatch must state the
+/// boundary instead of the generic "Tool not found", which reads like a
+/// retryable typo and implies a backend could appear later.
+pub const EXCLUDED_TOOLS: [(&str, &str); 1] = [(
+	"computer",
+	"native desktop automation (screen capture, mouse and keyboard control) is excluded from the \
+	 Android build and no desktop backend exists, so nothing was captured or synthesized",
+)];
+
+/// Boundary reason for an excluded-but-known tool name, or `None`.
+#[must_use]
+pub fn excluded_tool_reason(name: &str) -> Option<&'static str> {
+	EXCLUDED_TOOLS
+		.iter()
+		.find(|(tool, _)| *tool == name)
+		.map(|(_, reason)| *reason)
+}
+
 /// Registry storing available tools for model interaction.
 ///
 /// Ordered (`BTreeMap`) so the schema list handed to the provider — part of the
@@ -61,6 +80,12 @@ impl ToolRegistry {
 	}
 
 	pub fn missing_tool_diagnostic(&self, name: &str) -> String {
+		if let Some(reason) = excluded_tool_reason(name) {
+			return format!(
+				"Tool \"{name}\" is excluded by the platform boundary: {reason}. Nothing ran; this \
+				 tool is not retryable in this build."
+			);
+		}
 		if !name.starts_with("mcp__") {
 			return format!("Tool not found: {name}");
 		}
@@ -136,6 +161,22 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_excluded_tool_reports_the_platform_boundary() {
+		let registry = ToolRegistry::new();
+		let diag = registry.missing_tool_diagnostic("computer");
+		assert!(diag.contains("excluded by the platform boundary"), "{diag}");
+		assert!(diag.contains("\"computer\""), "{diag}");
+		assert!(!diag.contains("Tool not found"), "{diag}");
+		assert!(excluded_tool_reason("computer").is_some());
+		assert_eq!(excluded_tool_reason("computers"), None);
+		// A near-miss name stays a typo diagnostic.
+		assert_eq!(
+			registry.missing_tool_diagnostic("computers"),
+			"Tool not found: computers"
+		);
+	}
 
 	#[test]
 	fn test_missing_tool_diagnostic_builtins() {

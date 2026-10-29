@@ -35,17 +35,19 @@ pub enum Action {
 #[derive(Debug, Default)]
 pub struct Request {
 	/// First positional: `ls`/`list`, `find`, `refresh`, or a provider filter.
-	pub action:     Option<String>,
+	pub action:        Option<String>,
 	/// Second positional: search substring or `ls` filter.
-	pub pattern:    Option<String>,
+	pub pattern:       Option<String>,
 	/// `--json`.
-	pub json:       bool,
+	pub json:          bool,
 	/// `-e/--extension <path>` (repeatable).
-	pub extensions: Vec<PathBuf>,
+	pub extensions:    Vec<PathBuf>,
+	/// `--no-extensions`: restrict the listing to the file-backed catalog.
+	pub no_extensions: bool,
 	/// `--config <path>` overlays (repeatable); the root `--config` is merged in
 	/// by the caller. They drive `disabledProviders` and provider credentials,
 	/// exactly like the run path.
-	pub config:     Vec<PathBuf>,
+	pub config:        Vec<PathBuf>,
 }
 
 /// Upstream `resolveModelsArgs`: known keywords map to actions, anything else
@@ -85,6 +87,18 @@ pub fn run(request: &Request, cwd: &Path, out: &mut impl Write) -> Result<()> {
 		return Err(Error::new(
 			"`omp models refresh` needs a live provider catalog fetch (network + provider auth), which the headless build does not implement; run `omp models` to list the local catalog",
 		));
+	}
+	// `--no-extensions` asks for the file-backed catalog only: no ambient
+	// discovery and no settings `extensions:` (upstream `disableExtensionDiscovery`).
+	// Those are the only catalogs this build can produce, so the request is
+	// satisfied by construction — the flag is consumed here instead of being
+	// dropped as an unknown field. Upstream explicit `-e` paths survive the flag;
+	// here they still fail above rather than being silently downgraded by it.
+	if request.no_extensions {
+		debug_assert!(
+			request.extensions.is_empty(),
+			"explicit extension paths must fail before --no-extensions is honored"
+		);
 	}
 	// Settings drive availability, so they load even without `--config`:
 	// `disabledProviders` and provider credentials never get validate-and-dropped.

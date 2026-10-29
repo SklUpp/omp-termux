@@ -48,8 +48,9 @@ const OPTIONAL_VALUE_FLAGS: [&str; 3] = ["--resume", "-r", "--session"];
 /// First residual token naming a subcommand stops global extraction, matching
 /// `isSubcommand` in `profile-bootstrap.ts`. Must list every `args::Command`
 /// variant; `subcommand_gate_stops_extraction_for_every_clap_subcommand`
-/// enforces that through the extraction boundary.
-const SUBCOMMANDS: [&str; 8] = [
+/// enforces that through the extraction boundary, and `args` checks its upstream
+/// verb refusal tables against this list.
+pub(crate) const SUBCOMMANDS: [&str; 8] = [
 	"repl",
 	"completions",
 	"__complete",
