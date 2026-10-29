@@ -5,9 +5,12 @@
 //! caller thread.
 //! This avoids worker-thread `AppKit` pasteboard warnings in CLI contexts.
 
+#[cfg(not(target_os = "android"))]
 use std::io::Cursor;
 
+#[cfg(not(target_os = "android"))]
 use arboard::{Clipboard, Error as ClipboardError, ImageData};
+#[cfg(not(target_os = "android"))]
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use napi::{JsString, bindgen_prelude::*};
 use napi_derive::napi;
@@ -31,6 +34,7 @@ pub struct ClipboardImage {
 	pub mime_type: String,
 }
 
+#[cfg(not(target_os = "android"))]
 fn encode_png(image: ImageData<'_>) -> Result<Vec<u8>> {
 	let width = u32::try_from(image.width)
 		.map_err(|_| Error::from_reason("Clipboard image width overflow"))?;
@@ -42,6 +46,7 @@ fn encode_png(image: ImageData<'_>) -> Result<Vec<u8>> {
 	rgba_to_png(buffer)
 }
 
+#[cfg(not(target_os = "android"))]
 fn rgba_to_png(buffer: RgbaImage) -> Result<Vec<u8>> {
 	let capacity = (buffer
 		.width()
@@ -65,6 +70,7 @@ fn rgba_to_png(buffer: RgbaImage) -> Result<Vec<u8>> {
 /// skips 12 trailing mask bytes that those headers embed instead), which is
 /// why Qt-based screenshot tools (`PixPin`, `Snipaste`, ...) fail through
 /// arboard in the first place (#3426).
+#[cfg(not(target_os = "android"))]
 fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>> {
 	const FILE_HEADER_SIZE: u64 = 14;
 	const INFO_HEADER_SIZE: u64 = 40;
@@ -150,9 +156,17 @@ fn clipboard_has_bitmap() -> bool {
 /// Returns an error if clipboard access fails.
 #[napi]
 pub fn copy_to_clipboard(text: JsString) -> Result<()> {
-	let text = js::utf8(text)?;
-	let _access = CLIPBOARD_ACCESS.lock();
-	set_clipboard_text(&text)
+	#[cfg(target_os = "android")]
+	{
+		let _ = text;
+		return Err(Error::from_reason("Native arboard clipboard is unsupported on Android/Termux; use Termux/OSC52 clipboard helpers"));
+	}
+	#[cfg(not(target_os = "android"))]
+	{
+		let text = js::utf8(text)?;
+		let _access = CLIPBOARD_ACCESS.lock();
+		set_clipboard_text(&text)
+	}
 }
 
 /// Linux: keep a single `arboard::Clipboard` alive for the whole process.
@@ -194,8 +208,7 @@ fn set_clipboard_text(text: &str) -> Result<()> {
 /// macOS / Windows: the OS retains clipboard contents after the writing process
 /// exits, so a transient `Clipboard` is sufficient. Keeping the write on the
 /// calling thread also avoids worker-thread `AppKit` pasteboard warnings on
-/// macOS.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(target_os = "android")))]
 fn set_clipboard_text(text: &str) -> Result<()> {
 	let mut clipboard = Clipboard::new()
 		.map_err(|err| Error::from_reason(format!("Failed to access clipboard: {err}")))?;
@@ -215,6 +228,12 @@ fn set_clipboard_text(text: &str) -> Result<()> {
 #[napi]
 pub fn read_text_from_clipboard() -> task::Promise<Option<String>> {
 	task::blocking("clipboard.read_text", (), move |_| -> Result<Option<String>> {
+		#[cfg(target_os = "android")]
+		{
+			Err(Error::from_reason("Native arboard clipboard is unsupported on Android/Termux; use Termux/OSC52 clipboard helpers"))
+		}
+		#[cfg(not(target_os = "android"))]
+		{
 		let _access = CLIPBOARD_ACCESS.lock();
 		let mut clipboard = Clipboard::new()
 			.map_err(|err| Error::from_reason(format!("Failed to access clipboard: {err}")))?;
@@ -223,6 +242,7 @@ pub fn read_text_from_clipboard() -> task::Promise<Option<String>> {
 			Err(ClipboardError::ContentNotAvailable) => Ok(None),
 			Err(err) => Err(Error::from_reason(format!("Failed to read clipboard text: {err}"))),
 		}
+		}
 	})
 }
 
@@ -230,6 +250,7 @@ pub fn read_text_from_clipboard() -> task::Promise<Option<String>> {
 /// decoding run after [`CLIPBOARD_ACCESS`] is released: they only touch owned
 /// buffers, and holding the lock through them would stall a synchronous copy
 /// on the JS thread for the length of a large encode.
+#[cfg(not(target_os = "android"))]
 enum ImageRead {
 	Image(ImageData<'static>),
 	/// arboard found no image, but a bitmap format is advertised; carries the
@@ -241,6 +262,7 @@ enum ImageRead {
 	Failed(ClipboardError, Option<Vec<u8>>),
 }
 
+#[cfg(not(target_os = "android"))]
 fn png_image(bytes: Vec<u8>) -> ClipboardImage {
 	ClipboardImage { data: Uint8Array::from(bytes), mime_type: "image/png".to_string() }
 }
@@ -254,6 +276,12 @@ fn png_image(bytes: Vec<u8>) -> ClipboardImage {
 #[napi]
 pub fn read_image_from_clipboard() -> task::Promise<Option<ClipboardImage>> {
 	task::blocking("clipboard.read_image", (), move |_| -> Result<Option<ClipboardImage>> {
+		#[cfg(target_os = "android")]
+		{
+			Err(Error::from_reason("Native arboard clipboard image read is unsupported on Android/Termux"))
+		}
+		#[cfg(not(target_os = "android"))]
+		{
 		let read = {
 			let _access = CLIPBOARD_ACCESS.lock();
 			let mut clipboard = Clipboard::new()
@@ -296,6 +324,7 @@ pub fn read_image_from_clipboard() -> task::Promise<Option<ClipboardImage>> {
 				Some(bytes) => Ok(Some(png_image(bytes))),
 				None => Err(Error::from_reason(format!("Failed to read clipboard image: {err}"))),
 			},
+		}
 		}
 	})
 }

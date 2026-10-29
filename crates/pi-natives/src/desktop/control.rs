@@ -474,6 +474,8 @@ struct ControlLease {
 	_escape: Option<windows::EscapeMonitor>,
 	#[cfg(target_os = "linux")]
 	_escape: Option<linux::EscapeMonitor>,
+	#[cfg(target_os = "android")]
+	_escape: Option<()>,
 	_kernel: KernelOwner,
 	running: AtomicBool,
 }
@@ -535,6 +537,8 @@ impl ControlLease {
 			_escape: Some(escape),
 			#[cfg(target_os = "linux")]
 			_escape: escape,
+			#[cfg(target_os = "android")]
+			_escape: None,
 			_kernel: kernel,
 			running: AtomicBool::new(false),
 		})
