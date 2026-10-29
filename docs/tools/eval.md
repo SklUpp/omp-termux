@@ -185,3 +185,67 @@ Runs one subagent through `runStructuredSubagent(...)`:
 - Current schema tokens are only `py`, `js`, `rb`, and `jl`; long language names are renderer/approval formatting aliases, not wire values.
 - The former multi-cell `cells` payload, `*** Cell` parser, sniffing fallback, and constrained `eval.lark` grammar are removed.
 - Parent and ordinary task subagents may share an inherited eval executor id; children created by eval's own `agent()` explicitly do not.
+
+## Rust implementation
+
+Native parity lives in `crates/pi-agent/src/eval/`. The parent wires it into `ToolRegistry` and settings; the module never reads or mutates process-global environment.
+
+| File | Responsibility |
+| --- | --- |
+| `mod.rs` | Public exports and module map |
+| `tool.rs` | `EvalTool` (`Tool` impl): one cell, dynamic schema, timeout/background race |
+| `runtime.rs` | `EvalSettings`, `EvalAllowance`, `Interpreters`, `EvalRuntime` |
+| `session.rs` | Retained kernels keyed by language, owner, session, cwd, interpreter |
+| `kernel.rs` | Subprocess NDJSON protocol, startup, SIGINT escalation, shutdown |
+| `bridge.rs` | Loopback HTTP tool bridge, bearer auth, per-run registration |
+| `host.rs` | `EvalHost` seams and bridge name/status contracts |
+| `languages.rs` | Runner staging, argv, init snippets, bounded interpreter discovery |
+| `env.rs` | Per-language env allowlist/denylist/prefix filter, PATH/venv resolution |
+| `probe.rs` | Detached, bounded, cancellable availability probes |
+| `output.rs` | MIME display rendering, JSON cap, truncation/artifact metadata |
+| `idle.rs` | Reference-counted pause/resume watchdog |
+| `runners/` | `runner.py`, `prelude.py`, `runner.rb`, `prelude.rb`, `runner.jl`, `prelude.jl`, `runner.js` |
+
+### Construction
+
+```rust
+let settings = EvalSettings::new(
+    EvalAllowance { python: true, js: true, ruby: false, julia: false },
+    Interpreters::default(), // python/ruby/julia overrides, none by default
+)
+.with_flag_overrides(EvalFlagOverrides::from_values(pi_py, pi_js, pi_rb, pi_jl))
+.with_timeouts(30, tools_max_timeout)
+.with_probe_timeout_ms(10_000);
+
+let runtime = EvalRuntime::start(settings).await?;
+let tool = EvalTool::new(
+    Arc::new(runtime),
+    host, // Arc<dyn EvalHost>, implemented by the parent
+    EvalSessionInfo::new(session_id)
+        .with_owner(owner)
+        .with_session_file(session_file)
+        .with_artifacts_dir(artifacts_dir)
+        .with_local_roots(local_roots),
+);
+```
+
+`EvalHost` is required in full: `call_tool`, `completion`, `agent`, `budget`, `concurrency`, `write_artifact`, and `enqueue_background_result`. There is no default/placeholder host. `checkpoint` and `rewind` are rejected in the bridge dispatcher before the host is called. Synthetic bridge names (`__completion__`, `__agent__`, `__concurrency__`, `__budget__`) are model-invisible.
+
+### Behavior
+
+- Python/Ruby/Julia use the staged upstream runner and prelude scripts unchanged, with `PI_TOOL_BRIDGE_*` injected per spawn and per request. JS starts only when `language: "js"` is explicitly present; it spawns Bun and runs the standalone `runner.js` VM kernel. There is no Node fallback and no full Bun agent.
+- Gem/bundle/rbenv/asdf layout variables reach Ruby, conda/venv reach Python, `JULIA_*`/BLAS reach Julia. Secret-shaped names (`API_KEY`, `TOKEN`, `SECRET`, `PASSWORD`, …) never cross, even under an allow prefix. Provider keys and `PI_*` credentials are denylisted; bridge values are added after filtering.
+- The bridge is `127.0.0.1` only, requires a per-process bearer token, compares it in constant time, bounds headers/body, and closes each response. The token is passed through environment variables and is never logged.
+- Cancellation sends SIGINT so the runner can emit its own `KeyboardInterrupt`/cancelled frame; after 5 seconds the kernel escalates to SIGTERM/SIGKILL on the process group. Shutdown writes the language exit sentinel, waits 1 second, then sweeps the group.
+- `IdleTimeout` pauses around `agent()`/`completion()` bridge calls and resumes with a fresh window. `parallel`/`pipeline` use the host's live `task.maxConcurrency` width.
+- Availability probes are detached, bounded by the cell/probe budget, cancellable, and share one deadline per candidate list. Missing Julia reports the install prerequisite instead of omitting the language interface.
+- Output: 50 KiB inline window, 100 KiB live-tail budget constant, 3000-line cap, 8000-character per-JSON display cap, `meta.truncated`, and artifact spill through `EvalHost::write_artifact`.
+- Failure text distinguishes timeout (`Command aborted (timeout after Ns)`), external cancellation (`Command aborted`), kernel death (`Kernel exited unexpectedly`), and runtime exceptions.
+
+### Known gaps owned by the parent
+
+- `ToolResult` carries text only. Images are delivered as typed `details.images: [{ type: "image", data, mimeType }]` plus dimension notes in text; the parent's model-image path must convert them into content blocks. No resize/WebP exclusion is performed in Rust.
+- Auto-background delivery is a `EvalHost::enqueue_background_result` seam (wire it to the existing result sink/supervisor). If the host declines, the completed text is queued in the tool and prepended, with `notice`, to the next eval result.
+- Registry registration, session identity, interpreter settings, `PI_*` flag parsing, and owner disposal are parent-owned.
+- The JS kernel follows the upstream contract for persistence and imports, but exotic destructured declarations and class re-declaration rely on script scoping; they are not Babel-rewritten.
+
