@@ -4256,40 +4256,100 @@ mod tests {
 
 	#[test]
 	fn runner_transfers_ordered_image_and_text_to_wire() {
-		use std::io::{Read, Write};
+		// Every fixture read is bounded: headers stop at 64 KiB, the request body
+		// at 1 MiB, and each socket read has a timeout, so a truncated or stalled
+		// request fails the test with a diagnostic instead of silently dropping it.
+		const WIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 		let (addr_tx, addr_rx) = std::sync::mpsc::channel::<std::net::SocketAddr>();
-		let (wire_tx, wire_rx) = std::sync::mpsc::channel::<serde_json::Value>();
+		let (wire_tx, wire_rx) =
+			std::sync::mpsc::channel::<std::result::Result<serde_json::Value, String>>();
 
 		std::thread::spawn(move || {
-			let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-			addr_tx.send(listener.local_addr().expect("local addr")).expect("send addr");
-			if let Ok((mut stream, _)) = listener.accept() {
-				let mut buf = vec![0u8; 16384];
-				let mut n_read = 0;
-				while n_read < buf.len() {
-					let n = stream.read(&mut buf[n_read..]).unwrap_or(0);
-					if n == 0 {
-						break;
+			fn serve(
+				addr_tx: &std::sync::mpsc::Sender<std::net::SocketAddr>,
+			) -> std::result::Result<serde_json::Value, String> {
+				use std::io::{Read, Write};
+
+				const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+				const MAX_HEADER_BYTES: usize = 64 * 1024;
+				const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+				let listener = std::net::TcpListener::bind("127.0.0.1:0")
+					.map_err(|err| format!("fixture bind failed: {err}"))?;
+				let addr = listener
+					.local_addr()
+					.map_err(|err| format!("fixture local_addr failed: {err}"))?;
+				addr_tx
+					.send(addr)
+					.map_err(|_| "fixture address receiver dropped".to_string())?;
+				let (mut stream, _) = listener
+					.accept()
+					.map_err(|err| format!("fixture accept failed: {err}"))?;
+				stream
+					.set_read_timeout(Some(READ_TIMEOUT))
+					.map_err(|err| format!("fixture read timeout setup failed: {err}"))?;
+
+				let mut received: Vec<u8> = Vec::new();
+				let mut chunk = [0u8; 8192];
+				let header_end = loop {
+					if let Some(pos) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+						break pos;
 					}
-					n_read += n;
-					if let Some(pos) = buf[..n_read].windows(4).position(|w| w == b"\r\n\r\n") {
-						let header = String::from_utf8_lossy(&buf[..pos]);
-						let content_len: usize = header
-							.lines()
-							.find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-							.and_then(|l| l.split(':').nth(1))
-							.and_then(|v| v.trim().parse().ok())
-							.unwrap_or(0);
-						if n_read >= pos + 4 + content_len {
-							let body = &buf[pos + 4..pos + 4 + content_len];
-							if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-								let _ = wire_tx.send(json);
-							}
-							break;
-						}
+					if received.len() > MAX_HEADER_BYTES {
+						return Err(format!(
+							"fixture request headers exceeded {MAX_HEADER_BYTES} bytes"
+						));
+					}
+					let read = stream.read(&mut chunk).map_err(|err| {
+						format!("fixture reading request headers failed: {err}")
+					})?;
+					if read == 0 {
+						return Err("fixture connection closed before request headers completed"
+							.to_string());
+					}
+					received.extend_from_slice(&chunk[..read]);
+				};
+
+				let header = String::from_utf8_lossy(&received[..header_end]).into_owned();
+				let mut content_len: Option<usize> = None;
+				for line in header.lines() {
+					let Some((name, value)) = line.split_once(':') else {
+						continue;
+					};
+					if name.trim().eq_ignore_ascii_case("content-length") {
+						content_len = Some(value.trim().parse().map_err(|err| {
+							format!("fixture invalid Content-Length {value:?}: {err}")
+						})?);
 					}
 				}
+				let content_len = content_len.ok_or_else(|| {
+					format!("fixture request missing Content-Length header: {header:?}")
+				})?;
+				if content_len > MAX_BODY_BYTES {
+					return Err(format!(
+						"fixture request body of {content_len} bytes exceeds the {MAX_BODY_BYTES}-byte fixture cap"
+					));
+				}
+
+				let body_start = header_end + 4;
+				while received.len() < body_start + content_len {
+					let read = stream
+						.read(&mut chunk)
+						.map_err(|err| format!("fixture reading request body failed: {err}"))?;
+					if read == 0 {
+						return Err(format!(
+							"fixture connection closed after {} of {content_len} request body bytes",
+							received.len().saturating_sub(body_start)
+						));
+					}
+					received.extend_from_slice(&chunk[..read]);
+				}
+
+				let body = &received[body_start..body_start + content_len];
+				let wire_json = serde_json::from_slice(body)
+					.map_err(|err| format!("fixture request body is not valid JSON: {err}"))?;
+
 				let resp = serde_json::json!({
 					"id": "cmpl-img",
 					"object": "chat.completion",
@@ -4306,9 +4366,16 @@ mod tests {
 					resp.len(),
 					resp
 				);
-				let _ = stream.write_all(http_resp.as_bytes());
-				let _ = stream.flush();
+				stream
+					.write_all(http_resp.as_bytes())
+					.map_err(|err| format!("fixture writing response failed: {err}"))?;
+				stream
+					.flush()
+					.map_err(|err| format!("fixture flushing response failed: {err}"))?;
+				Ok(wire_json)
 			}
+
+			let _ = wire_tx.send(serve(&addr_tx));
 		});
 
 		let addr = addr_rx.recv().expect("recv addr");
@@ -4341,11 +4408,20 @@ mod tests {
 
 		let runner = PiAgentRunner::new().expect("runner");
 		let stream = runner.run(&req).expect("run runner");
-		let _events: Vec<_> = stream.collect();
-
-		let wire_json = wire_rx
-			.recv_timeout(std::time::Duration::from_secs(5))
-			.expect("received wire json");
+		let events: Vec<std::result::Result<Event, Error>> = stream.collect();
+		let stream_errors: Vec<String> = events
+			.iter()
+			.filter_map(|event| event.as_ref().err().map(ToString::to_string))
+			.collect();
+		let fixture_result = match wire_rx.recv_timeout(WIRE_TIMEOUT) {
+			Ok(result) => result,
+			Err(err) => panic!("wire fixture received no request: {err}"),
+		};
+		assert!(
+			stream_errors.is_empty(),
+			"runner stream reported errors before the wire payload was checked: {stream_errors:?}; fixture: {fixture_result:?}"
+		);
+		let wire_json = fixture_result.unwrap_or_else(|err| panic!("wire fixture failed: {err}"));
 		let messages = wire_json["messages"].as_array().expect("messages");
 		let user_msg = messages
 			.iter()
