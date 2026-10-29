@@ -481,6 +481,7 @@ impl EvalRuntime {
 			};
 			// The kernel owns its own process group: a failed, timed-out or
 			// cancelled attempt is swept by `Kernel`'s shutdown/drop path.
+			let attempt_started = Instant::now();
 			let started = tokio::select! {
 				() = cancellation.cancelled() => {
 					return Err(EvalError::Aborted("Julia kernel readiness was cancelled".to_string()));
@@ -496,11 +497,20 @@ impl EvalRuntime {
 					if cancellation.is_cancelled() {
 						return Err(EvalError::Aborted("Julia kernel readiness was cancelled".to_string()));
 					}
-					failures.push(format!("{} ({})", runtime.label, first_line(&error.to_string())));
+					failures.push(format!(
+						"{} ({}) in {}ms",
+						runtime.label,
+						first_line(&error.to_string()),
+						attempt_started.elapsed().as_millis()
+					));
 					continue;
 				},
 				Err(_) => {
-					failures.push(format!("{} (readiness timed out)", runtime.label));
+					failures.push(format!(
+						"{} (readiness timed out after {}ms)",
+						runtime.label,
+						attempt_started.elapsed().as_millis()
+					));
 					break;
 				},
 			};

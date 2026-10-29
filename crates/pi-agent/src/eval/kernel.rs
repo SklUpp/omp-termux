@@ -73,6 +73,9 @@ pub struct Kernel {
 	frames: AsyncMutex<mpsc::UnboundedReceiver<KernelEvent>>,
 	alive: AtomicBool,
 	shutdown_confirmed: AtomicBool,
+	/// Set once the runner emits its protocol `started` frame. Startup failure
+	/// text uses it to say whether the interpreter reached runner code at all.
+	started_seen: AtomicBool,
 	execution: AsyncMutex<()>,
 	reader: Mutex<Option<JoinHandle<()>>>,
 	stderr_drain: Mutex<Option<JoinHandle<()>>>,
@@ -112,12 +115,18 @@ impl Kernel {
 		}
 		let kernel = Self::spawn_process(spawn.language, &argv, &spawn.cwd, env)?;
 
+		let timeout = languages::startup_timeout(spawn.language);
 		let init = languages::init_script(spawn.language, &spawn.cwd);
-		kernel.run_startup("init", &init, &cancellation).await?;
+		kernel.run_startup("init", &init, timeout, &cancellation).await?;
 		let assets = languages::assets(spawn.language);
 		if !assets.prelude.is_empty() {
 			kernel
-				.run_startup(&format!("{} prelude", spawn.language.display_name()), assets.prelude, &cancellation)
+				.run_startup(
+					&format!("{} prelude", spawn.language.display_name()),
+					assets.prelude,
+					timeout,
+					&cancellation,
+				)
 				.await?;
 		}
 		Ok(kernel)
@@ -181,6 +190,7 @@ impl Kernel {
 			frames: AsyncMutex::new(frames_rx),
 			alive: AtomicBool::new(true),
 			shutdown_confirmed: AtomicBool::new(false),
+			started_seen: AtomicBool::new(false),
 			execution: AsyncMutex::new(()),
 			reader: Mutex::new(Some(reader)),
 			stderr_drain: Mutex::new(Some(stderr_drain)),
@@ -194,16 +204,24 @@ impl Kernel {
 		&self,
 		label: &str,
 		code: &str,
+		timeout: Duration,
 		cancellation: &CancellationToken,
 	) -> Result<(), EvalError> {
 		let token = CancellationToken::new();
 		let (combined, task) = combine(cancellation.clone(), token.clone());
 		let _combined_task = AbortOnDrop(task);
-		let timeout = languages::startup_timeout(self.language);
-		let _timer = AbortOnDrop(tokio::spawn(async move {
-			tokio::time::sleep(timeout).await;
-			token.cancel();
-		}));
+		// Provenance for the failure below: the flag is stored before `cancel`,
+		// so a failure observed after the deadline is attributable to the timer
+		// instead of to the caller's cancellation.
+		let deadline_fired = Arc::new(AtomicBool::new(false));
+		let _timer = AbortOnDrop({
+			let deadline_fired = Arc::clone(&deadline_fired);
+			tokio::spawn(async move {
+				tokio::time::sleep(timeout).await;
+				deadline_fired.store(true, Ordering::SeqCst);
+				token.cancel();
+			})
+		});
 		let env = HashMap::new();
 		let result = self
 			.execute(
@@ -220,6 +238,12 @@ impl Kernel {
 				},
 			)
 			.await;
+		// Read once, right after the cell settles: a later timer tick cannot
+		// relabel an already observed failure. Caller cancellation wins so an
+		// external abort never reads as a deadline.
+		let deadline = (deadline_fired.load(Ordering::SeqCst) && !cancellation.is_cancelled())
+			.then_some(timeout);
+		let runner_started = self.started_seen.load(Ordering::SeqCst);
 		match result {
 			Ok(result) if result.status == KernelStatus::Ok && !result.cancelled => Ok(()),
 			Ok(result) => {
@@ -228,15 +252,11 @@ impl Kernel {
 					.map_or_else(|| "kernel startup was cancelled".to_string(), |error| error.value);
 				let stderr = self.stderr_text();
 				self.shutdown().await;
-				Err(EvalError::Kernel(if stderr.trim().is_empty() {
-					format!("{label} failed: {reason}")
-				} else {
-					format!("{label} failed: {reason}\n{stderr}")
-				}))
+				Err(EvalError::Kernel(startup_failure(label, &reason, &stderr, deadline, runner_started)))
 			},
 			Err(error) => {
 				self.shutdown().await;
-				Err(error)
+				Err(startup_error(label, error, &self.stderr_text(), deadline, runner_started))
 			},
 		}
 	}
@@ -331,7 +351,9 @@ impl Kernel {
 						continue;
 					}
 					match frame.kind.as_str() {
-						"started" => {},
+						"started" => {
+							self.started_seen.store(true, Ordering::SeqCst);
+						},
 						"stdout" | "stderr" => {
 							if let (Some(chunk), Some(on_chunk)) =
 								(frame.data.as_deref(), options.on_chunk.as_mut())
@@ -519,6 +541,57 @@ fn cancelled_result(timed_out: bool) -> KernelExecuteResult {
 		timed_out,
 		stdin_requested: false,
 		kernel_killed: false,
+	}
+}
+
+/// Startup failure text: keeps the underlying reason, names an expired deadline
+/// explicitly with whether the runner had started, and appends the bounded
+/// runner stderr tail exactly once.
+fn startup_failure(
+	label: &str,
+	reason: &str,
+	stderr: &str,
+	deadline: Option<Duration>,
+	runner_started: bool,
+) -> String {
+	let mut message = match deadline {
+		Some(timeout) => format!(
+			"{label} timed out after {timeout:?} ({}): {reason}",
+			if runner_started { "runner started" } else { "no runner frame" }
+		),
+		None => format!("{label} failed: {reason}"),
+	};
+	let stderr = stderr.trim();
+	if !stderr.is_empty() && !message.contains(stderr) {
+		message.push('\n');
+		message.push_str(stderr);
+	}
+	message
+}
+
+/// Same context for errors that never reached a result frame, preserving the
+/// error kind. Only runner stderr is added; argv and environment stay out.
+fn startup_error(
+	label: &str,
+	error: EvalError,
+	stderr: &str,
+	deadline: Option<Duration>,
+	runner_started: bool,
+) -> EvalError {
+	match error {
+		EvalError::Kernel(reason) => EvalError::Kernel(startup_failure(
+			label,
+			&reason,
+			stderr,
+			deadline,
+			runner_started,
+		)),
+		EvalError::Io(error) => {
+			let kind = error.kind();
+			let message = startup_failure(label, &error.to_string(), stderr, deadline, runner_started);
+			EvalError::Io(std::io::Error::new(kind, message))
+		},
+		other => other,
 	}
 }
 
@@ -775,6 +848,131 @@ done"#;
 		assert!(!kernel.is_alive(), "kernel was retired");
 		assert!(!pid_alive(pid), "stalled kernel survived teardown");
 		hold.abort();
+	}
+
+	/// Blocks until killed and ignores SIGINT, so only the startup deadline's
+	/// escalation can end it.
+	const FAKE_SILENT: &str = r#"trap '' INT
+while :; do sleep 0.05; done"#;
+
+	/// Consumes one payload, then exits cleanly: EOF with no deadline involved.
+	const FAKE_EXIT_AFTER_REQUEST: &str = r#"read line
+exit 0"#;
+
+	/// Emits the protocol `started` frame, then hangs until killed.
+	const FAKE_STARTED_THEN_SILENT: &str = r#"trap '' INT
+while IFS= read -r line; do
+  case "$line" in
+    *'"id":"'*)
+      id=$(printf '%s' "$line" | sed -E 's/.*"id":"([^"]+)".*/\1/')
+      printf '{"type":"started","id":"%s"}\n' "$id"
+      ;;
+  esac
+done"#;
+
+	#[cfg(unix)]
+	fn fake_kernel(script: &str) -> Kernel {
+		let env = std::env::vars().collect::<HashMap<_, _>>();
+		Kernel::spawn_process(
+			EvalLanguage::Py,
+			&["sh".to_string(), "-c".to_string(), script.to_string()],
+			Path::new("."),
+			env,
+		)
+		.expect("fake kernel spawn")
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn startup_deadline_names_timeout_and_keeps_reason() {
+		let mut kernel = fake_kernel(FAKE_SILENT);
+		kernel.interrupt_grace = Duration::from_millis(200);
+		let started = Instant::now();
+		let error = kernel
+			.run_startup("init", "ignored", Duration::from_millis(300), &CancellationToken::new())
+			.await
+			.expect_err("deadline expiry fails startup");
+		let message = error.to_string();
+		assert!(message.contains("init timed out after 300ms"), "deadline provenance missing: {message}");
+		assert!(message.contains("no runner frame"), "started-frame provenance missing: {message}");
+		assert!(message.contains("exited unexpectedly"), "underlying EOF reason was dropped: {message}");
+		assert!(started.elapsed() < Duration::from_secs(3), "deadline path was unbounded");
+		assert!(!kernel.is_alive(), "timed-out kernel survived");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn external_cancel_is_never_reported_as_deadline() {
+		let mut kernel = fake_kernel(FAKE_SILENT);
+		kernel.interrupt_grace = Duration::from_millis(200);
+		let cancellation = CancellationToken::new();
+		let trigger = cancellation.clone();
+		tokio::spawn(async move {
+			tokio::time::sleep(Duration::from_millis(100)).await;
+			trigger.cancel();
+		});
+		let started = Instant::now();
+		let error = kernel
+			.run_startup("init", "ignored", Duration::from_secs(60), &cancellation)
+			.await
+			.expect_err("caller cancellation fails startup");
+		let message = error.to_string();
+		assert!(!message.contains("timed out"), "external cancel was blamed on the deadline: {message}");
+		assert!(message.contains("init failed"), "startup label missing: {message}");
+		assert!(started.elapsed() < Duration::from_secs(5), "cancel path was slow");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn early_exit_without_deadline_keeps_unexpected_eof_wording() {
+		let kernel = fake_kernel(FAKE_EXIT_AFTER_REQUEST);
+		let error = kernel
+			.run_startup("init", "ignored", Duration::from_secs(60), &CancellationToken::new())
+			.await
+			.expect_err("early exit fails startup");
+		let message = error.to_string();
+		assert!(!message.contains("timed out"), "early exit was blamed on the deadline: {message}");
+		assert!(message.contains("init failed"), "startup label missing: {message}");
+		assert!(message.contains("exited unexpectedly"), "EOF wording changed: {message}");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn deadline_reports_that_the_runner_had_started() {
+		let mut kernel = fake_kernel(FAKE_STARTED_THEN_SILENT);
+		kernel.interrupt_grace = Duration::from_millis(200);
+		let error = kernel
+			.run_startup("init", "ignored", Duration::from_secs(1), &CancellationToken::new())
+			.await
+			.expect_err("deadline expiry fails startup");
+		let message = error.to_string();
+		assert!(message.contains("timed out after 1s"), "{message}");
+		assert!(message.contains("runner started"), "started frame was not observed: {message}");
+		assert!(!message.contains("no runner frame"), "{message}");
+	}
+
+	#[test]
+	fn startup_failure_appends_stderr_once_and_keeps_io_kind() {
+		let message =
+			startup_failure("init", "Python kernel exited unexpectedly: boom", "boom\n", None, false);
+		assert_eq!(message.matches("boom").count(), 1, "stderr was duplicated: {message}");
+		let message =
+			startup_failure("init", "write failed", "trace\n", Some(Duration::from_millis(300)), false);
+		assert!(
+			message.starts_with("init timed out after 300ms (no runner frame): write failed"),
+			"{message}"
+		);
+		assert!(message.ends_with("\ntrace"), "{message}");
+		let error = startup_error(
+			"init",
+			EvalError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "boom")),
+			"trace\n",
+			None,
+			false,
+		);
+		assert!(matches!(&error, EvalError::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe));
+		let text = error.to_string();
+		assert!(text.contains("init failed: boom") && text.contains("trace"), "{text}");
 	}
 
 	/// Signal-0 existence probe: after the reap the pid is gone.
