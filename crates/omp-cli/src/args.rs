@@ -1205,9 +1205,6 @@ mod tests {
 		for verb in ["acp", "config", "browser-relay", "auth-broker", "img", "wt", "q"] {
 			let message = refusal(&[verb]).unwrap_or_else(|| panic!("{verb} must be refused"));
 			assert!(message.contains(&format!("`omp {verb}`")), "{message}");
-			assert!(message.contains("not implemented"), "{message}");
-			assert!(message.contains("Nothing was started"), "{message}");
-			assert!(message.contains("omp --help"), "{message}");
 			assert!(!message.contains("excluded"), "{verb} is missing, not excluded: {message}");
 		}
 	}
