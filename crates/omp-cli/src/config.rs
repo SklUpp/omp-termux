@@ -13,6 +13,9 @@ use pi_agent::mcp::{
 	MCPHttpServerConfig, MCPServerConfig, MCPSseServerConfig, MCPStdioServerConfig, RequestIdFormat,
 	validate_server_config,
 };
+use pi_agent::tools::task_isolation::{
+	IsolationCommitStyle, IsolationMergeMode, IsolationMode,
+};
 
 use crate::{
 	Error, Result,
@@ -464,6 +467,16 @@ pub struct Config {
 	pub checkpoint:           CheckpointConfig,
 	/// `eval.*` backend enablement and interpreter groups.
 	pub eval_config:          EvalConfig,
+	/// `task.isolation.mode`; `None` means unset (defaults to `none`).
+	pub task_isolation_mode:  Option<IsolationMode>,
+	/// `task.isolation.apply`; `None` means unset (defaults to `true`).
+	pub task_isolation_apply: Option<bool>,
+	/// `task.isolation.merge`; `None` means unset (defaults to `patch`).
+	pub task_isolation_merge: Option<IsolationMergeMode>,
+	/// `task.isolation.commits`; `None` means unset (defaults to `generic`).
+	pub task_isolation_commits: Option<IsolationCommitStyle>,
+	/// Root `worktree.base`; relative paths are ignored, matching the schema.
+	pub worktree_base:        Option<PathBuf>,
 	/// `tools.maxTimeout` in seconds; `0` means no global cap.
 	pub max_tool_timeout_secs: Option<u64>,
 	/// `readLineNumbers` (root schema key, not a `read` group leaf); absent
@@ -518,6 +531,21 @@ impl Config {
 		self.debug.merge(overlay.debug);
 		self.checkpoint.merge(overlay.checkpoint);
 		self.eval_config.merge(overlay.eval_config);
+		if overlay.task_isolation_mode.is_some() {
+			self.task_isolation_mode = overlay.task_isolation_mode;
+		}
+		if overlay.task_isolation_apply.is_some() {
+			self.task_isolation_apply = overlay.task_isolation_apply;
+		}
+		if overlay.task_isolation_merge.is_some() {
+			self.task_isolation_merge = overlay.task_isolation_merge;
+		}
+		if overlay.task_isolation_commits.is_some() {
+			self.task_isolation_commits = overlay.task_isolation_commits;
+		}
+		if overlay.worktree_base.is_some() {
+			self.worktree_base = overlay.worktree_base;
+		}
 		if overlay.max_tool_timeout_secs.is_some() {
 			self.max_tool_timeout_secs = overlay.max_tool_timeout_secs;
 		}
@@ -986,7 +1014,78 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 		config.max_tool_timeout_secs = expect_usize(timeout, "tools.maxTimeout", path)?
 			.map(|seconds| seconds as u64);
 	}
+	if let Some(mode) =
+		settings_nested_leaf(value, "task", "isolation", "mode", "task.isolation.mode")
+	{
+		config.task_isolation_mode = parse_isolation_mode(mode, "task.isolation.mode", path)?;
+	}
+	if let Some(apply) =
+		settings_nested_leaf(value, "task", "isolation", "apply", "task.isolation.apply")
+	{
+		config.task_isolation_apply =
+			expect_bool(apply, "task.isolation.apply", path)?;
+	}
+	if let Some(merge) =
+		settings_nested_leaf(value, "task", "isolation", "merge", "task.isolation.merge")
+	{
+		config.task_isolation_merge = parse_isolation_merge(merge, "task.isolation.merge", path)?;
+	}
+	if let Some(commits) =
+		settings_nested_leaf(value, "task", "isolation", "commits", "task.isolation.commits")
+	{
+		config.task_isolation_commits =
+			parse_isolation_commits(commits, "task.isolation.commits", path)?;
+	}
+	if let Some(base) = settings_leaf(value, "worktree", "base", "worktree.base") {
+		config.worktree_base = expect_text(base, "worktree.base", path)?
+			.filter(|value| !value.trim().is_empty())
+			.map(|value| value.trim().to_string())
+			.filter(|value| {
+				let value = value.as_str();
+				value == "~" || value.starts_with("~/") || Path::new(value).is_absolute()
+			})
+			.map(PathBuf::from);
+	}
 	Ok(())
+}
+
+fn parse_isolation_mode(
+	value: &Value,
+	key: &str,
+	path: &Path,
+) -> Result<Option<IsolationMode>> {
+	let Some(raw) = expect_text(value, key, path)? else {
+		return Ok(None);
+	};
+	IsolationMode::parse(&raw)
+		.map(Some)
+		.map_err(|message| invalid(path, key, &message))
+}
+
+fn parse_isolation_merge(
+	value: &Value,
+	key: &str,
+	path: &Path,
+) -> Result<Option<IsolationMergeMode>> {
+	let Some(raw) = expect_text(value, key, path)? else {
+		return Ok(None);
+	};
+	IsolationMergeMode::parse(&raw)
+		.map(Some)
+		.map_err(|message| invalid(path, key, &message))
+}
+
+fn parse_isolation_commits(
+	value: &Value,
+	key: &str,
+	path: &Path,
+) -> Result<Option<IsolationCommitStyle>> {
+	let Some(raw) = expect_text(value, key, path)? else {
+		return Ok(None);
+	};
+	IsolationCommitStyle::parse(&raw)
+		.map(Some)
+		.map_err(|message| invalid(path, key, &message))
 }
 
 /// `python.kernelMode`: the schema enum, so an invalid value is a load error
@@ -2525,5 +2624,32 @@ mod tests {
 		assert_eq!(config.resolve_api_key("env").as_deref(), Some("resolved"));
 		assert_eq!(config.resolve_api_key("literal").as_deref(), Some("sk-literal"));
 		assert_eq!(config.resolve_api_key("missing"), None);
+	}
+
+	#[test]
+	fn task_isolation_settings_parse_and_merge() {
+		let config = parse_config(
+			"task:\n  isolation:\n    mode: overlayfs\n    apply: false\n    merge: branch\n    commits: ai\nworktree:\n  base: /tmp/omp-wt\n",
+		)
+		.expect("config");
+		assert_eq!(config.task_isolation_mode, Some(IsolationMode::Overlayfs));
+		assert_eq!(config.task_isolation_apply, Some(false));
+		assert_eq!(config.task_isolation_merge, Some(IsolationMergeMode::Branch));
+		assert_eq!(config.task_isolation_commits, Some(IsolationCommitStyle::Ai));
+		assert_eq!(config.worktree_base.as_deref(), Some(Path::new("/tmp/omp-wt")));
+
+		let dotted = parse_config("\"task.isolation.mode\": worktree\n").expect("dotted");
+		assert_eq!(dotted.task_isolation_mode, Some(IsolationMode::Rcopy));
+
+		let relative = parse_config("worktree:\n  base: relative/wt\n").expect("relative");
+		assert_eq!(relative.worktree_base, None, "relative bases are ignored");
+	}
+
+	#[test]
+	fn invalid_task_isolation_values_are_rejected() {
+		assert!(parse_config("task:\n  isolation:\n    mode: bogus\n").is_err());
+		assert!(parse_config("task:\n  isolation:\n    merge: squash\n").is_err());
+		assert!(parse_config("task:\n  isolation:\n    commits: magic\n").is_err());
+		assert!(parse_config("task:\n  isolation:\n    apply: sometimes\n").is_err());
 	}
 }

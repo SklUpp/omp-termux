@@ -6216,6 +6216,7 @@ dependencies = [
  "futures",
  "libc",
  "pi-ast",
+ "pi-iso",
  "pi-shell",
  "pi-walker",
  "portable-pty",

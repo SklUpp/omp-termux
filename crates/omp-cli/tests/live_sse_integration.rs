@@ -516,7 +516,10 @@ fn test_live_sse_two_turn_read_early_delta_and_resume() {
 		.find(|e| e["type"] == "tool_execution_end")
 		.expect("tool_execution_end event");
 	assert_eq!(tool_end["toolName"], "read");
-	assert_eq!(tool_end["result"], read_output);
+	// TS parity: `result` is the `AgentToolResult` object; the text rides in
+	// `content[0]` (`crates/omp-cli/src/rpc/event_wire.rs:157`).
+	assert_eq!(tool_end["result"]["content"][0]["type"], "text");
+	assert_eq!(tool_end["result"]["content"][0]["text"], read_output);
 	assert_eq!(tool_end["isError"], false);
 
 	// Verify session JSONL file on disk

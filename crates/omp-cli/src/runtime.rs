@@ -37,6 +37,7 @@ use pi_agent::{
 		},
 		read::FileDisplayInputs,
 		registry::excluded_tool_reason,
+		task_isolation::TaskIsolationSettings,
 	},
 	tools::task_catalog::{
 		AgentCatalog, ChildModel, ChildModelFactory, EFFORT_SELECTORS, parse_effort_prefix,
@@ -724,9 +725,13 @@ impl AgentRunner for PiAgentRunner {
 			config: request.config.clone(),
 			catalog: Arc::clone(&request.catalog),
 			explicit_provider: request.provider.clone(),
-			api_key: request.api_key.clone(),
+			api_key: Some(plan.api_key.clone()),
 			default_model: request.model.clone(),
 			root_provider: Some(plan.provider.clone()),
+			root_base_url: Some(plan.base_url.clone()),
+			credential_resolver: request.credential_resolver.clone(),
+			session_id: request.session_id.clone(),
+			cancel: Some(cancellation_token.clone()),
 		});
 		let child_factory: Option<Arc<dyn ChildModelFactory>> =
 			allow_task.then(|| Arc::clone(&model_factory));
@@ -837,6 +842,16 @@ impl AgentRunner for PiAgentRunner {
 				supervisor.set_url_scope(Arc::clone(scope));
 			}
 			supervisor.set_child_session_root(request.child_session_root.clone());
+			let isolation_base =
+				crate::worktree_cmd::resolve_base(request.config.worktree_base.as_deref())
+					.map_err(|message| Error::new(message))?;
+			supervisor.set_task_isolation(TaskIsolationSettings {
+				mode: request.config.task_isolation_mode.unwrap_or_default(),
+				apply: request.config.task_isolation_apply.unwrap_or(true),
+				merge: request.config.task_isolation_merge.unwrap_or_default(),
+				commits: request.config.task_isolation_commits.unwrap_or_default(),
+				worktree_base: Some(isolation_base),
+			});
 			if let Some(processes) = &process_backend {
 				supervisor.set_processes(Arc::clone(processes));
 			}
@@ -1461,14 +1476,26 @@ impl RunPlan {
 /// The root provider is untouched, so `/model` changes refresh only the
 /// factory snapshot installed on the catalog.
 struct CliChildModelFactory {
-	config:           crate::config::Config,
-	catalog:          Arc<crate::catalog::Catalog>,
-	explicit_provider: Option<String>,
-	api_key:          Option<String>,
-	default_model:    Option<String>,
+	config:              crate::config::Config,
+	catalog:             Arc<crate::catalog::Catalog>,
+	explicit_provider:   Option<String>,
+	/// Key the root turn actually used (`RunPlan::api_key`). Reused only for
+	/// the root provider **and** base URL; never forwarded to another target.
+	api_key:             Option<String>,
+	default_model:       Option<String>,
 	/// Provider the root run actually selected. The root run key may only be
-	/// reused for this provider; every other child uses its own connection key.
-	root_provider:    Option<String>,
+	/// reused for this provider; every other child resolves its own credential.
+	root_provider:       Option<String>,
+	/// Base URL the root run actually used, paired with `root_provider`.
+	root_base_url:       Option<String>,
+	/// Shared credential store handle. Consulted for a child that overrides to
+	/// another provider; `None` keeps the connection-block fallback only.
+	credential_resolver: Option<crate::agent::ResolverHandle>,
+	/// Root session id for `getApiKey` sticky selection.
+	session_id:          Option<String>,
+	/// The turn's own cancellation token, so a cancelled child credential
+	/// lookup fails closed instead of hitting the store.
+	cancel:              Option<pi_agent::CancellationToken>,
 }
 
 impl CliChildModelFactory {
@@ -1644,10 +1671,13 @@ impl CliChildModelFactory {
 			.unwrap_or_default()
 	}
 
-	fn target(
+	fn locate(
 		&self,
 		pattern: &str,
-	) -> std::result::Result<(String, String, String, String, bool, Option<String>), String> {
+	) -> std::result::Result<
+		(String, String, String, bool, Option<String>, crate::config::ProviderConfig),
+		String,
+	> {
 		let (base, selector) = split_thinking(pattern, -1);
 		let effort = selector.and_then(|selector| match selector {
 			"inherit" | "auto" | "off" => None,
@@ -1681,25 +1711,63 @@ impl CliChildModelFactory {
 			.base_url
 			.clone()
 			.ok_or_else(|| format!("provider `{provider}` has no baseUrl"))?;
-		let api_key = if self.root_provider.as_deref() == Some(provider.as_str()) {
-			self
-				.api_key
-				.clone()
-				.or_else(|| connection.resolve_api_key())
-		} else {
-			// Never send the root provider's secret to a different base URL.
-			connection.resolve_api_key()
-		}
-		.unwrap_or_default();
 		let supports_images = self.catalog.supports_images(&provider, &model).unwrap_or(true);
+		Ok((provider, model, base_url, supports_images, effort, connection))
+	}
+
+	/// Key for a resolved child target. The root turn's key is reused only for
+	/// the identical provider+base URL (the existing same-provider guard). Any
+	/// other target resolves its own credential from the shared store first,
+	/// then its connection block — the root secret is never copied across.
+	fn api_key_for(
+		&self,
+		provider: &str,
+		base_url: &str,
+		connection: &crate::config::ProviderConfig,
+	) -> std::result::Result<String, String> {
+		let reuses_root = self.root_provider.as_deref() == Some(provider)
+			&& self.root_base_url.as_deref() == Some(base_url);
+		if reuses_root {
+			return Ok(self.api_key.clone().unwrap_or_default());
+		}
+		let cancel = match &self.cancel {
+			Some(token) => {
+				let token = token.clone();
+				crate::auth::http::Cancel::with_predicate(std::sync::Arc::new(move || {
+					token.is_cancelled()
+				}))
+			},
+			None => crate::auth::http::Cancel::new(),
+		};
+		let stored = match &self.credential_resolver {
+			Some(resolver) => resolver
+				.0
+				.api_key(provider, self.session_id.as_deref(), &cancel)
+				.map_err(|error| {
+					format!("credential lookup failed for provider `{provider}`: {error}")
+				})?,
+			None => None,
+		};
+		Ok(stored
+			.or_else(|| connection.resolve_api_key())
+			.unwrap_or_default())
+	}
+
+	fn target(
+		&self,
+		pattern: &str,
+	) -> std::result::Result<(String, String, String, String, bool, Option<String>), String> {
+		let (provider, model, base_url, supports_images, effort, connection) = self.locate(pattern)?;
+		let api_key = self.api_key_for(&provider, &base_url, &connection)?;
 		Ok((provider, model, base_url, api_key, supports_images, effort))
 	}
 }
 
 impl ChildModelFactory for CliChildModelFactory {
 	fn can_resolve(&self, model: &str) -> bool {
+		// Structural probe only: never touches the credential store.
 		self.patterns_for(model)
-			.map(|patterns| patterns.iter().any(|pattern| self.target(pattern).is_ok()))
+			.map(|patterns| patterns.iter().any(|pattern| self.locate(pattern).is_ok()))
 			.unwrap_or(false)
 	}
 
@@ -3655,6 +3723,10 @@ mod tests {
 				api_key: None,
 				default_model: default.map(str::to_string),
 				root_provider: None,
+				root_base_url: None,
+				credential_resolver: None,
+				session_id: None,
+				cancel: None,
 			}
 		};
 
@@ -3738,6 +3810,10 @@ mod tests {
 			api_key: Some("root-session-key".to_string()),
 			default_model: None,
 			root_provider: Some("rootprov".to_string()),
+			root_base_url: Some("http://127.0.0.1:1".to_string()),
+			credential_resolver: None,
+			session_id: None,
+			cancel: None,
 		};
 
 		let (_, _, _, key, _, _) = factory.target("otherprov/model").expect("other provider");
@@ -3746,6 +3822,109 @@ mod tests {
 		assert_eq!(key, "", "root key must not be sent to a keyless foreign provider");
 		let (_, _, _, key, _, _) = factory.target("rootprov/model").expect("root provider");
 		assert_eq!(key, "root-session-key");
+	}
+
+	#[test]
+	fn child_override_uses_child_provider_store_key_and_fails_closed_on_cancel() {
+		use crate::{
+			agent::ResolverHandle,
+			auth::{error::AuthError, http::Cancel},
+			rpc::auth::CredentialResolver,
+		};
+
+		/// Records every provider the factory asks the shared store about.
+		struct RecordingResolver {
+			keys:    std::collections::HashMap<&'static str, &'static str>,
+			queries: Mutex<Vec<String>>,
+		}
+
+		impl CredentialResolver for RecordingResolver {
+			fn api_key(
+				&self,
+				provider: &str,
+				_session_id: Option<&str>,
+				cancel: &Cancel,
+			) -> std::result::Result<Option<String>, AuthError> {
+				self.queries.lock().expect("lock").push(provider.to_string());
+				cancel.check(provider)?;
+				Ok(self.keys.get(provider).map(|key| (*key).to_string()))
+			}
+
+			fn peek_api_key(&self, _provider: &str) -> std::result::Result<Option<String>, AuthError> {
+				Ok(None)
+			}
+		}
+
+		let mut config = Config::default();
+		config.providers.insert(
+			"rootprov".to_string(),
+			ProviderConfig {
+				base_url: Some("http://127.0.0.1:1".to_string()),
+				api_key: None,
+				..ProviderConfig::default()
+			},
+		);
+		config.providers.insert(
+			"childprov".to_string(),
+			ProviderConfig {
+				base_url: Some("http://127.0.0.1:2".to_string()),
+				// No connection key: the store is the only source for this child.
+				api_key: None,
+				..ProviderConfig::default()
+			},
+		);
+		let resolver = Arc::new(RecordingResolver {
+			keys: std::collections::HashMap::from([
+				("rootprov", "root-store-key"),
+				("childprov", "child-store-key"),
+			]),
+			queries: Mutex::new(Vec::new()),
+		});
+		let factory = CliChildModelFactory {
+			config,
+			catalog: Arc::new(catalog()),
+			explicit_provider: None,
+			api_key: Some("root-store-key".to_string()),
+			default_model: None,
+			root_provider: Some("rootprov".to_string()),
+			root_base_url: Some("http://127.0.0.1:1".to_string()),
+			credential_resolver: Some(ResolverHandle(
+				resolver.clone() as Arc<dyn CredentialResolver>,
+			)),
+			session_id: Some("session-1".to_string()),
+			cancel: None,
+		};
+
+		// Same provider+base URL: reuse the root key, never touch the store.
+		let (_, _, _, key, _, _) = factory.target("rootprov/model").expect("root target");
+		assert_eq!(key, "root-store-key");
+		assert!(resolver.queries.lock().expect("lock").is_empty());
+
+		// Override to another provider: that provider's own store credential,
+		// and the root secret is not forwarded.
+		let (_, _, _, key, _, _) = factory.target("childprov/model").expect("child target");
+		assert_eq!(key, "child-store-key");
+		assert_eq!(*resolver.queries.lock().expect("lock"), vec!["childprov".to_string()]);
+
+		// A cancelled turn fails closed before returning any key.
+		let token = pi_agent::CancellationToken::new();
+		token.cancel();
+		let cancelled = CliChildModelFactory {
+			config: factory.config.clone(),
+			catalog: Arc::clone(&factory.catalog),
+			explicit_provider: None,
+			api_key: Some("root-store-key".to_string()),
+			default_model: None,
+			root_provider: Some("rootprov".to_string()),
+			root_base_url: Some("http://127.0.0.1:1".to_string()),
+			credential_resolver: Some(ResolverHandle(
+				resolver.clone() as Arc<dyn CredentialResolver>,
+			)),
+			session_id: Some("session-1".to_string()),
+			cancel: Some(token),
+		};
+		let error = cancelled.target("childprov/model").expect_err("cancelled lookup");
+		assert!(error.contains("credential lookup failed for provider `childprov`"), "{error}");
 	}
 
 	#[test]

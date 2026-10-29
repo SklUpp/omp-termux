@@ -23,6 +23,7 @@ libc = { workspace = true }
 reqwest = { workspace = true }
 pi-shell = { workspace = true }
 pi-walker = { workspace = true }
+pi-iso = { workspace = true }
 pi-ast = { workspace = true }
 portable-pty = { workspace = true }
 xxhash-rust = { workspace = true }

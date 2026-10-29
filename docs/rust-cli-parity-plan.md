@@ -1,18 +1,18 @@
 # Rust CLI parity plan
 
-Cold-start handoff: [`rust-cli-project-context.md`](rust-cli-project-context.md) — goal, verified state, authorizations, agent/worktree rules, runtime anchors, FIX queue. This plan remains the authoritative inventory; do not duplicate its per-ID tables there.
+Cold-start handoff: [`rust-cli-project-context.md`](rust-cli-project-context.md) — goal, verified state, authorizations, agent/worktree rules, runtime anchors, FIX subset. This plan remains the authoritative inventory; do not duplicate its per-ID tables there.
 
-Status: plan and inventory updated 2026-10-29 against accepted `0f601b6f61`; execution continues only through the FIX-only queue below. Target: separate `omp-rs` artifact on Termux/aarch64 Bionic. Rust owns CLI, agent, sessions, tools, auth, and protocols; user-requested JavaScript runs lazily only in `eval(language="js")` and `browser.run`. Existing Bun-based Android release and installed `$PREFIX/bin/omp` remain unchanged until final acceptance.
+Status (2026-10-30): objective is full plan completion; the historical FIX-only queue is not the scope limit. Published HEAD `abe3d8c274`, Actions `40944110426`: Android/native grep PASS, host FAIL on a stale JSON-result assertion. Local correction passed its unit/live-SSE/CLI checks, not full CI. Inventory tables below carry 2026-10-30 presence corrections; per-ID behavior depth remains un-audited. Target remains a separate Rust artifact on Termux/aarch64 Bionic; installed Bun-based CLI remains unchanged.
 
-## Current snapshot (2026-10-29)
+## Baseline and axis facts (2026-10-29 run snapshot; source axes corrected 2026-10-30)
 
 - **Accepted baseline.** Commit `0f601b6f61`; [Actions 40827646802](https://github.com/SklUpp/omp-termux/actions/runs/40827646802) passed all 3 gates (host checks/tests, native grep/matcher, Android arm64/Bionic build). Downloaded Android artifact SHA256 `d79bdbb3c0e407f3fb5f7156605c8fbe08d9836751f81e77f566105125af630f` (`$PREFIX/tmp/omp-rust-final.ciBYAL/omp`): `--help` and `--version` exit 0; 5 PTY scenarios PASS in 10.36s. These are artifact-level checks, not a per-ID command matrix.
-- **Local verification this pass: none.** Local Cargo hit the 600s dependency timeout; no local test pass is claimed. Test anchors below are source-tree assertions, not executions.
+- **Historical local verification:** the dependency timeout below described that earlier pass only. Subsequent scoped test and actual-CLI passes are recorded in the execution ledger and current project context; they do not constitute a new full CI pass.
 - **Two axes, never merged.** *Implementation/reachability* = code exists and a CLI/supervisor path can call it. *Acceptance* = that ID's own invocation, arguments, typed result, failure/cancel path and Android smoke are recorded. Shared CI green does not close any row. Every ID below remains acceptance-open unless explicitly marked excluded.
-- **Reachable is not parity.** 14 of 32 tool IDs are reachable, but several are subset-level; 5 are partial/unwired, 12 deferred, 1 excluded. That is *not* tool equivalence, CLI parity, or provider parity.
-- **Known-unwired despite source.** LSP and DAP sources plus parsed `lsp.enabled`/`debug.enabled` exist, but no `LspTool`/`DebugTool` registration in the CLI path. Parsed configuration is not a mounted tool.
-- **Eval is partial.** `eval` is late-mounted, but the bridge strips `eval`/`task`/`hub`, rejects `checkpoint`/`rewind`, and its `budget()` fails closed (no Goal Mode accounting).
-- **Delegation gaps.** `task` supports blocking and background jobs when the supervisor is background-ready; non-blocking jobs return real IDs and auto-deliver exactly once. It supports `outputSchema`/`schemaMode`/`effort` and rejects `isolated` only. Eval `agent()` additionally rejects `apply`/`merge`. `pi-iso` exists but no worktree wiring. `hub` ops are current (see row); no park/revive lifecycle; process ops are supported when a process backend is configured.
+- **Presence is not parity.** 19 of 32 tool IDs are source-present (16 registry-reachable, including gated mounts, plus the `eval`/`task`/`hub` special mounts); 12 deferred, 1 excluded. Behavior depth per present ID was not re-audited, so this is *not* tool equivalence, CLI parity, or provider parity.
+- **LSP and DAP are mounted, not unwired.** `lsp` and `debug` are in `BUILTIN_TOOLS` (`runtime.rs:56-78`, 13 entries), gated by `lsp.enabled`/`debug.enabled` in `allowed_tools` (`runtime.rs:1995-2036`) and constructed with session-scoped ownership in `build_registry_with_display` (`runtime.rs:2103-2186`); a disabled tool named by `--tools` fails with an explicit error. External language/debug servers remain prerequisites; per-ID invocation/result/cancel acceptance is open.
+- **Eval is partial.** `eval` is late-mounted; the bridge rejects only `checkpoint`/`rewind` (`crates/pi-agent/src/eval/host.rs:29,178-183`) — the older "strips `eval`/`task`/`hub`" reading was unsupported. `budget()` fails closed because Goal Mode accounting is absent, and no `GoalTool` exists.
+- **Delegation gaps.** `task` supports blocking and background jobs when the supervisor is background-ready; non-blocking jobs return real IDs and auto-deliver exactly once. It supports `outputSchema`/`schemaMode`/`effort` and, at published `abe3d8c274`, rejected `isolated` only (`task.rs:1461-1472`). Eval `agent()` additionally rejects `apply`/`merge`. `pi-iso` exists but no worktree wiring. The active task-isolation slice modifies `task.rs` in the working tree and is unverified: neither its rejection nor its new behavior is counted here. `hub` ops are current (see row); no park/revive lifecycle; process ops are supported when a process backend is configured.
 - **Provider dialects remain deferred, not excluded.** 14 wire dialects are a retained requirement.
 - **Performance unmeasured**; the full parity gate stays open.
 
@@ -26,18 +26,18 @@ Authoritative inventories are `packages/coding-agent/src/cli-commands.ts` (subco
 
 Excluded: extension/hook/plugin execution and `plugin`/`install`; interactive TUI, `rpc-ui`, full-screen `git`/`join`/`shell`, native desktop `computer`, local audio capture/playback, live WebRTC, image clipboard, and `update` without an Android release target. Headless `gallery` ANSI, file/ANSI `render`, cloud TTS and image generation remain in scope. `browser-relay serve` remains conditional on an external Chrome connection. Explicit requests for excluded paths must fail with a specific reason, without side effects. External interpreters, Chromium, and services remain external; JS execution starts only on the user-requested JS paths. No new dependencies, installs, publication, or replacement of the installed CLI without separate approval.
 
-Current defect: excluded verbs and most missing verbs are not rejected explicitly — they fall through to the positional `PROMPT` (see FIX queue).
+Current source state (2026-10-30): known missing and excluded verbs are refused in `main::run` (`crates/omp-cli/src/main.rs:118-121`) before profile activation, config, session, provider or JS startup. `refused_verb_message` (`args.rs:466-497`) covers `EXCLUDED_VERBS` (6, `args.rs:409-421`) and `MISSING_VERBS` (27 tokens including aliases `img`/`q`, `args.rs:423-450`), states the specific missing-vs-boundary reason plus "Nothing was started", and offers the `--` escape; contract tests at `args.rs:1231-1323`. The guard is not an implementation: every affected row below stays open, with Android smoke of the refusal path as the remaining acceptance step.
 
 ## Current baseline and high-risk gaps
 
-Baseline behavior recorded 2026-10-26, anchors re-pointed 2026-10-29 after refactor: `crates/omp-cli/src/runtime.rs:706-899` (`PiAgentRunner::run`) forwards live bounded `AgentLoop::run_dialog_message` events and emits `AgentEnd` from finished turns; preserve and test this user-modified path, not a synthetic replay. The provider path still constructs `OpenAiCompatibleProvider` at `runtime.rs:530`; seven tools and existing session/approval implementations need behavioral parity audits. User changes in `crates/omp-cli/src/config.rs`, `runtime.rs`, `tests/mcp_integration.rs`, and this document must be preserved. Existing release installer/workflow and `$PREFIX/bin/omp` are out of scope until acceptance.
+Baseline behavior recorded 2026-10-26, anchors re-checked 2026-10-30 against the current tree: `crates/omp-cli/src/runtime.rs:706-899` (`PiAgentRunner::run`) forwards live bounded `AgentLoop::run_dialog_message` events and emits `AgentEnd` from finished turns; preserve and test this user-modified path, not a synthetic replay. The provider path constructs only `OpenAiCompatibleProvider` (`runtime.rs:771`, `:1795`, `:4610`, `:5028`); no other dialect is routed. Behavior depth of the present tools and the existing session/approval paths is not re-audited. User changes in `crates/omp-cli/src/config.rs`, `runtime.rs`, `tests/mcp_integration.rs`, and this document must be preserved. Existing release installer/workflow and `$PREFIX/bin/omp` are out of scope until acceptance.
 
-High-risk defects confirmed by the 2026-10-29 read-only audits:
+Historical defects (audited 2026-10-29; source state re-checked 2026-10-30). Old findings stay for traceability; none is promoted to runtime acceptance, and no affected row is closed:
 
-1. **Known upstream verbs become prompts.** `Option<Command>` plus positional `PROMPT` (`crates/omp-cli/src/args.rs:25-28,169-170`; `main.rs` falls through when `command.is_none()`) means `omp acp|config|plugin|…` is silently accepted as a prompt instead of a usage or boundary error. This violates the DoD and the Boundary.
-2. **`omp models --no-extensions` is a silent no-op.** Accepted on `Command::Models` (`args.rs:443-445`) and dropped via `..` (`main.rs:170`). Contrast: `-e` is rejected explicitly (`local_models.rs:73-82`, test `explicit_extension_paths_are_rejected`).
-3. **LSP/DAP settings are unreachable.** `pi-agent/src/lsp/mod.rs:3-9` describes registration behind `lsp.enabled`; no CLI registration exists. `dap`/`debug` likewise present in source, absent from `BUILTIN_TOOLS` (`runtime.rs:58-75`) and `build_registry` (`runtime.rs:1696-1731`).
-4. **Excluded paths get a generic failure.** `computer` has no agent-side tool, so a model request would get "tool not found" rather than the boundary reason. Same class: excluded verbs fall into prompts.
+1. **Known upstream verbs became prompts — source-done.** `main::run` now refuses before profile/config/session/provider/JS boot (`main.rs:118-121`), driven by `refused_verb_message` (`args.rs:466-497`) over `EXCLUDED_VERBS` (6) and `MISSING_VERBS` (27 tokens), with a specific reason, "Nothing was started" and the `--` escape; tests `args.rs:1231-1323`. Acceptance open: Android smoke only.
+2. **`omp models --no-extensions` was a silent no-op — source-done.** The flag reaches `LocalModelsRequest` (`main.rs:187-201`, `args.rs:768-770`) and is honored by construction: file-backed catalog only, with a `debug_assert` that no extension paths are present (`local_models.rs:45-46,91-103`). Explicit `refresh`/`-e` rejections are intact (`local_models.rs:73-82`). Acceptance open: CLI invocation and Android smoke.
+3. **LSP/DAP settings were unreachable — false now.** `lsp` and `debug` are in `BUILTIN_TOOLS` (`runtime.rs:56-78`) and mounted behind `lsp.enabled`/`debug.enabled` plus tool selection, with explicit errors for a disabled tool named in `--tools` (`runtime.rs:1995-2036`) and session-scoped construction (`runtime.rs:2103-2186`). External servers remain prerequisites. Acceptance open: per-ID invocation/result/cancel/Android smoke.
+4. **Excluded tools got a generic failure — source-done for the selection path.** `EXCLUDED_TOOLS`/`excluded_tool_reason` plus `missing_tool_diagnostic` return the boundary reason (`crates/pi-agent/src/tools/registry.rs:11-20,82-88`; tests `:167-176`), and tool selection fails closed through `excluded_tool_reason` (`runtime.rs:2015`, `:2803`). Acceptance open: model-request path and Android smoke.
 
 ## Execution order and acceptance
 
@@ -45,15 +45,17 @@ Priority update 2026-10-28: finish safety and data-loss fixes already in progres
 
 Porting priorities: first complete core file/process tools, task/hub supervision and hidden coordination tools, ask/todo, live events, approvals, cancellation, sessions, headless CLI and MCP. Then port LSP, AST, debugging, checkpoint/rewind and on-demand eval, preserving existing work and rejecting unsafe operations. Later, as prerequisites permit, port remaining headless commands, GitHub/SSH/search/security integrations, image inspection, memory and skills; browser remains later and requires external Chromium. Defer frequently changing provider/auth implementations and rare cloud paths; keep the current provider functional. Excluded desktop, interactive UI, extensions and other boundary paths remain explicitly rejected, not silently ignored. This ordering does not waive the existing acceptance gate.
 
+Priority update 2026-10-30 (supersedes the ordering above where they differ): restore CI first, then core tools, delegation, sessions, CLI modes/flags and live events. Authorization/discovery work is LOW priority: preserve the uncommitted child-credential slice in `runtime.rs` but defer further auth work. Provider dialects are deferred, not dropped. `inspect_image` is deferred by explicit user decision with no image/resvg/WebP dependency approved; the merged partial loader is unregistered and must not be counted as a tool. The historical FIX subset below is retained as acceptance gates, not as the scope limit.
+
 1. **Live execution and interruption.** Preserve the existing bounded live event channel in `runtime.rs`, test incremental NDJSON before provider completion and Ctrl-C during a real tool call, then fix any observed cancellation/history failures. No post-hoc synthetic replay. Final text exactly once; each started tool call closes with one result.
 2. **Sessions and output contract.** Compare a real TypeScript JSONL session with Rust records. Read/write the per-directory layout, resume, fork, import, and provider-session fields without losing old Rust sessions; migration must be explicit and loss-safe. Match text/JSON error and exit semantics with real successful, interrupted, and failed turns. Preserve `--continue` behavior or document an intentional replacement before changing it.
 3. **MCP and tool boundaries.** Consume the existing JSON configuration paths and schema; implement initialization, discovery, execution, cancellation, and process cleanup over stdio and HTTP/SSE. Use the upstream protocol version and `mcp__<server>_<tool>` naming; handle failures as tool errors, not empty results. Exercise a real local stdio server and HTTP fixture. Resolve the dynamic `Tool::name` contract before registration.
 4. **Files and model payloads.** Expand `@file` using upstream 5 MiB text and 25 MiB image limits; validate format by content, preserve path/error context, and use model-supported image parts. Test text files, supported images, oversize, unreadable paths, and a provider request containing image data. Do not add an image decoder unless resizing becomes necessary for compatible requests.
    *Positional `@file` handling:* `@file` arguments separated into `file_args`, resolved relative to `cwd`, and formatted as `<file name="<abs_path>">\n{content}\n</file>\n` into the initial prompt. 5 MiB text limit (`MAX_AUTO_READ_TEXT_BYTES`) warns to stderr and emits `(skipped: too large, ...)`. Directories emit directory listing. Prevents falling into REPL (`cli.file_args.is_empty()`); `-p @file` does not wait on terminal stdin; piped stdin follows TS `readPipedInput` contract (reads to EOF if non-terminal, returns immediately if terminal TTY) and merges ahead of `@file` text (`stdin + "\n" + file_text + prompt[0]`).
    *Limitations and upgrade paths:* Images (PNG/JPEG/GIF/WebP detected by header sniffing) bounded to 25 MiB and attached to model wire requests as data URIs with text references; session log persists ordered text and image parts and preserves them across session resume; explicit text-only models fail closed; markit document converters (.pdf/.docx) omitted until markit integration.
-5. **Provider and authentication parity.** Add the 14 TypeScript wire dialects, model capability routing, credential discovery/refresh, and thinking/effort options by protocol family. Reuse existing HTTP/TLS support; external OAuth flows and provider-specific attestation must have explicit integration tests before being called supported. Test representative request/response streams for every dialect; run live provider checks only where credentials are available, without logging secrets.
-6. **Tools and delegated execution.** Port all Android-available builtin tools by observable function, including research, subagents, process/PTY, code intelligence, image inspection, storage, and remote integrations. JavaScript in `eval` uses a lazy persistent kernel only when explicitly called; `browser.run` executes page JS via external Chromium/CDP. No full JS agent. External interpreters, executables, or accounts must produce accurate prerequisite errors. Test concurrency, cancellation, approvals, trust boundaries, and typed tool-result payloads.
-7. **CLI flags, modes, and subcommands.** Add upstream flag semantics, settings precedence/profiles, shell-friendly REPL, `rpc` and `acp`, then native-capable command families in dependency order: local read/grep/config/models/session, broker/auth, web/browser, stats/storage, and remaining commands. Do not add placeholder subcommands or accept no-op flags. For network/cloud commands, exercise either a local protocol fixture or a configured live service. Any command excluded because it *only* launches a React view must fail explicitly with the boundary reason.
+5. **Provider and authentication parity — DEFERRED per the 2026-10-30 priority decision (auth LOW).** Keep the OpenAI-compatible path functional and limit changes to correctness; the following remains a retained requirement, not the next slice: add the 14 TypeScript wire dialects, model capability routing, credential discovery/refresh, and thinking/effort options by protocol family. Reuse existing HTTP/TLS support; external OAuth flows and provider-specific attestation must have explicit integration tests before being called supported. Test representative request/response streams for every dialect; run live provider checks only where credentials are available, without logging secrets.
+6. **Tools and delegated execution.** Port all Android-available builtin tools by observable function, including research, subagents, process/PTY, code intelligence, image inspection (deferred per the 2026-10-30 decision until image dependencies are approved), storage, and remote integrations. JavaScript in `eval` uses a lazy persistent kernel only when explicitly called; `browser.run` executes page JS via external Chromium/CDP. No full JS agent. External interpreters, executables, or accounts must produce accurate prerequisite errors. Test concurrency, cancellation, approvals, trust boundaries, and typed tool-result payloads.
+7. **CLI flags, modes, and subcommands.** Add upstream flag semantics, settings precedence/profiles and shell-friendly REPL; the `rpc` mode already exists (`output.rs:14-24`, `rpc_protocol` tests) and needs its native auth wiring and metaharness consumer contract finished rather than initial construction; `acp` is still absent (`--mode acp`/`rpc-ui` parse-reject). Then native-capable command families in dependency order: local read/grep/config/models/session, broker/auth, web/browser, stats/storage, and remaining commands. Do not add placeholder subcommands or accept no-op flags. For network/cloud commands, exercise either a local protocol fixture or a configured live service. Any command excluded because it *only* launches a React view must fail explicitly with the boundary reason.
 8. **Parity gate.** Reconcile each upstream registry entry with implemented behavior or the approved exclusions. Run host tests and real CLI scenarios, Android arm64/Bionic build in Actions, and final Termux smoke of MCP, file/image, session, interrupt, provider, and tool delegation. Update Android docs only for shipped behavior; no release packaging without approval.
 
 ## Dependency and risk decisions
@@ -62,14 +64,14 @@ Porting priorities: first complete core file/process tools, task/hub supervision
 - Port session format before exposing resume/fork: silent writes to a parallel session tree risk apparent data loss.
 - Preserve the platform boundary: no full Bun/Node agent fallback, no synthetic success, no ignored flags. Lazy JS kernel for `eval.js` and page JS for `browser.run` are expressly included; outside these requests JS must not start. TS compatibility is measured at behavior/protocol boundaries, not by matching internal class graphs.
 - Use built-in/native or already-installed dependencies first. Proposed Rust crates or Termux packages require user approval before installation or lockfile changes.
-- A login/item rejected without a specific message is a defect, not a disposition. Unknown flags already fail through clap; unknown and excluded verbs do not.
+- A login/item rejected without a specific message is a defect, not a disposition. Unknown flags fail through clap; known missing and excluded verbs are refused by the explicit scanner (`args.rs:466-497`) before prompt assembly.
 
-## Next action: FIX-only queue (no new capability)
+## Historical FIX-only queue (source-done 2026-10-30; retained as acceptance gates, not scope limit)
 
-1. Reject every known upstream verb that is missing or excluded, before prompt assembly, with a specific reason (missing vs boundary), zero side effects and no session/network/JS start. Covers `omp acp` (intended ACP server) and all excluded verbs.
-2. Remove the `models --no-extensions` silent drop: honor it or reject it explicitly; keep `refresh`/`-e` explicit rejections intact.
-3. Decide and enforce the LSP/DAP seam: either register the tools behind their parsed settings or report the feature as unavailable. Do not leave source + config that looks supported while unreachable.
-4. Give excluded tool paths a typed boundary error instead of generic not-found.
+1. Reject every known upstream verb that is missing or excluded, before prompt assembly, with a specific reason (missing vs boundary), zero side effects and no session/network/JS start. Covers `omp acp` (intended ACP server) and all excluded verbs. **Source-done:** `main.rs:118-121` + `args.rs:409-497`, tests `:1231-1323`; Android smoke open.
+2. Remove the `models --no-extensions` silent drop: honor it or reject it explicitly; keep `refresh`/`-e` explicit rejections intact. **Source-done:** honored by construction in `local_models.rs:91-103`; CLI invocation and Android smoke open.
+3. Decide and enforce the LSP/DAP seam: either register the tools behind their parsed settings or report the feature as unavailable. Do not leave source + config that looks supported while unreachable. **Source-done:** both mounted behind `lsp.enabled`/`debug.enabled` (`runtime.rs:1995-2036,2103-2186`); per-ID acceptance open.
+4. Give excluded tool paths a typed boundary error instead of generic not-found. **Source-done for the selection/diagnostic path** (`registry.rs:11-20,82-88`); model-request path and Android smoke open.
 
 These are fixes to recorded defects, not promises of added parity. After each fix: bounded local check, then push and wait for the exact-SHA Actions run before recording it.
 
@@ -81,8 +83,8 @@ Counts are split by axis. "Present" means registered and dispatchable, not accep
 
 | Registry | Total IDs / tokens | Implementation / reachability | Acceptance |
 |---|---|---|---|
-| CLI subcommands | 41 registry rows + Rust-only `repl` | 8 present (2 implemented, 6 partial), 27 missing, 6 excluded; `repl` extra | 35 open + 6 excluded |
-| Builtins & hidden tools | 32 tools (29 builtin + 3 hidden) | 14 reachable, 5 partial/unwired, 12 deferred, 1 excluded | 31 open + 1 excluded |
+| CLI subcommands | 41 canonical IDs (44 tokens) + Rust-only `repl` | 10 present, 25 missing canonical (27 missing tokens), 6 excluded; behavior depth not re-audited | 35 open + 6 excluded |
+| Builtins & hidden tools | 32 tools (29 builtin + 3 hidden) | 19 source-present including gated/special mounts, 12 deferred, 1 excluded; active image/isolation work not counted | 31 open + 1 excluded |
 | Wire APIs | 14 wire protocols | 14 deferred (retained requirement) | 14 open |
 | MCP transports | 3 transports | 3 partial (client path exists) | 3 open |
 | Launch flags (string) | 30 canonical (31 tokens; `-e` alias of `--extension`) | 17 present (15 partial, 2 implemented wire subset), 9 missing, 4 excluded | 26 open + 4 excluded |
@@ -90,59 +92,61 @@ Counts are split by axis. "Present" means registered and dispatchable, not accep
 | Launch flags (valueless) | 23 canonical (24 tokens; `--yolo` alias) | 11 present, 12 missing | 23 open |
 | Positional operands | 2 categories (`PROMPT`, `@FILE`) | 2 implemented | runtime re-check open |
 
-*Counts:* `__complete` is a TypeScript registry entry (`packages/coding-agent/src/cli-commands.ts:70`); the 8 present / 27 missing / 6 excluded split is authoritative for these 41 rows.
+*Counts:* `__complete` is a TypeScript registry entry (`packages/coding-agent/src/cli-commands.ts:70`); the presence recount is 10 present canonical / 25 missing canonical (27 missing tokens) / 6 excluded for these 41 rows. Provenance: read-only source audit of the published code basis `abe3d8c274`; later commits are `088367d8b9` (unregistered `inspect_image` loader) and `260a314843` (FixOwnerClearRace owner-clear fix, regression unrun). Neither changes presence counts, and in-flight slice edits are excluded. Behavior per present ID stays unknown unless a recorded run says otherwise.
 
 ### CLI subcommands (41)
 
-Disposition vocabulary: **implemented** (registered + behavior path + consumer test anchor), **partial** (registered subset), **missing** (absent; invocation currently becomes a prompt), **excluded** (boundary; still lacks explicit reject unless noted). `SMOKE0f601` = artifact help/version/PTY only.
+Disposition vocabulary: **implemented** (registered + behavior path + consumer test anchor), **partial** (registered subset), **missing** (absent; the startup guard refuses the verb, which is not an implementation), **excluded** (boundary; refused at startup by `EXCLUDED_VERBS`). Refusal facts: `refused_verb_message` (`args.rs:466-497`) runs in `main::run` before profile/config/session/provider/JS boot (`main.rs:118-121`), names the specific reason, states "Nothing was started", and offers the `--` escape; tests `args.rs:1231-1323`. `SMOKE0f601` = artifact help/version/PTY only. Behavior labels below rest on the tests cited, not on a fresh runtime audit.
 
 | ID (aliases) | Current source state | Evidence / behavior | Acceptance | Gap / prerequisite |
 |---|---|---|---|---|
-| `launch` | partial | Default path with no subcommand; text/json modes; `runtime` run path; TEST `tests/live_sse_integration.rs`; SMOKE0f601 PTY | open | `rpc`/`acp`/`rpc-ui` parse-reject; many launch flags missing. |
-| `acp` | missing + silent-prompt risk | Not in clap `Command`; `omp acp` becomes positional prompt (`args.rs:25-28,169-170`) | open | ACP stdio server absent; needs explicit verb reject until built. |
-| `auth-broker` | missing + silent-prompt risk | No Rust command | open | Local loopback port / auth store. |
-| `auth-gateway` | missing + silent-prompt risk | No Rust command | open | Broker reachability / proxy port. |
+| `launch` | partial | Default path with no subcommand; text/json modes; `runtime` run path; TEST `tests/live_sse_integration.rs`; SMOKE0f601 PTY | open | `acp`/`rpc-ui` parse-reject; `rpc` present (`output.rs:14-24`); many launch flags missing. |
+| `acp` | missing; startup-refused | Not in clap `Command`; refused before boot with the missing reason (`args.rs:423-450`, `main.rs:118-121`) | open | ACP stdio server absent; the refusal guard is not an implementation. |
+| `auth-broker` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Local loopback port / auth store. |
+| `auth-gateway` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Broker reachability / proxy port. |
 | `agents` | partial | `args.rs:408-426`, `agents.rs`, `main.rs:144-168`; unpack/list subset; catalog smoke in history | open | No plugin agents (`agents.rs:5-7`); catalog-only validation. |
-| `bench` | missing + silent-prompt risk | No Rust command | open | Benchmark fixtures / model access. |
-| `browser-relay` | missing + silent-prompt risk | No Rust command | open | Conditional external Chrome; device Chromium linker broken. |
-| `cleanse` | missing + silent-prompt risk | No Rust command | open | Subagent runner; model access. |
-| `commit` | missing + silent-prompt risk | No Rust command | open | `git` CLI present in repository. |
-| `completions` | implemented | `args.rs:394-397`, `completions.rs`, dispatch `main.rs:255-256`; TEST `tests/completions.rs` | open (host run not re-executed) | Completes only ported commands/flags, not full TS surface. |
-| `__complete` | implemented | `args.rs:399-405`, `main.rs:258-260`; TEST completions + args unit | open | Only `models`/`sessions` kinds; read-only. |
-| `compress` | missing + silent-prompt risk | No Rust command | open | File read/write. |
-| `config` | missing + silent-prompt risk | No Rust command | open | Config read/write; profile flags exist but no `config` verb. |
-| `dry-balance` | missing + silent-prompt risk | No Rust command | open | OAuth accounts. |
-| `gc` | missing + silent-prompt risk | No Rust command | open | Storage directory. |
+| `bench` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Benchmark fixtures / model access. |
+| `browser-relay` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Conditional external Chrome; device Chromium linker broken. |
+| `cleanse` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Subagent runner; model access. |
+| `commit` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | `git` CLI present in repository. |
+| `completions` | source-present | `args.rs:394-397`, `completions.rs`, dispatch `main.rs:255-256`; TEST `tests/completions.rs` | open (host run not re-executed) | Completes only ported commands/flags, not full TS surface; behavior depth not re-audited. |
+| `__complete` | source-present | `args.rs:399-405`, `main.rs:258-260`; TEST completions + args unit | open | Only `models`/`sessions` kinds; read-only; behavior depth not re-audited. |
+| `compress` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | File read/write. |
+| `config` | source-present | `config_cmd.rs`, enum/dispatch `main.rs:248-271` | open | Behavioral depth and per-ID acceptance not re-audited in presence recount. |
+| `dry-balance` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | OAuth accounts. |
+| `gc` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Storage directory. |
 | `grep` | partial | `args.rs:458-484`; matcher/native grep in CI; device smoke in history | open | CLI flag surface is not the full tool contract. |
-| `gallery` | missing + silent-prompt risk | No Rust command | open | ANSI preview in scope; `vhs` absent on Android. |
-| `git` | excluded | No reject path; verb becomes prompt | excluded / not enforced | Fullscreen TUI boundary; needs explicit refusal. |
-| `grievances` | missing + silent-prompt risk | No Rust command | open | Grievances store. |
-| `images` (alias `img`) | missing + silent-prompt risk | No Rust command | open | Cache directory; no auto-install. |
-| `if-bench` | missing + silent-prompt risk | No Rust command | open | Benchmark fixtures. |
-| `install` | excluded | No reject path; verb becomes prompt | excluded / not enforced | Plugin/extension boundary; needs explicit refusal. |
-| `join` | excluded | No reject path; verb becomes prompt | excluded / not enforced | TUI + WebRTC boundary. |
-| `models` | partial | `args.rs:429-448`, `local_models.rs`, `main.rs:170-188`; device metadata smoke in history; TEST `explicit_extension_paths_are_rejected` | open | `refresh` and `-e` explicit reject; **`--no-extensions` silently dropped**; no OAuth discovery. |
-| `plugin` | excluded | No reject path; reserved-word class; verb becomes prompt | excluded / not enforced | Plugin execution boundary; needs explicit refusal. |
+| `gallery` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | ANSI preview in scope; `vhs` absent on Android. |
+| `git` | excluded | Refused at startup by `EXCLUDED_VERBS` with boundary reason | excluded; guard source-done | Fullscreen TUI boundary; guard source-done; Android smoke open. |
+| `grievances` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Grievances store. |
+| `images` (alias `img`) | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Cache directory; no auto-install. |
+| `if-bench` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Benchmark fixtures. |
+| `install` | excluded | Refused at startup by `EXCLUDED_VERBS` with boundary reason | excluded; guard source-done | Plugin/extension boundary; guard source-done; Android smoke open. |
+| `join` | excluded | Refused at startup by `EXCLUDED_VERBS` with boundary reason | excluded; guard source-done | TUI + WebRTC boundary. |
+| `models` | partial | `local_models.rs:91-103`; `--no-extensions` honored by file-backed construction | open | `refresh` and `-e` remain explicit rejections; online discovery deferred. |
+| `plugin` | excluded; also a TS reserved word | Refused at startup by `EXCLUDED_VERBS` with boundary reason | excluded; guard source-done | Plugin execution boundary; guard source-done, Android smoke open. |
 | `ps` | partial | `args.rs:486-520`, `process_cli.rs`; TEST `tests/daemon_broker_smoke.rs` | open | Interactive monitor TUI excluded; headless list/logs/stop/kill/restart. |
-| `say` | missing + silent-prompt risk | No Rust command | open | File output in scope; speaker playback excluded. |
-| `share` | missing + silent-prompt risk | No Rust command | open | Session store / network. |
-| `setup` | missing + silent-prompt risk | No Rust command | open | Non-interactive paths only; no package installs. |
-| `shell` | excluded | No reject path; verb becomes prompt | excluded / not enforced | Interactive TUI boundary. |
+| `say` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | File output in scope; speaker playback excluded. |
+| `share` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Session store / network. |
+| `setup` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Non-interactive paths only; no package installs. |
+| `shell` | excluded | Refused at startup by `EXCLUDED_VERBS` with boundary reason | excluded; guard source-done | Interactive TUI boundary. |
 | `read` | partial | `args.rs:451-456`; TEST `tool_commands.rs`, `read_contract`; device smoke in history | open | Archive/SQLite/PDF/markit/internal URIs still refused (`tools/read.rs:265-373`). |
-| `render` | missing + silent-prompt risk | No Rust command | open | Session file / stdout. |
-| `ssh` | missing + silent-prompt risk | No Rust command | open | `ssh` present; host auth required. |
-| `stats` | missing + silent-prompt risk | No Rust command | open | Session DB; dashboard TUI excluded. |
-| `update` | excluded | No reject path; verb becomes prompt | excluded / not enforced | No Android release target. |
-| `usage` | missing + silent-prompt risk | No Rust command | open | Auth store / provider network. |
-| `tiny-models` | missing + silent-prompt risk | No Rust command | open | ONNX runtime unverified on Android; download needs approval. |
-| `token` | missing + silent-prompt risk | No Rust command | open | Auth database. |
-| `ttsr` | missing + silent-prompt risk | No Rust command | open | Stream ruleset. |
-| `worktree` (alias `wt`) | missing + silent-prompt risk | No Rust command | open | Git repo; task `isolated` worktree also unwired. |
-| `search` (alias `q`) | missing + silent-prompt risk | No Rust command | open | Search credential / network. |
+| `render` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Session file / stdout. |
+| `ssh` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | `ssh` present; host auth required. |
+| `stats` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Session DB; dashboard TUI excluded. |
+| `update` | excluded | Refused at startup by `EXCLUDED_VERBS` with boundary reason | excluded; guard source-done | No Android release target. |
+| `usage` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Auth store / provider network. |
+| `tiny-models` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | ONNX runtime unverified on Android; download needs approval. |
+| `token` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Auth database. |
+| `ttsr` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Stream ruleset. |
+| `worktree` (alias `wt`) | source-present | `worktree_cmd.rs`, dispatch `main.rs:272-313` | open | List/clear command is distinct from the active task-isolation slice; no cache/worktree deletion authorized. |
+| `search` (alias `q`) | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Search credential / network. |
 
 *Rust-only:* `repl` (`args.rs:390-391`, `main.rs:626-627`; SMOKE0f601 5 PTY scenarios) is a partial explicit REPL entry, not one of the 41 TS rows.
 
 ### Builtin tools (29)
+
+Presence axis (2026-10-30, read-only source audit): 19 of 32 canonical IDs source-present (16 registry-reachable including gated mounts, plus the `eval`/`task`/`hub` special mounts), 12 deferred, 1 excluded. Behavior cells rest on the cited tests; no fresh runtime audit was performed, and in-flight slices are not counted.
 
 | ID (aliases) | Reachability | Mount / behavior | Acceptance | Gap / prerequisite |
 |---|---|---|---|---|
@@ -152,20 +156,20 @@ Disposition vocabulary: **implemented** (registered + behavior path + consumer t
 | `ast_grep` | reachable (local only) | `AstGrepTool`; local file/dir/glob; ssh/internal refused explicitly | open | No remote/internal URI search. |
 | `ast_edit` | reachable | `AstEditTool`; staged queue + PendingStore; glob scope, partial-write reporting | open | Policy/store coupling; device staged smokes are historical artifact evidence. |
 | `ask` | reachable | `AskTool`; stripped when no ask channel (`allowed_tools`); child registry removes it | open | Needs interactive/RPC answer channel; PTY evidence historical. |
-| `debug` | partial/unwired | `pub mod dap`, `dap/tool.rs`; `config.debug.enabled` parsed | open | **Not in `BUILTIN_TOOLS` or `build_registry`**; adapters external. |
-| `eval` | partial/unwired | `EvalTool` late-mounted; kernels/preludes exist | open | Bridge strips `eval`/`task`/`hub`; rejects `checkpoint`/`rewind`; `budget()` fail-closed (`crates/omp-cli/src/eval_host.rs:407-414`); interpreters external. |
+| `debug` | source-present, gated | `runtime.rs` registers DAP tool behind `debug.enabled` and tool selection | open | External adapters; per-ID invocation/result/cancel/device proof remains open. |
+| `eval` | source-present, partial | Late-mounted kernels/preludes and bridge | open | Bridge rejects `checkpoint`/`rewind`; `budget()` fails closed; interpreters external. |
 | `github` | deferred | No `GithubTool` in agent path | open | `gh` + auth when ported. |
 | `glob` (alias `find`) | reachable | `GlobTool`; alias normalized in `agents.rs:396-399` | open | — |
 | `grep` (alias `search`) | reachable | `GrepTool`; gitignore/PCRE2 path | open | Device grep smoke historical. |
-| `lsp` | partial/unwired | `LspTool` source (`lsp/tool.rs:173+`); `lsp.enabled` parsed; seam comment `lsp/mod.rs:3-9` | open | **No CLI registration**; servers external. |
-| `inspect_image` | deferred | TS tool only; read error text points to it | open | Image read + 25 MiB bound. |
+| `lsp` | source-present, gated | `runtime.rs` registers LSP tool behind `lsp.enabled` and tool selection | open | External servers; per-ID invocation/result/cancel/device proof remains open. |
+| `inspect_image` | deferred (2026-10-30 user decision) | No Rust agent tool; a partial loader exists in source (`crates/pi-agent/src/tools/inspect_image.rs`, commit `088367d8b9`) but is unregistered and must not be counted. Actual TS contract includes a separate vision-model completion, not merely image loading | open | Deferral: no image decoder, resvg or WebP dependency is approved. TS inspect input bound is 20 MiB; 5/25 MiB read bounds and header sniff stay in `file_mentions.rs`/`read.rs`, whose image error only points at `inspect_image`. |
 | `browser` | deferred | No Rust agent browser tool | open | External Chromium; device linker broken (`_ZNSt6__ndk113__hash_memoryEPKvm`). |
-| `computer` | excluded | No `ComputerTool` in `pi-agent`; desktop backend returns unavailable (`pi-natives/src/desktop/mod.rs:604-606`) | excluded | Generic "tool not found" instead of boundary reason. |
+| `computer` | excluded | No `ComputerTool` in `pi-agent`; desktop backend returns unavailable (`pi-natives/src/desktop/mod.rs:604-606`) | excluded | Boundary reason source-done for the selection/diagnostic path (`registry.rs:11-20,82-88`, tests `:167-176`); model-request path and Android smoke open. |
 | `checkpoint` | reachable (gated) | Mount `runtime.rs:641-651`; requires tools on + allowlist + controller + `checkpoint.enabled` (default false) | open | Root-only; not in child template; eval bridge rejects. |
 | `rewind` | reachable (gated) | Same mount/gate; branches conversation; abandoned JSONL entries remain | open | Active checkpoint required; no Git/file restore. |
 | `security_scan` | deferred | TS only | open | Rules engine / history. |
-| `task` | partial/unwired | `TaskTool`; blocking and background delegation via `Supervisor` (`spawn_background_task`/`run_background_child`); non-blocking jobs return real IDs and auto-deliver once; supports `outputSchema`/`schemaMode`/`effort` (`task.rs:324-337`); rejects `isolated` only (`task.rs:1410-1421`); eval `agent()` additionally rejects `apply`/`merge` (`task.rs:973-975`); depth/concurrency bounded | open | In-memory job records; **worktree absent** (`crates/pi-agent/src/tools/task.rs:1413-1416`); TEST `delegation.rs`, `async_coordination.rs`. |
-| `hub` | partial/unwired | `HubTool`; `SUPPORTED_OPS` = `jobs`, `cancel`, `wait`, `send`, `inbox`, `list`, `start`, `ps`, `logs`, `stop`, `restart`, `describe` (`crates/pi-agent/src/tools/hub.rs:37-38`); owner scoping | open | No park/revive lifecycle; process ops supported when a process backend is configured; "jobs/cancel only" text in history is stale. |
+| `task` | present special-mount, partial behavior | `TaskTool`; blocking and background delegation via `Supervisor` (`spawn_background_task`/`run_background_child`); non-blocking jobs return real IDs and auto-deliver once; supports `outputSchema`/`schemaMode`/`effort` (`task.rs:324-337`); rejects `isolated` only (`task.rs:1461-1472` at `abe3d8c274`); eval `agent()` additionally rejects `apply`/`merge` (`task.rs:973-975`); depth/concurrency bounded | open | In-memory job records; **worktree absent at that SHA**; active `TaskIsolationSlice` modifies `task.rs` in the working tree, unverified and not counted; TEST `delegation.rs`, `async_coordination.rs`. |
+| `hub` | present special-mount, partial behavior | `HubTool`; `SUPPORTED_OPS` = `jobs`, `cancel`, `wait`, `send`, `inbox`, `list`, `start`, `ps`, `logs`, `stop`, `restart`, `describe` (`crates/pi-agent/src/tools/hub.rs:37-38`); owner scoping | open | No park/revive lifecycle; process ops supported when a process backend is configured; "jobs/cancel only" text in history is stale. |
 | `todo` | reachable | `TodoTool`; ops init/start/done/rm/drop/block/unblock/append/view; persists in session `toolResult.details`, restores on resume/fork | open | Child drops todo; TUI/`/todo` deferred. |
 | `web_search` | deferred | TS only; `agents.rs` accepts the name but builder cannot construct it → allowlist drift | open | Credential/network when ported. |
 | `write` | reachable | `WriteTool`; PendingStore; approval tier | open | Atomic existing-file path historically reviewed; acceptance open. |
@@ -186,7 +190,7 @@ Disposition vocabulary: **implemented** (registered + behavior path + consumer t
 
 ### Wire APIs (14)
 
-All 14 remain a **deferred, retained requirement**; none is excluded. Runtime still uses the OpenAI-compatible provider path (`runtime.rs:530`); no per-dialect fixture was executed this pass.
+All 14 remain a **deferred, retained requirement**; none is excluded, and the list is not the next slice (2026-10-30 auth-LOW decision). Runtime constructs only `OpenAiCompatibleProvider` (`runtime.rs:771`, `:1795`, `:4610`, `:5028`); no per-dialect fixture was executed this pass.
 
 | ID | State | Acceptance | Gate |
 |---|---|---|---|
@@ -224,7 +228,7 @@ Root keys `mcpServers`, `disabledServers`, `enabledServers` parse (denylist wins
 | `--cwd <dir>` | partial | `args.rs:42-44` | open |
 | `--config <path>` | partial | `args.rs:98-100`; profile/config tests | open |
 | `--add-dir <dir>` | missing | Clap rejects unknown flag | open |
-| `--mode <mode>` | partial | `args.rs:38-40`; enum only `text`/`json` (`output.rs:14-21`) | open; `rpc`/`acp`/`rpc-ui` parse-reject, `rpc-ui` lacks boundary message |
+| `--mode <mode>` | partial | `args.rs:38-40`; enum `text`/`json`/`rpc` (`output.rs:14-24`); `rpc` exercised by a loopback smoke, native auth wiring open | open; `acp`/`rpc-ui` parse-reject |
 | `--fork <id>` | partial | `args.rs:117-119`; session lifecycle tests | open |
 | `--provider <name>` | partial | `args.rs:58-60` | open; dialects deferred |
 | `--model <name>` | partial | `args.rs:54-56` | open |
@@ -284,7 +288,7 @@ Root keys `mcpServers`, `disabledServers`, `enabledServers` parse (denylist wins
 | `--plan-yolo` | missing | Clap rejects | open |
 | `--print` / `-p` | partial | `args.rs:34-36` | open |
 | `--print-thoughts` | missing | Clap rejects | open |
-| `--no-extensions` | missing at root; **silent no-op under `models`** | Root rejected by clap; `args.rs:443-445` accepted on `Command::Models` then dropped (`main.rs:170`) | open + defect |
+| `--no-extensions` | missing at root; honored under `models` | Root rejected by clap; `args.rs:768-770` carries it into `LocalModelsRequest` (`main.rs:187-201`) and `local_models.rs:91-103` restricts to the file-backed catalog with a `debug_assert`; explicit `-e`/`refresh` rejections intact | open (CLI invocation + Android smoke) |
 | `--no-skills` | partial | `args.rs:157-159` | open |
 | `--no-rules` | missing | Clap rejects | open |
 | `--no-title` | partial | `args.rs:141-143`; `main.rs:537-541` `PI_NO_TITLE` | open |
@@ -462,4 +466,6 @@ Follow-up verification: branch/parent-lineage reload regression passed 1/1 after
 Further execution evidence: RPC library tests passed 65/65; RPC protocol tests passed 16/16 after replacing a positional-response fixture assertion with checks on the actual HTTP user prompts (aborted queued input excluded, replacement delivered). Actual Android CLI host-tool round-trip passed: approval confirmed, original tool-call ID preserved, progress frame delivered, returned PNG included in the next localhost provider request, and stdin EOF exited 0. Host-URI CLI smoke exposed an unconditional obsolete prerequisite response despite a bound router; that response and equivalent subagent gates are now removed in source, awaiting a fresh binary smoke. Auth plus RPC-auth bridge tests passed 133/133 (`cargo test --locked --offline -j1 -p omp-cli --lib auth:: -- --test-threads=1`, exit 0); this predates the pending OAuth manual-dialog lifecycle correction and does not prove external-account login. Local-URI/steering checks reached a Termux LLVM linker tagged-pointer abort before execution; no passing result is claimed for them. Exact-SHA Actions `40908155304` finished with Android/Bionic and native grep passing, host tests failing on Julia initialization interrupted by SIGINT. Full parity remains open.
 
 2026-10-30 checkpoint: native auth lifecycle tests passed 139/139; final serial `cargo test --locked --offline -j1 -p omp-cli --test rpc_protocol -- --test-threads=1` and equivalent `-p pi-agent --test subagent_observability` passed 16/16 and 5/5 (exit 0; 139.45 s including compilation). RPC fixture now waits for the actual aborted frame before releasing SSE; observer fixture drains correctly, and a shared emission gate prevents real child events/progress from following terminal lifecycle frames. Cross-thread regression passed. Actual Android CLI host-URI round-trip now passed: custom `notes` registration, `read` callback, host content in the next localhost provider request, agent end and EOF exit 0. Custom-scheme selectors remain opaque as in upstream; earlier selector smoke expectation was invalid. Full checkpoint and next gates: `docs/rust-cli-project-context.md`, 2026-10-30 section. Current source remains unpublished at this checkpoint; auth runtime wiring, online catalog refresh and remaining full-plan acceptance stay open.
+
+2026-10-30 core-slice verification: task isolation now passes 11/11 scoped regressions plus 1/1 parent-cancellation forwarding check. CLI isolation settings passed 2/2, late-owner worktree clear guard 1/1, legacy import/reopen/fork text/image/details preservation and stop-reason canonicalization 1/1. `cargo check --locked --offline -j1 -p pi-agent -p omp-cli` exited 0. Actual Android CLI root-to-child isolated rcopy write, patch application and sandbox cleanup passed with a localhost provider fixture (exit 0). JSON contract correction separately passed unit 1/1, live SSE 2/2 and an actual tool round-trip. These are scoped passes, not exact-SHA CI or all-backend acceptance; no installed CLI replacement. `inspect_image` remains explicitly deferred and unregistered; authorization remains lower priority. Full current limits and evidence: `docs/rust-cli-project-context.md:260-262`.
 

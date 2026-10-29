@@ -31,6 +31,7 @@ use crate::{
 		read::ReadTool,
 		registry::ToolRegistry,
 		task_catalog::AgentCatalog,
+		task_isolation::TaskIsolationSettings,
 	},
 };
 
@@ -421,6 +422,9 @@ pub struct Supervisor {
 	/// [`ChildToolSettings`]). Set by the host from `lsp.shared` and
 	/// `tools.maxTimeout` on every root turn.
 	child_tool_settings: Mutex<ChildToolSettings>,
+	/// `task.isolation.*` + resolved `worktree.base`. Installed by the CLI on
+	/// every root turn; each `task` spawn snapshots it through `ChildContext`.
+	task_isolation: Mutex<TaskIsolationSettings>,
 	process_root: PathBuf,
 	/// Runner-unique prefix for backend-visible process owners. UI ids such as
 	/// `task-1` repeat across concurrent CLIs; process scoping must not.
@@ -521,6 +525,7 @@ impl Supervisor {
 			processes: Mutex::new(None),
 			eval_binder: Mutex::new(None),
 			child_tool_settings: Mutex::new(ChildToolSettings::default()),
+			task_isolation: Mutex::new(TaskIsolationSettings::default()),
 			process_root: {
 				std::env::temp_dir()
 					.join(format!("omp-agent-processes-{}-{scope}", std::process::id()))
@@ -1439,6 +1444,23 @@ impl Supervisor {
 			SubagentLifecycleStatus::Started,
 		)));
 		Some((id, cancellation_token))
+	}
+
+	/// Install the run's `task.isolation.*` policy. Called by the CLI before
+	/// building the root registry, so every new `TaskTool` snapshots it.
+	pub fn set_task_isolation(&self, settings: TaskIsolationSettings) {
+		*self
+			.task_isolation
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = settings;
+	}
+
+	pub fn task_isolation(&self) -> TaskIsolationSettings {
+		self
+			.task_isolation
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone()
 	}
 
 	/// Directory child transcripts are created in; `None` disables them.

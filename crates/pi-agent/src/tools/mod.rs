@@ -14,6 +14,7 @@ pub mod registry;
 pub mod scheduler;
 pub mod task;
 pub mod task_catalog;
+pub mod task_isolation;
 pub mod think;
 pub mod todo;
 pub mod yield_tool;

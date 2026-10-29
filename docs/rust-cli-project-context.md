@@ -12,35 +12,35 @@ Rust must not start a JavaScript runtime for general operation. JS is allowed la
 
 Approved exclusions remain: extension/hook/plugin execution and `plugin`/`install`; interactive TUI, `rpc-ui`, full-screen `git`/`join`/`shell`; native desktop `computer`; local audio capture/playback; live WebRTC; image clipboard; `update` without an Android release target. Excluded paths still need an explicit refusal instead of a generic failure or prompt absorption.
 
-Work is **FIX-only** until the recorded defects are closed: no new capability, no placeholders, no no-op flags, no new dependency/install without approval. Latest priority: safety/data-loss fixes first, then tools, delegation, CLI modes/flags and live events; keep the existing OpenAI-compatible provider path functional and defer the 14 provider dialects.
+Objective: complete the full plan, not a FIX-only queue. Current priority: safety/data-loss and confirmed CI failures first, then core tools, delegation, sessions, CLI modes/flags and live events. Authorization/discovery and frequently changing provider dialects have lower priority; preserve the existing provider path and unfinished auth work. No placeholders, no-op flags, external dependency installs or installed-CLI replacement.
 
-## Current verified state (2026-10-29)
+## Current evidence state (2026-10-30)
 
 | Item | State |
 |---|---|
-| Docs HEAD | `216179883b` — docs-only parity reconciliation; no code change. The handoff edits in this working tree are uncommitted pending review. |
-| Last tested executable | `0f601b6f61` — Actions [40827646802](https://github.com/SklUpp/omp-termux/actions/runs/40827646802), all 3 jobs pass: host check/tests, native grep/matcher, Android arm64/Bionic build |
-| Android artifact | SHA-256 `d79bdbb3c0e407f3fb5f7156605c8fbe08d9836751f81e77f566105125af630f`; `--help`/`--version` exit 0; 5 PTY scenarios PASS in 10.36 s |
-| Artifact path | `$PREFIX/tmp/omp-rust-final.ciBYAL/omp` — ephemeral evidence, not a durable dependency |
-| Local verification | Local Cargo hit the 600 s dependency timeout under `jobs1`; no local test pass is claimed for `0f601` or the docs HEAD |
-| CI coverage of docs HEAD | None. Docs commit did not change code and was not re-run; do not claim it is CI-verified |
+| Published HEAD | `abe3d8c274`; remote feature branch matched this commit. Current uncommitted slices are not covered by that SHA. |
+| Last exact-SHA CI | [40944110426](https://github.com/SklUpp/omp-termux/actions/runs/40944110426): Android build PASS, native grep PASS, host FAIL (467 passed / 1 failed in `omp-cli --lib`, stale JSON-result assertion). Not a full-suite pass. |
+| Historical Android smoke | `0f601b6f61` / run `40827646802`, artifact SHA-256 `d79bdbb3c0e407f3fb5f7156605c8fbe08d9836751f81e77f566105125af630f`: help/version and 5 PTY scenarios passed. Its 10.36 s is functional wall time, not current CPU/PSS/startup evidence. |
+| Historical artifact path | `$PREFIX/tmp/omp-rust-final.ciBYAL/omp` — ephemeral, tied only to the historical SHA/run above. |
+| Latest local JSON checks | Unit 1/1 and live SSE 2/2 passed; actual localhost-provider JSON CLI `read` turn passed. Test-only LLVM single-thread link workaround was required. Scoped evidence only. |
+| Performance / coverage | Equal-history 8/30-turn CPU/PSS/startup comparison: not measured. Rust coverage percentage: not measured. |
 
 Artifact-level help/version/PTY checks are not a per-ID command matrix. Every parity row stays **acceptance-open** unless the plan records that ID's own invocation, arguments, typed result, error/cancel path and Android smoke. Shared green CI does not close rows.
 
 ### Implementation-axis truth (summary)
 
 - Core present: CLI/agent loop, live bounded events and cancellation, session storage plus continue/resume/fork paths, approvals, read/write/edit (hashline plus variants), bash/process supervision, glob/grep, AST grep/edit, todo, ask, MCP client, task/hub delegation, checkpoint/rewind, `yield`/`think`. Foreign session import readers exist with non-TTY rejection. This is presence/reachability, not per-ID acceptance or full TypeScript equivalence.
-- CLI: 41 TypeScript subcommand IDs → 8 present (2 implemented, 6 partial), 27 missing, 6 excluded; Rust-only `repl`. Missing/excluded verbs currently fall through to the positional prompt unless explicitly rejected.
-- Tools: 32 registry IDs → 14 reachable, 5 partial/unwired, 12 deferred, 1 excluded (`computer`); `apply_patch` is a wire alias of `edit`, not a 33rd ID.
-- Wire APIs: 14 dialects deferred, retained requirement, none excluded.
+- CLI presence recount (2026-10-30): 41 canonical TypeScript IDs / 44 tokens; 10 present, 25 missing canonical / 27 missing tokens, 6 excluded; Rust-only `repl` extra. Explicit verb refusals are wired before prompt assembly, not implementations of missing commands. Per-command behavioral acceptance remains open.
+- Tool presence recount: 32 IDs; 19 source-present including gated/special mounts, 12 deferred, 1 excluded (`computer`). Provenance: read-only audit of the published code basis `abe3d8c274`; commits after it are `088367d8b9` (unregistered `inspect_image` loader, not a tool) and `260a314843` (FixOwnerClearRace owner-clear fix, regression unrun). Neither changes presence counts. `apply_patch` remains an `edit` wire alias. Presence is not full behavior or runtime acceptance; unfinished image/isolation work is not counted.
+- Wire APIs: 14 dialects deferred, retained requirement, none excluded, and not the next slice (2026-10-30 auth-LOW decision).
 - MCP: stdio/HTTP/SSE client paths exist; OAuth unsupported.
 - Flags: string 17 present / 9 missing / 4 excluded; optional 1 partial; valueless 11 present / 12 missing.
 
 ### New audit truths that must not be lost
 
-- **LSP and DAP are source-present but unmounted.** `pi-agent` exposes `lsp` and `dap`; `lsp.enabled`/`debug.enabled` are parsed, but no `LspTool`/`DebugTool` registration exists in `crates/omp-cli`. Configuration is not a mounted tool.
-- **Eval is partial.** `eval` is late-mounted; the eval bridge strips `eval`/`task`/`hub`, rejects `checkpoint`/`rewind`, and `budget()` fails closed because there is no Goal Mode accounting. There is no Rust `GoalTool`.
-- **Task supports blocking and background execution.** With a background-ready supervisor, non-blocking agents spawn as detached jobs that return real job IDs and auto-deliver exactly once unless a settled `hub jobs`/`wait` snapshot consumes the result first; blocking agents run inline. Covered by `crates/pi-agent/tests/async_coordination.rs` and `crates/pi-agent/src/tools/task.rs` (`spawn_background_task`/`run_background_child`). `task` supports `outputSchema`, `schemaMode` and `effort`; it rejects `isolated` only. Eval `agent()` additionally rejects `apply` and `merge`. Worktree create/apply/cleanup is absent.
+- **LSP and DAP are mounted behind settings.** CLI runtime registers them under `lsp.enabled`/`debug.enabled` and tool selection, with session-scoped ownership. Source reachability is established; per-ID Android invocation/result/cancellation acceptance remains open.
+- **Eval is partial.** The bridge rejects `checkpoint`/`rewind`; the older claim that it strips `eval`/`task`/`hub` is obsolete. `budget()` still fails closed because Goal Mode accounting is absent; no Rust `GoalTool` is implemented.
+- **Task supports blocking and background execution.** With a background-ready supervisor, non-blocking agents spawn as detached jobs that return real job IDs and auto-deliver exactly once unless a settled `hub jobs`/`wait` snapshot consumes the result first; blocking agents run inline. Covered by `crates/pi-agent/tests/async_coordination.rs` and `crates/pi-agent/src/tools/task.rs` (`spawn_background_task`/`run_background_child`). `task` supports `outputSchema`, `schemaMode` and `effort`; at published `abe3d8c274` it rejected `isolated` only (`task.rs:1461-1472`), and the active isolation slice now modifying `task.rs` is unverified either way and is not counted. Eval `agent()` additionally rejects `apply` and `merge`. Worktree create/apply/cleanup is absent at that SHA.
 - **Hub ops are current.** Supported ops are `jobs`, `cancel`, `wait`, `send`, `inbox`, `list`, `start`, `ps`, `logs`, `stop`, `restart`, `describe`; park/revive lifecycle is absent, and process ops require the configured process backend.
 - **`think` is always on** at supervisor root and child. Upstream gates it on external thinking; this is a known divergence.
 - **Checkpoint/rewind are root-only and gated** by tools enabled, allowlist, a controller and `checkpoint.enabled`.
@@ -133,21 +133,21 @@ Worktree audit (2026-10-29): 9 isolated dirs were audited; the user removed 8 ol
 
 - `~/.omp/wt/td6ddbf803/m` — owner `EvalHostImplement`, retained accepted/integrated backup. HEAD `7c4d6d67cf`, 50 tracked files modified plus 16 untracked (`+8562/−1007` tracked), not the current branch. Do not merge from it, delete it, or treat it as source of truth; it preserves pre-integration eval work only.
 
-Current main HEAD is `216179883b`; only this docs handoff and its plan link are uncommitted. Verify before acting:
+Published HEAD is `abe3d8c274`; later commits are `088367d8b9` (unregistered `inspect_image` loader) and `260a314843` (FixOwnerClearRace owner-clear fix, regression unrun). The working tree also carries active slice edits (not counted) and these docs. Verify before acting:
 
 ```sh
 git -C /data/data/com.termux/files/home/omp-work status --short
 git -C /data/data/com.termux/files/home/omp-work rev-parse HEAD
 ```
 
-## Next FIX-only queue (priority order)
+## Historical FIX subset (source-done 2026-10-30; acceptance gates retained, not scope limit)
 
-1. Reject every known upstream verb that is missing or excluded **before prompt assembly**, with a specific reason (missing vs boundary), zero side effects, and no session/network/JS start. Includes `omp acp` and all excluded verbs.
-2. Remove the `models --no-extensions` silent drop: honor it or reject it explicitly; keep `refresh`/`-e` explicit rejections intact.
-3. Decide and enforce the LSP/DAP seam: register behind parsed settings or report the feature unavailable. Never leave source + config that looks supported but is unreachable.
-4. Give excluded tool paths a typed boundary error instead of generic not-found (`computer` and analogues).
+1. Reject every known upstream verb that is missing or excluded **before prompt assembly**, with a specific reason (missing vs boundary), zero side effects, and no session/network/JS start. Includes `omp acp` and all excluded verbs. **Source-done:** `main.rs:118-121` + `args.rs:409-497`, tests `:1231-1323`; Android smoke open.
+2. Remove the `models --no-extensions` silent drop: honor it or reject it explicitly; keep `refresh`/`-e` explicit rejections intact. **Source-done:** honored by construction in `local_models.rs:91-103`; CLI invocation and Android smoke open.
+3. Decide and enforce the LSP/DAP seam: register behind parsed settings or report the feature unavailable. Never leave source + config that looks supported but unreachable. **Source-done:** mounted behind `lsp.enabled`/`debug.enabled` (`runtime.rs:1995-2036,2103-2186`); per-ID acceptance open.
+4. Give excluded tool paths a typed boundary error instead of generic not-found (`computer` and analogues). **Source-done for the selection/diagnostic path** (`registry.rs:11-20,82-88`); model-request path and Android smoke open.
 
-Do not silently narrow this queue. After each fix: bounded local check, then push and wait for the exact-SHA Actions run before recording it in the plan.
+These remain acceptance gates. Do not treat them as the scope limit, and after any further fix: bounded local check, then push and wait for the exact-SHA Actions run before recording it in the plan.
 
 ## Verification lessons — root causes and guardrails
 
@@ -168,12 +168,12 @@ Local guards: `CARGO_BUILD_JOBS=1 nice -n 10`, `-j1 -- --test-threads=1`, timeou
 All still open:
 
 - Bionic API24 ELF; two real model/tool turns; resume and fork.
-- MCP stdio and HTTP; RPC and ACP; task/hub delegation; SSH.
+- MCP stdio and HTTP; RPC native auth wiring and its consumer contract; ACP; task/hub delegation; SSH.
 - External Chromium screenshot/run only if validated; zero JS PID before `eval.js`/`browser.run`, one managed PID during, cleanup on cancel/EOF.
 - Cancellation cleanup; per-ID disposition for every CLI/tool/flag/MCP/provider row.
 - Equal-history 8-turn and 30-turn CPU/PSS/startup comparison against the installed CLI; no performance claim without measurements.
 
-Known blockers/limits: RPC/ACP protocols are absent (`--mode rpc|acp|rpc-ui` parse-reject; `omp acp` still becomes a prompt); LSP/DAP unmounted; Goal Mode absent; browser blocked by the installed Chromium Bionic linker error; external interpreters and services are environment prerequisites; remote SSH verification was historically unreachable and must not be assumed. The 14 deferred wire dialects are `openai-completions`, `openai-responses`, `openrouter`, `openai-codex-responses`, `azure-openai-responses`, `anthropic-messages`, `bedrock-converse-stream`, `google-generative-ai`, `google-gemini-cli`, `google-vertex`, `ollama-chat`, `cursor-agent`, `gitlab-duo-agent`, `devin-agent`.
+Known blockers/limits: ACP is absent (`--mode acp|rpc-ui` parse-reject), while `--mode rpc` exists and passed a loopback smoke with native auth wiring and the metaharness consumer contract still open; known missing and excluded verbs are refused before boot, so `omp acp` no longer becomes a prompt. LSP/DAP are mounted behind `lsp.enabled`/`debug.enabled`, with per-ID acceptance open. Goal Mode and `GoalTool` are absent. Browser is blocked by the installed Chromium Bionic linker error; external interpreters and services are environment prerequisites; remote SSH verification was historically unreachable and must not be assumed. `inspect_image` is deferred by explicit user decision with no image/resvg/WebP dependency approved; its merged loader is unregistered and not counted. The 14 deferred wire dialects are `openai-completions`, `openai-responses`, `openrouter`, `openai-codex-responses`, `azure-openai-responses`, `anthropic-messages`, `bedrock-converse-stream`, `google-generative-ai`, `google-gemini-cli`, `google-vertex`, `ollama-chat`, `cursor-agent`, `gitlab-duo-agent`, `devin-agent`.
 
 ## Evidence hygiene
 
@@ -182,7 +182,7 @@ Known blockers/limits: RPC/ACP protocols are absent (`--mode rpc|acp|rpc-ui` par
 - Apply-patch corpus: `packages/coding-agent/test/fixtures/apply-patch/scenarios/` has 21 end-to-end cases. Each case is a directory with `input/` (initial tree; absent for add-only cases), `patch.txt`, and `expected/` (final tree compared recursively, including directory entries and file text). The contract is documented in `scenarios/README.md`.
 - Direct offline oracle: `bun test packages/coding-agent/test/core/apply-patch.test.ts` exercises those cases at `:212+` by copying `input/`, applying `patch.txt` with the TypeScript `applyLegacyPatch`, and comparing the full tree snapshot to `expected/`. No provider or network is involved. This oracle has not been executed in this docs pass.
 - TS fixture ≠ Rust coverage: no current harness runs this corpus against Rust. Rust `apply_patch` coverage lives in `crates/pi-agent/tests/file_mutation_safety.rs` and `display_wiring.rs`; a passing TypeScript corpus does not establish corpus-wide Rust parity.
-- Metaharness is blocked on RPC: its native Terminal-Bench runner expects `omp --mode rpc` (`packages/metaharness/README.md`), while Rust has no RPC mode. Use direct CLI/PTY fixtures until RPC lands; do not present metaharness as a Rust runner.
+- Metaharness expects `omp --mode rpc` (`packages/metaharness/README.md`); Rust now has that mode (`output.rs:14-24`, `rpc_protocol` tests) but the runner has never been exercised against it. Until that consumer contract is verified, use direct CLI/PTY fixtures and do not present metaharness as a Rust runner.
 - `android/scripts/bench.sh` measures the installed Bun CLI (`$LIB_DIR/bun` + `cli.js`), not Rust; it is not valid Rust performance evidence. `scripts/ask-pty-smoke.py` is the device PTY/cancellation/delegation gate. Test fixtures live under `crates/omp-cli/tests/fixtures` and `crates/pi-agent/tests/fixtures`.
 - Historical plan blocks and local proof files stay attached to the SHA/artifact they measured. They do not verify newer commits.
 - This repository has no `specs/` lifecycle tree. Do not scaffold one as a second status system; the plan and this handoff are the durable project state.
@@ -234,4 +234,30 @@ Pending main-tree changes committed as `077bac1709` (`feat(auth): connect RPC cr
 
 
 
+
+Priority update from user: authorization work has lower priority. Preserve the existing uncommitted child-credential slice in `runtime.rs`, but defer further auth/discovery changes. First restore CI, then continue core tools, delegation, sessions, CLI modes/flags and live events in the plan's order.
+
+Published HEAD `abe3d8c274` was confirmed against the remote. Its Actions run `40944110426` passed Android build and native grep, but host tests failed: `output::tests::json_mode_tool_batch_printable_envelope`, `output.rs:647`, expected a string where actual output carried a structured text-content object. Failure is established; investigate the TS consumer contract before changing output or assertions. No full CI pass claimed.
+
+Physical-copy audit completed: neither retained snapshot needs integration; details in `docs/worktree-audit-2026-10-30.md:69`. Neither copy nor build cache has been removed. Cleanup discussion did not authorize deletion.
+
+JSON output root cause resolved: tests still expected pre-parity string results, while TS emits complete `AgentToolResult` objects. Production output stayed unchanged; assertions now cover text/image/details and the live SSE reader uses the structured text content. Local unit test passed 1/1; live SSE integration passed 2/2, including interruption/resume. Actual JSON CLI smoke completed a localhost-provider `read` turn, preserved structured content in `tool_execution_end`, continued the provider turn and exited 0.
+
+Local integration linking initially hit the known Android LLVM tagged-pointer abort. Re-linking only the test target with `cargo rustc --locked --offline -j1 -p omp-cli --test live_sse_integration -- -C link-arg=-Wl,--threads=1` succeeded; the resulting test binary exited 0. This is not an exact-SHA full CI pass.
+
+Next core slice selected from actual source: `task isolated:true` still rejected at published `abe3d8c274` (`task.rs:1461-1472`). Existing `pi-iso` PAL and TS baseline/capture/merge/owner lifecycle are the implementation basis. Required: preserve parent dirty baseline, execute in sandbox, capture child-only changes, retain recoverable output on conflicts, and clean owned resources on cancellation. Authorization work stays lower priority. The active `TaskIsolationSlice` now modifies `crates/pi-agent/src/tools/task.rs` in the working tree; it is unverified, and this handoff counts neither the old rejection nor any new isolation behavior.
+
+Image inspection decision (2026-10-30): the user deferred `inspect_image`. No image decoder, resvg or WebP dependency is approved. The merged partial loader (`088367d8b9`) stays unregistered and must never be counted as implemented or accepted; the plan's tool row and §6 record the deferral. Read-side image bounds and header sniff remain source facts only.
+
+Docs provenance for this reconciliation: presence claims reflect the published code basis `abe3d8c274` plus later commits `088367d8b9` (loader unregistered) and `260a314843` (FixOwnerClearRace, regression unrun); neither changes presence counts. Behavior stays unknown unless a recorded run exists, and no runtime verification was performed by the docs writers.
+
+
+Isolation acceptance remains blocked. Initial `cargo check --locked --offline -j1 -p pi-agent -p omp-cli` failed on an unavailable xxh3 feature; writer switched to the enabled xxh64 API. The next check passed `pi-agent` checking but exited 101 on nine CLI config type errors (heterogeneous merge tuple array and nested `Option<bool>`). Writer owns the fixes; no new successful compile claimed.
+
+Independent review identified and drove corrections for baseline-object reachability, uncaptured-result retention, merge-lock lifetime and terminal ordering. Still under correction: branch capture of a commit followed by an uncommitted revert, cancellation before queued merge mutation, and private metadata for initialized submodules. No task-isolation runtime acceptance yet. Legacy session import now preserves validated ordered user parts and canonical stop reasons; independent source review accepted it, but its regression and CLI smoke are not yet run.
+
+
+Latest verification supersedes the preceding blocked status: `cargo check --locked --offline -j1 -p pi-agent -p omp-cli` exited 0. Isolation regressions passed 11/11 (9.65 s): dirty baseline/binary deltas, committed-plus-uncommitted and net-zero branch cases, cleanup/cancellation, merge conflict/lock lifetime, private nested and submodule metadata. Parent-cancellation forwarding regression passed 1/1. CLI config regressions passed 2/2; late-owner clear refusal passed 1/1; legacy import/reopen/fork preservation passed 1/1. Independent targeted safety/contract rechecks found no remaining reviewed must-fix; these are scoped results, not full parity or CI.
+
+Actual freshly linked Android CLI smoke passed against an isolated localhost model fixture: root calls `task isolated:true`, child writes inside the rcopy sandbox, patch merges into the parent, sandbox is cleaned, CLI exits 0 (four provider requests). No installed CLI was replaced. Android LLVM tagged-pointer abort interrupted one test relink; single-thread linker commands succeeded and the resulting binaries were exercised directly. Current source still needs exact-SHA CI; full local suites were not run.
 

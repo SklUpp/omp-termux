@@ -587,14 +587,15 @@ mod tests {
 					args: serde_json::json!({"path": "a.txt"}),
 				})
 				.unwrap();
+			let image = pi_agent::ContentPart::image("aW1hZ2U=", "image/png").unwrap();
 			reporter
 				.event(&Event::ToolEnd {
 					id: "call_1".to_string(),
 					tool: "read".to_string(),
 					result: "file data".to_string(),
 					error: None,
-					images: Vec::new(),
-					details: None,
+					images: vec![image],
+					details: Some(serde_json::json!({"lines": 1})),
 				})
 				.unwrap();
 			reporter
@@ -644,7 +645,15 @@ mod tests {
 		assert_eq!(ts["toolName"], "read");
 		let te: serde_json::Value = serde_json::from_str(lines[5]).unwrap();
 		assert_eq!(te["type"], "tool_execution_end");
-		assert_eq!(te["result"], "file data");
+		assert_eq!(te["toolCallId"], "call_1");
+		// TS parity: `result` is the `AgentToolResult` object, not a bare string
+		// (`packages/agent/src/types.ts:678`, emitted verbatim by `printableEvent`).
+		assert_eq!(te["result"]["content"][0]["type"], "text");
+		assert_eq!(te["result"]["content"][0]["text"], "file data");
+		assert_eq!(te["result"]["content"][1]["type"], "image");
+		assert_eq!(te["result"]["content"][1]["data"], "aW1hZ2U=");
+		assert_eq!(te["result"]["content"][1]["mimeType"], "image/png");
+		assert_eq!(te["result"]["details"]["lines"], 1);
 		assert_eq!(te["isError"], false);
 		let tne: serde_json::Value = serde_json::from_str(lines[6]).unwrap();
 		assert_eq!(tne["type"], "turn_end");

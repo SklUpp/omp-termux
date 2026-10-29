@@ -1,5 +1,6 @@
 use std::{
 	collections::{BTreeSet, HashMap},
+	future::Future,
 	sync::Arc,
 	time::Instant,
 };
@@ -17,6 +18,10 @@ use super::{
 	task_catalog::{
 		AgentCatalog, AgentDefinition, AgentSource, ChildModel, ChildModelFactory, SchemaMode,
 		Spawns, array_valued_labels, normalize_schema, thinking_to_effort, validate_output,
+	},
+	task_isolation::{
+		self, IsolationArtifacts, IsolationFinalize, IsolationMergeMode, IsolationReport,
+		IsolationRequest, TaskIsolationSettings,
 	},
 };
 use crate::{
@@ -56,6 +61,8 @@ struct ChildContext {
 	parent_tools: Option<BTreeSet<String>>,
 	catalog: Option<Arc<AgentCatalog>>,
 	model_factory: Option<Arc<dyn ChildModelFactory>>,
+	/// `task.isolation.*` + resolved worktree base captured at spawn.
+	isolation: TaskIsolationSettings,
 }
 
 impl ChildContext {
@@ -247,6 +254,7 @@ impl TaskTool {
 			parent_tools: self.parent_tools.clone(),
 			catalog,
 			model_factory,
+			isolation: self.supervisor.task_isolation(),
 		}
 	}
 
@@ -299,7 +307,14 @@ impl TaskTool {
 		context: Option<String>,
 		defaults: &ItemDefaults,
 	) -> Result<TaskItemSpec, ToolError> {
-		check_unsupported_fields(obj)?;
+		let isolation = if obj.contains_key("isolated") {
+			IsolationRequest {
+				isolated: parse_isolated(obj.get("isolated"))?,
+				..defaults.isolation
+			}
+		} else {
+			defaults.isolation
+		};
 		let requested_agent = match obj.get("agent") {
 			None | Some(Value::Null) => None,
 			Some(Value::String(name)) => Some(name.as_str()),
@@ -366,6 +381,7 @@ impl TaskTool {
 			schema_mode,
 			schema_error,
 			effort,
+			isolation,
 		})
 	}
 
@@ -376,6 +392,7 @@ impl TaskTool {
 		ctx: &AgentContext,
 		child_ctx: &ChildContext,
 		parent_call_id: Option<&str>,
+		invocation_task: bool,
 	) -> SingleResult {
 		let start = Instant::now();
 		let child_name = item.name.clone();
@@ -415,6 +432,9 @@ impl TaskTool {
 				structured_output: None,
 				resolved_model: None,
 				model_role: None,
+				isolation: None,
+				isolation_artifacts: IsolationArtifacts::default(),
+				merge_summary: None,
 			};
 		};
 		let mut reservation = ReservationGuard::new(
@@ -454,6 +474,9 @@ impl TaskTool {
 				structured_output: None,
 				resolved_model: None,
 				model_role: None,
+				isolation: None,
+				isolation_artifacts: IsolationArtifacts::default(),
+				merge_summary: None,
 				};
 			}
 		};
@@ -483,6 +506,9 @@ impl TaskTool {
 				structured_output: None,
 				resolved_model: None,
 				model_role: None,
+				isolation: None,
+				isolation_artifacts: IsolationArtifacts::default(),
+				merge_summary: None,
 			};
 		}
 
@@ -517,6 +543,7 @@ impl TaskTool {
 			|| self.supervisor.provider(),
 			|model| model.provider,
 		);
+		let isolation_commit_provider = child_provider.clone();
 		let (mut child_registry, _effective_tools) =
 			match child_ctx.prepare_registry(&child_id, &item.agent, resolved_model.as_deref()) {
 				Ok(prepared) => prepared,
@@ -555,11 +582,83 @@ impl TaskTool {
 				None
 			}
 		});
+		let isolation = match task_isolation::resolve_policy(
+			&child_ctx.isolation,
+			&item.isolation,
+			invocation_task,
+		) {
+			Ok(None) => None,
+			Err(message) => {
+				reservation.disarm();
+				self.supervisor.mark_failed(
+					&child_id,
+					start.elapsed().as_millis() as u64,
+					&message,
+				);
+				self.supervisor.unregister_active_child(&child_id);
+				self.supervisor.release_outstanding(&child_id);
+				return single_failure(
+					index,
+					child_id,
+					child_name,
+					agent_name,
+					agent_source,
+					item.task,
+					message,
+					start.elapsed().as_millis() as u64,
+					None,
+					None,
+				);
+			},
+			Ok(Some(policy)) => {
+				let prepared = async {
+					let baseline = task_isolation::prepare_context(ctx.cwd.clone()).await?;
+					let sandbox = task_isolation::ensure(
+						baseline.root.repo_root.clone(),
+						child_id.clone(),
+						policy,
+						child_ctx.isolation.worktree_base.clone(),
+					)
+					.await?;
+					task_isolation::prepare_sandbox(&sandbox, &baseline).await?;
+					Ok::<_, String>((sandbox, baseline))
+				}
+				.await;
+				match prepared {
+					Ok((sandbox, baseline)) => Some((sandbox, baseline, policy)),
+					Err(message) => {
+						reservation.disarm();
+						self.supervisor.mark_failed(
+							&child_id,
+							start.elapsed().as_millis() as u64,
+							&message,
+						);
+						self.supervisor.unregister_active_child(&child_id);
+						self.supervisor.release_outstanding(&child_id);
+						return single_failure(
+							index,
+							child_id,
+							child_name,
+							agent_name,
+							agent_source,
+							item.task,
+							message,
+							start.elapsed().as_millis() as u64,
+							None,
+							None,
+						);
+					},
+				}
+			},
+		};
+		let child_cwd = isolation
+			.as_ref()
+			.map_or_else(|| ctx.cwd.clone(), |(sandbox, _, _)| sandbox.merged_dir().to_path_buf());
 		let child_config = AgentConfig {
 			max_turns: 20,
 			context_limit: 100_000,
 			system_prompt: child_system_prompt(&item.agent, prompt_schema.as_ref()),
-			cwd: ctx.cwd.clone(),
+			cwd: child_cwd,
 		};
 
 		let child_approver = self.supervisor.child_approver();
@@ -634,6 +733,9 @@ impl TaskTool {
 				structured_output: None,
 				resolved_model: None,
 				model_role: None,
+				isolation: None,
+				isolation_artifacts: IsolationArtifacts::default(),
+				merge_summary: None,
 			};
 		}
 
@@ -674,13 +776,12 @@ impl TaskTool {
 		};
 
 		let _ = events.await;
-		guard.defuse();
-		self.supervisor.unregister_active_child(&child_id);
 
 		let duration_ms = start.elapsed().as_millis() as u64;
 		let outstanding_id = child_id.clone();
 
-		let result = match outcome {
+		let mut terminal_mark = None;
+		let mut result = match outcome {
 			Ok(turn_results) => {
 				let messages: Vec<&Message> =
 					turn_results.iter().map(|turn| &turn.message).collect();
@@ -736,14 +837,13 @@ impl TaskTool {
 				let exit_code = if is_aborted { 1 } else { finalized.exit_code };
 
 				if is_aborted {
-					self.supervisor.mark_aborted(
-						&child_id,
-						abort_reason.as_deref().unwrap_or("aborted by yield"),
-					);
+					terminal_mark = Some(TerminalMark::Aborted(
+						abort_reason
+							.clone()
+							.unwrap_or_else(|| "aborted by yield".to_string()),
+					));
 				} else if finalized.failed {
-					self
-						.supervisor
-						.mark_failed(&child_id, duration_ms, finalized.stderr.trim());
+					terminal_mark = Some(TerminalMark::Failed(finalized.stderr.trim().to_string()));
 				} else {
 					// A child that yields carries its real result in the yielded
 					// data, not in assistant text. Surface that in hub snapshots.
@@ -761,9 +861,7 @@ impl TaskTool {
 								.map(Value::to_string)
 						})
 						.unwrap_or_else(|| output.clone());
-					self
-						.supervisor
-						.mark_completed(&child_id, duration_ms, &record_output);
+					terminal_mark = Some(TerminalMark::Completed(record_output));
 				}
 
 				SingleResult {
@@ -787,10 +885,13 @@ impl TaskTool {
 					structured_output: finalized.structured,
 					resolved_model,
 					model_role,
+				isolation: None,
+				isolation_artifacts: IsolationArtifacts::default(),
+				merge_summary: None,
 				}
 			},
 			Err(AgentError::Interrupted) => {
-				self.supervisor.mark_aborted(&child_id, "aborted by parent");
+				terminal_mark = Some(TerminalMark::Aborted("aborted by parent".to_string()));
 				SingleResult {
 					index,
 					id: child_id,
@@ -812,11 +913,14 @@ impl TaskTool {
 				structured_output: None,
 				resolved_model: None,
 				model_role: None,
+				isolation: None,
+				isolation_artifacts: IsolationArtifacts::default(),
+				merge_summary: None,
 				}
 			},
 			Err(err) => {
 				let err_msg = err.to_string();
-				self.supervisor.mark_failed(&child_id, duration_ms, &err_msg);
+				terminal_mark = Some(TerminalMark::Failed(err_msg.clone()));
 				SingleResult {
 					index,
 					id: child_id,
@@ -838,9 +942,74 @@ impl TaskTool {
 				structured_output: None,
 				resolved_model: None,
 				model_role: None,
+				isolation: None,
+				isolation_artifacts: IsolationArtifacts::default(),
+				merge_summary: None,
 				}
 			},
 		};
+		if let Some((sandbox, baseline, policy)) = isolation {
+			let artifacts_dir = self
+				.supervisor
+				.child_session_file(&outstanding_id)
+				.and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+				.unwrap_or_else(|| std::env::temp_dir().join("omp-task-artifacts"));
+			let succeeded = result.exit_code == 0
+				&& result.aborted != Some(true)
+				&& result.error.is_none();
+			let finalized = await_finalize_with_parent_cancel(
+				task_isolation::finalize(
+					&sandbox,
+					&baseline,
+					policy,
+					&outstanding_id,
+					artifacts_dir,
+					succeeded,
+					&child_cancel,
+					Some(isolation_commit_provider),
+				),
+				&ctx.cancellation_token,
+				&child_cancel,
+			)
+			.await;
+			if finalized.cancelled {
+				terminal_mark = Some(TerminalMark::Aborted(
+					"cancelled during isolation finalize".to_string(),
+				));
+				result.aborted = Some(true);
+				result.abort_reason = Some("cancelled during isolation finalize".to_string());
+				result.exit_code = 1;
+			}
+			if invocation_task && !finalized.summary.is_empty() {
+				result.merge_summary = Some(finalized.summary.clone());
+			}
+			result.isolation = finalized.report;
+			if let Some(report) = &result.isolation {
+				result.isolation_artifacts.patch_path = report.patch_path.clone();
+				result.isolation_artifacts.branch_name = report.branch_name.clone();
+				result.isolation_artifacts.branch_base_sha = report.base_sha.clone();
+				result.isolation_artifacts.nested_patches = report.nested_patches.clone();
+			}
+		}
+		if let Some(mark) = terminal_mark {
+			match mark {
+				TerminalMark::Completed(output) => {
+					self
+						.supervisor
+						.mark_completed(&outstanding_id, duration_ms, &output);
+				},
+				TerminalMark::Failed(message) => {
+					self
+						.supervisor
+						.mark_failed(&outstanding_id, duration_ms, &message);
+				},
+				TerminalMark::Aborted(reason) => {
+					self.supervisor.mark_aborted(&outstanding_id, &reason);
+				},
+			}
+		}
+		self.supervisor.unregister_active_child(&outstanding_id);
+		guard.defuse();
 		self.supervisor.release_outstanding(&outstanding_id);
 		self.supervisor.dispose_eval_owner(&outstanding_id).await;
 		result
@@ -959,10 +1128,10 @@ impl TaskTool {
 	/// depth / admission / `ChildGuard` path as the model-facing `task` tool.
 	///
 	/// Input is the bridge shape (`prompt`, `agent`, `label`, `schema`,
-	/// `schemaMode`, `isolated`/`apply`/`merge`, `handle`). Worktree isolation
-	/// and apply/merge are not implemented, so requesting them fails instead of
-	/// being silently ignored. Returns the prelude value shape
-	/// (`{"text", "data"?, "details": {"id", "agent"}}`).
+	/// `schemaMode`, `isolated`/`apply`/`merge`, `handle`). Isolation honors
+	/// `task.isolation.*`; `apply=false` retains the patch/branch artifact and
+	/// `merge=false` forces patch mode, matching the TS bridge. Returns the
+	/// prelude value shape (`{"text", "data"?, "details": {"id", "agent"}}`).
 	pub async fn run_eval_agent(&self, args: &Value, ctx: &AgentContext) -> Result<Value, String> {
 		let limits = self.supervisor.limits();
 		let max_depth = self
@@ -995,19 +1164,20 @@ impl TaskTool {
 			.and_then(Value::as_str)
 			.filter(|prompt| !prompt.trim().is_empty())
 			.ok_or_else(|| "agent() requires a non-empty `prompt`".to_string())?;
-		for (flag, effect) in [
-			("isolated", "there is no worktree create/apply/cleanup implementation"),
-			("apply", "worktree apply is not implemented"),
-			("merge", "worktree merge is not implemented"),
-		] {
+		let parse_flag = |flag: &str| -> Result<Option<bool>, String> {
 			match obj.get(flag) {
-				None | Some(Value::Null) | Some(Value::Bool(false)) => {},
-				Some(Value::Bool(true)) => {
-					return Err(format!("agent() `{flag}` is not supported: {effect}"));
-				},
-				Some(_) => return Err(format!("agent() `{flag}` must be a boolean")),
+				None | Some(Value::Null) => Ok(None),
+				Some(Value::Bool(value)) => Ok(Some(*value)),
+				Some(_) => Err(format!("agent() `{flag}` must be a boolean")),
 			}
-		}
+		};
+		let isolated = parse_flag("isolated")?;
+		let apply = parse_flag("apply")?;
+		let merge = if parse_flag("merge")? == Some(false) {
+			Some(IsolationMergeMode::Patch)
+		} else {
+			None
+		};
 
 		let mut item_obj = serde_json::Map::new();
 		item_obj.insert("task".to_string(), Value::String(prompt.to_string()));
@@ -1025,14 +1195,22 @@ impl TaskTool {
 			output_schema: None,
 			schema_mode: SchemaMode::default(),
 			effort: None,
+			isolation: IsolationRequest::default(),
 		};
 		let child_ctx = self.child_context();
-		let item = self
+		let mut item = self
 			.build_item(&item_obj, None, &defaults)
 			.map_err(|error| error.to_string())?;
+		item.isolation = IsolationRequest {
+			isolated,
+			apply,
+			merge,
+		};
 		let expects_schema = item.output_schema.is_some()
 			|| (item.agent.output.is_some() && item.schema_error.is_none());
-		let single = self.run_single_task(0, item, ctx, &child_ctx, None).await;
+		let single = self
+			.run_single_task(0, item, ctx, &child_ctx, None, false)
+			.await;
 		if single.aborted == Some(true) {
 			return Err(single
 				.abort_reason
@@ -1047,6 +1225,30 @@ impl TaskTool {
 			} else {
 				single.stderr
 			});
+		}
+		let isolation = single.isolation.clone();
+		if let Some(report) = &isolation {
+			let summary = report.summary.clone().unwrap_or_default();
+			if report.changes_applied == Some(false) {
+				return Err(format!(
+					"agent() isolated apply failed for {}: {}",
+					single.id,
+					summary
+						.replace("<system-notification>", "")
+						.replace("</system-notification>", "")
+						.trim()
+				));
+			}
+			if single.structured_output.is_some() && summary.contains("<system-notification>") {
+				return Err(format!(
+					"agent() isolated nested patch apply failed for {}: {}",
+					single.id,
+					summary
+						.replace("<system-notification>", "")
+						.replace("</system-notification>", "")
+						.trim()
+				));
+			}
 		}
 		let structured_data = single
 			.structured_output
@@ -1074,17 +1276,68 @@ impl TaskTool {
 		}
 		let text = match &data {
 			Some(data) => serde_json::to_string(data).unwrap_or_else(|_| single.output.clone()),
-			None => single.output,
+			None => {
+				let mut text = single.output;
+				if let Some(summary) = isolation.as_ref().and_then(|report| report.summary.as_deref())
+				{
+					text.push_str("\n\n");
+					text.push_str(summary);
+				}
+				text
+			},
 		};
 		let mut result = json!({
 			"text": text,
 			"details": { "id": single.id, "agent": single.agent },
 		});
+		if let Some(report) = &isolation {
+			let details = result["details"].as_object_mut().expect("details object");
+			details.insert("isolated".to_string(), Value::Bool(true));
+			if let Some(path) = &report.patch_path {
+				details.insert("patchPath".to_string(), Value::String(path.clone()));
+			}
+			if let Some(branch) = &report.branch_name {
+				details.insert("branchName".to_string(), Value::String(branch.clone()));
+			}
+			if let Some(base) = &report.base_sha {
+				details.insert("branchBaseSha".to_string(), Value::String(base.clone()));
+			}
+			if !report.nested_patches.is_empty() {
+				details.insert(
+					"nestedPatches".to_string(),
+					serde_json::to_value(&report.nested_patches).unwrap_or(Value::Null),
+				);
+			}
+			details.insert(
+				"changesApplied".to_string(),
+				report.changes_applied.map_or(Value::Null, Value::Bool),
+			);
+			if let Some(summary) = &report.summary {
+				details.insert(
+					"isolationSummary".to_string(),
+					Value::String(summary.clone()),
+				);
+			}
+		}
 		if let Some(data) = data {
 			result["data"] = data;
 		}
 		Ok(result)
 	}
+}
+
+/// Owned outcome of a detached child, including the isolation report that must
+/// be attached before the record settles.
+struct BackgroundOutcome {
+	turns: Vec<TurnResult>,
+	isolation: Option<IsolationFinalize>,
+	cancelled: bool,
+}
+
+enum TerminalMark {
+	Completed(String),
+	Failed(String),
+	Aborted(String),
 }
 
 /// Build a child loop with fresh read/edit state, its own result sink, and its
@@ -1098,7 +1351,7 @@ async fn run_background_child(
 	steering_rx: tokio::sync::mpsc::Receiver<SteeringEvent>,
 	cancel: CancellationToken,
 	child_ctx: ChildContext,
-) -> Result<Vec<TurnResult>, AgentError> {
+) -> Result<BackgroundOutcome, AgentError> {
 	let child_model = child_ctx
 		.resolve_model(&item.agent, item.effort.as_deref())
 		.map_err(AgentError::Internal)?;
@@ -1107,6 +1360,7 @@ async fn run_background_child(
 		|| supervisor.provider(),
 		|model| model.provider,
 	);
+	let isolation_commit_provider = child_provider.clone();
 	let (mut child_registry, _effective_tools) = child_ctx
 		.prepare_registry(&child_id, &item.agent, child_active_model.as_deref())
 		.map_err(AgentError::Internal)?;
@@ -1122,11 +1376,36 @@ async fn run_background_child(
 			None
 		}
 	});
+	let isolation = match task_isolation::resolve_policy(&child_ctx.isolation, &item.isolation, true)
+	{
+		Ok(None) => None,
+		Ok(Some(policy)) => {
+			let baseline = task_isolation::prepare_context(cwd.clone())
+				.await
+				.map_err(AgentError::Internal)?;
+			let sandbox = task_isolation::ensure(
+				baseline.root.repo_root.clone(),
+				child_id.clone(),
+				policy,
+				child_ctx.isolation.worktree_base.clone(),
+			)
+			.await
+			.map_err(AgentError::Internal)?;
+			task_isolation::prepare_sandbox(&sandbox, &baseline)
+				.await
+				.map_err(AgentError::Internal)?;
+			Some((sandbox, baseline, policy))
+		},
+		Err(message) => return Err(AgentError::Internal(message)),
+	};
+	let child_cwd = isolation
+		.as_ref()
+		.map_or(cwd, |(sandbox, _, _)| sandbox.merged_dir().to_path_buf());
 	let child_config = AgentConfig {
 		max_turns: 20,
 		context_limit: 100_000,
 		system_prompt: child_system_prompt(&item.agent, prompt_schema.as_ref()),
-		cwd,
+		cwd: child_cwd,
 	};
 	let child_approver = supervisor.child_approver();
 	let assignment = if let Some(context) = &item.context {
@@ -1148,6 +1427,7 @@ async fn run_background_child(
 	let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
 	let events = forward_child_events(Arc::clone(&supervisor), child_id.clone(), event_rx);
 	let mut child_state = AgentState::default();
+	let cancel_for_finalize = cancel.clone();
 	let outcome = child_loop
 		.run_dialog_message_with_cancel(
 			Message::user(full_prompt),
@@ -1160,7 +1440,37 @@ async fn run_background_child(
 	// Drain the forwarder before the caller settles the record, so no event is
 	// emitted after the terminal lifecycle frame.
 	let _ = events.await;
-	outcome
+	let turns = outcome?;
+	let (base, aborted, _) = summarize_turns(&turns);
+	let succeeded = !aborted && !finalize_output(&item, &turns, &base, false).failed;
+	let isolation = match isolation {
+		Some((sandbox, baseline, policy)) => {
+			let artifacts_dir = supervisor
+				.child_session_file(&child_id)
+				.and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+				.unwrap_or_else(|| std::env::temp_dir().join("omp-task-artifacts"));
+			Some(
+				task_isolation::finalize(
+					&sandbox,
+					&baseline,
+					policy,
+					&child_id,
+					artifacts_dir,
+					succeeded,
+					&cancel_for_finalize,
+					Some(isolation_commit_provider),
+				)
+				.await,
+			)
+		},
+		None => None,
+	};
+	let cancelled = cancel_for_finalize.is_cancelled();
+	Ok(BackgroundOutcome {
+		turns,
+		isolation,
+		cancelled,
+	})
 }
 
 /// Forward real child agent events to the supervisor's observer bus. Stops when
@@ -1214,15 +1524,23 @@ fn settle_background_result(
 	supervisor: Arc<Supervisor>,
 	id: String,
 	start: Instant,
-	outcome: Result<Vec<TurnResult>, AgentError>,
+	outcome: Result<BackgroundOutcome, AgentError>,
 	item: TaskItemSpec,
 ) {
 	let duration_ms = start.elapsed().as_millis() as u64;
 	let agent = item.agent.name.clone();
 	match outcome {
-		Ok(turns) => {
+		Ok(BackgroundOutcome {
+			turns,
+			isolation,
+			cancelled,
+		}) => {
 			let messages: Vec<&Message> = turns.iter().map(|turn| &turn.message).collect();
 			supervisor.append_child_transcript(&id, &messages);
+			if cancelled {
+				supervisor.mark_aborted(&id, "cancelled during isolation finalize");
+				return;
+			}
 			let (base, aborted, reason) = summarize_turns(&turns);
 			if aborted {
 				supervisor.mark_aborted(
@@ -1240,6 +1558,7 @@ fn settle_background_result(
 					"failed (schema_violation)",
 					duration_ms,
 					&output,
+					None,
 				);
 				supervisor.mark_failed(&id, duration_ms, &envelope);
 				supervisor.enqueue_delivery(&id, envelope);
@@ -1250,7 +1569,18 @@ fn settle_background_result(
 			} else {
 				format!("{}{output}", finalized.stderr)
 			};
-			let envelope = task_result_envelope(&id, &agent, "completed", duration_ms, &output);
+			let merge_summary = isolation
+				.as_ref()
+				.filter(|finalize| !finalize.summary.is_empty())
+				.map(|finalize| finalize.summary.clone());
+			let envelope = task_result_envelope(
+				&id,
+				&agent,
+				"completed",
+				duration_ms,
+				&output,
+				merge_summary.as_deref(),
+			);
 			supervisor.mark_completed(&id, duration_ms, &envelope);
 			supervisor.enqueue_delivery(&id, envelope);
 		},
@@ -1259,11 +1589,45 @@ fn settle_background_result(
 		},
 		Err(error) => {
 			let message = error.to_string();
-			let envelope =
-				task_result_envelope(&id, &agent, "failed (exit 1)", duration_ms, &message);
+			let envelope = task_result_envelope(
+				&id,
+				&agent,
+				"failed (exit 1)",
+				duration_ms,
+				&message,
+				None,
+			);
 			supervisor.mark_failed(&id, duration_ms, &envelope);
 			supervisor.enqueue_delivery(&id, envelope);
 		},
+	}
+}
+
+/// Await isolation finalize while forwarding parent cancellation to the child
+/// token. The parent token is checked before the future is polled so a parent
+/// cancel can never race a ready merge. Once cancelled, the same pinned future
+/// keeps running to capture/cleanup completion instead of being dropped.
+async fn await_finalize_with_parent_cancel<F>(
+	future: F,
+	parent: &CancellationToken,
+	child: &CancellationToken,
+) -> F::Output
+where
+	F: Future,
+{
+	if parent.is_cancelled() {
+		child.cancel();
+	}
+	tokio::pin!(future);
+	let cancel = async {
+		parent.cancelled().await;
+		child.cancel();
+	};
+	tokio::pin!(cancel);
+	tokio::select! {
+		biased;
+		_ = &mut cancel => future.await,
+		output = &mut future => output,
 	}
 }
 
@@ -1276,11 +1640,17 @@ fn task_result_envelope(
 	status: &str,
 	duration_ms: u64,
 	output: &str,
+	merge_summary: Option<&str>,
 ) -> String {
-	format!(
-		"<task-result id=\"{id}\" agent=\"{agent}\" status=\"{status}\" duration=\"{}\">\n<output>\n{output}\n</output>\n</task-result>",
+	let mut envelope = format!(
+		"<task-result id=\"{id}\" agent=\"{agent}\" status=\"{status}\" duration=\"{}\">\n<output>\n{output}\n</output>",
 		format_duration_ms(duration_ms)
-	)
+	);
+	if let Some(summary) = merge_summary.filter(|summary| !summary.is_empty()) {
+		envelope.push_str(&format!("\n<merge-summary>\n{summary}\n</merge-summary>"));
+	}
+	envelope.push_str("\n</task-result>");
+	envelope
 }
 
 fn format_duration_ms(milliseconds: u64) -> String {
@@ -1417,6 +1787,7 @@ struct ItemDefaults {
 	output_schema: Option<Value>,
 	schema_mode: SchemaMode,
 	effort: Option<String>,
+	isolation: IsolationRequest,
 }
 
 fn parse_schema(value: Option<&Value>) -> Result<Option<Value>, ToolError> {
@@ -1458,14 +1829,10 @@ fn parse_effort(value: Option<&Value>) -> Result<Option<String>, ToolError> {
 		.map_err(|error| ToolError::InvalidArguments(format!("Invalid 'effort': {error}")))
 }
 
-fn check_unsupported_fields(obj: &serde_json::Map<String, Value>) -> Result<(), ToolError> {
-	match obj.get("isolated") {
-		None | Some(Value::Bool(false)) => Ok(()),
-		Some(Value::Bool(true)) => Err(ToolError::InvalidArguments(
-			"'isolated' is not supported in this build: there is no git worktree create/apply/cleanup \
-			 implementation; run without 'isolated' and apply child changes manually"
-				.to_string(),
-		)),
+fn parse_isolated(value: Option<&Value>) -> Result<Option<bool>, ToolError> {
+	match value {
+		None | Some(Value::Null) => Ok(None),
+		Some(Value::Bool(flag)) => Ok(Some(*flag)),
 		Some(_) => Err(ToolError::InvalidArguments(
 			"'isolated' must be a boolean".to_string(),
 		)),
@@ -1848,6 +2215,9 @@ fn single_failure(
 		structured_output: None,
 		resolved_model: None,
 		model_role: None,
+		isolation: None,
+		isolation_artifacts: IsolationArtifacts::default(),
+		merge_summary: None,
 	}
 }
 
@@ -1863,6 +2233,7 @@ struct TaskItemSpec {
 	/// Non-fatal agent-schema parse error in permissive mode.
 	schema_error: Option<String>,
 	effort: Option<String>,
+	isolation: IsolationRequest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1909,6 +2280,18 @@ pub struct SingleResult {
 	pub resolved_model: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub model_role: Option<String>,
+	/// Isolation capture/merge outcome when the child ran in a sandbox.
+	/// Internal only; the flat artifact fields below are the wire payload.
+	#[serde(skip)]
+	pub isolation: Option<IsolationReport>,
+	/// Flat TS-compatible artifact fields (`patchPath`, `branchName`,
+	/// `branchBaseSha`, `nestedPatches`).
+	#[serde(flatten)]
+	pub isolation_artifacts: IsolationArtifacts,
+	/// Merge/capture summary rendered as a sibling of `<output>` (never
+	/// embedded inside the child output).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub merge_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1978,7 +2361,7 @@ impl Tool for TaskTool {
 				},
 				"isolated": {
 					"type": "boolean",
-					"description": "Not supported in this build; an explicit true is rejected instead of silently ignored."
+					"description": "Run this child in an owned git isolation sandbox (task.isolation.mode must not be \"none\"). Successful changes are captured and merged per task.isolation.apply/merge."
 				},
 				"tasks": {
 					"type": "array",
@@ -1997,7 +2380,10 @@ impl Tool for TaskTool {
 								"enum": ["permissive", "strict"]
 							},
 							"effort": { "type": "string" },
-							"isolated": { "type": "boolean" }
+							"isolated": {
+								"type": "boolean",
+								"description": "Per-item override of the top-level isolated flag."
+							}
 						},
 						"required": ["task"]
 					}
@@ -2051,11 +2437,19 @@ impl TaskTool {
 			.as_object()
 			.ok_or_else(|| ToolError::InvalidArguments("Arguments must be an object".to_string()))?;
 
-		check_unsupported_fields(obj)?;
 		let defaults = ItemDefaults {
 			output_schema: parse_schema(obj.get("outputSchema"))?,
 			schema_mode: parse_schema_mode(obj.get("schemaMode"))?.unwrap_or_default(),
 			effort: parse_effort(obj.get("effort"))?,
+			isolation: IsolationRequest {
+				isolated: if obj.contains_key("isolated") {
+					parse_isolated(obj.get("isolated"))?
+				} else {
+					None
+				},
+				apply: None,
+				merge: None,
+			},
 		};
 		let child_ctx = self.child_context();
 
@@ -2201,7 +2595,7 @@ impl TaskTool {
 			// keep their receipts so post-return delivery never loses a spawn.
 			let start_total = Instant::now();
 			let futures = sync_items.into_iter().map(|(index, item)| {
-				self.run_single_task(index, item, ctx, &child_ctx, parent_call_id)
+				self.run_single_task(index, item, ctx, &child_ctx, parent_call_id, true)
 			});
 			let results = join_all(futures).await;
 			let total_duration_ms = start_total.elapsed().as_millis() as u64;
@@ -2266,7 +2660,7 @@ impl TaskTool {
 
 		let start_total = Instant::now();
 		let futures = items.into_iter().enumerate().map(|(index, item)| {
-			self.run_single_task(index, item, ctx, &child_ctx, parent_call_id)
+			self.run_single_task(index, item, ctx, &child_ctx, parent_call_id, true)
 		});
 
 		let results = join_all(futures).await;
@@ -2509,6 +2903,7 @@ mod tests {
 			parent_tools: None,
 			catalog: None,
 			model_factory: None,
+			isolation: TaskIsolationSettings::default(),
 		};
 		let mut scout = named_agent("scout", None);
 		scout.tools = Some(vec![
@@ -2583,14 +2978,15 @@ mod tests {
 
 	#[test]
 	fn unsupported_isolation_and_agent_capabilities_are_explicit() {
-		assert!(check_unsupported_fields(
-			serde_json::json!({ "isolated": true }).as_object().expect("object")
-		)
-		.is_err());
-		assert!(check_unsupported_fields(
-			serde_json::json!({ "isolated": false }).as_object().expect("object")
-		)
-		.is_ok());
+		assert_eq!(
+			parse_isolated(Some(&serde_json::json!(true))).expect("true"),
+			Some(true)
+		);
+		assert_eq!(
+			parse_isolated(Some(&serde_json::json!(false))).expect("false"),
+			Some(false)
+		);
+		assert!(parse_isolated(Some(&serde_json::json!("yes"))).is_err());
 		let mut agent = named_agent("handoff", None);
 		agent.prewalk = Some(crate::tools::task_catalog::HandoffTarget::Default);
 		let error = check_agent_capabilities(&agent).expect_err("prewalk");
@@ -2683,6 +3079,24 @@ mod tests {
 		}
 	}
 
+	#[tokio::test]
+	async fn parent_cancel_pre_cancels_child_before_finalize_poll() {
+		let parent = CancellationToken::new();
+		parent.cancel();
+		let child = CancellationToken::new();
+		let result = await_finalize_with_parent_cancel(
+			async {
+				child.cancelled().await;
+				42u8
+			},
+			&parent,
+			&child,
+		)
+		.await;
+		assert_eq!(result, 42);
+		assert!(child.is_cancelled());
+	}
+
 	/// `completion(model = "default")` inside a child eval session must use the
 	/// child's resolved provider, never the root session provider.
 	#[tokio::test]
@@ -2753,6 +3167,7 @@ mod tests {
 			schema_mode: SchemaMode::default(),
 			schema_error: None,
 			effort: None,
+			isolation: IsolationRequest::default(),
 		};
 		let (_steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
 		let _ = run_background_child(
