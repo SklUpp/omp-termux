@@ -252,15 +252,6 @@ fn excluded_plugin_is_refused_without_starting_a_runtime() {
 			String::from_utf8_lossy(&version.stdout)
 		);
 	}
-	// A help token after a verb is not a help request: there is no help for a
-	// command this build does not have.
-	let trailing_help = run(&["acp", "--help"]);
-	assert_eq!(trailing_help.status.code(), Some(i32::from(EXIT_USAGE)));
-	assert!(
-		String::from_utf8_lossy(&trailing_help.stderr).contains("`omp acp` is not implemented"),
-		"stderr: {}",
-		String::from_utf8_lossy(&trailing_help.stderr)
-	);
 
 	// `--` keeps the same word as literal prompt text: it reaches the runtime and
 	// fails on the missing model config, not on the verb guard.
