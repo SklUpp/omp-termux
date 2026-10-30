@@ -605,7 +605,9 @@ mod tests {
 	use serde_json::json;
 
 	use super::*;
-	use crate::session::{MessageContent, MessageEntry, SessionMessage, SessionOptions};
+	use crate::session::{
+		MessageContent, MessageEntry, SessionMessage, SessionOptions, fork_session,
+	};
 
 	static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -732,8 +734,14 @@ mod tests {
 	#[tokio::test]
 	async fn lifecycle_rewinds_to_checkpoint_and_rehydrates_retained_report() {
 		let dir = temp_dir();
+		let worktree = dir.join("worktree");
+		fs::create_dir_all(&worktree).expect("worktree dir");
+		let tracked = worktree.join("plan.md");
+		fs::write(&tracked, "untouched worktree file\n").expect("worktree file");
+		let mut session_options = options(dir.clone(), "lifecycle");
+		session_options.cwd = worktree.clone();
 		let host = CheckpointHost::new();
-		let mut store = SessionStore::open(&options(dir.clone(), "lifecycle"));
+		let mut store = SessionStore::open(&session_options);
 		assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
 
 		checkpoint_turn(&mut store, &host, "cp");
@@ -832,7 +840,7 @@ mod tests {
 
 		// Completed guard survives resume.
 		drop(store);
-		let reopened = SessionStore::open(&options(dir.clone(), "lifecycle"));
+		let reopened = SessionStore::open(&session_options);
 		assert!(reopened.enabled());
 		let resumed = CheckpointHost::new();
 		resumed.rehydrate(&reopened);
@@ -852,6 +860,97 @@ mod tests {
 		);
 		assert!(!applied.history.iter().any(|turn| turn.prompt == "explore"));
 		assert!(!applied.history.iter().any(|turn| turn.prompt == "wrap up"));
+
+		// Fork the log through the real session layer: the completed rewind, its
+		// report, and the exact timestamps must survive rehydration, the
+		// abandoned exploration must stay byte-identical on disk but out of
+		// context, and the worktree must be untouched.
+		let source = reopened.file().expect("source session file").to_path_buf();
+		let forked_cwd = dir.join("forked-worktree");
+		fs::create_dir_all(&forked_cwd).expect("forked worktree dir");
+		let worktree_before = fs::read(&tracked).expect("read worktree file");
+		let fork_dir = dir.join("forks");
+		let forked_path = fork_session(&source, Some(&forked_cwd), Some(&fork_dir))
+			.expect("fork session");
+		assert!(forked_path.is_file());
+		assert_eq!(
+			fs::read(&tracked).expect("worktree file after fork"),
+			worktree_before,
+			"fork must not touch the source worktree"
+		);
+		assert!(
+			fs::read_dir(&forked_cwd).expect("forked cwd").next().is_none(),
+			"fork must not populate the new worktree"
+		);
+
+		let forked_content = fs::read_to_string(&forked_path).expect("read fork");
+		let forked_header: Value = forked_content
+			.lines()
+			.filter_map(|line| serde_json::from_str::<Value>(line).ok())
+			.find(|value| value.get("type").and_then(Value::as_str) == Some("session"))
+			.expect("forked header");
+		assert_eq!(
+			forked_header["parentSession"].as_str(),
+			Some(reopened.id()),
+			"fork keeps the parent reference"
+		);
+		assert_eq!(
+			forked_header["cwd"].as_str(),
+			Some(forked_cwd.to_str().expect("utf-8 cwd")),
+			"fork re-roots the header at the new worktree"
+		);
+		let forked = SessionStore::open(&SessionOptions {
+			enabled: true,
+			cwd: forked_cwd,
+			model: None,
+			provider: None,
+			dir: Some(fork_dir),
+			id: forked_header["id"].as_str().map(str::to_string),
+			continue_latest: false,
+			parent_session: None,
+			no_title: true,
+		});
+		assert!(forked.enabled(), "forked store: {:?}", forked.corrupt_reason());
+
+		let forked_host = CheckpointHost::new();
+		forked_host.rehydrate(&forked);
+		assert_eq!(forked_host.checkpoint_state(), None, "rewind completed before fork");
+		let forked_completed = forked_host
+			.last_completed_rewind()
+			.expect("completed rewind after fork");
+		assert_eq!(forked_completed.report, applied.report);
+		assert_eq!(forked_completed.started_at, applied.started_at);
+		assert_eq!(forked_completed.rewound_at, applied.rewound_at);
+
+		let forked_context = CheckpointHost::context_messages(&forked).expect("forked context");
+		let forked_joined = forked_context
+			.iter()
+			.map(|message| message.content.as_str())
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(forked_joined.contains("concise findings"));
+		assert!(forked_joined.contains("Branch-return summary:"));
+		assert!(
+			!forked_joined.contains("contents"),
+			"abandoned exploration leaked into forked context"
+		);
+
+		let forked_entries: Vec<String> = forked
+			.entries()
+			.iter()
+			.map(|entry| serde_json::to_string(entry).expect("serialize forked entry"))
+			.collect();
+		for line in &before {
+			assert!(
+				forked_entries.contains(line),
+				"fork changed or dropped entry: {line}"
+			);
+		}
+		assert!(
+			forked.entries().iter().any(|entry| entry.id == "ex-result"),
+			"abandoned exploration must stay persisted in the fork"
+		);
+		assert!(forked.branch_messages().iter().all(|entry| entry.id != "ex-result"));
 
 		fs::remove_dir_all(dir).ok();
 	}
