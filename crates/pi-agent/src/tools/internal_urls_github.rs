@@ -31,8 +31,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
 	io::{AsyncRead, AsyncReadExt},
-	process::{Child, Command},
-	time::timeout,
+	process::{Child, ChildStderr, ChildStdout, Command},
+	time::{timeout, timeout_at, Instant},
 };
 
 use super::internal_urls::{InternalResource, InternalUrl, ProtocolHandler, ResolveContext};
@@ -53,6 +53,16 @@ const PR_DIFF_FILES_PAGE_SIZE: usize = 100;
 const PR_DIFF_FILES_MAX: u64 = 3000;
 /// `REVIEW_COMMENTS_PAGE_SIZE` (`tools/gh-view.ts`).
 const REVIEW_COMMENTS_PAGE_SIZE: usize = 100;
+/// Review-comment pagination ceiling, mirroring the files-API shape
+/// (`PR_DIFF_FILES_MAX` / `PR_DIFF_FILES_PAGE_SIZE`). One extra page is
+/// allowed so a response of exactly `REVIEW_COMMENTS_MAX` comments can still
+/// prove it ended instead of being mistaken for a truncated one.
+const REVIEW_COMMENTS_MAX: usize = PR_DIFF_FILES_MAX as usize;
+const REVIEW_COMMENTS_MAX_PAGES: u64 =
+	(REVIEW_COMMENTS_MAX / REVIEW_COMMENTS_PAGE_SIZE) as u64 + 1;
+/// Bound on reaping a killed `gh` leader: a leader stuck in uninterruptible
+/// sleep must not pin cleanup forever.
+const GH_REAP_DEADLINE: Duration = Duration::from_secs(5);
 const GH_NOT_INSTALLED: &str =
 	"GitHub CLI (gh) is not installed. Install it from https://cli.github.com/.";
 const GH_INVALID_JSON: &str = "GitHub CLI returned invalid JSON output.";
@@ -365,12 +375,16 @@ pub(crate) fn parse_issue_pr_url(href: &str, scheme: &str) -> Result<GithubParse
 	let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
 	let (head, query) = rest.split_once('?').unwrap_or((rest, ""));
 	let (raw_host, raw_path) = head.split_once('/').unwrap_or((head, ""));
+	// Upstream decodes `rawHost` once and keeps path segments encoded
+	// (`internal-urls/parse.ts:91-100`): numeric/host decisions below run on
+	// the decoded host, while `parts` and the resource URL stay verbatim.
+	let decoded_host = percent_decode(raw_host).unwrap_or_else(|| raw_host.to_string());
 	let mut parts = split_segments(raw_path, scheme)?;
 
 	// A dotted first segment can only be a host. A single-label host is only
 	// recognizable from the item number's position, so it is accepted in the
 	// numbered form alone (upstream keeps the bad-number error otherwise).
-	let dotted_host = raw_host.contains('.');
+	let dotted_host = decoded_host.contains('.');
 	if dotted_host && parts.len() < 2 {
 		return Err(format!(
 			"Invalid {scheme}:// URL. Expected {scheme}://<host>/<owner>/<repo> or \
@@ -383,7 +397,7 @@ pub(crate) fn parse_issue_pr_url(href: &str, scheme: &str) -> Result<GithubParse
 		parts.len() >= 3 && parts.get(2).is_some_and(|part| parse_positive_int(part).is_some())
 	};
 	let mut repo_host: Option<String> = None;
-	let mut host = raw_host.to_string();
+	let mut host = decoded_host;
 	if host_prefixed {
 		repo_host = Some(host);
 		host = parts.first().cloned().unwrap_or_default();
@@ -509,13 +523,18 @@ fn parse_list_options(
 
 /// Percent-encoded path segments. Segments are validated after decoding but
 /// kept raw, exactly like upstream: `parts.push(seg)` pushes the encoded text.
+///
+/// `raw_path` is the text after the host-separator slash
+/// (`head.split_once('/')`), i.e. upstream's `rawPathname` already minus its
+/// single leading slash. A residual leading slash therefore names an empty
+/// first segment (`pr://owner//77` -> `"/77"` -> `["", "77"]`), which is the
+/// same throw as `decodeURIComponent("")` upstream.
 fn split_segments(raw_path: &str, scheme: &str) -> Result<Vec<String>, String> {
-	let stripped = raw_path.strip_prefix('/').unwrap_or(raw_path);
 	let mut parts = Vec::new();
-	if stripped.is_empty() {
+	if raw_path.is_empty() {
 		return Ok(parts);
 	}
-	for segment in stripped.split('/') {
+	for segment in raw_path.split('/') {
 		let decoded = percent_decode(segment).ok_or_else(|| {
 			format!("Invalid {scheme}:// URL: empty or unsafe path segment")
 		})?;
@@ -1155,9 +1174,19 @@ async fn fetch_pr_review_comments(
 	signal: &CancellationToken,
 ) -> Result<Vec<GhReviewComment>, String> {
 	let (host, slug) = parse_repo_ref(repo);
+	let comments_path = format!("/repos/{slug}/pulls/{number}/comments");
+	// One deadline for the whole response: pages share it instead of each
+	// `gh` call getting a fresh 5 minutes, so a giant PR stays bounded.
+	let deadline = Instant::now() + GH_DEADLINE;
 	let mut review_comments = Vec::new();
 	let mut page: u64 = 1;
 	loop {
+		if page > REVIEW_COMMENTS_MAX_PAGES {
+			return Err(format!(
+				"pr://{repo}/{number} has more than {REVIEW_COMMENTS_MAX} review comments \
+				 ({REVIEW_COMMENTS_MAX_PAGES} pages); refusing to return a partial list."
+			));
+		}
 		let mut args = vec!["api".to_string()];
 		if let Some(host) = host.as_deref() {
 			args.push("--hostname".to_string());
@@ -1166,17 +1195,23 @@ async fn fetch_pr_review_comments(
 		args.extend([
 			"--method".to_string(),
 			"GET".to_string(),
-			format!("/repos/{slug}/pulls/{number}/comments"),
+			comments_path.clone(),
 			"-F".to_string(),
 			format!("per_page={REVIEW_COMMENTS_PAGE_SIZE}"),
 			"-F".to_string(),
 			format!("page={page}"),
 		]);
-		let raw = run_gh_json(cwd, &args, signal, true).await?;
+		let raw = run_gh_json_until(cwd, &args, signal, true, deadline).await?;
 		let response: Vec<GhReviewCommentApi> =
 			serde_json::from_str(&raw).map_err(|_| GH_INVALID_JSON.to_string())?;
 		let page_len = response.len();
 		review_comments.extend(response.into_iter().filter_map(normalize_review_comment));
+		if review_comments.len() > REVIEW_COMMENTS_MAX {
+			return Err(format!(
+				"pr://{repo}/{number} has more than {REVIEW_COMMENTS_MAX} review comments; \
+				 refusing to return a partial list."
+			));
+		}
 		// Compare the raw page length: a dropped malformed item must not end
 		// pagination early and silently lose the remaining pages.
 		if page_len < REVIEW_COMMENTS_PAGE_SIZE {
@@ -1331,6 +1366,13 @@ struct GhRun {
 	stderr: String,
 }
 
+/// Distinguishes pipe-capture failures from `gh` process failures so the
+/// upstream error strings stay distinct without a detached reader to join.
+enum GhCaptureError {
+	Stream(std::io::Error),
+	Wait(std::io::Error),
+}
+
 /// Run `gh` argv in `cwd`: non-interactive env, stdin closed, both streams
 /// capped at 8 MiB, 5-minute deadline, and a fresh process group so cancel or
 /// timeout kills and reaps the whole tree.
@@ -1339,8 +1381,22 @@ async fn run_gh(
 	args: &[String],
 	signal: &CancellationToken,
 ) -> Result<GhRun, String> {
+	run_gh_until(cwd, args, signal, Instant::now() + GH_DEADLINE).await
+}
+
+/// [`run_gh`] against a shared deadline, so callers that issue several `gh`
+/// invocations (pagination) bound the whole response rather than each page.
+async fn run_gh_until(
+	cwd: &Path,
+	args: &[String],
+	signal: &CancellationToken,
+	deadline: Instant,
+) -> Result<GhRun, String> {
 	if signal.is_cancelled() {
 		return Err("aborted".to_string());
+	}
+	if Instant::now() >= deadline {
+		return Err(format!("GitHub CLI command timed out: gh {}", args.join(" ")));
 	}
 	let mut command = Command::new("gh");
 	command
@@ -1364,43 +1420,56 @@ async fn run_gh(
 	let pid = child.id();
 	let stdout = child.stdout.take().ok_or("Failed to capture GitHub CLI output.")?;
 	let stderr = child.stderr.take().ok_or("Failed to capture GitHub CLI output.")?;
-	let out = tokio::spawn(read_capped(stdout));
-	let err = tokio::spawn(read_capped(stderr));
-	let waited = tokio::select! {
-		() = signal.cancelled() => None,
-		result = timeout(GH_DEADLINE, child.wait()) => Some(result),
+	// Readers are joined first and `wait` follows, all inside a single
+	// deadline/cancel selection: an inherited pipe held by a descendant cannot
+	// outlive `GH_DEADLINE`, and no failure path waits on an unreaped leader
+	// before the group kill below. Dropping the collection closes our pipe ends.
+	let outcome = {
+		let collected = collect_streams(&mut child, stdout, stderr);
+		tokio::select! {
+			biased;
+			() = signal.cancelled() => None,
+			result = timeout_at(deadline, collected) => Some(result),
+		}
 	};
-	let status = match waited {
+	match outcome {
 		None => {
 			kill_tree(&mut child, pid).await;
-			let _ = out.await;
-			let _ = err.await;
-			return Err("aborted".to_string());
+			Err("aborted".to_string())
 		},
-		Some(Ok(Ok(status))) => status,
-		Some(Ok(Err(error))) => {
+		Some(Err(_elapsed)) => {
 			kill_tree(&mut child, pid).await;
-			let _ = out.await;
-			let _ = err.await;
-			return Err(format!("GitHub CLI command failed: {error}"));
+			Err(format!("GitHub CLI command timed out: gh {}", args.join(" ")))
 		},
-		Some(Err(_)) => {
+		Some(Ok(Err(GhCaptureError::Wait(error)))) => {
 			kill_tree(&mut child, pid).await;
-			let _ = out.await;
-			let _ = err.await;
-			return Err(format!("GitHub CLI command timed out: gh {}", args.join(" ")));
+			Err(format!("GitHub CLI command failed: {error}"))
 		},
-	};
-	let stdout = out
-		.await
-		.map_err(|error| format!("Failed to capture GitHub CLI output: {error}"))??;
-	let stderr = err
-		.await
-		.map_err(|error| format!("Failed to capture GitHub CLI output: {error}"))??;
-	if signal.is_cancelled() {
-		return Err("aborted".to_string());
+		Some(Ok(Err(GhCaptureError::Stream(error)))) => {
+			kill_tree(&mut child, pid).await;
+			Err(format!("Failed to capture GitHub CLI output: {error}"))
+		},
+		Some(Ok(Ok((status, stdout, stderr)))) => {
+			if signal.is_cancelled() {
+				return Err("aborted".to_string());
+			}
+			Ok(GhRun { status, stdout, stderr })
+		},
 	}
-	Ok(GhRun { status, stdout, stderr })
+}
+
+/// Drain both pipes to EOF, then reap `child`. Callers wrap this in one
+/// deadline/cancel selection; on expiry the futures drop and close the pipes.
+async fn collect_streams(
+	child: &mut Child,
+	stdout: ChildStdout,
+	stderr: ChildStderr,
+) -> Result<(ExitStatus, String, String), GhCaptureError> {
+	let (out, err) = tokio::join!(read_capped(stdout), read_capped(stderr));
+	let out = out.map_err(GhCaptureError::Stream)?;
+	let err = err.map_err(GhCaptureError::Stream)?;
+	let status = child.wait().await.map_err(GhCaptureError::Wait)?;
+	Ok((status, out, err))
 }
 
 async fn read_capped<R: AsyncRead + Unpin>(mut reader: R) -> std::io::Result<String> {
@@ -1429,13 +1498,17 @@ async fn kill_tree(child: &mut Child, pid: Option<u32>) {
 	#[cfg(unix)]
 	if let Some(pid) = pid.filter(|pid| *pid > 1) {
 		// SAFETY: signalling the process group we created; the negative pid is
-		// guarded against the catastrophic 0/1 targets.
+		// guarded against the catastrophic 0/1 targets. The leader has not been
+		// reaped at this point, so its pid (and thus the group id) is still ours
+		// to signal and cannot have been recycled.
 		unsafe {
 			libc::kill(-(pid as i32), libc::SIGKILL);
 		}
 	}
 	let _ = child.start_kill();
-	let _ = child.wait().await;
+	// The group kill cannot reach a `setsid`-escaped descendant, so the leader
+	// reap is bounded: cleanup never waits forever on a stuck process.
+	let _ = timeout(GH_REAP_DEADLINE, child.wait()).await;
 }
 
 /// Run `gh`, treat a non-zero exit as [`map_gh_failure`], require non-empty
@@ -1446,7 +1519,17 @@ pub(crate) async fn run_gh_json(
 	signal: &CancellationToken,
 	repo_provided: bool,
 ) -> Result<String, String> {
-	let run = run_gh(cwd, args, signal).await?;
+	run_gh_json_until(cwd, args, signal, repo_provided, Instant::now() + GH_DEADLINE).await
+}
+
+async fn run_gh_json_until(
+	cwd: &Path,
+	args: &[String],
+	signal: &CancellationToken,
+	repo_provided: bool,
+	deadline: Instant,
+) -> Result<String, String> {
+	let run = run_gh_until(cwd, args, signal, deadline).await?;
 	if !run.status.success() {
 		return Err(map_gh_failure(args, &run.stdout, &run.stderr, repo_provided));
 	}
@@ -2234,6 +2317,80 @@ mod tests {
 			assert_eq!(IssueUrlHandler.resolve(&url, &context).await.unwrap_err(), "aborted");
 			let url = InternalUrl::parse("pr://o/r/1/diff").unwrap();
 			assert_eq!(PrUrlHandler.resolve(&url, &context).await.unwrap_err(), "aborted");
+		});
+	}
+
+	#[test]
+	fn decodes_host_but_keeps_path_segments_raw() {
+		// `rawHost` is decoded once upstream (`parse.ts:91-97`), so `%31` in
+		// the host names item 1 instead of failing the numeric check.
+		assert_eq!(issue("issue://%31").unwrap(), single(None, 1, true));
+		assert_eq!(
+			pr("pr://ghe%2Eexample.com/o/r/5").unwrap(),
+			single(Some("ghe.example.com/o/r"), 5, true)
+		);
+		// Path segments stay encoded for decisions, exactly like upstream.
+		assert_eq!(
+			issue("issue://o/r/%31").unwrap_err(),
+			"Invalid issue:// number: %31"
+		);
+	}
+
+	#[test]
+	fn review_comment_limits_match_files_shape() {
+		assert_eq!(REVIEW_COMMENTS_PAGE_SIZE, PR_DIFF_FILES_PAGE_SIZE);
+		assert_eq!(REVIEW_COMMENTS_MAX, PR_DIFF_FILES_MAX as usize);
+		assert_eq!(
+			REVIEW_COMMENTS_MAX_PAGES,
+			(REVIEW_COMMENTS_MAX / REVIEW_COMMENTS_PAGE_SIZE) as u64 + 1
+		);
+	}
+
+	#[test]
+	fn expired_shared_deadline_fails_before_spawning() {
+		let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+		runtime.block_on(async {
+			let signal = CancellationToken::new();
+			let deadline = Instant::now() - Duration::from_secs(1);
+			let args = vec!["issue".to_string(), "list".to_string()];
+			let error = run_gh_until(Path::new("."), &args, &signal, deadline)
+				.await
+				.err()
+				.expect("expired deadline must fail");
+			assert_eq!(error, "GitHub CLI command timed out: gh issue list");
+		});
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn inherited_pipe_cannot_outlive_collection_deadline() {
+		let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+		runtime.block_on(async {
+			// The leader exits at once while a background descendant keeps both
+			// pipes open: EOF never arrives, so only the deadline can end the
+			// collection and the group kill can free the pipes.
+			let mut command = Command::new("sh");
+			command
+				.arg("-c")
+				.arg("sleep 60 & exit 0")
+				.stdin(Stdio::null())
+				.stdout(Stdio::piped())
+				.stderr(Stdio::piped())
+				.kill_on_drop(true)
+				.process_group(0);
+			let mut child = command.spawn().unwrap();
+			let pid = child.id();
+			let stdout = child.stdout.take().unwrap();
+			let stderr = child.stderr.take().unwrap();
+			let collected =
+				timeout(Duration::from_millis(250), collect_streams(&mut child, stdout, stderr))
+					.await;
+			assert!(collected.is_err(), "collection must be deadline bounded");
+			kill_tree(&mut child, pid).await;
+			assert!(
+				child.try_wait().unwrap().is_some(),
+				"group kill must reap the leader"
+			);
 		});
 	}
 }

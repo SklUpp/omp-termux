@@ -6,9 +6,10 @@
 //! trailing-selector grammar, literal-colon filenames, context expansion,
 //! line numbering, and 3000-line / 50 KiB / 768-column caps.
 //!
-//! Remaining read slices (planned, not yet ported): archives, markit
-//! documents, images/`:img`, and the internal-URL router. SQLite databases are
-//! handled by `read_sqlite.rs`. `:conflicts`
+//! Remaining read slices (planned, not yet ported): markit documents,
+//! images/`:img`, and the internal-URL router. SQLite databases are handled by
+//! `read_sqlite.rs`; ZIP/tar/compressed streams and their members by
+//! `read_archive.rs` (Python 3 stdlib backend). `:conflicts`
 //! is blocked on the conflict-history store that
 //! `write({path:"conflict://<N>"})` resolves against; until that store lands
 //! the selector errors rather than listing ids nothing can act on.
@@ -89,12 +90,6 @@ const CONVERTIBLE_EXTENSIONS: &[&str] =
 const IMAGE_EXTENSIONS: &[&str] = &[
 	".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff", ".avif", ".heic", ".svgz",
 ];
-const ARCHIVE_SUFFIXES: &[&str] = &[
-	".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".zip", ".jar", ".war", ".ear", ".apk", ".whl", ".tar",
-	".rar", ".7z", ".iso", ".cab", ".deb", ".rpm", ".cpio", ".ar", ".a", ".lzh", ".arj", ".asar", ".gz", ".bz2",
-	".xz", ".zst",
-];
-
 /// Hashline snapshot seam. The hashline module owns the concrete store; this
 /// trait only lets `read` record what it displayed. Implementations receive the
 /// absolute display path and canonicalize it themselves.
@@ -213,7 +208,7 @@ impl ReadTool {
 
 	/// Display for one read. Legacy construction (no explicit inputs) derives
 	/// hashline from the sink and always numbers non-raw output.
-	fn display_mode(&self, raw: bool, immutable: bool) -> FileDisplayMode {
+	pub(super) fn display_mode(&self, raw: bool, immutable: bool) -> FileDisplayMode {
 		match self.display {
 			Some(inputs) => inputs.resolve(raw, immutable),
 			None => FileDisplayMode {
@@ -382,12 +377,31 @@ impl Tool for ReadTool {
 
 		let mut target = resolve_path(ctx, &path_part);
 
-		// An archive member (`archive.ext:inner`) never stats as one path.
-		if let Some(archive) = existing_archive_prefix(&raw_path, ctx) {
-			return Ok(unsupported(
-				format!("Archive reads are not supported in this build: '{archive}'. Extract the member with a shell tool."),
-				&target,
-			));
+		// Archives run before SQLite (upstream order). A literal whole path keeps
+		// precedence; otherwise the longest existing archive prefix resolves the
+		// container and the remainder is the member path plus selector.
+		if !literal_whole_path {
+			match super::read_archive::resolve_archive_read_path(&raw_path, ctx).await {
+				Ok(Some(super::read_archive::ArchiveRoute::Read(resolved))) => {
+					return Ok(
+						super::read_archive::read_archive(resolved, &raw_path, self, ctx).await,
+					);
+				},
+				Ok(Some(super::read_archive::ArchiveRoute::UnsupportedBackend {
+					target,
+					backend,
+				})) => {
+					return Ok(unsupported(
+						format!(
+							"Archive reads for '{}' require the {backend} backend, which is not bundled with this build.",
+							target.display()
+						),
+						&target,
+					));
+				},
+				Ok(None) => {},
+				Err(message) => return Ok(tool_result(message, true)),
+			}
 		}
 
 		// SQLite databases are addressed as `<db>:table[:key][?query]` or bare;
@@ -634,14 +648,14 @@ impl Tool for ReadTool {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LineRange {
-	start_line: u64,
+pub(super) struct LineRange {
+	pub(super) start_line: u64,
 	/// `None` means open-ended (`:N-`).
-	end_line: Option<u64>,
+	pub(super) end_line: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Sel {
+pub(super) enum Sel {
 	None,
 	Raw,
 	Conflicts,
@@ -649,7 +663,7 @@ enum Sel {
 	Lines { ranges: Vec<LineRange>, raw: bool },
 }
 
-fn is_raw(sel: &Sel) -> bool {
+pub(super) fn is_raw(sel: &Sel) -> bool {
 	matches!(sel, Sel::Raw) || matches!(sel, Sel::Lines { raw: true, .. })
 }
 
@@ -659,7 +673,7 @@ fn invalid_selector(sel: &str) -> String {
 	)
 }
 
-fn parse_sel(sel: Option<&str>) -> Result<Sel, String> {
+pub(super) fn parse_sel(sel: Option<&str>) -> Result<Sel, String> {
 	let Some(sel) = sel.filter(|sel| !sel.is_empty()) else {
 		return Ok(Sel::None);
 	};
@@ -863,12 +877,12 @@ fn is_range_candidate(chunk: &str) -> bool {
 	!rhs.is_empty() && rhs.chars().all(|c| c.is_ascii_digit())
 }
 
-struct StrictSplit {
-	path: String,
-	sel: String,
+pub(super) struct StrictSplit {
+	pub(super) path: String,
+	pub(super) sel: String,
 }
 
-fn split_path_and_sel(raw_path: &str) -> Option<StrictSplit> {
+pub(super) fn split_path_and_sel(raw_path: &str) -> Option<StrictSplit> {
 	let colon = raw_path.rfind(':')?;
 	if colon == 0 {
 		return None;
@@ -1083,7 +1097,7 @@ fn internal_scheme(raw: &str) -> Option<String> {
 /// the router already resolved. Both run the same selector grammar, line model,
 /// caps and rendering, so an internal read can neither bypass the 3000-line /
 /// 50 KiB limits nor return a resource's unbounded `content` verbatim.
-enum TextSource<'a> {
+pub(super) enum TextSource<'a> {
 	File { path: &'a Path, size: u64 },
 	Memory {
 		url:   &'a str,
@@ -1212,34 +1226,6 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
 fn unsupported_extension(path: &Path) -> Option<&'static str> {
 	if has_extension(path, CONVERTIBLE_EXTENSIONS) {
 		return Some("Document");
-	}
-	if has_extension(path, ARCHIVE_SUFFIXES) {
-		return Some("Archive");
-	}
-	None
-}
-
-fn existing_archive_prefix(raw: &str, ctx: &AgentContext) -> Option<String> {
-	let lower = raw.to_ascii_lowercase();
-	let mut cuts = Vec::new();
-	for suffix in ARCHIVE_SUFFIXES {
-		if lower.ends_with(suffix) {
-			cuts.push(raw.len());
-		}
-		let needle = format!("{suffix}:");
-		let mut from = 0;
-		while let Some(offset) = lower[from..].find(&needle) {
-			let end = from + offset + suffix.len();
-			cuts.push(end);
-			from = end;
-		}
-	}
-	for end in cuts {
-		let candidate = &raw[..end];
-		let target = resolve_path(ctx, candidate);
-		if std::fs::symlink_metadata(&target).is_ok() {
-			return Some(target.display().to_string());
-		}
 	}
 	None
 }
@@ -1486,7 +1472,7 @@ async fn scan_window(
 	})
 }
 
-async fn read_single_range(
+pub(super) async fn read_single_range(
 	source: &TextSource<'_>,
 	range: LineRange,
 	raw: bool,
@@ -1752,7 +1738,7 @@ async fn read_single_range(
 	Ok(result_with_details(output, Value::Object(details), false))
 }
 
-async fn read_multi_range(
+pub(super) async fn read_multi_range(
 	source: &TextSource<'_>,
 	ranges: &[LineRange],
 	raw: bool,
@@ -2516,7 +2502,7 @@ async fn read_directory(target: &Path, parsed: &Sel, ctx: &AgentContext) -> Tool
 	result_with_details(output, Value::Object(details), false)
 }
 
-fn selector_offset_limit(parsed: &Sel) -> (Option<u64>, Option<u64>) {
+pub(super) fn selector_offset_limit(parsed: &Sel) -> (Option<u64>, Option<u64>) {
 	match parsed {
 		Sel::Lines { ranges, raw: false } => {
 			let first = ranges[0];
@@ -2757,7 +2743,7 @@ fn is_cancelled(ctx: &AgentContext) -> bool {
 	ctx.cancellation_token.is_cancelled()
 }
 
-fn result_with_details(content: String, details: Value, is_error: bool) -> ToolResult {
+pub(super) fn result_with_details(content: String, details: Value, is_error: bool) -> ToolResult {
 	ToolResult {
 		tool_call_id: String::new(),
 		content,
@@ -2975,7 +2961,10 @@ mod display_tests {
 		let tool = ReadTool::new()
 			.with_internal_urls(router, Arc::new(UrlScope::default()));
 		let result = read_with(&tool, &dir, "nope://x").await;
-		assert_eq!(result.content, "Unknown protocol: nope://\nSupported: local://, notes://");
+		assert_eq!(
+			result.content,
+			"Unknown protocol: nope://\nSupported: issue://, local://, mcp://, notes://, pr://, ssh://"
+		);
 	}
 
 	#[tokio::test]

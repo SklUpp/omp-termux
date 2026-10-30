@@ -169,6 +169,23 @@ pub struct BackgroundDelivery {
 	pub usage: Option<TokenUsage>,
 }
 
+/// One child's own provider-reported usage, recorded once for accounting.
+///
+/// This is the accounting ledger, not a delivery: it carries no result text,
+/// so an aborted child — which never queues a body — still contributes every
+/// counter its completed provider requests really reported. A consumer drains
+/// it at a turn boundary (and once more after shutdown); each entry appears
+/// once, keyed by the immutable spawn-time result key, so the same child can
+/// never be counted twice whether it arrives through a delivery or the ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountedUsage {
+	/// Supervisor identity of the child (raw `task-N`), for diagnostics only.
+	pub id: String,
+	/// Immutable accounting key captured when the child was reserved.
+	pub result_key: String,
+	pub usage: TokenUsage,
+}
+
 struct OwnerResultSink {
 	supervisor: Arc<Supervisor>,
 	owner: Option<String>,
@@ -262,6 +279,11 @@ pub struct ChildRecord {
 	/// authoritative.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub usage: Option<TokenUsage>,
+	/// Write-once: this child's own usage already entered the accounting ledger.
+	/// Bound to the record lifetime (`MAX_SETTLED_RECORDS` + retention); never a
+	/// second global keyset. Skipped on the wire — hub snapshots do not need it.
+	#[serde(skip)]
+	pub accounted: bool,
 }
 
 /// One reserve request with every field observability needs. `reserve_child`
@@ -433,6 +455,18 @@ struct SupervisorState {
 	outstanding: HashSet<String>,
 	/// Bytes held by queued undelivered result text.
 	pending_bytes: usize,
+	/// Real usage seen on a live child's `MessageEnd` frames, summed per child.
+	/// A cancelled child loop never returns its turns, so this is the only
+	/// surviving record of what its provider requests already charged.
+	observed_usage: HashMap<String, TokenUsage>,
+	/// Accounting-only ledger: one entry per child whose own usage became
+	/// known, oldest first. Drained by the session owner.
+	accounting: VecDeque<AccountedUsage>,
+	/// Whether this supervisor has a consumer that will drain the ledger. Off
+	/// until the owning scope enables it with a goal runtime to drain into, so a
+	/// scope that tracks nothing collects nothing instead of accumulating spend
+	/// nobody reads.
+	track_usage: bool,
 }
 
 pub struct Supervisor {
@@ -446,6 +480,8 @@ pub struct Supervisor {
 	allow_hub: AtomicBool,
 	/// `async.enabled` equivalent: background spawns are allowed by default.
 	async_enabled: AtomicBool,
+	/// `--external-thinking`: mount the private `think` scratchpad tool.
+	external_thinking: AtomicBool,
 	/// Set once a result sink is registered. Without a sink a background
 	/// result has nowhere to go, so the task tool falls back to synchronous
 	/// execution (same fallback the TypeScript manager logs when it is absent).
@@ -524,6 +560,42 @@ pub enum CancelAttempt {
 	AlreadyCompleted,
 }
 
+/// Append one child's own usage to the accounting ledger, write-once per result
+/// key. An unreported child appends nothing: there is no zero placeholder, and
+/// a redelivery of the same key appends nothing either.
+///
+/// Collection happens only while [`Supervisor::enable_accounting`] has been
+/// called: a scope without a consumer that drains the ledger collects nothing,
+/// so nothing is ever collected and then discarded to bound the backlog. Once
+/// enabled, an entry is never dropped — the owner drains it at every boundary
+/// and once more at close, while the goal runtime is still retained.
+///
+/// Every child is ledgered, blocking or background. The ledger owns a namespaced
+/// key per child; the `task` result carries the same key beside that child's own
+/// counters (`details.accounting`), so whoever lands first claims it and the
+/// other adds nothing.
+fn account_usage(state: &mut SupervisorState, id: &str, usage: Option<TokenUsage>) {
+	if !state.track_usage {
+		return;
+	}
+	let Some(usage) = usage else {
+		return;
+	};
+	let Some(record) = state.records.get_mut(id) else {
+		return;
+	};
+	if record.result_key.is_empty() || record.accounted {
+		return;
+	}
+	record.accounted = true;
+	let key = record.result_key.clone();
+	state.accounting.push_back(AccountedUsage {
+		id: id.to_string(),
+		result_key: key,
+		usage,
+	});
+}
+
 /// Backend owner namespace: random per supervisor, never a bare PID/scope
 /// counter. Without `/dev/urandom`, fall back to this process's kernel start
 /// time (a recycled PID gets a new start time; execve keeps both), and
@@ -578,6 +650,7 @@ impl Supervisor {
 			allow_task: AtomicBool::new(allow_task),
 			allow_hub: AtomicBool::new(allow_hub),
 			async_enabled: AtomicBool::new(true),
+			external_thinking: AtomicBool::new(false),
 			result_sink_attached: AtomicBool::new(false),
 			root_permits: Arc::new(Semaphore::new(permits)),
 			mailbox: Arc::new(Mailbox::default()),
@@ -605,6 +678,9 @@ impl Supervisor {
 				settled_at: HashMap::new(),
 				outstanding: HashSet::new(),
 				pending_bytes: 0,
+				observed_usage: HashMap::new(),
+				accounting: VecDeque::new(),
+				track_usage: false,
 			}),
 			seq: AtomicU64::new(0),
 			settle: Notify::new(),
@@ -640,6 +716,17 @@ impl Supervisor {
 		// reach it. Normal completion, cancellation, and parent-future drop all
 		// unregister their own handle, so this map cannot grow stale.
 	}
+
+	/// Enable or disable the private `think` scratchpad (TS `externalThinking`).
+	pub fn set_external_thinking(&self, enabled: bool) {
+		self.external_thinking.store(enabled, Ordering::SeqCst);
+	}
+
+	#[must_use]
+	pub fn external_thinking(&self) -> bool {
+		self.external_thinking.load(Ordering::SeqCst)
+	}
+
 
 	pub fn set_agent_catalog(&self, catalog: Arc<AgentCatalog>) {
 		*self
@@ -760,6 +847,9 @@ impl Supervisor {
 			state.records.remove(id);
 			state.settled_at.remove(id);
 			state.consumed.remove(id);
+			// An evicted child's real usage stays in the ledger; only the
+			// observation cache goes.
+			state.observed_usage.remove(id);
 		}
 	}
 
@@ -1014,6 +1104,43 @@ impl Supervisor {
 		format!("{}:{id}", self.process_owner_ns)
 	}
 
+	/// Turn on child-usage accounting for this supervisor's whole lifetime.
+	///
+	/// Called by the owning scope only when it holds a drain sink (a retained
+	/// goal runtime) for as long as children can settle, so nothing is collected
+	/// and then thrown away. Deliberately one-way: once a scope tracks spend,
+	/// losing an entry would under-report it, so there is no matching disable.
+	pub fn enable_accounting(&self) {
+		self.state.lock().unwrap().track_usage = true;
+	}
+
+	/// Immutable accounting key captured when this child was reserved. A late
+	/// fill carries this exact string back and the supervisor verifies it, so
+	/// usage can never be attributed to a later record that happens to reuse
+	/// `task-N`.
+	pub fn capture_result_key(&self, id: &str) -> Option<String> {
+		let state = self.state.lock().unwrap();
+		state
+			.records
+			.get(id)
+			.map(|record| record.result_key.clone())
+			.filter(|key| !key.is_empty())
+	}
+
+	/// Usage this child's completed provider requests already reported, summed.
+	/// `None` means the provider reported nothing — never zero.
+	pub fn observed_usage(&self, id: &str) -> Option<TokenUsage> {
+		self.state.lock().unwrap().observed_usage.get(id).copied()
+	}
+
+	/// Drain the accounting ledger. Removal happens under the state lock, so a
+	/// boundary drain and the post-shutdown drain together account every child
+	/// exactly once; nothing is re-delivered.
+	pub fn take_accounting(&self) -> Vec<AccountedUsage> {
+		let mut state = self.state.lock().unwrap();
+		state.accounting.drain(..).collect()
+	}
+
 	pub fn processes(&self) -> Arc<dyn ProcessBackend> {
 		let mut slot = self.processes.lock().unwrap();
 		if let Some(processes) = slot.as_ref() {
@@ -1219,16 +1346,20 @@ impl Supervisor {
 			};
 			state.pending.clear();
 			(state.reservations.drain().map(|(_, token)| token).collect::<Vec<_>>(),
-			 state.active.drain().map(|(_, child)| child).collect::<Vec<_>>())
+			 state.active.drain().collect::<Vec<_>>())
 		};
 		for reservation in reservations {
 			reservation.cancel();
 		}
-		for active in active {
+		for (id, active) in active {
 			// Cancel first so shell tools can unwind their process trees, then
 			// abort the task as the bounded fallback.
 			active.cancellation_token.cancel();
 			let _ = active.steering_tx.try_send(SteeringEvent::Interrupt);
+			// The loop drops its turns on cancellation, so settle the usage its
+			// completed requests already reported before the task is aborted and
+			// can no longer report anything at all.
+			self.abort_with_observed_usage(&id, "aborted by supervisor shutdown");
 			active.abort_handle.abort();
 		}
 		self.settle.notify_waiters();
@@ -1283,7 +1414,9 @@ impl Supervisor {
 				None,
 			)));
 		}
-		reg.register(Arc::new(ThinkTool::new()));
+		if self.external_thinking() {
+			reg.register(Arc::new(ThinkTool::new()));
+		}
 		let limits = self.limits();
 		if self.task_enabled() && (limits.max_depth < 0 || 0 < limits.max_depth) {
 			reg.register(Arc::new(TaskTool::with_semaphore(
@@ -1337,7 +1470,9 @@ impl Supervisor {
 			));
 		}
 		reg.register(Arc::new(YieldTool::new()));
-		reg.register(Arc::new(ThinkTool::new()));
+		if self.external_thinking() {
+			reg.register(Arc::new(ThinkTool::new()));
+		}
 		// The template's `lsp`/`debug` instances belong to the root: the LSP tool
 		// holds the root's shared ownership scope and the debug tool the root's
 		// session tree. A child must neither drive the parent's debuggee nor keep
@@ -1431,7 +1566,7 @@ impl Supervisor {
 				.is_err()
 			{
 				active.abort_handle.abort();
-				self.mark_aborted(id, "cancelled by hub");
+				self.abort_with_observed_usage(id, "cancelled by hub");
 			}
 		} else if let Some(token) = reservation {
 			// Still queued for a permit: cancel the reservation so the child never
@@ -1455,7 +1590,7 @@ impl Supervisor {
 					active.abort_handle.abort();
 					let _ = tokio::time::timeout(CANCEL_SETTLE_TIMEOUT, self.wait_settled(id)).await;
 				}
-				self.mark_aborted(id, "cancelled by hub");
+				self.abort_with_observed_usage(id, "cancelled by hub");
 			}
 			self.unregister_active_child(id);
 		}
@@ -1545,6 +1680,7 @@ impl Supervisor {
 				parent_tool_call_id: spawn.parent_tool_call_id.map(str::to_string),
 				detached: spawn.detached,
 				usage: None,
+				accounted: false,
 			};
 			state.order.push(id.clone());
 			state.records.insert(id.clone(), record.clone());
@@ -1719,22 +1855,56 @@ impl Supervisor {
 		true
 	}
 
-	/// Forward one real event from a running child's loop to observers. Events
-	/// for settled or unknown ids are dropped, so no frame outlives its record.
+	/// Forward one real event from a child's loop to observers.
+	///
+	/// `MessageEnd` usage is merged while the child is `Running`, and also after
+	/// a forced abort while the record still has no filled usage — so a queued
+	/// terminal frame that races shutdown/`ChildGuard` is not dropped. Observers
+	/// still see frames only while `Running`; return stays true after an aborted
+	/// usage accept so the forwarder drains remaining queued frames.
 	pub fn report_event(&self, id: &str, event: AgentEvent) -> bool {
 		let _emission = self.emission_gate();
-		let live = {
-			let state = self.state.lock().unwrap();
-			state
-				.records
-				.get(id)
-				.is_some_and(|record| record.status == ChildStatus::Running)
+		let (emit, keep_draining) = {
+			let mut state = self.state.lock().unwrap();
+			let Some(status) = state.records.get(id).map(|record| record.status) else {
+				return false;
+			};
+			let running = status == ChildStatus::Running;
+			let accept_aborted_usage = status == ChildStatus::Aborted
+				&& state
+					.records
+					.get(id)
+					.is_some_and(|record| record.usage.is_none());
+			if let AgentEvent::MessageEnd { message, .. } = &event
+				&& let Some(usage) = message.usage
+				&& (running || accept_aborted_usage)
+			{
+				state
+					.observed_usage
+					.entry(id.to_string())
+					.or_insert_with(TokenUsage::default)
+					.merge(usage);
+				if accept_aborted_usage {
+					let key_ok = state
+						.records
+						.get(id)
+						.is_some_and(|record| !record.result_key.is_empty());
+					if key_ok {
+						if let Some(record) = state.records.get_mut(id)
+							&& record.usage.is_none()
+						{
+							record.usage = Some(usage);
+						}
+						account_usage(&mut state, id, Some(usage));
+					}
+				}
+			}
+			(running, running || accept_aborted_usage)
 		};
-		if !live {
-			return false;
+		if emit {
+			self.emit(SubagentEvent::Event { id: id.to_string(), event });
 		}
-		self.emit(SubagentEvent::Event { id: id.to_string(), event });
-		true
+		keep_draining
 	}
 
 	/// Emission gate. Taken before `state` and held until the frames are handed
@@ -1854,6 +2024,22 @@ impl Supervisor {
 	}
 
 	pub fn mark_aborted(&self, id: &str, reason: &str) -> bool {
+		self.abort_child(id, reason, None)
+	}
+
+	/// Abort a job whose completed turns already reported usage. The counters
+	/// ride the same terminal transition, so a child cancelled after real
+	/// provider requests still contributes what they charged.
+	pub fn mark_aborted_with_usage(
+		&self,
+		id: &str,
+		reason: &str,
+		usage: Option<TokenUsage>,
+	) -> bool {
+		self.abort_child(id, reason, usage)
+	}
+
+	fn abort_child(&self, id: &str, reason: &str, usage: Option<TokenUsage>) -> bool {
 		let _emission = self.emission_gate();
 		let (changed, record) = {
 			let mut state = self.state.lock().unwrap();
@@ -1862,6 +2048,10 @@ impl Supervisor {
 					record.status = ChildStatus::Aborted;
 					record.aborted = Some(true);
 					record.abort_reason = Some(reason.to_string());
+					// Terminal status and real usage are separate writes: usage
+					// stays `None` here unless this caller already knows it, and
+					// a later [`Self::fill_aborted_usage`] fills it once.
+					record.usage = usage;
 					true
 				},
 				_ => false,
@@ -1869,6 +2059,7 @@ impl Supervisor {
 			if changed {
 				state.settled_at.insert(id.to_string(), now_ms());
 				state.outstanding.remove(id);
+				account_usage(&mut state, id, usage);
 			}
 			let record = state.records.get(id).cloned();
 			(changed, record)
@@ -1886,6 +2077,49 @@ impl Supervisor {
 		changed
 	}
 
+	/// Abort after the child's own settlement failed to arrive in time: mark it
+	/// terminal, then hand over the usage its completed requests really
+	/// reported. Same write-once fill the normal interrupt path uses, so a
+	/// forced cancel neither invents zeros nor double-counts.
+	pub(crate) fn abort_with_observed_usage(&self, id: &str, reason: &str) {
+		self.mark_aborted(id, reason);
+		if let Some(key) = self.capture_result_key(id) {
+			self.fill_aborted_usage(id, &key, self.observed_usage(id));
+		}
+	}
+
+	/// Give an already-terminal child the usage its cancelled turns preserved,
+	/// write-once and key-checked.
+	///
+	/// `result_key` is the key the caller captured when it spawned this child;
+	/// a record that no longer exists, carries another key, or already holds
+	/// real usage rejects the fill instead of re-attributing or double-counting
+	/// counters. `None` fills nothing: unknown stays unknown, never zero.
+	pub fn fill_aborted_usage(
+		&self,
+		id: &str,
+		result_key: &str,
+		usage: Option<TokenUsage>,
+	) -> bool {
+		let Some(usage) = usage else {
+			return false;
+		};
+		let mut state = self.state.lock().unwrap();
+		if !state
+			.records
+			.get(id)
+			.is_some_and(|record| record.result_key == result_key)
+		{
+			return false;
+		}
+		match state.records.get_mut(id) {
+			Some(record) if record.usage.is_none() => record.usage = Some(usage),
+			_ => return false,
+		}
+		account_usage(&mut state, id, Some(usage));
+		true
+	}
+
 	fn settle_child(
 		&self,
 		id: &str,
@@ -1897,6 +2131,7 @@ impl Supervisor {
 		let _emission = self.emission_gate();
 		let (changed, record) = {
 			let mut state = self.state.lock().unwrap();
+			let observed = state.observed_usage.get(id).copied();
 			let changed = match state.records.get_mut(id) {
 				Some(record) if record.status == ChildStatus::Running => {
 					record.duration_ms = Some(duration_ms);
@@ -1911,13 +2146,15 @@ impl Supervisor {
 						},
 						_ => return,
 					}
-					record.usage = usage;
+					let reported = usage.or(observed);
+					record.usage = reported;
 					true
 				},
 				_ => false,
 			};
 			if changed {
 				state.settled_at.insert(id.to_string(), now_ms());
+				account_usage(&mut state, id, usage.or(observed));
 			}
 			let record = state.records.get(id).cloned();
 			(changed, record)
@@ -2002,7 +2239,11 @@ impl Drop for ChildGuard {
 			self.cancellation_token.cancel();
 			let _ = self.steering_tx.try_send(SteeringEvent::Interrupt);
 			self.handle.abort();
-			self.supervisor.mark_aborted(&self.id, "aborted by parent");
+			// A parent abort also drops the child loop's turns: keep the usage its
+			// completed requests already reported instead of settling an unknown.
+			self
+				.supervisor
+				.abort_with_observed_usage(&self.id, "aborted by parent");
 			self.supervisor.unregister_active_child(&self.id);
 		}
 	}
@@ -2069,14 +2310,34 @@ mod process_wiring_tests {
 	}
 
 	fn supervisor() -> Arc<Supervisor> {
-		Supervisor::with_selection(
+		let supervisor = Supervisor::with_selection(
 			ToolRegistry::with_builtins(),
 			Arc::new(QuietProvider),
 			None,
 			DelegationLimits::default(),
 			true,
 			true,
-		)
+		);
+		// Production enables collection only when a goal runtime drains it; the
+		// ledger tests below stand in for that consumer.
+		supervisor.enable_accounting();
+		supervisor
+	}
+
+	/// A detached (`task` async) reservation. The ledger covers blocking children
+	/// too; the blocking case is asserted separately because its counters also
+	/// ride the tool result, and only the shared key keeps them single.
+	fn detached_spawn<'a>(name: &'a str, index: usize, parent: Option<&'a str>) -> ChildSpawn<'a> {
+		ChildSpawn {
+			name,
+			index,
+			agent: "task",
+			agent_source: "builtin",
+			task: "work",
+			parent_id: parent,
+			parent_tool_call_id: None,
+			detached: true,
+		}
 	}
 
 	#[test]
@@ -2141,6 +2402,287 @@ mod process_wiring_tests {
 		assert_eq!(deliveries[0].id, "", "a text-only sink has no identity");
 		assert_eq!(deliveries[0].result_key, None, "no key is invented");
 	}
+
+	/// Nested accounting: each child contributes its own reported counters once,
+	/// never its subtree, and a child whose first terminal write carried no usage
+	/// is filled later. A owns 22/14, B (spawned by A) 11/7, C (also A's) is
+	/// aborted while still unknown and filled with the real 11/7 it reported
+	/// before cancellation: 44/28 in total, three entries, all keys distinct.
+	#[test]
+	fn accounting_ledger_totals_nested_children_exactly_once() {
+		let supervisor = supervisor();
+		let usage = |input: u64, output: u64| TokenUsage {
+			input,
+			output,
+			total_tokens: input + output,
+			..TokenUsage::default()
+		};
+		let (a, _a_token) = supervisor
+			.reserve_child_full(detached_spawn("a", 0, None))
+			.expect("reserve a");
+		let (b, _b_token) = supervisor
+			.reserve_child_full(detached_spawn("b", 1, Some(&a)))
+			.expect("reserve b");
+		let (c, _c_token) = supervisor
+			.reserve_child_full(detached_spawn("c", 2, Some(&a)))
+			.expect("reserve c");
+		let c_key = supervisor.capture_result_key(&c).expect("spawn-time key");
+
+		supervisor.mark_completed_with_usage(&a, 1, "<task-result/>", Some(usage(22, 14)));
+		supervisor.mark_completed_with_usage(&b, 1, "<task-result/>", Some(usage(11, 7)));
+		assert!(supervisor.mark_aborted(&c, "aborted"));
+		assert_eq!(
+			supervisor.capture_result_key(&c).as_deref(),
+			Some(c_key.as_str()),
+			"the key is immutable across settlement"
+		);
+		assert!(supervisor.fill_aborted_usage(&c, &c_key, Some(usage(11, 7))));
+
+		// Write-once: a repeated fill, a fill without usage, and a fill quoting
+		// another record's key all add nothing.
+		assert!(!supervisor.fill_aborted_usage(&c, &c_key, Some(usage(11, 7))));
+		assert!(!supervisor.fill_aborted_usage(&c, &c_key, None));
+		assert!(!supervisor.fill_aborted_usage(&c, "omp-foreign:task-3", Some(usage(11, 7))));
+
+		let entries = supervisor.take_accounting();
+		let own: Vec<(String, u64, u64)> = entries
+			.iter()
+			.map(|entry| (entry.id.clone(), entry.usage.input, entry.usage.output))
+			.collect();
+		assert_eq!(
+			own,
+			vec![
+				(a.clone(), 22, 14),
+				(b.clone(), 11, 7),
+				(c.clone(), 11, 7),
+			],
+			"each child's own turns, never a subtree sum"
+		);
+		let total = entries
+			.iter()
+			.fold((0u64, 0u64), |(input, output), entry| {
+				(
+					input + entry.usage.input,
+					output + entry.usage.output,
+				)
+			});
+		assert_eq!(total, (44, 28));
+		let keys: HashSet<&str> = entries
+			.iter()
+			.map(|entry| entry.result_key.as_str())
+			.collect();
+		assert_eq!(keys.len(), 3, "one namespaced key per child");
+		assert!(
+			supervisor.take_accounting().is_empty(),
+			"a drained ledger never re-delivers an entry"
+		);
+	}
+
+	/// A child that never reported usage stays unknown: the ledger holds no
+	/// zero-filled entry for it, even after a terminal transition.
+	#[test]
+	fn accounting_ledger_never_invents_zero_usage() {
+		let supervisor = supervisor();
+		let (id, _token) = supervisor
+			.reserve_child_full(detached_spawn("quiet", 0, None))
+			.expect("reserve");
+		supervisor.mark_completed_with_usage(&id, 1, "<task-result/>", None);
+		assert_eq!(supervisor.observed_usage(&id), None);
+		assert!(supervisor.take_accounting().is_empty(), "no report, no entry");
+
+		let (aborted, _token) = supervisor
+			.reserve_child_full(detached_spawn("aborted", 1, None))
+			.expect("reserve");
+		assert!(supervisor.mark_aborted(&aborted, "cancelled by hub"));
+		assert!(supervisor.take_accounting().is_empty(), "an early cancel has no counters");
+	}
+
+	/// A blocking child is ledgered too. Its counters also ride the `task` result
+	/// (`details.accounting` pairs this same key with the child's own usage), and
+	/// the key is what keeps the batch from being charged on both paths.
+	#[test]
+	fn accounting_ledger_covers_blocking_child_with_same_key_as_details() {
+		let supervisor = supervisor();
+		let (id, _token) = supervisor
+			.reserve_child("blocking", 0, "task", "work", None)
+			.expect("reserve");
+		let key = supervisor.capture_result_key(&id).expect("spawn-time key");
+		supervisor.mark_completed_with_usage(
+			&id,
+			1,
+			"<task-result/>",
+			Some(TokenUsage {
+				input: 4,
+				output: 6,
+				total_tokens: 10,
+				..TokenUsage::default()
+			}),
+		);
+		let entries = supervisor.take_accounting();
+		assert_eq!(entries.len(), 1, "a blocking child is accounted exactly once");
+		assert_eq!(entries[0].result_key, key, "the details payload quotes this key");
+		assert!(
+			supervisor.take_accounting().is_empty(),
+			"a blocking child is never ledgered twice"
+		);
+	}
+
+	/// A forced abort (shutdown, parent drop, permit race) settles the usage its
+	/// completed requests already reported before the task is killed — the same
+	/// real counters, once, and still write-once.
+	#[test]
+	fn forced_abort_fills_observed_usage_once() {
+		let supervisor = supervisor();
+		let (id, _token) = supervisor
+			.reserve_child_full(detached_spawn("bg", 0, None))
+			.expect("reserve");
+		let key = supervisor.capture_result_key(&id).expect("spawn-time key");
+		let mut message = Message::assistant("partial");
+		message.usage = Some(TokenUsage {
+			input: 11,
+			output: 7,
+			..TokenUsage::default()
+		});
+		assert!(supervisor.report_event(
+			&id,
+			AgentEvent::MessageEnd {
+				message,
+				status: crate::state::TurnStatus::ToolUse,
+			},
+		));
+		supervisor.abort_with_observed_usage(&id, "aborted by supervisor shutdown");
+		let entries = supervisor.take_accounting();
+		assert_eq!(entries.len(), 1);
+		assert_eq!((entries[0].usage.input, entries[0].usage.output), (11, 7));
+		assert_eq!(entries[0].result_key, key);
+		assert!(
+			!supervisor.fill_aborted_usage(
+				&id,
+				&key,
+				Some(TokenUsage {
+					input: 1,
+					output: 1,
+					..TokenUsage::default()
+				}),
+			),
+			"the interrupted loop's turns are never counted twice"
+		);
+		assert!(supervisor.take_accounting().is_empty());
+	}
+	/// Forced abort marks Aborted before a queued `MessageEnd` reaches
+	/// `report_event`: that frame must still fill observed usage once under the
+	/// spawn-time key, and a second report / fill must add nothing.
+	#[test]
+	fn forced_shutdown_queued_message_end_accounts_once() {
+		let supervisor = supervisor();
+		let (id, _token) = supervisor
+			.reserve_child_full(detached_spawn("bg", 0, None))
+			.expect("reserve");
+		let key = supervisor.capture_result_key(&id).expect("spawn-time key");
+		assert!(supervisor.mark_aborted(&id, "aborted by supervisor shutdown"));
+		assert!(supervisor.observed_usage(&id).is_none());
+		let mut message = Message::assistant("partial");
+		message.usage = Some(TokenUsage {
+			input: 11,
+			output: 7,
+			..TokenUsage::default()
+		});
+		assert!(
+			supervisor.report_event(
+				&id,
+				AgentEvent::MessageEnd {
+					message: message.clone(),
+					status: crate::state::TurnStatus::ToolUse,
+				},
+			),
+			"queued MessageEnd after abort still drains"
+		);
+		let entries = supervisor.take_accounting();
+		assert_eq!(entries.len(), 1);
+		assert_eq!((entries[0].usage.input, entries[0].usage.output), (11, 7));
+		assert_eq!(entries[0].result_key, key);
+		assert!(
+			!supervisor.report_event(
+				&id,
+				AgentEvent::MessageEnd {
+					message,
+					status: crate::state::TurnStatus::ToolUse,
+				},
+			),
+			"second MessageEnd after fill stops the forwarder"
+		);
+		assert!(
+			!supervisor.fill_aborted_usage(
+				&id,
+				&key,
+				Some(TokenUsage {
+					input: 1,
+					output: 1,
+					..TokenUsage::default()
+				}),
+			),
+			"write-once fill rejects a second settle"
+		);
+		assert!(supervisor.take_accounting().is_empty());
+	}
+
+	/// After retention prune drops the record, a late fill cannot settle again:
+	/// the accounted flag lived on the record and dies with it; missing record
+	/// rejects the fill (no unbounded global keyset).
+	#[test]
+	fn accounting_ledger_rejects_fill_after_record_prune() {
+		let supervisor = supervisor();
+		let (id, token) = supervisor
+			.reserve_child_full(detached_spawn("bg", 0, None))
+			.expect("reserve");
+		let key = supervisor.capture_result_key(&id).expect("spawn-time key");
+		supervisor.mark_completed_with_usage(
+			&id,
+			1,
+			"<task-result/>",
+			Some(TokenUsage {
+				input: 10,
+				output: 5,
+				total_tokens: 15,
+				..TokenUsage::default()
+			}),
+		);
+		let entries = supervisor.take_accounting();
+		assert_eq!(entries.len(), 1);
+		assert_eq!(entries[0].result_key, key);
+		drop(token);
+		supervisor.unregister_active_child(&id);
+		// This detached record has no auto-delivery body in this fixture; remove
+		// the pending envelope so retention is eligible to evict it.
+		{
+			let mut state = supervisor.state.lock().unwrap();
+			state.pending.clear();
+		}
+
+		{
+			let mut state = supervisor.state.lock().unwrap();
+			state
+				.settled_at
+				.insert(id.clone(), now_ms().saturating_sub(RECORD_RETENTION_MS + 1000));
+			Supervisor::prune_state(&mut state);
+			assert!(!state.records.contains_key(&id), "record was pruned");
+		}
+		assert!(
+			!supervisor.fill_aborted_usage(
+				&id,
+				&key,
+				Some(TokenUsage {
+					input: 10,
+					output: 5,
+					total_tokens: 15,
+					..TokenUsage::default()
+				}),
+			),
+			"missing record rejects a second settle"
+		);
+		assert!(supervisor.take_accounting().is_empty());
+	}
+
 
 	#[test]
 	fn child_registry_gets_isolated_lsp_scope_and_debug_tree() {

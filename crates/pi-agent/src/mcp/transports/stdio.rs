@@ -19,6 +19,30 @@ struct PendingGuard<'a> {
     active: bool,
 }
 
+/// Fire-and-forget JSON-RPC cancel. try_send never blocks the timeout/abort path.
+fn write_cancelled(stdin_tx: &mpsc::Sender<String>, request_id: &Value) {
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": { "requestId": request_id }
+    });
+    let _ = stdin_tx.try_send(format!("{}\n", notification));
+}
+
+struct CancelNotifyGuard {
+    stdin_tx: mpsc::Sender<String>,
+    request_id: Value,
+    active: bool,
+}
+
+impl Drop for CancelNotifyGuard {
+    fn drop(&mut self) {
+        if self.active {
+            write_cancelled(&self.stdin_tx, &self.request_id);
+        }
+    }
+}
+
 impl<'a> Drop for PendingGuard<'a> {
     fn drop(&mut self) {
         if self.active {
@@ -272,6 +296,13 @@ impl McpTransport for StdioTransport {
             active: true,
         };
 
+        // Declared after PendingGuard so cancel is sent before the pending entry is removed.
+        let mut cancel_guard = CancelNotifyGuard {
+            stdin_tx: self.stdin_tx.clone(),
+            request_id: id_val.clone(),
+            active: true,
+        };
+
         let stdin_tx = self.stdin_tx.clone();
         let send_and_recv = async move {
             let line = format!("{}\n", req);
@@ -283,12 +314,24 @@ impl McpTransport for StdioTransport {
         };
 
         let res = if let Some(dur) = timeout {
-            match tokio::time::timeout(dur, send_and_recv).await {
-                Ok(res) => res,
-                Err(_) => Err(McpError::Timeout(format!("Request '{}' timed out after {:?}", method, dur))),
+            // On timeout: notify server before select drops the oneshot receiver.
+            // On abort: CancelNotifyGuard Drop still fires (active left true).
+            tokio::select! {
+                biased;
+                res = send_and_recv => {
+                    cancel_guard.active = false;
+                    res
+                }
+                _ = tokio::time::sleep(dur) => {
+                    cancel_guard.active = false;
+                    write_cancelled(&self.stdin_tx, &id_val);
+                    Err(McpError::Timeout(format!("Request '{}' timed out after {:?}", method, dur)))
+                }
             }
         } else {
-            send_and_recv.await
+            let res = send_and_recv.await;
+            cancel_guard.active = false;
+            res
         };
 
         if res.is_ok() {
@@ -326,8 +369,11 @@ impl McpTransport for StdioTransport {
         };
         if let Some(mut child) = child_opt {
             let _ = child.kill().await;
+            // Reap in the background so close() never blocks on a stuck wait.
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
         }
-
         let mut map = self.pending_requests.lock().unwrap();
         for (_, tx) in map.drain() {
             let _ = tx.send(Err(McpError::Closed));
@@ -346,10 +392,56 @@ impl Drop for StdioTransport {
         let mut child_guard = self.child.lock().unwrap();
         if let Some(mut child) = child_guard.take() {
             let _ = child.start_kill();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = child.wait().await;
+                });
+            }
         }
         let mut map = self.pending_requests.lock().unwrap();
         for (_, tx) in map.drain() {
             let _ = tx.send(Err(McpError::Closed));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::types::MCPStdioServerConfig;
+    use std::collections::HashMap;
+
+    /// Stub: after close(), child pid must leave /proc (reaped, not zombie).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_reaps_child_process() {
+        let config = MCPStdioServerConfig {
+            command: "sleep".to_string(),
+            args: vec!["30".to_string()],
+            env: HashMap::new(),
+            cwd: None,
+            timeout: Some(5_000),
+            request_id_format: Some(RequestIdFormat::Number),
+        };
+        let transport = StdioTransport::spawn(&config)
+            .await
+            .expect("spawn sleep");
+        let pid = {
+            let guard = transport.child.lock().unwrap();
+            guard.as_ref().and_then(|c| c.id()).expect("child pid")
+        };
+        transport.close().await.expect("close");
+
+        let status_path = format!("/proc/{pid}/status");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !std::path::Path::new(&status_path).exists() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("pid {pid} still in /proc after close — unreaped zombie");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }

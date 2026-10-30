@@ -29,7 +29,13 @@ pub struct Reporter<W: Write, E: Write> {
 	out: W,
 	err: E,
 	working_announced: bool,
-	final_text: Option<String>,
+	/// Final assistant blocks in message order (thinking/text as streamed).
+	final_blocks: Vec<(pi_agent::StreamBlockKind, String)>,
+	/// Per-message first-occurrence block cursor: the `contentIndex` each delta
+	/// belongs to (TS `appendText`/`appendThinking`), reset per assistant message.
+	stream_blocks: pi_agent::StreamBlockCursor,
+	/// Text mode only: render public reasoning before the answer.
+	print_thoughts: bool,
 	api: String,
 	provider: String,
 	model: String,
@@ -42,7 +48,9 @@ impl<W: Write, E: Write> Reporter<W, E> {
 			out,
 			err,
 			working_announced: false,
-			final_text: None,
+			final_blocks: Vec::new(),
+			stream_blocks: pi_agent::StreamBlockCursor::default(),
+			print_thoughts: false,
 			api: "openai-completions".to_string(),
 			provider: "openai".to_string(),
 			model: "gpt-4o".to_string(),
@@ -70,6 +78,13 @@ impl<W: Write, E: Write> Reporter<W, E> {
 		self.api = api.into();
 		self.provider = provider.into();
 		self.model = model.into();
+	}
+
+	/// Text mode only: also print public reasoning from the persisted message.
+	#[must_use]
+	pub fn with_print_thoughts(mut self, print_thoughts: bool) -> Self {
+		self.print_thoughts = print_thoughts;
+		self
 	}
 
 	/// NDJSON session header. Emitted once, JSON mode only.
@@ -104,6 +119,7 @@ impl<W: Write, E: Write> Reporter<W, E> {
 			let ts = current_timestamp_ms();
 			match event {
 				Event::MessageStart { role } => {
+					self.stream_blocks.reset();
 					let envelope = serde_json::json!({
 						"type": "message_start",
 						"message": { "role": role }
@@ -111,17 +127,38 @@ impl<W: Write, E: Write> Reporter<W, E> {
 					writeln!(self.out, "{envelope}")?;
 				},
 				Event::MessageUpdate { delta } => {
-					let envelope = serde_json::json!({
-						"type": "message_update",
-						"assistantMessageEvent": {
-							"type": "text_delta",
-							"contentIndex": 0,
-							"delta": delta,
-						}
-					});
-					writeln!(self.out, "{envelope}")?;
+					// TS `appendText`: the index is the block's position in the
+					// message content, not a constant.
+					if !delta.is_empty() {
+						let content_index = self.stream_blocks.open(pi_agent::StreamBlockKind::Text);
+						let envelope = serde_json::json!({
+							"type": "message_update",
+							"assistantMessageEvent": {
+								"type": "text_delta",
+								"contentIndex": content_index,
+								"delta": delta,
+							}
+						});
+						writeln!(self.out, "{envelope}")?;
+					}
+				},
+				Event::ThinkingUpdate { delta } => {
+					if !delta.is_empty() {
+						let content_index =
+							self.stream_blocks.open(pi_agent::StreamBlockKind::Thinking);
+						let envelope = serde_json::json!({
+							"type": "message_update",
+							"assistantMessageEvent": {
+								"type": "thinking_delta",
+								"contentIndex": content_index,
+								"delta": delta,
+							}
+						});
+						writeln!(self.out, "{envelope}")?;
+					}
 				},
 				Event::MessageEnd { message, stop_reason, api, provider, model } => {
+					self.stream_blocks.reset();
 					let eff_api = api.as_deref().unwrap_or(&self.api);
 					let eff_provider = provider.as_deref().unwrap_or(&self.provider);
 					let eff_model = model.as_deref().unwrap_or(&self.model);
@@ -261,11 +298,11 @@ impl<W: Write, E: Write> Reporter<W, E> {
 		}
 		match event {
 			Event::MessageEnd { message, .. } => {
-				self.final_text = Some(message.content.clone());
+				self.final_blocks = message_blocks(message);
 			},
 			Event::AgentEnd { messages, .. } => {
 				if let Some(last_asst) = messages.iter().rfind(|m| m.role == pi_agent::Role::Assistant) {
-					self.final_text = Some(last_asst.content.clone());
+					self.final_blocks = message_blocks(last_asst);
 				}
 			},
 			Event::ToolStart { tool, .. } => {
@@ -283,12 +320,23 @@ impl<W: Write, E: Write> Reporter<W, E> {
 		Ok(())
 	}
 
-	/// Flush the final assistant text (text mode) and stdout.
+	/// Flush the final assistant blocks (text mode) and stdout.
+	///
+	/// TS `print-mode.ts:228-233` walks `assistantMsg.content` in order: every
+	/// text block prints, reasoning prints only when `--print-thoughts` is set.
 	pub fn finish(&mut self) -> Result<()> {
-		if self.mode == OutputMode::Text
-			&& let Some(text) = self.final_text.take()
-		{
-			writeln!(self.out, "{text}")?;
+		if self.mode == OutputMode::Text {
+			let blocks = std::mem::take(&mut self.final_blocks);
+			for (kind, text) in blocks {
+				match kind {
+					pi_agent::StreamBlockKind::Text => writeln!(self.out, "{text}")?,
+					pi_agent::StreamBlockKind::Thinking => {
+						if self.print_thoughts && !text.trim().is_empty() {
+							writeln!(self.out, "{text}")?;
+						}
+					},
+				}
+			}
 		}
 		self.out.flush()?;
 		self.err.flush()?;
@@ -303,6 +351,30 @@ fn current_timestamp_ms() -> u64 {
 		.unwrap_or(0)
 }
 
+/// Assistant blocks in message order, thinking and text kept apart.
+fn message_blocks(
+	message: &pi_agent::Message,
+) -> Vec<(pi_agent::StreamBlockKind, String)> {
+	let blocks: Vec<_> = message
+		.parts
+		.iter()
+		.filter_map(|part| match part {
+			pi_agent::ContentPart::Thinking { thinking } => {
+				Some((pi_agent::StreamBlockKind::Thinking, thinking.clone()))
+			},
+			pi_agent::ContentPart::Text { text } => {
+				Some((pi_agent::StreamBlockKind::Text, text.clone()))
+			},
+			pi_agent::ContentPart::Image { .. } => None,
+		})
+		.collect();
+	if blocks.is_empty() && !message.content.is_empty() {
+		vec![(pi_agent::StreamBlockKind::Text, message.content.clone())]
+	} else {
+		blocks
+	}
+}
+
 fn format_ts_assistant_message(
 	message: &pi_agent::Message,
 	api: &str,
@@ -312,7 +384,28 @@ fn format_ts_assistant_message(
 	timestamp: u64,
 ) -> serde_json::Value {
 	let mut content = Vec::new();
-	if !message.content.is_empty() {
+	for part in &message.parts {
+		match part {
+			pi_agent::ContentPart::Thinking { thinking } => {
+				content.push(serde_json::json!({
+					"type": "thinking",
+					"thinking": thinking,
+				}));
+			},
+			pi_agent::ContentPart::Text { text } => {
+				content.push(serde_json::json!({
+					"type": "text",
+					"text": text,
+				}));
+			},
+			pi_agent::ContentPart::Image { .. } => {},
+		}
+	}
+	let has_text_part = message
+		.parts
+		.iter()
+		.any(|part| matches!(part, pi_agent::ContentPart::Text { .. }));
+	if !has_text_part && !message.content.is_empty() {
 		content.push(serde_json::json!({
 			"type": "text",
 			"text": message.content,
@@ -402,6 +495,10 @@ fn format_ts_message(
 						pi_agent::ContentPart::Text { text } => serde_json::json!({
 							"type": "text",
 							"text": text,
+						}),
+						pi_agent::ContentPart::Thinking { thinking } => serde_json::json!({
+							"type": "thinking",
+							"thinking": thinking,
 						}),
 						pi_agent::ContentPart::Image { data, mime_type } => serde_json::json!({
 							"type": "image",

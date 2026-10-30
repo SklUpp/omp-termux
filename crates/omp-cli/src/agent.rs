@@ -35,6 +35,11 @@ pub enum Event {
 	MessageUpdate {
 		delta: String,
 	},
+	/// Incremental public provider reasoning (TS `thinking_delta`). Kept apart
+	/// from [`Event::MessageUpdate`]; only text mode's final render gates it.
+	ThinkingUpdate {
+		delta: String,
+	},
 	MessageEnd {
 		message: pi_agent::Message,
 		#[serde(default, skip_serializing_if = "Option::is_none")]

@@ -43,7 +43,9 @@ use super::{
 	},
 };
 
-use pi_agent::{supervisor::SubagentObserver, tools::internal_urls::InternalUrlRouter};
+use pi_agent::{
+	StreamBlockKind, supervisor::SubagentObserver, tools::internal_urls::InternalUrlRouter,
+};
 
 fn now_ms() -> u64 {
 	SystemTime::now()
@@ -82,7 +84,10 @@ struct Meta {
 /// `turn_end`.
 #[derive(Default)]
 struct EventFrames {
-	text:          String,
+	/// Streamed content blocks in first-occurrence order (TS
+	/// `AssistantMessage.content`): a kind flip opens a new block, so the
+	/// snapshot order matches the finalized message for any provider order.
+	blocks:        Vec<(StreamBlockKind, String)>,
 	turn_open:     bool,
 	/// Whether an assistant `message_end` already reached the host. A retry
 	/// after that frame would deliver a second end for the same prompt.
@@ -93,12 +98,42 @@ struct EventFrames {
 }
 
 impl EventFrames {
+	/// Append a delta, opening a new block when the kind flips.
+	fn append(&mut self, kind: StreamBlockKind, delta: &str) {
+		match self.blocks.last_mut() {
+			Some((current, text)) if *current == kind => text.push_str(delta),
+			_ => self.blocks.push((kind, delta.to_string())),
+		}
+	}
+
+	/// Streamed answer text across all text blocks.
+	fn text(&self) -> String {
+		self
+			.blocks
+			.iter()
+			.filter(|(kind, _)| *kind == StreamBlockKind::Text)
+			.map(|(_, text)| text.as_str())
+			.collect()
+	}
+
+	/// Current streamed content in block order; reasoning and answer never merge.
+	fn content_blocks(&self) -> Vec<Value> {
+		self
+			.blocks
+			.iter()
+			.map(|(kind, text)| match kind {
+				StreamBlockKind::Thinking => json!({ "type": "thinking", "thinking": text }),
+				StreamBlockKind::Text => json!({ "type": "text", "text": text }),
+			})
+			.collect()
+	}
+
 	/// Upstream `#hasReplayUnsafeOutput` veto: a retry re-streams the turn from
 	/// `message_start`, so it is only safe while nothing user-visible was
 	/// emitted. Whitespace-only deltas stay replayable (thinking-only partials),
 	/// matching `turn-recovery.ts`.
 	fn replay_safe(&self) -> bool {
-		self.text.trim().is_empty() && !self.saw_tool
+		self.text().trim().is_empty() && !self.saw_tool
 	}
 }
 
@@ -109,6 +144,9 @@ impl EventFrames {
 				if role != "assistant" {
 					return;
 				}
+				// A new assistant message opens a new content list (TS new
+				// `output.content`), so a retried stream cannot inherit stale blocks.
+				self.blocks.clear();
 				if !self.turn_open {
 					sink.send(json!({ "type": "turn_start" }));
 					self.turn_open = true;
@@ -123,15 +161,27 @@ impl EventFrames {
 				}));
 			},
 			AgentEvent::MessageUpdate { delta } => {
-				self.text.push_str(delta);
+				self.append(StreamBlockKind::Text, delta);
 				sink.send(json!({
 					"type": "message_update",
 					"message": {
 						"role": "assistant",
-						"content": [{ "type": "text", "text": self.text }],
+						"content": self.content_blocks(),
 						"timestamp": now_ms(),
 					},
 					"assistantMessageEvent": { "type": "text_delta", "delta": delta },
+				}));
+			},
+			AgentEvent::ThinkingUpdate { delta } => {
+				self.append(StreamBlockKind::Thinking, delta);
+				sink.send(json!({
+					"type": "message_update",
+					"message": {
+						"role": "assistant",
+						"content": self.content_blocks(),
+						"timestamp": now_ms(),
+					},
+					"assistantMessageEvent": { "type": "thinking_delta", "delta": delta },
 				}));
 			},
 			AgentEvent::MessageEnd { message, stop_reason, api, provider, model } => {
@@ -140,7 +190,7 @@ impl EventFrames {
 					"type": "message_end",
 					"message": {
 						"role": "assistant",
-						"content": [{ "type": "text", "text": self.text }],
+						"content": self.content_blocks(),
 						"api": api.as_deref().or(meta.api.as_deref()),
 						"provider": provider.as_deref().or(meta.provider.as_deref()),
 						"model": model.as_deref().or(meta.model.as_deref()),
@@ -177,7 +227,7 @@ impl EventFrames {
 					"message": message.unwrap_or(Value::Null),
 					"toolResults": results,
 				}));
-				self.text.clear();
+				self.blocks.clear();
 				self.turn_open = false;
 			},
 			// TS `emitInputMessages`: an accepted steering message reaches the host

@@ -8,6 +8,11 @@
 //! No transport lives here: RPC host schemes register an adapter handler that
 //! speaks `host_uri_request`/`host_uri_result` frames, and any other embedder
 //! can register its own. That keeps `pi-agent` free of RPC dependencies.
+//!
+//! The `ssh://` handler is built in and lives in [`super::ssh`]: it shells out
+//! to the native OpenSSH client instead of routing frames through a host.
+//! The `mcp://` handler is built in and resolves live MCP sessions from
+//! [`crate::mcp::client`]'s process-wide registry.
 
 use std::{
 	collections::BTreeMap,
@@ -25,8 +30,11 @@ use crate::CancellationToken;
 pub const LOCAL_SCHEME: &str = "local";
 
 /// OMP-owned namespaces a host may never replace: `security://` is reserved for
-/// the security review surface, `local://` for the built-in root handler.
-pub const RESERVED_SCHEMES: [&str; 2] = ["local", "security"];
+/// the security review surface, `local://` for the built-in root handler,
+/// `ssh://` for the built-in native OpenSSH read handler, `mcp://` for the
+/// built-in MCP resource consumer, and `issue://`/`pr://` for the built-in
+/// native GitHub handlers.
+pub const RESERVED_SCHEMES: [&str; 6] = ["issue", "local", "mcp", "pr", "security", "ssh"];
 
 /// One parsed internal URL (`skill://plugin:name` style colons are preserved in
 /// the path because only the first `://` separates the scheme).
@@ -229,11 +237,26 @@ pub struct InternalUrlRouter {
 }
 
 impl Default for InternalUrlRouter {
-	/// Every constructor starts with the built-in `local://` handler, so a
-	/// session scope root resolves without an extra mount step.
+	/// Every constructor starts with the built-in `local://`, `ssh://`,
+	/// `mcp://`, `issue://`, and `pr://` handlers, so a session scope root, a
+	/// remote read, an MCP resource, and a GitHub issue or PR resolve without
+	/// an extra mount step.
 	fn default() -> Self {
 		let mut handlers: BTreeMap<String, Arc<dyn ProtocolHandler>> = BTreeMap::new();
 		handlers.insert(LOCAL_SCHEME.to_string(), Arc::new(LocalRootHandler));
+		handlers.insert(
+			super::ssh::SSH_SCHEME.to_string(),
+			Arc::new(super::ssh::SshProtocolHandler::new()),
+		);
+		handlers.insert(MCP_SCHEME.to_string(), Arc::new(McpUrlHandler));
+		handlers.insert(
+			"issue".to_string(),
+			Arc::new(super::internal_urls_github::IssueUrlHandler),
+		);
+		handlers.insert(
+			"pr".to_string(),
+			Arc::new(super::internal_urls_github::PrUrlHandler),
+		);
 		Self { handlers: Mutex::new(handlers) }
 	}
 }
@@ -252,10 +275,9 @@ impl InternalUrlRouter {
 		Self::default()
 	}
 
-	/// Register (or replace) one handler; returns the replaced handler.
-	///
 	/// Reserved namespaces are built in and refuse replacement, so a host can
-	/// never displace `local://` or `security://`.
+	/// never displace `local://`, `security://`, `ssh://`, `mcp://`, `issue://`,
+	/// or `pr://`.
 	pub fn register(
 		&self,
 		handler: Arc<dyn ProtocolHandler>,
@@ -344,6 +366,139 @@ impl InternalUrlRouter {
 
 	fn lock_handlers(&self) -> MutexGuard<'_, BTreeMap<String, Arc<dyn ProtocolHandler>>> {
 		self.handlers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+}
+
+/// Registered scheme for live MCP resource reads.
+pub const MCP_SCHEME: &str = "mcp";
+
+/// Built-in `mcp://` read handler.
+///
+/// URL forms (assignment contract, server-scoped listing):
+/// - `mcp://` — list active MCP server names
+/// - `mcp://<server>` — `resources/list` for that server
+/// - `mcp://<server>/<resource-uri>` — `resources/read` (path after the first
+///   `/` is the opaque resource URI, including nested schemes)
+///
+/// Sessions come from [`crate::mcp::client`]'s process-wide registry. The
+/// handler never connects; unknown/empty registries are explicit errors.
+pub struct McpUrlHandler;
+
+#[async_trait]
+impl ProtocolHandler for McpUrlHandler {
+	fn scheme(&self) -> &str {
+		MCP_SCHEME
+	}
+
+	fn immutable(&self) -> bool {
+		true
+	}
+
+	async fn resolve(
+		&self,
+		url: &InternalUrl,
+		context: &ResolveContext,
+	) -> Result<InternalResource, String> {
+		if context.signal.is_cancelled() {
+			return Err("aborted".to_string());
+		}
+		let servers = crate::mcp::list_active_sessions();
+		if servers.is_empty() {
+			return Err(
+				"No active MCP sessions. MCP servers may not be configured or connected."
+					.to_string(),
+			);
+		}
+
+		if url.host.is_empty() {
+			let mut lines = vec!["# Active MCP servers".to_string(), String::new()];
+			for name in &servers {
+				lines.push(format!("- {name}"));
+			}
+			let content = lines.join("\n");
+			let mut resource = InternalResource::text(&url.href, content);
+			resource.content_type = "text/markdown".to_string();
+			resource.immutable = true;
+			resource.is_directory = true;
+			return Ok(resource);
+		}
+
+		let Some(connection) = crate::mcp::get_active_session(&url.host) else {
+			return Err(format!(
+				"Unknown MCP server \"{}\".\nAvailable servers: {}",
+				url.host,
+				servers.join(", ")
+			));
+		};
+
+		if context.signal.is_cancelled() {
+			return Err("aborted".to_string());
+		}
+
+		let resource_uri = url.path.trim_start_matches('/');
+		if resource_uri.is_empty() {
+			let resources = connection.list_resources().await.map_err(|error| {
+				format!("mcp://{} resources/list failed: {error}", url.host)
+			})?;
+			let content = if resources.is_empty() {
+				format!("# MCP resources on {}\n\n(none)", url.host)
+			} else {
+				let mut lines =
+					vec![format!("# MCP resources on {}", url.host), String::new()];
+				for resource in &resources {
+					let mut line = format!("- {}", resource.uri);
+					if !resource.name.is_empty() && resource.name != resource.uri {
+						line.push_str(&format!(" ({})", resource.name));
+					}
+					if let Some(mime) = &resource.mime_type {
+						line.push_str(&format!(" [{mime}]"));
+					}
+					lines.push(line);
+				}
+				lines.join("\n")
+			};
+			let mut resource = InternalResource::text(&url.href, content);
+			resource.content_type = "text/markdown".to_string();
+			resource.immutable = true;
+			resource.is_directory = true;
+			resource.notes = Some(vec![format!("MCP server: {}", url.host)]);
+			return Ok(resource);
+		}
+
+		let result = connection
+			.read_resource(resource_uri)
+			.await
+			.map_err(|error| {
+				format!("MCP resource read error for \"{resource_uri}\" on \"{}\": {error}", url.host)
+			})?;
+		if result.contents.is_empty() {
+			return Err(format!(
+				"Server \"{}\" returned no content for \"{resource_uri}\".",
+				url.host
+			));
+		}
+
+		let mut text_parts = Vec::new();
+		for item in &result.contents {
+			if let Some(text) = &item.text {
+				text_parts.push(text.clone());
+			} else if let Some(blob) = &item.blob {
+				let mime = item.mime_type.as_deref().unwrap_or("unknown");
+				text_parts.push(format!(
+					"[Binary content: {mime}, base64 length {}]",
+					blob.len()
+				));
+			}
+		}
+		let content = if text_parts.is_empty() {
+			"(empty resource)".to_string()
+		} else {
+			text_parts.join("\n---\n")
+		};
+		let mut resource = InternalResource::text(&url.href, content);
+		resource.immutable = true;
+		resource.notes = Some(vec![format!("MCP server: {}", url.host)]);
+		Ok(resource)
 	}
 }
 
@@ -612,6 +767,8 @@ mod tests {
 		assert!(!is_valid_scheme("A"));
 		assert!(is_reserved_scheme("security"));
 		assert!(is_reserved_scheme("local"));
+		assert!(is_reserved_scheme("ssh"));
+		assert!(is_reserved_scheme("mcp"));
 		let url = InternalUrl::parse("skill://plugin:name/x").expect("parse");
 		assert_eq!(url.scheme, "skill");
 		assert_eq!(url.host, "plugin:name");
@@ -626,12 +783,18 @@ mod tests {
 		let error = runtime()
 			.block_on(router.resolve("nope://x", &context))
 			.expect_err("unknown");
-		assert_eq!(error, "Unknown protocol: nope://\nSupported: local://");
+		assert_eq!(
+			error,
+			"Unknown protocol: nope://\nSupported: issue://, local://, mcp://, pr://, ssh://"
+		);
 		router.register(Echo::new("notes", false, false)).expect("register");
 		let error = runtime()
 			.block_on(router.resolve("nope://x", &context))
 			.expect_err("unknown");
-		assert_eq!(error, "Unknown protocol: nope://\nSupported: local://, notes://");
+		assert_eq!(
+			error,
+			"Unknown protocol: nope://\nSupported: issue://, local://, mcp://, notes://, pr://, ssh://"
+		);
 		assert!(!router.can_handle("nope://x"));
 		assert!(router.can_handle("notes://x"));
 	}
@@ -659,7 +822,17 @@ mod tests {
 		assert_eq!(writable.writes.load(Ordering::SeqCst), 1);
 		assert!(router.unregister("docs"));
 		assert!(!router.unregister("docs"));
-		assert_eq!(router.schemes(), vec!["local".to_string(), "notes".to_string()]);
+		assert_eq!(
+			router.schemes(),
+			vec![
+				"issue".to_string(),
+				"local".to_string(),
+				"mcp".to_string(),
+				"notes".to_string(),
+				"pr".to_string(),
+				"ssh".to_string()
+			]
+		);
 	}
 
 	#[test]
@@ -686,7 +859,10 @@ mod tests {
 	#[test]
 	fn builtin_local_is_reserved_and_cannot_be_replaced() {
 		let router = InternalUrlRouter::new();
-		assert_eq!(router.schemes(), vec!["local".to_string()]);
+		assert_eq!(
+			router.schemes(),
+			vec!["issue".to_string(), "local".to_string(), "mcp".to_string(), "pr".to_string(), "ssh".to_string()]
+		);
 		let error = router
 			.register(Echo::new("local", false, false))
 			.err()
@@ -694,6 +870,150 @@ mod tests {
 		assert_eq!(error, "local:// is reserved for built-in handlers");
 		assert!(!router.unregister("local"));
 		assert!(router.get_handler("local").is_some());
+	}
+
+	#[test]
+	fn mcp_scheme_lists_servers_resources_and_reads() {
+		use crate::mcp::{
+			register_active_session, unregister_active_session, McpConnection, MCPResource,
+			MCPResourceContentItem, MCPResourceReadResult, MCPResourcesListResult,
+			MCPServerCapabilities, MCPServerConfig, MCPServerInfo, MCPStdioServerConfig,
+		};
+		use crate::mcp::client::clear_active_sessions;
+		use crate::mcp::transports::McpTransport;
+		use crate::mcp::error::McpError;
+		use serde_json::{json, Value};
+		use std::time::Duration;
+		use tokio::sync::RwLock;
+
+		struct FakeTransport;
+
+		#[async_trait]
+		impl McpTransport for FakeTransport {
+			async fn request(
+				&self,
+				method: &str,
+				params: Option<Value>,
+				_timeout: Option<Duration>,
+			) -> Result<Value, McpError> {
+				match method {
+					"resources/list" => Ok(serde_json::to_value(MCPResourcesListResult {
+						resources: vec![MCPResource {
+							uri: "test://notes".to_string(),
+							name: "notes".to_string(),
+							title: None,
+							description: None,
+							mime_type: Some("text/plain".to_string()),
+							size: None,
+							annotations: None,
+						}],
+						next_cursor: None,
+					})
+					.expect("serialize list")),
+					"resources/read" => {
+						let uri = params
+							.as_ref()
+							.and_then(|value| value.get("uri"))
+							.and_then(Value::as_str)
+							.unwrap_or_default();
+						assert_eq!(uri, "test://notes");
+						Ok(serde_json::to_value(MCPResourceReadResult {
+							contents: vec![MCPResourceContentItem {
+								uri: uri.to_string(),
+								mime_type: Some("text/plain".to_string()),
+								text: Some("hello from mcp".to_string()),
+								blob: None,
+							}],
+						})
+						.expect("serialize read"))
+					},
+					other => Err(McpError::Protocol(format!("unexpected method {other}"))),
+				}
+			}
+
+			async fn notify(&self, _method: &str, _params: Option<Value>) -> Result<(), McpError> {
+				Ok(())
+			}
+
+			async fn close(&self) -> Result<(), McpError> {
+				Ok(())
+			}
+		}
+
+		clear_active_sessions();
+		let router = InternalUrlRouter::new();
+		let cancel = CancellationToken::new();
+		let context = UrlScope::default().resolve_context(Path::new("/w"), &cancel);
+		let runtime = runtime();
+
+		let empty = runtime
+			.block_on(router.resolve("mcp://", &context))
+			.expect_err("no sessions");
+		assert!(
+			empty.contains("No active MCP sessions"),
+			"empty registry error: {empty}"
+		);
+
+		let connection = Arc::new(McpConnection {
+			name: "demo".to_string(),
+			config: MCPServerConfig::Stdio(MCPStdioServerConfig {
+				command: "true".to_string(),
+				args: Vec::new(),
+				env: Default::default(),
+				cwd: None,
+				timeout: None,
+				request_id_format: None,
+			}),
+			transport: Arc::new(RwLock::new(Arc::new(FakeTransport) as Arc<dyn McpTransport>)),
+			server_info: MCPServerInfo {
+				name: "demo".to_string(),
+				version: Some("1.0.0".to_string()),
+			},
+			capabilities: MCPServerCapabilities {
+				resources: Some(json!({})),
+				..Default::default()
+			},
+			instructions: None,
+		});
+		register_active_session(Arc::clone(&connection));
+
+		let listed = runtime
+			.block_on(router.resolve("mcp://", &context))
+			.expect("list servers");
+		assert!(listed.content.contains("- demo"), "{}", listed.content);
+		assert!(listed.immutable);
+		assert!(listed.is_directory);
+
+		let unknown = runtime
+			.block_on(router.resolve("mcp://missing", &context))
+			.expect_err("unknown server");
+		assert!(
+			unknown.contains("Unknown MCP server \"missing\""),
+			"{unknown}"
+		);
+		assert!(unknown.contains("demo"), "{unknown}");
+
+		let resources = runtime
+			.block_on(router.resolve("mcp://demo", &context))
+			.expect("list resources");
+		assert!(
+			resources.content.contains("test://notes"),
+			"{}",
+			resources.content
+		);
+		assert_eq!(
+			resources.notes.as_deref(),
+			Some(["MCP server: demo".to_string()].as_slice())
+		);
+
+		let body = runtime
+			.block_on(router.resolve("mcp://demo/test://notes", &context))
+			.expect("read resource");
+		assert_eq!(body.content, "hello from mcp");
+		assert!(body.immutable);
+
+		unregister_active_session("demo");
+		clear_active_sessions();
 	}
 
 	#[test]

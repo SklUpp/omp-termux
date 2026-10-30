@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -499,4 +499,48 @@ impl McpConnection {
         let guard = self.transport.read().await;
         guard.close().await
     }
+}
+
+/// Process-wide live MCP connections for `mcp://` URI resolution.
+///
+/// Mirrors TS `MCPManager.#connections` / `MCPManager.instance()`: the URI
+/// handler is stateless and looks sessions up here. Runtime code registers a
+/// connection after `connect_to_server` and unregisters on disconnect; this
+/// module never connects on its own.
+static ACTIVE_SESSIONS: LazyLock<Mutex<BTreeMap<String, Arc<McpConnection>>>> =
+	LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn lock_sessions() -> std::sync::MutexGuard<'static, BTreeMap<String, Arc<McpConnection>>> {
+	ACTIVE_SESSIONS
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Install or replace one live connection under its server name.
+pub fn register_active_session(connection: Arc<McpConnection>) {
+	let name = connection.name.clone();
+	lock_sessions().insert(name, connection);
+}
+
+/// Drop one live connection by server name.
+pub fn unregister_active_session(name: &str) -> Option<Arc<McpConnection>> {
+	lock_sessions().remove(name)
+}
+
+/// Look up one live connection by server name.
+#[must_use]
+pub fn get_active_session(name: &str) -> Option<Arc<McpConnection>> {
+	lock_sessions().get(name).cloned()
+}
+
+/// Sorted names of every live MCP server.
+#[must_use]
+pub fn list_active_sessions() -> Vec<String> {
+	lock_sessions().keys().cloned().collect()
+}
+
+/// Clear every live connection. Test-only.
+#[cfg(test)]
+pub fn clear_active_sessions() {
+	lock_sessions().clear();
 }

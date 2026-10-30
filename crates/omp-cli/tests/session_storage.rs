@@ -128,6 +128,8 @@ fn v1_legacy_log_is_read_only_and_never_overwritten() {
 	let dummy_turn = TurnRecord {
 		prompt: "next".to_string(),
 		assistant: "done".to_string(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "end_turn".to_string(),
 		tool_calls: Vec::new(),
 		parts: Vec::new(),
@@ -225,6 +227,8 @@ fn malformed_header_fails_without_append() {
 	let turn = TurnRecord {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "end_turn".into(),
 		tool_calls: vec![],
 		parts: vec![],
@@ -270,6 +274,8 @@ fn malformed_entry_disables_persistence_and_refuses_append() {
 	let turn = TurnRecord {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "end_turn".into(),
 		tool_calls: vec![],
 		parts: vec![],
@@ -494,6 +500,8 @@ fn append_turn_titles_and_appends_entries_and_reopens_cleanly() {
 		.append_turn(&TurnRecord {
 			prompt: "initial prompt".to_string(),
 			assistant: "initial reply".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "end_turn".to_string(),
 			tool_calls: Vec::new(),
 			parts: Vec::new(),
@@ -553,6 +561,8 @@ fn slotless_v3_append_never_overwrites_header_and_reopens_untitled() {
 		.append_turn(&TurnRecord {
 			prompt: "must not overwrite the header".to_string(),
 			assistant: "reply".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: Vec::new(),
 			parts: Vec::new(),
@@ -677,6 +687,8 @@ fn unsupported_session_version_rejected_without_append() {
 	let turn = TurnRecord {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "stop".into(),
 		tool_calls: vec![],
 		parts: vec![],
@@ -727,6 +739,8 @@ fn missing_session_version_rejected_without_append() {
 	let turn = TurnRecord {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "stop".into(),
 		tool_calls: vec![],
 		parts: vec![],
@@ -763,6 +777,8 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 		.append_turn(&TurnRecord {
 			prompt: "first prompt".to_string(),
 			assistant: "first reply".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "end_turn".to_string(),
 			tool_calls: Vec::new(),
 			parts: Vec::new(),
@@ -774,6 +790,8 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 		.append_turn(&TurnRecord {
 			prompt: "second prompt".to_string(),
 			assistant: "second reply".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "tool_use".to_string(),
 			tool_calls: vec![ToolCallRecord {
 				id: "call-1".to_string(),
@@ -848,6 +866,8 @@ fn session_storage_preserves_and_replays_tool_result_images() {
 		.append_turn(&TurnRecord {
 			prompt: "capture screen".to_string(),
 			assistant: "calling screenshot".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![ToolCallRecord {
 				id: "call-sc-1".to_string(),

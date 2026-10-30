@@ -57,11 +57,48 @@ pub enum ToolChoice {
 	Required,
 }
 
+/// Kind of a streamed content block, in first-occurrence order (TS
+/// `AssistantMessage.content`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamBlockKind {
+	Thinking,
+	Text,
+}
+
+/// First-occurrence block cursor (TS `appendText`/`appendThinking`): a new block
+/// opens whenever the delta kind flips, so delta `contentIndex` values and the
+/// finalized message parts agree for any reasoning/answer order.
+#[derive(Debug, Default)]
+pub struct StreamBlockCursor {
+	blocks:  usize,
+	current: Option<StreamBlockKind>,
+}
+
+impl StreamBlockCursor {
+	pub fn reset(&mut self) {
+		*self = Self::default();
+	}
+
+	/// Index of the block this delta belongs to, opening a new one on a flip.
+	pub fn open(&mut self, kind: StreamBlockKind) -> usize {
+		if self.current == Some(kind) {
+			return self.blocks.saturating_sub(1);
+		}
+		self.current = Some(kind);
+		let index = self.blocks;
+		self.blocks += 1;
+		index
+	}
+}
+
 /// Delta chunk emitted by streaming completions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamChunk {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub content: Option<String>,
+	/// Public provider-supplied reasoning delta for this chunk.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reasoning: Option<String>,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub tool_call_deltas: Vec<ToolCallDelta>,
 	/// Usage snapshot the provider reported with this chunk, when the dialect
@@ -166,6 +203,10 @@ pub struct OpenAiCompatibleProvider {
 	/// Enabled by default because that is the TS default; only dialects known to
 	/// reject the field should turn it off.
 	usage_in_streaming: bool,
+	/// When set, force native reasoning off (`reasoning_effort: "none"`).
+	force_reasoning_off: bool,
+	/// OpenAI `service_tier`; omitted when unset/`none`/empty.
+	service_tier: Option<String>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -209,6 +250,8 @@ impl OpenAiCompatibleProvider {
 			prompt_cache_key: None,
 			prompt_cache_enabled: false,
 			usage_in_streaming: true,
+			force_reasoning_off: false,
+			service_tier: None,
 		}
 	}
 
@@ -231,6 +274,25 @@ impl OpenAiCompatibleProvider {
 		self.effort = effort.filter(|value| !value.trim().is_empty());
 		self
 	}
+
+	/// Force native reasoning off (TS `forceReasoningOff` / external thinking).
+	///
+	/// Completions wire: `reasoning_effort: "none"` (lowest disable). Responses/
+	/// Anthropic dialects are not implemented in this provider yet.
+	pub fn with_force_reasoning_off(mut self, enabled: bool) -> Self {
+		self.force_reasoning_off = enabled;
+		self
+	}
+
+	/// OpenAI `service_tier`. `"none"` and blank strings omit the wire field.
+	pub fn with_service_tier(mut self, tier: Option<String>) -> Self {
+		self.service_tier = tier.filter(|value| {
+			let trimmed = value.trim();
+			!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none")
+		});
+		self
+	}
+
 
 	/// Reasoning effort currently configured for this provider.
 	pub fn effort(&self) -> Option<&str> {
@@ -332,8 +394,13 @@ impl OpenAiCompatibleProvider {
 			stream,
 			stream_options: (stream && self.usage_in_streaming)
 				.then_some(OpenAiStreamOptions { include_usage: true }),
-			reasoning_effort: self.effort.clone(),
+			reasoning_effort: if self.force_reasoning_off {
+				Some("none".to_string())
+			} else {
+				self.effort.clone()
+			},
 			prompt_cache_key: self.prompt_cache_enabled.then(|| self.prompt_cache_key()).flatten(),
+			service_tier: self.service_tier.clone(),
 		})
 	}
 }
@@ -428,9 +495,12 @@ impl ModelProvider for OpenAiCompatibleProvider {
 /// request, and the terminal usage-only trailer repeats the counters.
 #[derive(Debug, Default)]
 pub struct StreamAssembler {
-	content: String,
-	calls: BTreeMap<usize, PendingCall>,
-	usage: Option<TokenUsage>,
+	/// Content blocks in first-occurrence order (TS `output.content`), so the
+	/// finalized parts order matches the streamed `contentIndex` order even when
+	/// the provider sends the answer before its reasoning.
+	blocks: Vec<(StreamBlockKind, String)>,
+	calls:  BTreeMap<usize, PendingCall>,
+	usage:  Option<TokenUsage>,
 }
 
 #[derive(Debug, Default)]
@@ -447,8 +517,13 @@ impl StreamAssembler {
 
 	/// Fold one streamed chunk into the accumulated turn.
 	pub fn push(&mut self, chunk: &StreamChunk) {
-		if let Some(content) = &chunk.content {
-			self.content.push_str(content);
+		// TS `openai-completions.ts:1160-1192`: reasoning in one chunk precedes
+		// its content, which is what decides first-occurrence block order.
+		if let Some(delta) = chunk.reasoning.as_deref().filter(|delta| !delta.is_empty()) {
+			self.append(StreamBlockKind::Thinking, delta);
+		}
+		if let Some(delta) = chunk.content.as_deref().filter(|delta| !delta.is_empty()) {
+			self.append(StreamBlockKind::Text, delta);
 		}
 		if let Some(usage) = chunk.usage {
 			self.usage = Some(usage);
@@ -467,10 +542,50 @@ impl StreamAssembler {
 		}
 	}
 
+	/// Append a delta, opening a new block when the kind flips.
+	fn append(&mut self, kind: StreamBlockKind, delta: &str) {
+		match self.blocks.last_mut() {
+			Some((current, text)) if *current == kind => text.push_str(delta),
+			_ => self.blocks.push((kind, delta.to_string())),
+		}
+	}
+
+	/// The answer text: every text block, in block order.
+	fn text(&self) -> String {
+		self
+			.blocks
+			.iter()
+			.filter(|(kind, _)| *kind == StreamBlockKind::Text)
+			.map(|(_, text)| text.as_str())
+			.collect()
+	}
+
+	/// Ordered parts, empty when no reasoning streamed so text-only messages
+	/// keep the plain string wire form.
+	fn parts(&self) -> Vec<crate::state::ContentPart> {
+		if !self
+			.blocks
+			.iter()
+			.any(|(kind, _)| *kind == StreamBlockKind::Thinking)
+		{
+			return Vec::new();
+		}
+		self
+			.blocks
+			.iter()
+			.map(|(kind, text)| match kind {
+				StreamBlockKind::Thinking => crate::state::ContentPart::thinking(text.clone()),
+				StreamBlockKind::Text => crate::state::ContentPart::Text { text: text.clone() },
+			})
+			.collect()
+	}
+
 	/// Finish the turn, producing an assistant message with reassembled tool calls.
 	///
 	/// Returns a protocol error if any completed tool call lacks a name.
 	pub fn finish(self) -> Result<Message, ProviderError> {
+		let content = self.text();
+		let parts = self.parts();
 		let mut tool_calls = Vec::with_capacity(self.calls.len());
 		for (index, pending) in self.calls {
 			let Some(name) = pending.name.filter(|n| !n.trim().is_empty()) else {
@@ -490,7 +605,8 @@ impl StreamAssembler {
 				arguments,
 			});
 		}
-		let mut message = Message::assistant_with_tools(self.content, tool_calls);
+		let mut message = Message::assistant_with_tools(content, tool_calls);
+		message.parts = parts;
 		message.usage = self.usage;
 		Ok(message)
 	}
@@ -500,7 +616,8 @@ impl StreamAssembler {
 	/// Carries whatever usage the provider already reported, so a failed or
 	/// cancelled request is accounted exactly once instead of silently dropped.
 	pub(crate) fn finish_partial(&self) -> Message {
-		let mut message = Message::assistant(&self.content);
+		let mut message = Message::assistant(self.text());
+		message.parts = self.parts();
 		message.usage = self.usage;
 		message
 	}
@@ -528,6 +645,9 @@ pub struct OpenAiChatRequest {
 	/// OpenAI-compatible `prompt_cache_key`; omitted when unset.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub prompt_cache_key: Option<String>,
+	/// OpenAI-compatible `service_tier`; omitted when unset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub service_tier: Option<String>,
 }
 
 /// `stream_options` body field asking the host for a usage trailer.
@@ -650,6 +770,12 @@ pub struct OpenAiResponseMessage {
 	#[serde(default)]
 	pub content: Option<String>,
 	#[serde(default)]
+	pub reasoning_content: Option<String>,
+	#[serde(default)]
+	pub reasoning: Option<String>,
+	#[serde(default)]
+	pub reasoning_text: Option<String>,
+	#[serde(default)]
 	pub tool_calls: Option<Vec<OpenAiToolCall>>,
 }
 
@@ -678,6 +804,12 @@ pub struct OpenAiStreamChoice {
 pub struct OpenAiDelta {
 	#[serde(default)]
 	pub content: Option<String>,
+	#[serde(default)]
+	pub reasoning_content: Option<String>,
+	#[serde(default)]
+	pub reasoning: Option<String>,
+	#[serde(default)]
+	pub reasoning_text: Option<String>,
 	#[serde(default)]
 	pub tool_calls: Option<Vec<OpenAiStreamToolCall>>,
 }
@@ -833,6 +965,8 @@ pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Pr
 								text_parts.push(text.clone());
 							}
 						}
+						// Public reasoning is print/persist only; never replayed.
+						crate::state::ContentPart::Thinking { .. } => {}
 						crate::state::ContentPart::Image { data, mime_type } => {
 							let (clean_b64, mime) = crate::state::normalize_image_payload(data, mime_type)
 								.map_err(|err| ProviderError::UnsupportedImage(format!("invalid image payload: {err}")))?;
@@ -914,7 +1048,8 @@ pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Pr
 			)
 		};
 
-		let content = if m.has_image() || !m.parts.is_empty() {
+		let has_parts = m.parts.iter().any(|part| !part.is_thinking());
+		let content = if m.has_image() || has_parts {
 			let mut parts = Vec::new();
 			for part in &m.parts {
 				match part {
@@ -925,6 +1060,8 @@ pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Pr
 							});
 						}
 					}
+					// Public reasoning is print/persist only; never replayed.
+					crate::state::ContentPart::Thinking { .. } => {}
 					crate::state::ContentPart::Image { data, mime_type } => {
 						let (clean_b64, mime) = crate::state::normalize_image_payload(data, mime_type)
 							.map_err(|err| ProviderError::UnsupportedImage(format!("invalid image payload: {err}")))?;
@@ -980,7 +1117,25 @@ pub fn from_openai_response(resp_msg: OpenAiResponseMessage) -> Message {
 		}
 	}
 
-	Message::assistant_with_tools(resp_msg.content.unwrap_or_default(), tool_calls)
+	let content = resp_msg.content.unwrap_or_default();
+	let mut message = Message::assistant_with_tools(content.clone(), tool_calls);
+	if let Some(reasoning) = first_nonempty([
+		resp_msg.reasoning_content.as_deref(),
+		resp_msg.reasoning.as_deref(),
+		resp_msg.reasoning_text.as_deref(),
+	]) {
+		let mut parts = vec![crate::state::ContentPart::thinking(reasoning)];
+		if !content.is_empty() {
+			parts.push(crate::state::ContentPart::Text { text: content });
+		}
+		message.parts = parts;
+	}
+	message
+}
+
+/// First public reasoning field a chunk carries, ignoring empty strings.
+fn first_nonempty<'a, const N: usize>(candidates: [Option<&'a str>; N]) -> Option<&'a str> {
+	candidates.into_iter().flatten().find(|value| !value.is_empty())
 }
 
 /// Parse one SSE line (`data: {...}` / `data: [DONE]`).
@@ -997,6 +1152,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 	if data == "[DONE]" {
 		return Some(Ok(StreamChunk {
 			content: None,
+			reasoning: None,
 			tool_call_deltas: Vec::new(),
 			usage: None,
 			is_done: true,
@@ -1006,6 +1162,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 	match serde_json::from_str::<OpenAiStreamChunk>(data) {
 		Ok(chunk) => {
 			let mut content = None;
+			let mut reasoning = None;
 			let mut tool_call_deltas = Vec::new();
 			// TS reads the top-level payload first and only falls back to the
 			// first choice's usage (vLLM-style hosts).
@@ -1019,6 +1176,13 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 			for choice in chunk.choices {
 				if let Some(delta) = choice.delta.content {
 					content = Some(delta);
+				}
+				if let Some(delta) = first_nonempty([
+					choice.delta.reasoning_content.as_deref(),
+					choice.delta.reasoning.as_deref(),
+					choice.delta.reasoning_text.as_deref(),
+				]) {
+					reasoning = Some(delta.to_string());
 				}
 				for tc in choice.delta.tool_calls.unwrap_or_default() {
 					let (name, arguments_delta) = match tc.function {
@@ -1034,7 +1198,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 				}
 			}
 
-			Some(Ok(StreamChunk { content, tool_call_deltas, usage, is_done: false }))
+			Some(Ok(StreamChunk { content, reasoning, tool_call_deltas, usage, is_done: false }))
 		},
 		Err(err) => Some(Err(ProviderError::Serialization(err))),
 	}
@@ -1133,6 +1297,7 @@ mod tests {
 				arguments_delta: Some("{}".into()),
 			}],
 			usage: None,
+			reasoning: None,
 			is_done: false,
 		});
 		let err = assembler.finish().unwrap_err();
@@ -1151,6 +1316,7 @@ mod tests {
 				arguments_delta: Some("{}".into()),
 			}],
 			usage: None,
+			reasoning: None,
 			is_done: false,
 		});
 		let err = assembler.finish().unwrap_err();
@@ -1169,6 +1335,7 @@ mod tests {
 				arguments_delta: Some("{}".into()),
 			}],
 			usage: None,
+			reasoning: None,
 			is_done: false,
 		});
 		let msg = assembler.finish().unwrap();

@@ -392,6 +392,7 @@ impl ModelProvider for FailingAfterUsageProvider {
 				content: Some("partial".to_string()),
 				tool_call_deltas: Vec::new(),
 				usage: Some(usage),
+				reasoning: None,
 				is_done: false,
 			}),
 			Err(ProviderError::Network("connection dropped".to_string())),

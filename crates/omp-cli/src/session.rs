@@ -233,6 +233,34 @@ fn task_tool_usage(message: &SessionMessage) -> Option<Usage> {
 	serde_json::from_value(usage.clone()).ok()
 }
 
+/// Per-child accounting entries a blocking `task` result carries: one
+/// `{resultKey, usage}` pair per child, holding that child's **own** counters.
+///
+/// `None` for a log written before keys existed; the caller then counts the
+/// batch aggregate once by itself, exactly as before.
+fn task_tool_accounting(message: &SessionMessage) -> Option<Vec<(String, Usage)>> {
+	let entries = message
+		.extra
+		.get("details")?
+		.get("accounting")?
+		.as_array()?;
+	Some(
+		entries
+			.iter()
+			.filter_map(|entry| {
+				let key = entry
+					.get("resultKey")
+					.and_then(serde_json::Value::as_str)
+					.filter(|key| !key.is_empty())?;
+				let usage = entry
+					.get("usage")
+					.and_then(|usage| serde_json::from_value::<Usage>(usage.clone()).ok())?;
+				Some((key.to_string(), usage))
+			})
+			.collect(),
+	)
+}
+
 /// Durable accounting key for one background job: `resultKey` alone when the
 /// writer recorded one, else the legacy raw `id`.
 ///
@@ -246,6 +274,79 @@ pub(crate) fn background_usage_key(value: &serde_json::Value) -> Option<&str> {
 		.filter(|key| !key.is_empty())
 		.or_else(|| value.get("id").and_then(serde_json::Value::as_str))
 		.filter(|key| !key.is_empty())
+}
+
+/// Collect every keyed background contribution already present in the retained
+/// in-memory log, using the same identity rules as [`SessionStore::session_usage`].
+///
+/// Ephemeral: callers must not store this set on `SessionStore`. Legacy unkeyed
+/// task aggregates are ignored — they have no durable key to dedup against.
+#[must_use]
+pub fn durable_background_keys(store: &SessionStore) -> HashSet<String> {
+	let mut keys = HashSet::new();
+	for entry in &store.messages {
+		match entry.message.role.as_str() {
+			"toolResult" if entry.message.tool_name.as_deref() == Some("task") => {
+				if let Some(entries) = task_tool_accounting(&entry.message) {
+					for (key, _) in entries {
+						keys.insert(key);
+					}
+				}
+			},
+			"toolResult" if entry.message.tool_name.as_deref() == Some("hub") => {
+				let jobs = entry
+					.message
+					.extra
+					.get("details")
+					.and_then(|details| details.get("jobs"))
+					.and_then(serde_json::Value::as_array);
+				for job in jobs.into_iter().flatten() {
+					if job
+						.get("usage")
+						.and_then(|usage| serde_json::from_value::<Usage>(usage.clone()).ok())
+						.is_none()
+					{
+						continue;
+					}
+					if let Some(key) = background_usage_key(job) {
+						keys.insert(key.to_string());
+					}
+				}
+			},
+			_ => {},
+		}
+	}
+	for entry in &store.entries {
+		if entry.kind != "custom"
+			|| entry.extra.get("customType").and_then(serde_json::Value::as_str)
+				!= Some(BACKGROUND_USAGE_CUSTOM_TYPE)
+		{
+			continue;
+		}
+		let Some(data) = entry.extra.get("data") else {
+			continue;
+		};
+		if data
+			.get("usage")
+			.and_then(|usage| serde_json::from_value::<Usage>(usage.clone()).ok())
+			.is_none()
+		{
+			continue;
+		}
+		if let Some(key) = background_usage_key(data) {
+			keys.insert(key.to_string());
+		}
+	}
+	keys
+}
+
+/// Whether `key` already contributes through a retained log record.
+#[must_use]
+pub(crate) fn has_durable_background_key(store: &SessionStore, key: &str) -> bool {
+	if key.is_empty() {
+		return false;
+	}
+	durable_background_keys(store).contains(key)
 }
 
 /// Provider-side orchestration tokens (`Usage.orchestration`, kept verbatim in
@@ -375,6 +476,35 @@ impl ContentPart {
 	#[must_use]
 	pub fn is_image(&self) -> bool {
 		self.kind == "image"
+	}
+
+	/// Genuine TS `{ "type": "thinking", "thinking": ... }` part. The text of
+	/// the field rides the `extra` passthrough so older literals stay valid.
+	#[must_use]
+	pub fn thinking(text: impl Into<String>) -> Self {
+		let text: String = text.into();
+		let mut extra = serde_json::Map::new();
+		extra.insert("thinking".to_string(), serde_json::json!(text));
+		Self {
+			kind: "thinking".to_string(),
+			text: None,
+			data: None,
+			mime_type: None,
+			extra,
+		}
+	}
+
+	#[must_use]
+	pub fn is_thinking(&self) -> bool {
+		self.kind == "thinking"
+	}
+
+	#[must_use]
+	pub fn thinking_text(&self) -> Option<&str> {
+		if self.kind != "thinking" {
+			return None;
+		}
+		self.extra.get("thinking").and_then(serde_json::Value::as_str)
 	}
 }
 
@@ -769,6 +899,12 @@ where
 								"malformed image part in turn record at index {index}: missing data or mimeType"
 							)));
 						}
+					} else if part.is_thinking() {
+						if part.thinking_text().is_none() {
+							return Err(serde::de::Error::custom(format!(
+								"malformed thinking part in turn record at index {index}: missing thinking"
+							)));
+						}
 					} else if part.kind != "text" {
 						return Err(serde::de::Error::custom(format!(
 							"unsupported content part kind in turn record at index {index}"
@@ -803,6 +939,15 @@ pub struct TurnRecord {
 	pub prompt: String,
 	#[serde(default)]
 	pub assistant: String,
+	/// Public reasoning persisted next to the answer (TS `ThinkingContent`),
+	/// never folded into `assistant`.
+	#[serde(default, skip_serializing_if = "String::is_empty")]
+	pub reasoning: String,
+	/// `true` when the streamed answer block came before the reasoning block, so
+	/// assistant parts replay as `[text, thinking]` instead of the canonical
+	/// `[thinking, text]`. Older logs omit it and default to canonical order.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub reasoning_after_text: bool,
 	#[serde(default)]
 	pub stop_reason: String,
 	#[serde(default)]
@@ -831,6 +976,31 @@ impl TurnRecord {
 	}
 }
 
+/// Public reasoning carried by a native assistant message.
+fn message_reasoning(message: &pi_agent::Message) -> String {
+	message
+		.parts
+		.iter()
+		.filter_map(pi_agent::ContentPart::as_thinking)
+		.collect()
+}
+
+/// Whether the answer block came before the reasoning block (TS first-occurrence
+/// content order), so a two-block turn replays as `[text, thinking]`.
+fn reasoning_after_text(message: &pi_agent::Message) -> bool {
+	let first_thinking = message
+		.parts
+		.iter()
+		.position(pi_agent::ContentPart::is_thinking);
+	let first_text = message.parts.iter().position(|part| {
+		matches!(part, pi_agent::ContentPart::Text { .. })
+	});
+	match (first_thinking, first_text) {
+		(Some(thinking), Some(text)) => thinking > text,
+		_ => false,
+	}
+}
+
 /// Builds a [`TurnRecord`] from the runner's event stream.
 #[derive(Debug, Default)]
 pub struct TurnBuilder {
@@ -845,6 +1015,8 @@ impl TurnBuilder {
 			record: TurnRecord {
 				prompt: prompt.into(),
 				assistant: String::new(),
+				reasoning: String::new(),
+				reasoning_after_text: false,
 				stop_reason: String::new(),
 				tool_calls: Vec::new(),
 				parts: Vec::new(),
@@ -859,6 +1031,8 @@ impl TurnBuilder {
 			record: TurnRecord {
 				prompt: prompt.into(),
 				assistant: String::new(),
+				reasoning: String::new(),
+				reasoning_after_text: false,
 				stop_reason: String::new(),
 				tool_calls: Vec::new(),
 				parts,
@@ -881,6 +1055,8 @@ impl TurnBuilder {
 			record: TurnRecord {
 				prompt,
 				assistant: String::new(),
+				reasoning: String::new(),
+				reasoning_after_text: false,
 				stop_reason: String::new(),
 				tool_calls: Vec::new(),
 				parts,
@@ -892,10 +1068,14 @@ impl TurnBuilder {
 		match event {
 			Event::MessageEnd { message, .. } => {
 				self.record.assistant = message.content.clone();
+				self.record.reasoning = message_reasoning(message);
+				self.record.reasoning_after_text = reasoning_after_text(message);
 			},
 			Event::AgentEnd { messages, .. } => {
 				if let Some(last_asst) = messages.iter().rfind(|m| m.role == pi_agent::Role::Assistant) {
 					self.record.assistant = last_asst.content.clone();
+					self.record.reasoning = message_reasoning(last_asst);
+					self.record.reasoning_after_text = reasoning_after_text(last_asst);
 				}
 			},
 			Event::TurnEnd { stop_reason, tool_results, .. } => {
@@ -1361,11 +1541,12 @@ impl SessionStore {
 	/// denominator; they never contribute zeros.
 	///
 	/// Like TS `entryUsage` (`session-manager.ts`), a `task` tool result also
-	/// contributes the subagent usage persisted in its `details.usage` (present
-	/// only in TS-written/imported logs; native Rust never writes it). A `hub`
-	/// `jobs` snapshot and a `background-usage` custom entry describe the same
-	/// background child, so they share one key: `resultKey` when present, else
-	/// the legacy job `id`.
+	/// contributes the subagent usage persisted in `details.accounting`: one
+	/// `{resultKey, usage}` entry per child, each holding that child's own
+	/// counters. A `hub` `jobs` snapshot, a `background-usage` custom entry and
+	/// those entries all describe the same child, so they share one key:
+	/// `resultKey` when present, else the legacy job `id`. Only an unseen key
+	/// contributes; a legacy log with no keyed field is counted as one batch.
 	#[must_use]
 	pub fn session_usage(&self) -> SessionUsage {
 		let mut total = SessionUsage::default();
@@ -1381,8 +1562,23 @@ impl SessionStore {
 					total.add(usage);
 				},
 				"toolResult" if entry.message.tool_name.as_deref() == Some("task") => {
-					if let Some(usage) = task_tool_usage(&entry.message) {
-						total.add(&usage);
+					match task_tool_accounting(&entry.message) {
+						// Keyed per child: charge only the children this log has not
+						// seen through a hub snapshot, delivery or custom entry yet.
+						Some(entries) => {
+							for (key, usage) in entries {
+								if seen_background_ids.insert(key) {
+									total.add(&usage);
+								}
+							}
+						},
+						// Legacy aggregate: a log written before keys existed counted
+						// the whole batch here, so it still does.
+						None => {
+							if let Some(usage) = task_tool_usage(&entry.message) {
+								total.add(&usage);
+							}
+						},
 					}
 				},
 				"toolResult" if entry.message.tool_name.as_deref() == Some("hub") => {
@@ -2120,10 +2316,22 @@ impl SessionStore {
 		));
 		let mut parent_id = Some(user_id);
 
-		if !turn.assistant.is_empty() || !turn.tool_calls.is_empty() {
+		if !turn.assistant.is_empty() || !turn.reasoning.is_empty() || !turn.tool_calls.is_empty() {
 			let mut parts = Vec::new();
-			if !turn.assistant.is_empty() {
-				parts.push(ContentPart::text(turn.assistant.clone()));
+			// `TurnRecord` carries one reasoning string, so it can only express a
+			// single flip: `reasoning_after_text` selects between `[thinking, text]`
+			// (canonical, what older logs mean) and `[text, thinking]`. The
+			// message-part write paths keep the full streamed order.
+			let reasoning = (!turn.reasoning.is_empty())
+				.then(|| ContentPart::thinking(turn.reasoning.clone()));
+			let answer = (!turn.assistant.is_empty())
+				.then(|| ContentPart::text(turn.assistant.clone()));
+			if turn.reasoning_after_text {
+				parts.extend(answer);
+				parts.extend(reasoning);
+			} else {
+				parts.extend(reasoning);
+				parts.extend(answer);
 			}
 			for tc in &turn.tool_calls {
 				let mut part = ContentPart {
@@ -2735,6 +2943,8 @@ pub(crate) fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnR
 	let mut current_prompt: Option<String> = None;
 	let mut current_parts: Vec<ContentPart> = Vec::new();
 	let mut current_asst = String::new();
+	let mut current_reasoning = String::new();
+	let mut current_reasoning_after_text = false;
 	let mut current_stop = String::new();
 	let mut current_tool_calls: Vec<ToolCallRecord> = Vec::new();
 	let mut current_matched: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2743,6 +2953,8 @@ pub(crate) fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnR
 		|prompt: &mut Option<String>,
 		 parts: &mut Vec<ContentPart>,
 		 asst: &mut String,
+		 reasoning: &mut String,
+		 reasoning_after_text: &mut bool,
 		 stop: &mut String,
 		 calls: &mut Vec<ToolCallRecord>,
 		 matched: &mut std::collections::HashSet<String>,
@@ -2760,6 +2972,8 @@ pub(crate) fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnR
 				turns.push(TurnRecord {
 					prompt,
 					assistant: std::mem::take(asst),
+					reasoning: std::mem::take(reasoning),
+					reasoning_after_text: std::mem::take(reasoning_after_text),
 					stop_reason: if stop.is_empty() {
 						"stop".to_string()
 					} else {
@@ -2778,6 +2992,8 @@ pub(crate) fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnR
 					&mut current_prompt,
 					&mut current_parts,
 					&mut current_asst,
+					&mut current_reasoning,
+					&mut current_reasoning_after_text,
 					&mut current_stop,
 					&mut current_tool_calls,
 					&mut current_matched,
@@ -2856,6 +3072,20 @@ pub(crate) fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnR
 				if !text.is_empty() {
 					current_asst = text;
 				}
+				let parts = entry.message.content.parts();
+				let thinking: String = parts.iter().filter_map(ContentPart::thinking_text).collect();
+				if !thinking.is_empty() {
+					current_reasoning = thinking;
+					// Persisted order, so a resumed turn replays its parts the way
+					// they were streamed (answer before reasoning when the provider
+					// sent it that way).
+					let first_thinking = parts.iter().position(ContentPart::is_thinking);
+					let first_text = parts.iter().position(|part| part.kind == "text");
+					current_reasoning_after_text =
+						matches!((first_thinking, first_text), (Some(thinking), Some(text)) if thinking > text);
+				} else {
+					current_reasoning_after_text = false;
+				}
 			},
 			"toolResult" => {
 				let call_id = entry.message.tool_call_id.as_deref().unwrap_or_default();
@@ -2923,6 +3153,8 @@ pub(crate) fn derive_turn_history(messages: &[MessageEntry]) -> Result<Vec<TurnR
 		&mut current_prompt,
 		&mut current_parts,
 		&mut current_asst,
+		&mut current_reasoning,
+		&mut current_reasoning_after_text,
 		&mut current_stop,
 		&mut current_tool_calls,
 		&mut current_matched,
@@ -4055,6 +4287,8 @@ mod tests {
 		TurnRecord {
 			prompt: prompt.to_string(),
 			assistant: assistant.to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![ToolCallRecord {
 				id: "call-1".to_string(),
@@ -4067,6 +4301,60 @@ mod tests {
 			}],
 			parts: Vec::new(),
 		}
+	}
+
+	/// Persisted block order survives the log -> `TurnRecord` reconstruction:
+	/// an answer streamed before its reasoning keeps that order on resume.
+	#[test]
+	fn derive_turn_history_keeps_persisted_block_order() {
+		let assistant = SessionMessage::assistant(
+			MessageContent::Parts(vec![
+				ContentPart::text("answer"),
+				ContentPart::thinking("weigh options"),
+			]),
+			"openai-completions",
+			"openai",
+			"model",
+			None,
+			"stop",
+			0,
+		);
+		let messages = vec![
+			MessageEntry::new(
+				"m1",
+				None,
+				"2026-01-01T00:00:00.000Z",
+				SessionMessage::user(MessageContent::Text("why".to_string()), 0),
+			),
+			MessageEntry::new("m2", Some("m1".to_string()), "2026-01-01T00:00:01.000Z", assistant),
+		];
+		let turns = derive_turn_history(&messages).expect("derive turn history");
+		assert_eq!(turns.len(), 1);
+		assert_eq!(turns[0].assistant, "answer");
+		assert_eq!(turns[0].reasoning, "weigh options");
+		assert!(turns[0].reasoning_after_text, "text-first order must be recorded");
+
+		// Canonical order stays the default for older/thinking-first logs.
+		let mut thinking_first = messages;
+		thinking_first[1] = MessageEntry::new(
+			"m2",
+			Some("m1".to_string()),
+			"2026-01-01T00:00:01.000Z",
+			SessionMessage::assistant(
+				MessageContent::Parts(vec![
+					ContentPart::thinking("weigh options"),
+					ContentPart::text("answer"),
+				]),
+				"openai-completions",
+				"openai",
+				"model",
+				None,
+				"stop",
+				0,
+			),
+		);
+		let canonical = derive_turn_history(&thinking_first).expect("derive canonical");
+		assert!(!canonical[0].reasoning_after_text);
 	}
 
 	/// Reported usage is summed once per assistant entry, stays identical after
@@ -4226,6 +4514,127 @@ mod tests {
 		fs::remove_dir_all(dir).ok();
 	}
 
+	/// A blocking `task` result that quotes its children's keys is counted once
+	/// even though the same children also wrote `background-usage` entries: the
+	/// key is shared, so the second record adds nothing.
+	#[test]
+	fn session_usage_counts_keyed_task_details_once() {
+		const TS: &str = "2026-01-01T00:00:00.000Z";
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("task-keys")));
+		assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+		let usage = serde_json::json!({
+			"input": 4,
+			"output": 6,
+			"cacheRead": 0,
+			"cacheWrite": 0,
+			"totalTokens": 10,
+		});
+		let mut task = SessionMessage::tool_result(
+			"c1",
+			"task",
+			MessageContent::Text("done".to_string()),
+			false,
+			1,
+		);
+		task.extra.insert(
+			"details".to_string(),
+			serde_json::json!({
+				"usage": usage.clone(),
+				"accounting": [{ "resultKey": "ns1:task-1", "usage": usage.clone() }],
+			}),
+		);
+		store
+			.append_messages(&[MessageEntry::new("t1", None, TS, task)])
+			.expect("append task result");
+		store
+			.append_custom(
+				BACKGROUND_USAGE_CUSTOM_TYPE,
+				Some(serde_json::json!({
+					"id": "task-1",
+					"resultKey": "ns1:task-1",
+					"usage": usage,
+				})),
+			)
+			.expect("append background usage");
+		let counted = store.session_usage();
+		assert_eq!(
+			(counted.input, counted.output, counted.total_tokens),
+			(4, 6, 10),
+			"one key contributes its usage once across both record kinds"
+		);
+		assert_eq!(counted.assistant_messages, 0);
+		assert!(counted.is_known(), "child usage stays reported usage");
+	}
+
+	/// A batch that only partly overlaps what the log already holds charges the
+	/// unseen child's own counters, not the batch aggregate (which still sums the
+	/// seen child). The aggregate here is deliberately larger than either child.
+	#[test]
+	fn session_usage_charges_only_unseen_batch_children() {
+		const TS: &str = "2026-01-01T00:00:00.000Z";
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("task-partial")));
+		assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+		let seen = serde_json::json!({
+			"input": 20,
+			"output": 10,
+			"cacheRead": 0,
+			"cacheWrite": 0,
+			"totalTokens": 30,
+		});
+		let unseen = serde_json::json!({
+			"input": 2,
+			"output": 4,
+			"cacheRead": 0,
+			"cacheWrite": 0,
+			"totalTokens": 6,
+		});
+		let aggregate = serde_json::json!({
+			"input": 22,
+			"output": 14,
+			"cacheRead": 0,
+			"cacheWrite": 0,
+			"totalTokens": 36,
+		});
+		store
+			.append_custom(
+				BACKGROUND_USAGE_CUSTOM_TYPE,
+				Some(serde_json::json!({
+					"id": "task-1",
+					"resultKey": "ns1:task-1",
+					"usage": seen,
+				})),
+			)
+			.expect("append background usage");
+		let mut task = SessionMessage::tool_result(
+			"c1",
+			"task",
+			MessageContent::Text("done".to_string()),
+			false,
+			1,
+		);
+		task.extra.insert(
+			"details".to_string(),
+			serde_json::json!({
+				"usage": aggregate,
+				"accounting": [
+					{ "resultKey": "ns1:task-1", "usage": seen },
+					{ "resultKey": "ns1:task-2", "usage": unseen },
+				],
+			}),
+		);
+		store
+			.append_messages(&[MessageEntry::new("t1", None, TS, task)])
+			.expect("append task result");
+		let counted = store.session_usage();
+		assert_eq!(
+			(counted.input, counted.output, counted.total_tokens),
+			(22, 14, 36),
+			"the unseen child's own counters are added, the aggregate is not"
+		);
+	}
+
 	#[test]
 	fn session_usage_counts_background_child_once_across_hub_and_custom_entry() {
 		const TS: &str = "2026-01-01T00:00:00.000Z";
@@ -4305,6 +4714,43 @@ mod tests {
 		assert_eq!(counted.input, 11, "both runs count despite the repeated raw id");
 		assert_eq!(counted.output, 2);
 		assert_eq!(counted.total_tokens, 13);
+		fs::remove_dir_all(dir).ok();
+	}
+
+	/// An aborted background child has no delivery and no hub snapshot: its usage
+	/// reaches the log only as the `background-usage` custom entry the ledger
+	/// drain writes. Reopening the log must still count it — and a replay of the
+	/// identical key must not count it twice.
+	#[test]
+	fn session_usage_counts_ledger_entry_for_aborted_child_after_reopen() {
+		let dir = temp_dir();
+		let entry = serde_json::json!({
+			"id": "task-3",
+			"resultKey": "omp-4242-abcd-0:task-3",
+			"usage": {
+				"input": 11,
+				"output": 7,
+				"cacheRead": 0,
+				"cacheWrite": 0,
+				"totalTokens": 18,
+			},
+		});
+		let mut store = SessionStore::open(&options(dir.clone(), Some("aborted-ledger")));
+		assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+		for _ in 0..2 {
+			store
+				.append_custom(BACKGROUND_USAGE_CUSTOM_TYPE, Some(entry.clone()))
+				.expect("append background usage");
+		}
+		let reopened = SessionStore::open(&options(dir.clone(), Some("aborted-ledger")));
+		let counted = reopened.session_usage();
+		assert_eq!(
+			(counted.input, counted.output, counted.total_tokens),
+			(11, 7, 18),
+			"the aborted child survives the reopen and its key counts once"
+		);
+		assert_eq!(counted.assistant_messages, 0);
+		assert!(counted.is_known(), "reported usage stays known after reopen");
 		fs::remove_dir_all(dir).ok();
 	}
 
@@ -4488,6 +4934,155 @@ mod tests {
 		fs::remove_dir_all(dir).ok();
 	}
 
+	/// Durable key scan matches session_usage identity rules: keyed task
+	/// accounting, hub jobs with usage, and background-usage customs; ignores
+	/// legacy aggregates and usage-less snapshots.
+	#[test]
+	fn durable_background_keys_matches_session_usage_identity() {
+		const TS: &str = "2026-01-01T00:00:00.000Z";
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("durable-keys")));
+		assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+
+		let mut hub = SessionMessage::tool_result(
+			"call-h",
+			"hub",
+			MessageContent::Text("ok".to_string()),
+			false,
+			0,
+		);
+		hub.extra.insert(
+			"details".to_string(),
+			serde_json::json!({
+				"jobs": [
+					{
+						"id": "task-1",
+						"resultKey": "ns1:task-1",
+						"usage": { "input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0 },
+					},
+					{
+						"id": "task-running",
+						"resultKey": "ns1:task-running",
+						"status": "running",
+					},
+				],
+			}),
+		);
+		store
+			.append_messages(&[MessageEntry::new("h1", None, TS, hub)])
+			.expect("append hub");
+
+		let mut task = SessionMessage::tool_result(
+			"call-t",
+			"task",
+			MessageContent::Text("ok".to_string()),
+			false,
+			0,
+		);
+		task.extra.insert(
+			"details".to_string(),
+			serde_json::json!({
+				"usage": { "input": 5, "output": 7, "cacheRead": 0, "cacheWrite": 0 },
+				"accounting": [
+					{ "resultKey": "ns1:task-1", "usage": {
+						"input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0
+					}},
+					{ "resultKey": "ns1:task-2", "usage": {
+						"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0
+					}},
+				],
+			}),
+		);
+		store
+			.append_messages(&[MessageEntry::new(
+				"t1",
+				Some("h1".to_string()),
+				TS,
+				task,
+			)])
+			.expect("append task");
+
+		// Legacy unkeyed aggregate: no durable key.
+		let mut legacy = SessionMessage::tool_result(
+			"call-l",
+			"task",
+			MessageContent::Text("ok".to_string()),
+			false,
+			0,
+		);
+		legacy.extra.insert(
+			"details".to_string(),
+			serde_json::json!({
+				"usage": { "input": 9, "output": 9, "cacheRead": 0, "cacheWrite": 0 },
+			}),
+		);
+		store
+			.append_messages(&[MessageEntry::new(
+				"l1",
+				Some("t1".to_string()),
+				TS,
+				legacy,
+			)])
+			.expect("append legacy");
+
+		store
+			.append_custom(
+				BACKGROUND_USAGE_CUSTOM_TYPE,
+				Some(serde_json::json!({
+					"id": "task-3",
+					"resultKey": "ns1:task-3",
+					"usage": { "input": 2, "output": 2, "cacheRead": 0, "cacheWrite": 0 },
+				})),
+			)
+			.expect("append custom");
+
+		let keys = durable_background_keys(&store);
+		assert!(keys.contains("ns1:task-1"));
+		assert!(keys.contains("ns1:task-2"));
+		assert!(keys.contains("ns1:task-3"));
+		assert!(
+			!keys.contains("ns1:task-running"),
+			"usage-less hub snapshot must not seed a key"
+		);
+		assert_eq!(keys.len(), 3);
+		assert!(has_durable_background_key(&store, "ns1:task-1"));
+		assert!(!has_durable_background_key(&store, "ns1:task-9"));
+
+		let counted = store.session_usage();
+		assert_eq!(
+			(counted.input, counted.output),
+			(4 + 1 + 9 + 2, 6 + 1 + 9 + 2),
+			"legacy aggregate still counts; keyed children once"
+		);
+		fs::remove_dir_all(dir).ok();
+	}
+
+	/// Reopen must reproduce the same durable key set — authority after append.
+	#[test]
+	fn durable_background_keys_survive_reopen() {
+		let dir = temp_dir();
+		{
+			let mut store = SessionStore::open(&options(dir.clone(), Some("durable-reopen")));
+			assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+			store
+				.append_custom(
+					BACKGROUND_USAGE_CUSTOM_TYPE,
+					Some(serde_json::json!({
+						"id": "task-1",
+						"resultKey": "ns1:task-1",
+						"usage": { "input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0 },
+					})),
+				)
+				.expect("append");
+			assert!(has_durable_background_key(&store, "ns1:task-1"));
+		}
+		let reopened = SessionStore::open(&options(dir.clone(), Some("durable-reopen")));
+		assert!(has_durable_background_key(&reopened, "ns1:task-1"));
+		assert_eq!(durable_background_keys(&reopened).len(), 1);
+		fs::remove_dir_all(dir).ok();
+	}
+
+
 	#[test]
 	fn latest_context_tokens_prefers_reported_context_then_total() {
 		const TS: &str = "2026-01-01T00:00:00.000Z";
@@ -4632,6 +5227,8 @@ mod tests {
 		let second = TurnRecord {
 			prompt: "again".to_string(),
 			assistant: "ok".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: Vec::new(),
 			parts: Vec::new(),
@@ -5042,6 +5639,8 @@ mod tests {
 		let turn1 = TurnRecord {
 			prompt: "hello plain text".to_string(),
 			assistant: "hello human".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![],
 			parts: vec![],
@@ -5094,6 +5693,8 @@ mod tests {
 		let turn = TurnRecord {
 			prompt: "unused-when-parts-present".to_string(),
 			assistant: "done".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![],
 			parts,
@@ -5161,6 +5762,8 @@ mod tests {
 		let initial_turn = TurnRecord {
 			prompt: "first prompt".to_string(),
 			assistant: "first reply".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![],
 			parts: vec![],
@@ -5173,6 +5776,8 @@ mod tests {
 		let bad_turn = TurnRecord {
 			prompt: "bad".to_string(),
 			assistant: "no".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![],
 			parts: vec![ContentPart {
@@ -5201,6 +5806,8 @@ mod tests {
 		let bad_turn = TurnRecord {
 			prompt: "bad".to_string(),
 			assistant: "no".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![],
 			parts: vec![ContentPart {
@@ -5243,6 +5850,8 @@ mod tests {
 		let dummy_turn = TurnRecord {
 			prompt: "hello".to_string(),
 			assistant: "world".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![],
 			parts: vec![],
@@ -5268,6 +5877,8 @@ mod tests {
 		let initial_turn = TurnRecord {
 			prompt: "hello".to_string(),
 			assistant: "world".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![],
 			parts: vec![],
@@ -5322,6 +5933,8 @@ mod tests {
 		let turn_record = TurnRecord {
 			prompt: "take picture".to_string(),
 			assistant: "calling camera".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![ToolCallRecord {
 				id: "call-cam-1".to_string(),
@@ -5395,6 +6008,8 @@ mod tests {
 		let bad_turn = TurnRecord {
 			prompt: "take picture".to_string(),
 			assistant: "calling camera".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![ToolCallRecord {
 				id: "call-cam-1".to_string(),
@@ -5488,6 +6103,8 @@ mod tests {
 			TurnRecord {
 				prompt: prompt.to_string(),
 				assistant: "updated todos".to_string(),
+				reasoning: String::new(),
+				reasoning_after_text: false,
 				stop_reason: "toolUse".to_string(),
 				tool_calls: vec![ToolCallRecord {
 					id: "call-todo".to_string(),

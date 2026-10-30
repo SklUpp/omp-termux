@@ -6,6 +6,9 @@
 //! (256 KiB payloads, 64 MiB reassembled ceiling). Frame *counts*, chunk ids and
 //! error text mirror `packages/coding-agent/src/modes/rpc/rpc-frame.ts`.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use pi_agent::state::is_valid_base64_payload;
 use serde_json::{Map, Value, json};
 
@@ -39,6 +42,12 @@ const SHRINK_PASSES: [ShrinkPass; 7] = [
 
 fn serialized_frame_bytes(json: &str) -> usize {
 	json.len() + 1
+}
+
+fn hash_payload(payload: &str) -> u64 {
+	let mut hasher = DefaultHasher::new();
+	payload.hash(&mut hasher);
+	hasher.finish()
 }
 
 fn shrink_string(value: &str, cap: usize) -> String {
@@ -256,11 +265,14 @@ fn reassembled_overflow_lines(frame: &Value) -> String {
 	text
 }
 
-/// Stateful encoder that remembers which messages the client already streamed.
+/// Stateful encoder that remembers which messages the client already streamed
+/// and suppresses consecutive exact-equal logical frames.
 pub struct RpcFrameEncoder {
 	streamed_messages: Vec<Value>,
 	protocol_version:  u8,
 	chunk_counter:     u64,
+	/// Hash of the last delivered logical frame payload (`Value::to_string`).
+	last_frame_hash:   Option<u64>,
 }
 
 impl Default for RpcFrameEncoder {
@@ -272,7 +284,12 @@ impl Default for RpcFrameEncoder {
 impl RpcFrameEncoder {
 	#[must_use]
 	pub fn new() -> Self {
-		Self { streamed_messages: Vec::new(), protocol_version: 1, chunk_counter: 0 }
+		Self {
+			streamed_messages: Vec::new(),
+			protocol_version: 1,
+			chunk_counter: 0,
+			last_frame_hash: None,
+		}
 	}
 
 	#[must_use]
@@ -289,12 +306,18 @@ impl RpcFrameEncoder {
 	}
 
 	/// Encode one logical frame. The returned iterable MUST be consumed exactly
-	/// once; encoder bookkeeping already ran.
+	/// once; encoder bookkeeping already ran. Consecutive frames whose payload
+	/// serializes identically are collapsed to an empty iterator.
 	pub fn encode_frames(&mut self, frame: &Value) -> FrameLines {
 		if frame.get("type").and_then(Value::as_str) == Some("agent_start") {
 			self.streamed_messages.clear();
+			self.last_frame_hash = None;
 		}
 		let encoded = frame.to_string();
+		let payload_hash = hash_payload(&encoded);
+		if self.last_frame_hash == Some(payload_hash) {
+			return FrameLines::Single(None);
+		}
 		let mut lines = if self.protocol_version == 2
 			&& serialized_frame_bytes(&encoded) > MAX_RPC_FRAME_BYTES
 		{
@@ -339,6 +362,7 @@ impl RpcFrameEncoder {
 			},
 			_ => {},
 		}
+		self.last_frame_hash = Some(payload_hash);
 		lines
 	}
 
@@ -560,6 +584,44 @@ mod tests {
 		"x".repeat(bytes)
 	}
 
+	#[test]
+	fn consecutive_identical_frames_are_collapsed() {
+		let mut encoder = RpcFrameEncoder::new();
+		let frame = json!({ "type": "notice", "message": "same" });
+		let first: Vec<String> = encoder.encode_frames(&frame).collect();
+		assert_eq!(first.len(), 1);
+		assert!(encoder.encode_frames(&frame).next().is_none());
+		assert!(encoder.encode_frames(&frame).next().is_none());
+	}
+
+	#[test]
+	fn alternating_identical_runs_redeliver_after_change() {
+		let mut encoder = RpcFrameEncoder::new();
+		let a = json!({ "type": "notice", "message": "A" });
+		let b = json!({ "type": "notice", "message": "B" });
+		let delivered: Vec<String> = [a.clone(), a.clone(), b.clone(), b.clone(), a]
+			.into_iter()
+			.flat_map(|frame| encoder.encode_frames(&frame))
+			.collect();
+		assert_eq!(
+			delivered,
+			vec![
+				"{\"type\":\"notice\",\"message\":\"A\"}\n".to_string(),
+				"{\"type\":\"notice\",\"message\":\"B\"}\n".to_string(),
+				"{\"type\":\"notice\",\"message\":\"A\"}\n".to_string(),
+			]
+		);
+	}
+
+	#[test]
+	fn agent_start_resets_consecutive_dedupe() {
+		let mut encoder = RpcFrameEncoder::new();
+		let frame = json!({ "type": "notice", "message": "same" });
+		assert_eq!(encoder.encode_frames(&frame).count(), 1);
+		assert!(encoder.encode_frames(&frame).next().is_none());
+		let _: Vec<String> = encoder.encode_frames(&json!({ "type": "agent_start" })).collect();
+		assert_eq!(encoder.encode_frames(&frame).count(), 1);
+	}
 	#[test]
 	fn small_frame_is_one_line() {
 		let mut encoder = RpcFrameEncoder::new();

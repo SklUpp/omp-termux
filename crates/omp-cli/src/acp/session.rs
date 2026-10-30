@@ -2175,6 +2175,16 @@ fn map_event(event: &AgentEvent, map: &mut TurnMap, cwd: &Path, next_id: &Atomic
 				"messageId": map.message_id.clone(),
 			})]
 		},
+		AgentEvent::ThinkingUpdate { delta } => {
+			if delta.is_empty() {
+				return Vec::new();
+			}
+			vec![json!({
+				"sessionUpdate": "agent_thought_chunk",
+				"content": { "type": "text", "text": limit_text(delta) },
+				"messageId": map.message_id.clone(),
+			})]
+		},
 		AgentEvent::MessageEnd { message, stop_reason, .. } => {
 			let mut updates = Vec::new();
 			if message.role == pi_agent::Role::Assistant {

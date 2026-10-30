@@ -23,8 +23,9 @@ pub use tokio_util::sync::CancellationToken;
 pub use provider::{
 	ChunkStream, ModelProvider, OpenAiChatRequest, OpenAiCompatibleProvider, OpenAiContent,
 	OpenAiContentPart, OpenAiImageUrl, OpenAiMessage, OpenAiStreamOptions, OpenAiToolChoice,
-	OpenAiToolChoiceFunction, OpenAiUsage, ProviderError, StreamAssembler, StreamChunk,
-	ToolCallDelta, ToolChoice, normalize_usage, parse_sse_line, sse_stream, to_openai_messages,
+	OpenAiToolChoiceFunction, OpenAiUsage, ProviderError, StreamAssembler, StreamBlockCursor,
+	StreamBlockKind, StreamChunk, ToolCallDelta, ToolChoice, normalize_usage, parse_sse_line,
+	sse_stream, to_openai_messages,
 };
 pub use state::{
 	AcpClientBridge, AcpClientError, AgentConfig, AgentContext, AgentState, ContentPart, ImagePart,

@@ -64,7 +64,7 @@ pub const DEFAULT_CONTEXT_LIMIT: usize = 32_768;
 /// `lsp` and `debug` are mixed-tier: approval classifies their per-action
 /// readonly sets, so both are listed as not read-only here. Their availability
 /// still follows `lsp.enabled`/`debug.enabled` (see [`allowed_tools`]).
-pub const BUILTIN_TOOLS: [(&str, bool); 13] = [
+pub const BUILTIN_TOOLS: [(&str, bool); 14] = [
 	("read", true),
 	("glob", true),
 	("grep", true),
@@ -74,6 +74,7 @@ pub const BUILTIN_TOOLS: [(&str, bool); 13] = [
 	("edit", false),
 	("bash", false),
 	("eval", false),
+	("web_search", true),
 	("todo", false),
 	("ask", true),
 	("lsp", false),
@@ -116,12 +117,29 @@ struct SupervisorSlot {
 	value:  Option<Arc<Supervisor>>,
 }
 
+/// Move every accounted child result into goal accounting.
+///
+/// The supervisor removes each ledger entry under its own lock, so a boundary
+/// drain and the post-shutdown drain never hand the same entry over twice; the
+/// goal then dedups by the same result key a delivery carries, so a child is
+/// charged exactly once whichever path reaches it first. Without a goal there
+/// is no accounting sink and the ledger is left untouched.
+fn drain_accounting(supervisor: &Supervisor, goal: &crate::goal::GoalRuntime) {
+	for entry in supervisor.take_accounting() {
+		goal.observe_background_result(&entry.id, Some(&entry.result_key), Some(&entry.usage));
+	}
+}
+
 /// One session's root resources. The supervisor is created on the first
 /// delegation-enabled turn and rebound per turn; both handles persist across
 /// turns until the session closes or the process shuts down.
 struct SessionResources {
 	tools:      Arc<RunnerSession>,
 	supervisor: Mutex<SupervisorSlot>,
+	/// Goal controller of the newest run on this scope. Retained so the
+	/// post-shutdown accounting drain can still queue its persistence before
+	/// the session log closes; `None` when no run installed one.
+	goal:       Mutex<Option<Arc<crate::goal::GoalRuntime>>>,
 }
 
 /// Closed scopes stay as tombstones so a late or stale run cannot recreate
@@ -534,6 +552,7 @@ impl PiAgentRunner {
 							closed: false,
 							value:  None,
 						}),
+						goal:       Mutex::new(None),
 					});
 					lifecycle.slots.insert(
 						scope.clone(),
@@ -586,6 +605,11 @@ impl PiAgentRunner {
 				slot.closed = true;
 				slot.value.take()
 			};
+			let goal = resources
+				.goal
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.clone();
 			let session = Arc::clone(&resources.tools);
 			let handle = self.runtime.handle().clone();
 			// Supervisor cancellation and session release are both owned by this
@@ -594,6 +618,12 @@ impl PiAgentRunner {
 			let teardown = std::thread::spawn(move || {
 				if let Some(supervisor) = supervisor {
 					supervisor.shutdown();
+					// Children are cancelled by now, so every usage their completed
+					// requests reported is settled in the ledger: queue it before the
+					// session log closes, or a resumed log would lose it.
+					if let Some(goal) = goal {
+						drain_accounting(&supervisor, &goal);
+					}
 				}
 				handle.block_on(shutdown_session(session));
 			});
@@ -732,14 +762,25 @@ impl PiAgentRunner {
 					slot.value.take()
 				};
 				if let Some(supervisor) = supervisor {
-					supervisors.push(supervisor);
+					let goal = resources
+						.goal
+						.lock()
+						.unwrap_or_else(|poison| poison.into_inner())
+						.clone();
+					supervisors.push((supervisor, goal));
 				}
 				sessions.push(Arc::clone(&resources.tools));
 			}
 			(closing, sessions, supervisors)
 		};
-		for supervisor in supervisors {
+		for (supervisor, goal) in supervisors {
 			supervisor.shutdown();
+			// Same post-shutdown drain as an explicit scope close: what the
+			// cancelled children's completed requests reported still reaches goal
+			// accounting, and the host writes it before the log closes.
+			if let Some(goal) = goal {
+				drain_accounting(&supervisor, &goal);
+			}
 		}
 		// The plain teardown thread owns every published close handle and all
 		// remaining session releases, even when `sessions` is empty; `LatchFinish`
@@ -1222,6 +1263,14 @@ impl AgentRunner for PiAgentRunner {
 		let resources = self
 			.session_tools(&scope, edit_options, resolved_display.edit_tool)
 			.ok_or_else(|| Error::new("session scope is closed"))?;
+		// Retained for the post-shutdown accounting drain, which must still be able
+		// to queue its persistence after this turn's stream is gone.
+		if let Some(goal) = &request.goal {
+			*resources
+				.goal
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(goal));
+		}
 		let session = Arc::clone(&resources.tools);
 		session.set_session_identity(
 			request.session_id.as_deref(),
@@ -1246,7 +1295,7 @@ impl AgentRunner for PiAgentRunner {
 			.copied()
 			.filter(|tool| *tool != "ask")
 			.collect();
-		let base_registry = build_registry_with_display(
+		let mut base_registry = build_registry_with_display(
 			&build_tools,
 			mcp_spawn.tools,
 			mcp_spawn.server_errors,
@@ -1258,6 +1307,16 @@ impl AgentRunner for PiAgentRunner {
 			resolved_display,
 			&request.plan_mode,
 		)?;
+		// Mounted before the supervisor clones its child template so an agent that
+		// requests `web_search` inherits the same host-configured instance. The
+		// endpoint and credentials come from settings plus the `SEARXNG_*`
+		// environment fallback; the model can never supply them.
+		if plan.tools.contains(&"web_search") {
+			let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+			base_registry.register(Arc::new(pi_agent::tools::WebSearchTool::new(
+				request.config.searxng.clone().with_env_overrides(&env),
+			)));
+		}
 		let (allow_task, allow_hub) = delegation_selection(request);
 		// Needed for completion tiers and agent spawning; the `task` tool remains
 		// gated separately by `allow_task`.
@@ -1326,7 +1385,9 @@ impl AgentRunner for PiAgentRunner {
 			// dialect rejects the `stream_options` field.
 			.with_usage_in_streaming(plan.supports_usage_in_streaming)
 			.with_session_id(request.provider_session_id.clone())
-			.with_prompt_cache_key(request.prompt_cache_key.clone());
+			.with_prompt_cache_key(request.prompt_cache_key.clone())
+			.with_force_reasoning_off(request.config.external_thinking)
+			.with_service_tier(request.config.service_tier.clone());
 		let config = AgentConfig {
 			max_turns: plan.max_turns,
 			context_limit: plan.context_limit,
@@ -1377,6 +1438,13 @@ impl AgentRunner for PiAgentRunner {
 				},
 			};
 			supervisor.set_edit_options(edit_options);
+			// The goal runtime is the only durable sink for child spend: this run
+			// drains the ledger into it at every event boundary, at scope close and
+			// after process shutdown. Without one, nothing is collected, so no
+			// entry can ever be accumulated only to be thrown away.
+			if request.goal.is_some() {
+				supervisor.enable_accounting();
+			}
 			supervisor.set_display_resolver(Arc::clone(&display_resolver));
 			// Children inherit the same reverse bridge as the root; a later
 			// turn without ACP clears it again.
@@ -1442,12 +1510,16 @@ impl AgentRunner for PiAgentRunner {
 				}
 			}
 			supervisor.set_async_enabled(request.config.async_config.enabled());
+			supervisor.set_external_thinking(request.config.external_thinking);
 			root_sink = Some(supervisor.owner_results_sink(None));
 			root_supervisor = Some(Arc::clone(&supervisor));
 			supervisor.root_registry()
 		} else {
 			base_registry
 		};
+		if request.config.external_thinking && registry.get("think").is_none() {
+			registry.register(Arc::new(pi_agent::tools::ThinkTool::new()));
+		}
 		// Bash-only sessions still need the real process backend: `bash async`
 		// must run on the same scoped supervisor as hub process ops.
 		if root_supervisor.is_none()
@@ -1537,6 +1609,13 @@ impl AgentRunner for PiAgentRunner {
 		if let Some(ack) = &request.turn_ack {
 			agent = agent.with_turn_ack(Arc::clone(ack));
 		}
+		// Captured before the match below consumes the handle: ledger drains happen
+		// at every event boundary, not only at shutdown, so a child that settled
+		// (or was cancelled) since the last boundary reaches goal accounting — and
+		// the session log the host writes for it — without waiting for another
+		// turn. The supervisor removes each entry itself, so repeated drains never
+		// re-deliver one child.
+		let accounting_supervisor = root_supervisor.clone();
 		let agent = match (root_supervisor, root_sink) {
 			(Some(supervisor), Some(sink)) => agent
 				.with_background_results(sink)
@@ -1563,6 +1642,16 @@ impl AgentRunner for PiAgentRunner {
 		let goal_runtime = request.goal.clone();
 		let completed = Arc::new(AtomicBool::new(false));
 		let completed_clone = Arc::clone(&completed);
+
+		let drain_ledger = {
+			let supervisor = accounting_supervisor.clone();
+			let goal = goal_runtime.clone();
+			move || {
+				if let (Some(supervisor), Some(goal)) = (supervisor.as_ref(), goal.as_ref()) {
+					drain_accounting(supervisor, goal);
+				}
+			}
+		};
 
 		let _guard = self.runtime.enter();
 
@@ -1624,11 +1713,37 @@ impl AgentRunner for PiAgentRunner {
 							return;
 						}
 					},
+					AgentEvent::ThinkingUpdate { delta } => {
+						if !message_started {
+							if event_tx_clone
+								.send(Ok(Event::MessageStart { role: "assistant".to_string() }))
+								.await
+								.is_err()
+							{
+								cancel_on_err.cancel();
+								let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
+								abort_after_grace(dialog_abort_clone);
+								return;
+							}
+							message_started = true;
+						}
+						if event_tx_clone
+							.send(Ok(Event::ThinkingUpdate { delta }))
+							.await
+							.is_err()
+						{
+							cancel_on_err.cancel();
+							let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
+							abort_after_grace(dialog_abort_clone);
+							return;
+						}
+					},
 					AgentEvent::MessageEnd { message, status } => {
 						// The only accounting tick: one report per provider request.
 						if let Some(goal) = &goal_runtime {
 							goal.observe_message(&message);
 						}
+						drain_ledger();
 						if !message_started {
 							if event_tx_clone
 								.send(Ok(Event::MessageStart { role: "assistant".to_string() }))
@@ -1696,6 +1811,7 @@ impl AgentRunner for PiAgentRunner {
 						if let Some(goal) = &goal_runtime {
 							goal.observe_tool_end(&name, details.as_ref());
 						}
+						drain_ledger();
 						let error = is_error.then(|| result.clone());
 						if event_tx_clone
 							.send(Ok(Event::ToolEnd { id, tool: name, result, error, images, details }))
@@ -1726,8 +1842,10 @@ impl AgentRunner for PiAgentRunner {
 								usage.as_ref(),
 							);
 						}
+						drain_ledger();
 					},
 					AgentEvent::TurnEnd { message, tool_results, status } => {
+						drain_ledger();
 						let stop_reason = match status {
 							pi_agent::TurnStatus::EndTurn => "stop",
 							pi_agent::TurnStatus::ToolUse => "toolUse",
@@ -1755,6 +1873,10 @@ impl AgentRunner for PiAgentRunner {
 					},
 				}
 			}
+
+			// The event channel is closed: hand over everything the last boundary
+			// missed, so the terminal event lets the host persist it.
+			drain_ledger();
 
 			let dialog_result = match dialog_handle.await {
 				Ok(res) => res,
@@ -2271,7 +2393,9 @@ impl ChildModelFactory for CliChildModelFactory {
 							.catalog
 							.supports_usage_in_streaming(&provider_id, &id)
 							.unwrap_or(provider_id != "cerebras"),
-					),
+					)
+					.with_force_reasoning_off(self.config.external_thinking)
+					.with_service_tier(self.config.service_tier.clone()),
 				Err(error) => {
 					last_error = Some(error.to_string());
 					continue;
@@ -2840,6 +2964,9 @@ fn build_registry_with_display(
 			// Eval needs a session-scoped runtime/host; `run_turn` mounts it into
 			// the final root/child registries instead.
 			"eval" => continue,
+			// Web search needs the host's SearXNG settings; `run_turn` mounts the
+			// configured instance before the supervisor clones its child template.
+			"web_search" => continue,
 			other => {
 				return Err(Error::new(format!(
 					"unknown builtin tool `{other}`: BUILTIN_TOOLS and build_registry drifted"
@@ -3831,6 +3958,28 @@ pub fn user_message_from_parts(
 	)?))
 }
 
+/// Assistant history message carrying persisted public reasoning (if any).
+///
+/// Thinking stays in `parts` only; `content` remains the answer so no consumer
+/// ever sees reasoning duplicated into the text.
+fn assistant_history(turn: &crate::session::TurnRecord, content: String, calls: Vec<pi_agent::ToolCall>) -> pi_agent::Message {
+	let mut message = if calls.is_empty() {
+		pi_agent::Message::assistant(content.clone())
+	} else {
+		pi_agent::Message::assistant_with_tools(content.clone(), calls)
+	};
+	if !turn.reasoning.is_empty() {
+		let reasoning = pi_agent::ContentPart::thinking(turn.reasoning.clone());
+		let answer = (!content.is_empty()).then_some(pi_agent::ContentPart::Text { text: content });
+		message.parts = if turn.reasoning_after_text {
+			answer.into_iter().chain([reasoning]).collect()
+		} else {
+			std::iter::once(reasoning).chain(answer).collect()
+		};
+	}
+	message
+}
+
 /// Previous session turns as `pi-agent` history messages.
 pub fn history_messages(history: &[crate::session::TurnRecord]) -> Result<Vec<pi_agent::Message>, Error> {
 	let mut messages = Vec::new();
@@ -3853,7 +4002,7 @@ pub fn history_messages(history: &[crate::session::TurnRecord]) -> Result<Vec<pi
 						arguments: call.arguments.clone(),
 					})
 					.collect();
-				messages.push(pi_agent::Message::assistant_with_tools("", calls));
+				messages.push(assistant_history(turn, String::new(), calls));
 				for call in &turn.tool_calls {
 					let name = if call.name.is_empty() {
 						"tool"
@@ -3883,8 +4032,8 @@ pub fn history_messages(history: &[crate::session::TurnRecord]) -> Result<Vec<pi
 			continue;
 		}
 		if turn.tool_calls.is_empty() {
-			if !turn.assistant.is_empty() {
-				messages.push(pi_agent::Message::assistant(turn.assistant.clone()));
+			if !turn.assistant.is_empty() || !turn.reasoning.is_empty() {
+				messages.push(assistant_history(turn, turn.assistant.clone(), Vec::new()));
 			}
 			continue;
 		}
@@ -3897,7 +4046,7 @@ pub fn history_messages(history: &[crate::session::TurnRecord]) -> Result<Vec<pi
 				arguments: call.arguments.clone(),
 			})
 			.collect();
-		messages.push(pi_agent::Message::assistant_with_tools(turn.assistant.clone(), calls));
+		messages.push(assistant_history(turn, turn.assistant.clone(), calls));
 		for call in &turn.tool_calls {
 			let name = if call.name.is_empty() {
 				"tool"
@@ -4696,6 +4845,8 @@ mod tests {
 		let history = vec![crate::session::TurnRecord {
 			prompt:      "fix".to_string(),
 			assistant:   "done".to_string(),
+			reasoning:   String::new(),
+			reasoning_after_text: false,
 			stop_reason: "end_turn".to_string(),
 			tool_calls:  vec![crate::session::ToolCallRecord {
 				id:        "call-1".to_string(),
@@ -4721,10 +4872,42 @@ mod tests {
 	}
 
 	#[test]
+	fn history_messages_keep_text_first_reasoning_order() {
+		let history = vec![crate::session::TurnRecord {
+			prompt: "why".to_string(),
+			assistant: "answer".to_string(),
+			reasoning: "weigh options".to_string(),
+			reasoning_after_text: true,
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![],
+			parts: vec![],
+		}];
+		let messages = history_messages(&history).expect("history messages");
+		let assistant = messages
+			.iter()
+			.find(|message| message.role == pi_agent::Role::Assistant)
+			.expect("assistant history message");
+		let kinds: Vec<&str> = assistant
+			.parts
+			.iter()
+			.map(|part| match part {
+				pi_agent::ContentPart::Text { .. } => "text",
+				pi_agent::ContentPart::Thinking { .. } => "thinking",
+				pi_agent::ContentPart::Image { .. } => "image",
+			})
+			.collect();
+		// The recorded order is the streamed order, not a thinking-first regroup.
+		assert_eq!(kinds, ["text", "thinking"]);
+		assert_eq!(assistant.content, "answer");
+	}
+
+	#[test]
 	fn history_messages_excludes_aborted_assistant_without_tools() {
 		let history = vec![crate::session::TurnRecord {
 			prompt:      "fix".to_string(),
 			assistant:   "partial output".to_string(),
+			reasoning:   String::new(),
+			reasoning_after_text: false,
 			stop_reason: "aborted".to_string(),
 			tool_calls:  vec![],
 			parts:       vec![],
@@ -4740,6 +4923,8 @@ mod tests {
 		let history = vec![crate::session::TurnRecord {
 			prompt:      "fix".to_string(),
 			assistant:   "partial answer that should be excluded".to_string(),
+			reasoning:   String::new(),
+			reasoning_after_text: false,
 			stop_reason: "aborted".to_string(),
 			tool_calls:  vec![crate::session::ToolCallRecord {
 				id:        "call-1".to_string(),
@@ -4767,6 +4952,8 @@ mod tests {
 		let history = vec![crate::session::TurnRecord {
 			prompt:      "run command".to_string(),
 			assistant:   "running".to_string(),
+			reasoning:   String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls:  vec![crate::session::ToolCallRecord {
 				id:        "call-err-1".to_string(),
@@ -4793,6 +4980,8 @@ mod tests {
 		let history = vec![crate::session::TurnRecord {
 			prompt:      "run command".to_string(),
 			assistant:   "running".to_string(),
+			reasoning:   String::new(),
+			reasoning_after_text: false,
 			stop_reason: "aborted".to_string(),
 			tool_calls:  vec![crate::session::ToolCallRecord {
 				id:        "call-err-2".to_string(),
@@ -4822,6 +5011,8 @@ mod tests {
 		let history = vec![crate::session::TurnRecord {
 			prompt:      "inspect diagram".to_string(),
 			assistant:   "looks correct".to_string(),
+			reasoning:   String::new(),
+			reasoning_after_text: false,
 			stop_reason: "end_turn".to_string(),
 			tool_calls:  vec![],
 			parts:       vec![
@@ -4844,6 +5035,8 @@ mod tests {
 		let history = vec![crate::session::TurnRecord {
 			prompt: "look".to_string(),
 			assistant: "ok".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![],
 			parts: vec![crate::session::ContentPart {
@@ -4866,6 +5059,8 @@ mod tests {
 		let history = vec![crate::session::TurnRecord {
 			prompt: "look".to_string(),
 			assistant: "ok".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![],
 			parts: vec![crate::session::ContentPart {
@@ -4888,6 +5083,8 @@ mod tests {
 		let history = vec![crate::session::TurnRecord {
 			prompt:      "inspect camera".to_string(),
 			assistant:   "taking photo".to_string(),
+			reasoning:   String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls:  vec![crate::session::ToolCallRecord {
 				id:           "call-cam-1".to_string(),
@@ -4917,6 +5114,8 @@ mod tests {
 		let history = vec![crate::session::TurnRecord {
 			prompt:      "inspect camera".to_string(),
 			assistant:   "taking photo".to_string(),
+			reasoning:   String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls:  vec![crate::session::ToolCallRecord {
 				id:           "call-cam-1".to_string(),
@@ -4947,6 +5146,8 @@ mod tests {
 		let history = vec![crate::session::TurnRecord {
 			prompt:      "inspect camera".to_string(),
 			assistant:   "taking photo".to_string(),
+			reasoning:   String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls:  vec![crate::session::ToolCallRecord {
 				id:           "call-cam-1".to_string(),
@@ -4977,6 +5178,8 @@ mod tests {
 		let history = vec![crate::session::TurnRecord {
 			prompt: "hello purely textual".to_string(),
 			assistant: "hello human".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![],
 			parts: vec![],
@@ -5931,6 +6134,8 @@ mod tests {
 			.append_turn(&crate::session::TurnRecord {
 				prompt: "seed".to_string(),
 				assistant: "planned".to_string(),
+				reasoning: String::new(),
+				reasoning_after_text: false,
 				stop_reason: "toolUse".to_string(),
 				tool_calls: vec![crate::session::ToolCallRecord {
 					id: "call-todo".to_string(),
@@ -5994,6 +6199,8 @@ mod tests {
 			TurnRecord {
 				prompt: String::new(),
 				assistant: String::new(),
+				reasoning: String::new(),
+				reasoning_after_text: false,
 				stop_reason: "toolUse".to_string(),
 				tool_calls: calls,
 				parts: Vec::new(),
@@ -6064,6 +6271,8 @@ mod tests {
 		let history = vec![crate::session::TurnRecord {
 			prompt: "plan".to_string(),
 			assistant: "planned".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "toolUse".to_string(),
 			tool_calls: vec![crate::session::ToolCallRecord {
 				id: "call-todo".to_string(),

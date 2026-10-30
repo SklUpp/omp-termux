@@ -1249,7 +1249,7 @@ impl RpcSession {
 				Ok(AgentContentPart::Image { data, mime_type }) => {
 					parts.push(ContentPart::image(&data, &mime_type));
 				},
-				Ok(AgentContentPart::Text { .. }) => {
+				Ok(_) => {
 					return Err(Error::new("image content is required for prompt images"));
 				},
 				Err(err) => return Err(Error::new(format!("invalid image: {err}"))),
@@ -1344,7 +1344,11 @@ impl RpcSession {
 
 	/// Drain queued goal writes through this session's single writer and return
 	/// the live `goal_updated` frames in order.
+	///
+	/// Successful `background-usage` appends move those keys into the
+	/// turn-scoped durable seed; other in-flight keys stay until they append.
 	pub fn goal_frames(&mut self) -> Vec<Value> {
+		let mut retired = Vec::new();
 		for intent in self.goal.take_pending() {
 			let result = match intent {
 				crate::goal::GoalPersist::ModeChange { mode, data } => {
@@ -1356,13 +1360,26 @@ impl RpcSession {
 				crate::goal::GoalPersist::BackgroundUsage { id, result_key, usage } => {
 					if self.store.enabled() {
 						let mut data = json!({ "id": id, "usage": usage });
+						let retire_key = result_key
+							.as_deref()
+							.filter(|key| !key.is_empty())
+							.map(str::to_string)
+							.or_else(|| (!id.is_empty()).then_some(id.clone()));
 						if let Some(result_key) = result_key {
 							data["resultKey"] = json!(result_key);
 						}
-						self.store.append_custom(
+						match self.store.append_custom(
 							crate::goal::BACKGROUND_USAGE_CUSTOM_TYPE,
 							Some(data),
-						)
+						) {
+							Ok(entry_id) => {
+								if let Some(key) = retire_key {
+									retired.push(key);
+								}
+								Ok(entry_id)
+							},
+							Err(err) => Err(err),
+						}
 					} else {
 						Ok(String::new())
 					}
@@ -1371,6 +1388,9 @@ impl RpcSession {
 			if let Err(err) = result {
 				eprintln!("warning: {err}");
 			}
+		}
+		if !retired.is_empty() {
+			self.goal.retire_durable_background_keys(retired);
 		}
 		self
 			.goal
@@ -1515,6 +1535,7 @@ impl RpcSession {
 		// window and the accounting baseline before the request is built.
 		let seed = self.goal_seed();
 		self.goal.begin_turn(Some(&input.text), seed);
+		self.goal.seed_background_dedup(crate::session::durable_background_keys(&self.store));
 		// Build the request BEFORE the user entry is appended: with a durable
 		// `branch_summary` the context is rebuilt from the store, so an entry
 		// written first would come back as history and the runner would append
@@ -1787,6 +1808,8 @@ impl RpcSession {
 				AgentContentPart::Image { data, mime_type } => {
 					images.push(ContentPart::image(data, mime_type));
 				},
+				// A user message never carries provider reasoning.
+				AgentContentPart::Thinking { .. } => {},
 			}
 		}
 		let joined = text.join("\n");
@@ -1880,6 +1903,7 @@ impl RpcSession {
 								Some(ContentPart::image(data, mime_type))
 							},
 							AgentContentPart::Text { .. } => None,
+							AgentContentPart::Thinking { .. } => None,
 						})
 						.collect();
 					prepared.tool_images.insert(id.clone(), converted);
@@ -1930,7 +1954,20 @@ impl RpcSession {
 			.as_millis() as u64;
 
 		let mut parts = Vec::new();
-		if !message.content.is_empty() {
+		// Streamed block order, not a regrouped one: the persisted content array
+		// is what the host saw in `contentIndex` order.
+		for part in &message.parts {
+			match part {
+				pi_agent::ContentPart::Thinking { thinking } => {
+					parts.push(ContentPart::thinking(thinking.clone()));
+				},
+				pi_agent::ContentPart::Text { text } => {
+					parts.push(ContentPart::text(text.clone()));
+				},
+				pi_agent::ContentPart::Image { .. } => {},
+			}
+		}
+		if message.parts.is_empty() && !message.content.is_empty() {
 			parts.push(ContentPart::text(message.content.clone()));
 		}
 		for call in &message.tool_calls {

@@ -59,6 +59,8 @@ fn read_real_ts_v3_session_and_preserve_typed_content() {
 	let turn = TurnRecord {
 		prompt: "check image".to_string(),
 		assistant: "looks good".to_string(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "aborted".to_string(),
 		tool_calls: Vec::new(),
 		parts: Vec::new(),
@@ -121,6 +123,8 @@ fn v1_legacy_log_rejects_append_and_stays_immutable() {
 	let new_turn = TurnRecord {
 		prompt: "do more work".to_string(),
 		assistant: "done".to_string(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "end_turn".to_string(),
 		tool_calls: Vec::new(),
 		parts: Vec::new(),
@@ -168,6 +172,8 @@ fn malformed_tail_refuses_append() {
 	let turn = TurnRecord {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "end_turn".into(),
 		tool_calls: Vec::new(),
 		parts: Vec::new(),
@@ -222,6 +228,8 @@ fn malformed_entry_refuses_append() {
 	let turn = TurnRecord {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "end_turn".into(),
 		tool_calls: Vec::new(),
 		parts: Vec::new(),
@@ -427,6 +435,8 @@ fn parse_error_does_not_leak_raw_line_secrets() {
 	let turn = TurnRecord {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "end_turn".into(),
 		tool_calls: Vec::new(),
 		parts: Vec::new(),
@@ -479,6 +489,8 @@ fn parse_error_field_type_mismatch_does_not_leak_field_value_secret() {
 	let turn = TurnRecord {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "end_turn".into(),
 		tool_calls: Vec::new(),
 		parts: Vec::new(),
@@ -531,6 +543,8 @@ fn parse_error_untyped_record_is_rejected_without_secret_leak() {
 	let turn = TurnRecord {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "end_turn".into(),
 		tool_calls: Vec::new(),
 		parts: Vec::new(),
@@ -584,6 +598,8 @@ fn parse_v1_log_field_type_mismatch_does_not_leak_field_value_secret() {
 	let turn = TurnRecord {
 		prompt: "hi".into(),
 		assistant: "hello".into(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "end_turn".into(),
 		tool_calls: Vec::new(),
 		parts: Vec::new(),
@@ -648,6 +664,8 @@ fn raw_content_with_secret_does_not_leak_into_diagnostics_or_warnings() {
 	let turn = TurnRecord {
 		prompt: "hi".to_string(),
 		assistant: "hello".to_string(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "stop".to_string(),
 		tool_calls: vec![],
 		parts: vec![],
@@ -848,6 +866,8 @@ fn direct_append_message_with_malformed_text_and_image_fails_preflight_and_prese
 	let initial_turn = TurnRecord {
 		prompt: "initial turn".to_string(),
 		assistant: "initial reply".to_string(),
+		reasoning: String::new(),
+		reasoning_after_text: false,
 		stop_reason: "stop".to_string(),
 		tool_calls: vec![],
 		parts: vec![],

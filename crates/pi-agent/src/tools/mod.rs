@@ -10,15 +10,19 @@ pub mod internal_urls_github;
 pub mod pending;
 pub mod process;
 pub mod read;
+mod read_archive;
 mod read_sqlite;
 pub mod registry;
 pub mod scheduler;
+pub mod search_query;
+pub mod ssh;
 pub mod task;
 pub mod task_catalog;
 pub mod task_isolation;
 pub mod think;
 pub mod todo;
 pub mod yield_tool;
+pub mod web_search;
 
 pub use ask::AskTool;
 pub use ast_edit::{AstEditTool, PreviewDisplay};
@@ -37,6 +41,7 @@ pub use task::TaskTool;
 pub use think::ThinkTool;
 pub use todo::TodoTool;
 pub use yield_tool::YieldTool;
+pub use web_search::{SearxngConfig, WebSearchTool};
 
 use std::{
 	collections::{BTreeMap, HashMap},

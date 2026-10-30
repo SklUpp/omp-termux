@@ -88,12 +88,14 @@ fn text_stream(reply: &str) -> ChunkStream {
 			content: Some(reply.to_string()),
 			tool_call_deltas: Vec::new(),
 			usage: None,
+			reasoning: None,
 			is_done: false,
 		}),
 		Ok(StreamChunk {
 			content: None,
 			tool_call_deltas: Vec::new(),
 			usage: None,
+			reasoning: None,
 			is_done: true,
 		}),
 	];

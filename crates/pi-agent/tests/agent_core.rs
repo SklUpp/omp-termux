@@ -1905,6 +1905,7 @@ fn text_chunk(delta: &str) -> StreamChunk {
 		content: Some(delta.to_string()),
 		tool_call_deltas: Vec::new(),
 		usage: None,
+		reasoning: None,
 		is_done: false,
 	}
 }
@@ -1924,12 +1925,13 @@ fn tool_delta(
 			arguments_delta: arguments_delta.map(ToString::to_string),
 		}],
 		usage: None,
+		reasoning: None,
 		is_done: false,
 	}
 }
 
 fn done_chunk() -> StreamChunk {
-	StreamChunk { content: None, tool_call_deltas: Vec::new(), usage: None, is_done: true }
+	StreamChunk { content: None, reasoning: None, tool_call_deltas: Vec::new(), usage: None, is_done: true }
 }
 
 /// Drains the event channel concurrently with the dialog: `run_dialog_with`
@@ -2036,6 +2038,7 @@ async fn streaming_rejects_missing_tool_name() {
 			arguments_delta: Some("{\"path\":\"x\"}".to_string()),
 		}],
 		usage: None,
+		reasoning: None,
 		is_done: true,
 	});
 
@@ -2207,6 +2210,7 @@ fn reasoning_effort_is_serialized_only_when_set() {
 		stream_options: None,
 		reasoning_effort: None,
 		prompt_cache_key: None,
+		service_tier: None,
 	};
 	let payload = serde_json::to_value(&without).expect("serialize");
 	assert!(payload.get("reasoning_effort").is_none(), "got: {payload}");

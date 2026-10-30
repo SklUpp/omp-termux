@@ -34,6 +34,10 @@ struct LaunchArgs {
 	#[arg(long, value_enum, default_value = "text")]
 	mode: OutputMode,
 
+	/// Text mode only: also print public provider reasoning before the answer.
+	#[arg(long = "print-thoughts")]
+	print_thoughts: bool,
+
 	/// Working directory for the session.
 	#[arg(long, value_name = "DIR")]
 	cwd: Option<PathBuf>,
@@ -57,6 +61,19 @@ struct LaunchArgs {
 	/// Slow/reasoning model for thorough analysis (or `PI_SLOW_MODEL`).
 	#[arg(long, value_name = "MODEL")]
 	slow: Option<String>,
+
+	/// Plan model for architectural planning (or `PI_PLAN_MODEL`).
+	#[arg(long, value_name = "MODEL")]
+	plan: Option<String>,
+
+	/// Private think scratchpad; disables supported native provider reasoning.
+	#[arg(long = "external-thinking")]
+	external_thinking: bool,
+
+	/// OpenAI service tier: none, auto, default, flex, scale, or priority.
+	#[arg(long = "service-tier", value_name = "TIER", value_parser = parse_service_tier)]
+	service_tier: Option<String>,
+
 
 	/// Provider id.
 	#[arg(long)]
@@ -214,6 +231,9 @@ pub struct Cli {
 	/// Output format.
 	pub mode: OutputMode,
 
+	/// Text mode only: also print public provider reasoning before the answer.
+	pub print_thoughts: bool,
+
 	/// Working directory for the session.
 	pub cwd: Option<PathBuf>,
 
@@ -231,6 +251,16 @@ pub struct Cli {
 
 	/// Slow/reasoning model for thorough analysis (or `PI_SLOW_MODEL`).
 	pub slow: Option<String>,
+
+	/// Plan model for architectural planning (or `PI_PLAN_MODEL`).
+	pub plan: Option<String>,
+
+	/// Private think scratchpad; disables supported native provider reasoning.
+	pub external_thinking: bool,
+
+	/// OpenAI service tier (`none` omits the wire field).
+	pub service_tier: Option<String>,
+
 
 	/// Provider id.
 	pub provider: Option<String>,
@@ -404,12 +434,16 @@ impl Cli {
 			file_args,
 			print: raw.print,
 			mode: raw.mode,
+			print_thoughts: raw.print_thoughts,
 			cwd: raw.cwd,
 			profile: raw.profile,
 			alias: raw.alias,
 			model: raw.model,
 			smol: raw.smol,
 			slow: raw.slow,
+			plan: raw.plan,
+			external_thinking: raw.external_thinking,
+			service_tier: raw.service_tier,
 			provider: raw.provider,
 			api_key: raw.api_key,
 			system_prompt: raw.system_prompt,
@@ -496,14 +530,12 @@ const EXCLUDED_VERBS: [(&str, &str); 6] = [
 ];
 
 /// Known upstream verbs this binary does not implement yet, including the
-/// upstream registry aliases `img` and `q`.
-const MISSING_VERBS: [&str; 26] = [
+/// upstream registry alias `img`.
+const MISSING_VERBS: [&str; 20] = [
 	"auth-broker",
 	"auth-gateway",
 	"bench",
 	"browser-relay",
-	"cleanse",
-	"commit",
 	"compress",
 	"dry-balance",
 	"gc",
@@ -515,15 +547,11 @@ const MISSING_VERBS: [&str; 26] = [
 	"say",
 	"share",
 	"setup",
-	"render",
 	"ssh",
-	"stats",
 	"usage",
 	"tiny-models",
 	"token",
 	"ttsr",
-	"search",
-	"q",
 ];
 
 /// Refusal for a known upstream verb that would otherwise be absorbed as prompt
@@ -969,6 +997,80 @@ pub enum Command {
 		#[arg(long, value_name = "SECONDS")]
 		timeout: Option<u64>,
 	},
+
+	/// Web search via the configured SearXNG endpoint (same backend as `web_search`).
+	///
+	/// Usage: `omp search <query>` or `omp q <query>`. Requires `searxng.endpoint`
+	/// or `SEARXNG_ENDPOINT`; no direct HTTP outside `WebSearchTool`.
+	#[command(alias = "q")]
+	Search {
+		/// Search query text (joined when multiple words).
+		#[arg(value_name = "QUERY", trailing_var_arg = true, allow_hyphen_values = true)]
+		query:   Vec<String>,
+		/// Restrict results by publication window: day, week, month, year.
+		#[arg(long, value_name = "WINDOW")]
+		recency: Option<String>,
+		/// Maximum number of sources to return.
+		#[arg(short = 'l', long, value_name = "N")]
+		limit:   Option<u32>,
+	},
+
+	/// Export a session JSONL file to standalone HTML and exit.
+	///
+	/// Usage: `omp export <session> [--output <path>]`. Reads the session via
+	/// `SessionStore` (no live RPC session required).
+	Export {
+		/// Session file path or id (same selectors as `--resume`).
+		#[arg(value_name = "SESSION")]
+		session: Option<String>,
+		/// Output HTML path (default: `<session>.html` beside the log).
+		#[arg(short = 'o', long = "output", value_name = "PATH")]
+		output:  Option<PathBuf>,
+	},
+
+	/// Show session statistics (token usage, tool calls, duration) and exit.
+	///
+	/// Usage: `omp stats [session]`. Reads via `SessionStore` (no live RPC).
+	Stats {
+		/// Session file path or id (same selectors as `--resume`); omit for
+		/// the most recent session under the cwd session dir.
+		#[arg(value_name = "SESSION")]
+		session: Option<String>,
+	},
+
+	/// Render a session to terminal-friendly plain text and exit.
+	///
+	/// Usage: `omp render <session> [--output <path>]`. Different from `export`
+	/// (HTML); this writes plain text.
+	Render {
+		/// Session file path or id (same selectors as `--resume`).
+		#[arg(value_name = "SESSION")]
+		session: Option<String>,
+		/// Output path (default: stdout).
+		#[arg(short = 'o', long = "output", value_name = "PATH")]
+		output:  Option<PathBuf>,
+	},
+
+	/// Remove sensitive data (API keys, tokens) from a session log and exit.
+	///
+	/// Usage: `omp cleanse <session> --confirm`. Requires `--confirm`.
+	Cleanse {
+		/// Session file path or id (same selectors as `--resume`).
+		#[arg(value_name = "SESSION")]
+		session: Option<String>,
+		/// Required safety gate; without it the command refuses to rewrite.
+		#[arg(long)]
+		confirm: bool,
+	},
+
+	/// Stage and commit the current working tree via `git add -A` / `git commit`.
+	///
+	/// Usage: `omp commit [--message MSG]`. Requires a git repository.
+	Commit {
+		/// Commit message (default: `omp commit`).
+		#[arg(short = 'm', long = "message", value_name = "MSG")]
+		message: Option<String>,
+	},
 }
 
 
@@ -1001,6 +1103,20 @@ pub fn parse_max_time(raw: &str) -> std::result::Result<Duration, String> {
 	}
 	Ok(Duration::from_secs_f64(seconds))
 }
+
+const SERVICE_TIER_VALUES: &[&str] = &["none", "auto", "default", "flex", "scale", "priority"];
+
+/// Parse `--service-tier`: strict OpenAI setting enum (TS `SERVICE_TIER_OPENAI_VALUES`).
+pub fn parse_service_tier(raw: &str) -> std::result::Result<String, String> {
+	if SERVICE_TIER_VALUES.contains(&raw) {
+		return Ok(raw.to_string());
+	}
+	Err(format!(
+		"Invalid --service-tier value: {raw:?}. Expected one of: {}.",
+		SERVICE_TIER_VALUES.join(", ")
+	))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1428,6 +1544,72 @@ mod tests {
 	}
 
 	#[test]
+	fn search_and_export_subcommands_parse() {
+		assert_eq!(
+			parse(&["omp", "search", "rust", "async"]).command,
+			Some(Command::Search {
+				query:   vec!["rust".to_string(), "async".to_string()],
+				recency: None,
+				limit:   None,
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "q", "--recency", "week", "-l", "5", "latest"]).command,
+			Some(Command::Search {
+				query:   vec!["latest".to_string()],
+				recency: Some("week".to_string()),
+				limit:   Some(5),
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "export", "session.jsonl", "--output", "out.html"]).command,
+			Some(Command::Export {
+				session: Some("session.jsonl".to_string()),
+				output:  Some(PathBuf::from("out.html")),
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "export"]).command,
+			Some(Command::Export { session: None, output: None })
+		);
+	}
+
+	#[test]
+	fn stats_render_cleanse_commit_subcommands_parse() {
+		assert_eq!(
+			parse(&["omp", "stats", "session.jsonl"]).command,
+			Some(Command::Stats { session: Some("session.jsonl".to_string()) })
+		);
+		assert_eq!(parse(&["omp", "stats"]).command, Some(Command::Stats { session: None }));
+		assert_eq!(
+			parse(&["omp", "render", "session.jsonl", "--output", "out.txt"]).command,
+			Some(Command::Render {
+				session: Some("session.jsonl".to_string()),
+				output:  Some(PathBuf::from("out.txt")),
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "cleanse", "session.jsonl", "--confirm"]).command,
+			Some(Command::Cleanse {
+				session: Some("session.jsonl".to_string()),
+				confirm: true,
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "cleanse", "session.jsonl"]).command,
+			Some(Command::Cleanse {
+				session: Some("session.jsonl".to_string()),
+				confirm: false,
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "commit", "--message", "ship it"]).command,
+			Some(Command::Commit { message: Some("ship it".to_string()) })
+		);
+		assert_eq!(parse(&["omp", "commit"]).command, Some(Command::Commit { message: None }));
+	}
+
+	#[test]
 	fn max_time_accepts_seconds_and_units() {
 		assert_eq!(parse_max_time("5"), Ok(Duration::from_secs(5)));
 		assert_eq!(parse_max_time("5s"), Ok(Duration::from_secs(5)));
@@ -1438,6 +1620,35 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn plan_external_thinking_and_service_tier_flags_parse() {
+		let cli = parse(&[
+			"omp",
+			"--plan",
+			"openai/o3",
+			"--external-thinking",
+			"--service-tier",
+			"flex",
+		]);
+		assert_eq!(cli.plan.as_deref(), Some("openai/o3"));
+		assert!(cli.external_thinking);
+		assert_eq!(cli.service_tier.as_deref(), Some("flex"));
+		assert!(!parse(&["omp"]).external_thinking);
+		assert_eq!(parse(&["omp"]).plan, None);
+		assert_eq!(parse(&["omp"]).service_tier, None);
+		for tier in ["none", "auto", "default", "flex", "scale", "priority"] {
+			assert_eq!(
+				parse(&["omp", "--service-tier", tier]).service_tier.as_deref(),
+				Some(tier)
+			);
+		}
+		assert!(Cli::try_parse_from(["omp", "--service-tier", "turbo"]).is_err());
+		assert!(Cli::try_parse_from(["omp", "--service-tier"]).is_err());
+		assert!(parse_service_tier("bogus").is_err());
+		assert_eq!(parse_service_tier("priority").as_deref(), Ok("priority"));
+	}
+
+
 	fn refusal(args: &[&str]) -> Option<String> {
 		let mut argv = vec![std::ffi::OsString::from("omp")];
 		argv.extend(args.iter().map(|arg| std::ffi::OsString::from(*arg)));
@@ -1446,7 +1657,7 @@ mod tests {
 
 	#[test]
 	fn known_missing_verbs_are_refused_not_absorbed_as_prompts() {
-		for verb in ["compress", "browser-relay", "auth-broker", "img", "q"] {
+		for verb in ["compress", "browser-relay", "auth-broker", "img", "usage"] {
 			let message = refusal(&[verb]).unwrap_or_else(|| panic!("{verb} must be refused"));
 			assert!(message.contains(&format!("`omp {verb}`")), "{message}");
 			assert!(!message.contains("excluded"), "{verb} is missing, not excluded: {message}");
@@ -1493,16 +1704,16 @@ mod tests {
 		assert_eq!(refusal(&["--resume", "acp"]), None);
 		assert_eq!(refusal(&["--model=acp", "hello"]), None);
 		// A leading valueless flag does not turn the following verb into a prompt.
-		assert!(refusal(&["--no-tools", "stats"]).is_some());
+		assert!(refusal(&["--no-tools", "usage"]).is_some());
 		assert!(refusal(&["-p", "compress"]).is_some());
-		assert!(refusal(&["-c", "stats"]).is_some());
+		assert!(refusal(&["-c", "usage"]).is_some());
 		// Combined short flags: valueless ones keep the verb in the command slot…
-		assert!(refusal(&["-pc", "stats"]).is_some());
-		assert!(refusal(&["-cp", "stats"]).is_some());
+		assert!(refusal(&["-pc", "usage"]).is_some());
+		assert!(refusal(&["-cp", "usage"]).is_some());
 		// …while a value-taking flag at the tail consumes the next token, and the
 		// attached form (`-rc` = resume "c") consumes only the cluster tail.
-		assert_eq!(refusal(&["-pr", "stats"]), None);
-		assert!(refusal(&["-rc", "stats"]).is_some());
+		assert_eq!(refusal(&["-pr", "usage"]), None);
+		assert!(refusal(&["-rc", "usage"]).is_some());
 		// A recognized subcommand keeps its own dispatch.
 		assert_eq!(refusal(&["models", "acp"]), None);
 		assert_eq!(refusal(&["read", "acp"]), None);
@@ -1522,17 +1733,17 @@ mod tests {
 		}
 		// Once an operand leads, a later `--help` does not rescue the verb: this
 		// build cannot help with a command it does not have.
-		assert!(refusal(&["stats", "--help"]).is_some());
-		assert!(refusal(&["--print", "stats", "--help"]).is_some());
+		assert!(refusal(&["usage", "--help"]).is_some());
+		assert!(refusal(&["--print", "usage", "--help"]).is_some());
 		// A help character consumed as a flag value is not a request.
-		assert!(refusal(&["-rh", "stats"]).is_some());
-		assert!(refusal(&["--system-prompt", "--help", "stats"]).is_some());
-		assert!(refusal(&["--resume=--help", "stats"]).is_some());
+		assert!(refusal(&["-rh", "usage"]).is_some());
+		assert!(refusal(&["--system-prompt", "--help", "usage"]).is_some());
+		assert!(refusal(&["--resume=--help", "usage"]).is_some());
 		// An attached cluster value ends that flag, not the scan: a later `--help`
 		// is still the leading help request.
-		assert_eq!(refusal(&["-rh", "--help", "stats"]), None);
-		assert_eq!(refusal(&["-rc", "--help", "stats"]), None);
-		assert!(refusal(&["-rc", "stats"]).is_some());
+		assert_eq!(refusal(&["-rh", "--help", "usage"]), None);
+		assert_eq!(refusal(&["-rc", "--help", "usage"]), None);
+		assert!(refusal(&["-rc", "usage"]).is_some());
 	}
 
 	#[test]

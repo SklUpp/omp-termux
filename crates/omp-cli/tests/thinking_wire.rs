@@ -28,6 +28,10 @@ fn temp_dir(prefix: &str) -> PathBuf {
 	dir
 }
 
+/// Default reply body: one content delta, then the done frame.
+const DEFAULT_SSE: &str =
+	"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+
 struct MockWireServer {
 	port: u16,
 	requests: Arc<Mutex<Vec<serde_json::Value>>>,
@@ -37,6 +41,12 @@ struct MockWireServer {
 
 impl MockWireServer {
 	fn start() -> Self {
+		Self::start_with(DEFAULT_SSE)
+	}
+
+	/// Same server, answering with a caller-supplied SSE body.
+	fn start_with(sse_body: &str) -> Self {
+		let sse_body = sse_body.to_string();
 		let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
 		let port = listener.local_addr().expect("local addr").port();
 		listener.set_nonblocking(true).expect("set nonblocking");
@@ -94,10 +104,7 @@ impl MockWireServer {
 								}
 							}
 						}
-						let body = concat!(
-							"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
-							"data: [DONE]\n\n"
-						);
+						let body = sse_body.as_str();
 						let response = format!(
 							"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
 							body.len(),
@@ -292,5 +299,389 @@ fn provider_model_colons_are_preserved() {
 	let suffixed = server.body(1);
 	assert_eq!(suffixed["model"], "qwen:7b");
 	assert_eq!(suffixed["reasoning_effort"], "minimal");
+	server.stop();
+}
+
+/// Provider stream that reports a public reasoning block before the answer.
+/// Two chunks, each carrying the block in a different public field
+/// (`reasoning_content`, then `reasoning_text`), so both decoders are exercised.
+const REASONING_SSE: &str = concat!(
+	"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"weigh\"}}]}\n\n",
+	"data: {\"choices\":[{\"delta\":{\"reasoning_text\":\" options\"}}]}\n\n",
+	"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+	"data: [DONE]\n\n"
+);
+
+/// Run the binary with exactly the given arguments (no forced mode or session).
+fn run_omp_raw(agent_dir: &Path, cwd: &Path, args: &[&str]) -> Output {
+	let mut cmd = ProcCommand::new(env!("CARGO_BIN_EXE_omp"));
+	cmd.env("PI_CODING_AGENT_DIR", agent_dir);
+	cmd.stdin(Stdio::null());
+	cmd.args(["--cwd", cwd.to_str().expect("utf8 cwd")]);
+	cmd.args(args);
+	let out = cmd.output().expect("run omp");
+	assert!(
+		out.status.success(),
+		"omp failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	out
+}
+
+/// NDJSON events with volatile fields (timestamps, generated ids) removed so two
+/// runs of the same stream compare equal.
+fn stable_events(stdout: &[u8]) -> Vec<serde_json::Value> {
+	fn scrub(value: &mut serde_json::Value) {
+		match value {
+			serde_json::Value::Object(map) => {
+				for volatile in ["timestamp", "id", "sessionId"] {
+					map.remove(volatile);
+				}
+				for nested in map.values_mut() {
+					scrub(nested);
+				}
+			},
+			serde_json::Value::Array(items) => {
+				for item in items {
+					scrub(item);
+				}
+			},
+			_ => {},
+		}
+	}
+
+	String::from_utf8_lossy(stdout)
+		.lines()
+		.filter(|line| !line.trim().is_empty())
+		.map(|line| {
+			let mut value: serde_json::Value =
+				serde_json::from_str(line).expect("json mode emits NDJSON only");
+			scrub(&mut value);
+			value
+		})
+		.collect()
+}
+
+/// Rebuild streamed blocks strictly by `contentIndex`, the way a host does.
+///
+/// Asserts each block keeps one kind and indices are contiguous from zero, so
+/// this fails if the answer and the reasoning are folded into one index.
+fn blocks_by_index(events: &[serde_json::Value]) -> Vec<(String, String)> {
+	let mut blocks: Vec<Option<(String, String)>> = Vec::new();
+	for event in events {
+		let delta = &event["assistantMessageEvent"];
+		let kind = match delta["type"].as_str() {
+			Some("text_delta") => "text",
+			Some("thinking_delta") => "thinking",
+			_ => continue,
+		};
+		let index = delta["contentIndex"]
+			.as_u64()
+			.expect("streamed delta must carry contentIndex") as usize;
+		assert!(
+			index <= blocks.len(),
+			"contentIndex {index} is not contiguous: {event}"
+		);
+		if blocks.len() == index {
+			blocks.push(None);
+		}
+		let slot = blocks[index]
+			.get_or_insert_with(|| (kind.to_string(), String::new()));
+		assert_eq!(slot.0, kind, "one block must not mix kinds: {event}");
+		slot.1.push_str(delta["delta"].as_str().unwrap_or_default());
+	}
+	blocks
+		.into_iter()
+		.map(|block| block.expect("no empty contentIndex"))
+		.collect()
+}
+
+/// Assistant blocks in the finalized message, in message order.
+fn final_assistant_blocks(events: &[serde_json::Value]) -> Vec<(String, String)> {
+	let agent_end = events
+		.iter()
+		.rev()
+		.find(|event| event["type"] == "agent_end")
+		.expect("agent_end must be emitted");
+	let message = agent_end["messages"]
+		.as_array()
+		.expect("agent_end.messages")
+		.iter()
+		.rev()
+		.find(|message| message["role"] == "assistant")
+		.expect("final assistant message");
+	message["content"]
+		.as_array()
+		.expect("assistant content blocks")
+		.iter()
+		.map(|block| {
+			let kind = block["type"].as_str().unwrap_or_default().to_string();
+			let text = block["thinking"]
+				.as_str()
+				.or(block["text"].as_str())
+				.unwrap_or_default();
+			(kind, text.to_string())
+		})
+		.collect()
+}
+
+/// Real binary against a real SSE endpoint: public provider reasoning stays
+/// apart from the answer in the text render (gated by `--print-thoughts`), in
+/// the JSON stream (ungated), in the session log (once), and in the next
+/// outbound request (never).
+#[test]
+fn public_reasoning_stays_apart_and_never_replays() {
+	let server = MockWireServer::start_with(REASONING_SSE);
+	let base = temp_dir("reasoning-stream");
+	let (agent_dir, cwd) = setup(server.port, &base);
+	let session_dir = base.join("sessions");
+	fs::create_dir_all(&session_dir).expect("session dir");
+	let session_dir_arg = session_dir.to_str().expect("utf8 session dir").to_string();
+
+	// Default text mode: only the answer reaches stdout.
+	let plain = run_omp_raw(
+		&agent_dir,
+		&cwd,
+		&["--no-session", "--no-tools", "--no-title", "--mode", "text", "say hi"],
+	);
+	assert_eq!(String::from_utf8_lossy(&plain.stdout).trim(), "answer");
+
+	// `--print-thoughts`: reasoning renders before the answer, still separate.
+	let thoughts = run_omp_raw(
+		&agent_dir,
+		&cwd,
+		&[
+			"--no-session",
+			"--no-tools",
+			"--no-title",
+			"--mode",
+			"text",
+			"--print-thoughts",
+			"say hi",
+		],
+	);
+	assert_eq!(
+		String::from_utf8_lossy(&thoughts.stdout).trim(),
+		"weigh options\nanswer"
+	);
+
+	// JSON mode is flag-independent: the same event stream either way.
+	let json_off = run_omp_raw(
+		&agent_dir,
+		&cwd,
+		&["--no-session", "--no-tools", "--no-title", "--mode", "json", "say hi"],
+	);
+	let json_on = run_omp_raw(
+		&agent_dir,
+		&cwd,
+		&[
+			"--no-session",
+			"--no-tools",
+			"--no-title",
+			"--mode",
+			"json",
+			"--print-thoughts",
+			"say hi",
+		],
+	);
+	let off = stable_events(&json_off.stdout);
+	let on = stable_events(&json_on.stdout);
+	assert!(!off.is_empty(), "json mode must emit events");
+	let deltas = |events: &[serde_json::Value], kind: &str| -> String {
+		events
+			.iter()
+			.filter(|event| event["assistantMessageEvent"]["type"].as_str() == Some(kind))
+			.filter_map(|event| event["assistantMessageEvent"]["delta"].as_str())
+			.collect()
+	};
+	assert_eq!(deltas(&off, "thinking_delta"), "weigh options");
+	assert_eq!(deltas(&off, "text_delta"), "answer");
+	// A host rebuilding by `contentIndex` must get two clean blocks, in the
+	// streamed order, and the finalized message must agree with that order.
+	let expected = vec![
+		("thinking".to_string(), "weigh options".to_string()),
+		("text".to_string(), "answer".to_string()),
+	];
+	assert_eq!(blocks_by_index(&off), expected);
+	assert_eq!(final_assistant_blocks(&off), expected);
+	assert_eq!(off, on, "the print flag must not change the JSON stream");
+
+	// Persisted turn: one thinking block beside the answer, never inside it.
+	run_omp_raw(
+		&agent_dir,
+		&cwd,
+		&[
+			"--session-dir",
+			session_dir_arg.as_str(),
+			"--session-id",
+			"reasoning-turn",
+			"--no-tools",
+			"--no-title",
+			"--mode",
+			"text",
+			"say hi",
+		],
+	);
+	let log_path = fs::read_dir(&session_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|entry| entry.path())
+		.find(|path| {
+			path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+				&& path
+					.file_stem()
+					.and_then(|stem| stem.to_str())
+					.map_or(false, |stem| stem.ends_with("reasoning-turn"))
+		})
+		.expect("session log must exist");
+	let log = fs::read_to_string(&log_path).expect("read session log");
+	assert_eq!(
+		log.matches("weigh options").count(),
+		1,
+		"reasoning must persist exactly once: {log}"
+	);
+	assert!(
+		log.contains(r#"{"type":"thinking","thinking":"weigh options"}"#),
+		"thinking must persist as a typed part: {log}"
+	);
+	assert!(
+		log.contains(r#"{"type":"text","text":"answer"}"#),
+		"answer must persist unchanged: {log}"
+	);
+
+	// Resumed turn replays the history but never the reasoning.
+	run_omp_raw(
+		&agent_dir,
+		&cwd,
+		&[
+			"--session-dir",
+			session_dir_arg.as_str(),
+			"--resume",
+			"reasoning-turn",
+			"--no-tools",
+			"--no-title",
+			"--mode",
+			"text",
+			"and again",
+		],
+	);
+	let requests = server.requests.lock().expect("lock").clone();
+	assert!(requests.len() >= 2, "resume must issue a request");
+	for body in &requests {
+		assert!(
+			!body.to_string().contains("weigh options"),
+			"public reasoning must never be replayed outbound: {body}"
+		);
+	}
+	server.stop();
+}
+
+/// Provider stream that sends the answer first and the reasoning afterwards, the
+/// order some OpenAI-compatible servers use for tool-ish turns.
+const TEXT_FIRST_SSE: &str = concat!(
+	"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+	"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"weigh\"}}]}\n\n",
+	"data: {\"choices\":[{\"delta\":{\"reasoning_text\":\" options\"}}]}\n\n",
+	"data: [DONE]\n\n"
+);
+
+/// Answer before reasoning: indices, text render, persisted parts and the
+/// resumed turn all keep the streamed order instead of regrouping to
+/// thinking-first.
+#[test]
+fn text_first_reasoning_keeps_block_order_on_resume() {
+	let server = MockWireServer::start_with(TEXT_FIRST_SSE);
+	let base = temp_dir("reasoning-text-first");
+	let (agent_dir, cwd) = setup(server.port, &base);
+	let session_dir = base.join("sessions");
+	fs::create_dir_all(&session_dir).expect("session dir");
+	let session_dir_arg = session_dir.to_str().expect("utf8 session dir").to_string();
+
+	// Answer only by default; `--print-thoughts` renders in message order, so the
+	// answer still comes first.
+	let plain = run_omp_raw(
+		&agent_dir,
+		&cwd,
+		&["--no-session", "--no-tools", "--no-title", "--mode", "text", "say hi"],
+	);
+	assert_eq!(String::from_utf8_lossy(&plain.stdout).trim(), "answer");
+	let thoughts = run_omp_raw(
+		&agent_dir,
+		&cwd,
+		&[
+			"--session-dir",
+			session_dir_arg.as_str(),
+			"--session-id",
+			"text-first-turn",
+			"--no-tools",
+			"--no-title",
+			"--mode",
+			"text",
+			"--print-thoughts",
+			"say hi",
+		],
+	);
+	assert_eq!(
+		String::from_utf8_lossy(&thoughts.stdout).trim(),
+		"answer\nweigh options"
+	);
+
+	let expected = vec![
+		("text".to_string(), "answer".to_string()),
+		("thinking".to_string(), "weigh options".to_string()),
+	];
+
+	// Persisted turn keeps answer-first block order, each block once.
+	let log_path = fs::read_dir(&session_dir)
+		.expect("read session dir")
+		.flatten()
+		.map(|entry| entry.path())
+		.find(|path| {
+			path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+				&& path
+					.file_stem()
+					.and_then(|stem| stem.to_str())
+					.map_or(false, |stem| stem.ends_with("text-first-turn"))
+		})
+		.expect("session log must exist");
+	let log = fs::read_to_string(&log_path).expect("read session log");
+	assert_eq!(log.matches("weigh options").count(), 1, "{log}");
+	let text_at = log
+		.find(r#"{"type":"text","text":"answer"}"#)
+		.expect("answer part must persist");
+	let thinking_at = log
+		.find(r#"{"type":"thinking","thinking":"weigh options"}"#)
+		.expect("thinking part must persist");
+	assert!(
+		text_at < thinking_at,
+		"persisted parts must keep streamed order: {log}"
+	);
+
+	// Resumed turn: history replays in the recorded order and the new stream is
+	// still indexed from zero with one kind per block.
+	let resumed = run_omp_raw(
+		&agent_dir,
+		&cwd,
+		&[
+			"--session-dir",
+			session_dir_arg.as_str(),
+			"--resume",
+			"text-first-turn",
+			"--no-tools",
+			"--no-title",
+			"--mode",
+			"json",
+			"and again",
+		],
+	);
+	let events = stable_events(&resumed.stdout);
+	assert_eq!(blocks_by_index(&events), expected);
+	assert_eq!(final_assistant_blocks(&events), expected);
+	for body in server.requests.lock().expect("lock").iter() {
+		assert!(
+			!body.to_string().contains("weigh options"),
+			"public reasoning must never be replayed outbound: {body}"
+		);
+	}
 	server.stop();
 }

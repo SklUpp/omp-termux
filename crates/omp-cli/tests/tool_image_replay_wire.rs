@@ -189,6 +189,8 @@ fn test_cli_tool_result_image_replay_to_openai_chat_wire() {
 		let turn = TurnRecord {
 			prompt: "capture scene and verify metrics".to_string(),
 			assistant: "running capture tools".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![
 				ToolCallRecord {
@@ -330,6 +332,8 @@ fn test_cli_image_only_tool_result_uses_placeholder_on_wire() {
 		let turn = TurnRecord {
 			prompt: "snap".to_string(),
 			assistant: "ok".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![ToolCallRecord {
 				id: "call-only-img".to_string(),
@@ -408,6 +412,8 @@ fn test_cli_aborted_tool_turn_with_image_replays_properly() {
 		let turn = TurnRecord {
 			prompt: "start camera and interrupt".to_string(),
 			assistant: "started".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "aborted".to_string(),
 			tool_calls: vec![ToolCallRecord {
 				id: "call-aborted-1".to_string(),
@@ -532,6 +538,8 @@ fn test_cli_legacy_text_tool_session_replays_without_user_image_insertion() {
 		let turn = TurnRecord {
 			prompt: "read config".to_string(),
 			assistant: "reading".to_string(),
+			reasoning: String::new(),
+			reasoning_after_text: false,
 			stop_reason: "stop".to_string(),
 			tool_calls: vec![ToolCallRecord {
 				id: "call-txt-1".to_string(),

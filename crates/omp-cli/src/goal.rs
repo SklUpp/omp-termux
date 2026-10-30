@@ -685,8 +685,13 @@ struct Inner {
 	pending:             Vec<GoalPersist>,
 	events:              Vec<GoalRuntimeEvent>,
 	steer:               Option<GoalSteerFn>,
-	/// Background job ids already accounted in this runtime: auto-delivery and
-	/// a hub snapshot can carry the same id, and only the first counts.
+	/// Turn-scoped durable seed: keys already in the retained log (or just
+	/// appended this turn). Replaced at `begin_turn` / after append; never a
+	/// log-lifetime index on `SessionStore`.
+	durable_background_ids: HashSet<String>,
+	/// In-flight exact-once keys charged this turn but not yet confirmed
+	/// durable. Grows with hub/task/delivery charges; retired after a
+	/// successful `background-usage` append.
 	seen_background_ids: HashSet<String>,
 }
 
@@ -739,6 +744,7 @@ impl GoalRuntime {
 				pending:             Vec::new(),
 				events:              Vec::new(),
 				steer:               None,
+				durable_background_ids: HashSet::new(),
 				seen_background_ids: HashSet::new(),
 			}),
 			clock,
@@ -774,6 +780,7 @@ impl GoalRuntime {
 	pub fn set_restored_state(&self, state: Option<GoalModeState>) {
 		let mut inner = self.lock();
 		if state.is_none() {
+			inner.durable_background_ids.clear();
 			inner.seen_background_ids.clear();
 		}
 		inner.state = state;
@@ -797,8 +804,49 @@ impl GoalRuntime {
 		let mut inner = self.lock();
 		inner.turn = None;
 		inner.budget_reported_for = None;
+		inner.durable_background_ids.clear();
 		inner.seen_background_ids.clear();
 		clear_active_accounting(&mut inner, now);
+	}
+
+	/// Replace the turn-scoped durable seed with `keys` from a retained-log
+	/// scan and clear in-flight charges. Call at turn start (and after a
+	/// successful background append batch) so reopen / mid-turn hub duplicates
+	/// do not re-charge, while the in-flight set stays bounded.
+	pub fn seed_background_dedup(&self, keys: HashSet<String>) {
+		let mut inner = self.lock();
+		inner.durable_background_ids = keys;
+		inner.seen_background_ids.clear();
+	}
+
+	/// Move keys that just became durable out of the in-flight set into the
+	/// durable seed. In-flight-only keys stay until the next seed or turn.
+	pub fn retire_durable_background_keys<I, S>(&self, durable: I)
+	where
+		I: IntoIterator<Item = S>,
+		S: AsRef<str>,
+	{
+		let mut inner = self.lock();
+		for key in durable {
+			let key = key.as_ref();
+			inner.seen_background_ids.remove(key);
+			if !key.is_empty() {
+				inner.durable_background_ids.insert(key.to_string());
+			}
+		}
+	}
+
+	/// Observable size of the in-flight (non-durable) background dedup set.
+	#[cfg(test)]
+	#[must_use]
+	pub(crate) fn background_dedup_len(&self) -> usize {
+		self.lock().seen_background_ids.len()
+	}
+
+	#[cfg(test)]
+	#[must_use]
+	pub(crate) fn durable_background_dedup_len(&self) -> usize {
+		self.lock().durable_background_ids.len()
 	}
 
 	/// Open the budget window and accounting baseline for one turn.
@@ -806,10 +854,16 @@ impl GoalRuntime {
 	/// `text` is `Some` for a user-authored prompt (which may carry a `+Nk`
 	/// directive) and `None` for a synthetic/continuation turn, which keeps the
 	/// window the user set. `seed` is the session's cumulative usage.
+	///
+	/// Clears the transient background dedup set; the session writer then calls
+	/// [`Self::seed_background_dedup`] with durable log keys so a reopened
+	/// session does not re-charge retained children.
 	pub fn begin_turn(&self, text: Option<&str>, seed: TokenCounters) {
 		let now = self.now_ms();
 		let mut inner = self.lock();
 		inner.usage = seed;
+		inner.durable_background_ids.clear();
+		inner.seen_background_ids.clear();
 		if let Some(text) = text {
 			inner.window = match parse_turn_budget(text) {
 				Some(budget) => TurnWindow {
@@ -880,7 +934,9 @@ impl GoalRuntime {
 		let now = self.now_ms();
 		let steer = {
 			let mut inner = self.lock();
-			if !inner.seen_background_ids.insert(key.to_string()) {
+			if inner.durable_background_ids.contains(key)
+				|| !inner.seen_background_ids.insert(key.to_string())
+			{
 				return;
 			}
 			inner.pending.push(GoalPersist::BackgroundUsage {
@@ -896,16 +952,66 @@ impl GoalRuntime {
 		self.send_steer(steer);
 	}
 
-	/// One tool finished. Delegated child usage rides on `details.usage` and is
-	/// summed once; goal-tool flushes are suppressed so the goal cannot charge
+	/// One tool finished. Delegated child usage rides on `details.accounting`
+	/// (one entry per child, with that child's own counters) and is charged once
+	/// per result key; goal-tool flushes are suppressed so the goal cannot charge
 	/// itself for its own transitions.
+	///
+	/// Fresh keyed hub/task charges also queue [`GoalPersist::BackgroundUsage`]
+	/// so the session writer can durably append them before the transient key
+	/// is retired — hub-only keys must not live only in RAM across turns.
 	pub fn observe_tool_end(&self, tool: &str, details: Option<&Value>) {
-		if let Some(child) = details
-			.and_then(|details| details.get("usage"))
-			.and_then(usage_counters_from_value)
-		{
-			let mut inner = self.lock();
-			inner.usage = inner.usage.saturating_add(child);
+		if let Some(details) = details {
+			let accounting = details.get("accounting").and_then(Value::as_array);
+			match accounting {
+				// Keyed: a batch that partly overlaps an already-charged ledger or
+				// delivery contributes exactly the unseen children, never the sum.
+				Some(entries) => {
+					let mut inner = self.lock();
+					for entry in entries {
+						let Some(key) = entry
+							.get("resultKey")
+							.and_then(Value::as_str)
+							.filter(|key| !key.is_empty())
+						else {
+							continue;
+						};
+						let Some(usage) =
+							entry.get("usage").and_then(usage_counters_from_value)
+						else {
+							continue;
+						};
+						if inner.durable_background_ids.contains(key)
+							|| !inner.seen_background_ids.insert(key.to_string())
+						{
+							continue;
+						}
+						inner.usage = inner.usage.saturating_add(usage);
+						// Persist so reopen / next-turn seed sees the key even
+						// when no auto-delivery later writes background-usage.
+						let id = key
+							.rsplit_once(':')
+							.map(|(_, raw)| raw.to_string())
+							.unwrap_or_else(|| key.to_string());
+						inner.pending.push(GoalPersist::BackgroundUsage {
+							id,
+							result_key: Some(key.to_string()),
+							usage: token_usage_from_counters(usage),
+						});
+					}
+				},
+				// Legacy aggregate: only a payload with no per-child identity at all
+				// (a log written before keys existed) is charged as one batch.
+				None => {
+					if let Some(child) = details
+						.get("usage")
+						.and_then(usage_counters_from_value)
+					{
+						let mut inner = self.lock();
+						inner.usage = inner.usage.saturating_add(child);
+					}
+				},
+			}
 		}
 		// A hub `jobs` snapshot repeats each background child's summed usage;
 		// the job id is the exactly-once key shared with auto-delivery.
@@ -924,9 +1030,28 @@ impl GoalRuntime {
 				let Some(key) = crate::session::background_usage_key(job) else {
 					continue;
 				};
-				if inner.seen_background_ids.insert(key.to_string()) {
-					inner.usage = inner.usage.saturating_add(usage);
+				if inner.durable_background_ids.contains(key)
+					|| !inner.seen_background_ids.insert(key.to_string())
+				{
+					continue;
 				}
+				inner.usage = inner.usage.saturating_add(usage);
+				let id = job
+					.get("id")
+					.and_then(Value::as_str)
+					.filter(|id| !id.is_empty())
+					.unwrap_or(key)
+					.to_string();
+				let result_key = job
+					.get("resultKey")
+					.and_then(Value::as_str)
+					.filter(|key| !key.is_empty())
+					.map(str::to_string);
+				inner.pending.push(GoalPersist::BackgroundUsage {
+					id,
+					result_key,
+					usage: token_usage_from_counters(usage),
+				});
 			}
 		}
 		if tool == "goal" {
@@ -1469,6 +1594,22 @@ fn usage_counters_from_value(value: &Value) -> Option<TokenCounters> {
 	(counters != TokenCounters::default()).then_some(counters)
 }
 
+fn token_usage_from_counters(usage: TokenCounters) -> pi_agent::TokenUsage {
+	pi_agent::TokenUsage {
+		input: usage.input,
+		output: usage.output,
+		cache_read: usage.cache_read,
+		cache_write: usage.cache_write,
+		total_tokens: usage
+			.input
+			.saturating_add(usage.output)
+			.saturating_add(usage.cache_read)
+			.saturating_add(usage.cache_write),
+		reasoning_tokens: None,
+	}
+}
+
+
 #[cfg(test)]
 mod tests {
 	use std::fs;
@@ -1929,11 +2070,11 @@ mod tests {
 		);
 		let pending = runtime.take_pending();
 		assert!(
-			!pending.iter().any(|intent| matches!(
+			pending.iter().any(|intent| matches!(
 				intent,
 				GoalPersist::BackgroundUsage { id, .. } if id == "bg-2"
 			)),
-			"a hub snapshot persists its own tool result, not a duplicate custom entry"
+			"a hub-only charge must queue BackgroundUsage so reopen can seed it"
 		);
 	}
 
@@ -2016,6 +2157,316 @@ mod tests {
 			"each persisted entry keeps its namespaced key beside the legacy id"
 		);
 	}
+
+	/// A blocking `task` result reports one `{resultKey, usage}` entry per child.
+	/// The ledger hands the same child over separately, so both orders must
+	/// charge it once — and a batch that only partly overlaps what was already
+	/// charged adds the unseen child's own counters, never the aggregate.
+	#[test]
+	fn task_details_accounting_charges_only_unseen_children() {
+		let runtime = GoalRuntime::with_clock(Box::new(|| 1_000));
+		runtime.create_goal("ship", None).expect("create goal");
+		runtime.begin_turn(Some("go"), TokenCounters::default());
+		let usage: pi_agent::TokenUsage = serde_json::from_value(json!({
+			"input": 4,
+			"output": 6,
+			"cacheRead": 0,
+			"cacheWrite": 0,
+			"totalTokens": 10,
+		}))
+		.expect("token usage");
+
+		// Details first: each entry claims its own key.
+		runtime.observe_tool_end(
+			"task",
+			Some(&json!({
+				"usage": {
+					"input": 8,
+					"output": 12,
+					"cacheRead": 0,
+					"cacheWrite": 0,
+					"totalTokens": 20,
+				},
+				"accounting": [
+					{ "resultKey": "ns1:task-1", "usage": {
+						"input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10,
+					}},
+					{ "resultKey": "ns1:task-2", "usage": {
+						"input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10,
+					}},
+				],
+			})),
+		);
+		assert_eq!(runtime.state().expect("goal state").goal.tokens_used, 20);
+		runtime.observe_background_result("task-1", Some("ns1:task-1"), Some(&usage));
+		runtime.observe_background_result("task-2", Some("ns1:task-2"), Some(&usage));
+		assert_eq!(
+			runtime.state().expect("goal state").goal.tokens_used,
+			20,
+			"the ledger entries for the quoted batch add nothing"
+		);
+
+		// Partial overlap: task-9 is already charged, so only task-10's own 2
+		// counts — the 12 aggregate would double-charge task-9.
+		runtime.observe_background_result("task-9", Some("ns1:task-9"), Some(&usage));
+		assert_eq!(runtime.state().expect("goal state").goal.tokens_used, 30);
+		runtime.observe_tool_end(
+			"task",
+			Some(&json!({
+				"usage": {
+					"input": 5,
+					"output": 7,
+					"cacheRead": 0,
+					"cacheWrite": 0,
+					"totalTokens": 12,
+				},
+				"accounting": [
+					{ "resultKey": "ns1:task-9", "usage": {
+						"input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10,
+					}},
+					{ "resultKey": "ns1:task-10", "usage": {
+						"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 2,
+					}},
+				],
+			})),
+		);
+		assert_eq!(
+			runtime.state().expect("goal state").goal.tokens_used,
+			32,
+			"the already-charged child is not charged again"
+		);
+	}
+
+	/// A legacy payload with no per-child identity is still charged as one batch,
+	/// and one without usage charges nothing.
+	#[test]
+	fn task_details_without_accounting_charges_legacy_aggregate_once() {
+		let runtime = GoalRuntime::with_clock(Box::new(|| 1_000));
+		runtime.create_goal("ship", None).expect("create goal");
+		runtime.begin_turn(Some("go"), TokenCounters::default());
+		runtime.observe_tool_end(
+			"task",
+			Some(&json!({
+				"usage": {
+					"input": 4,
+					"output": 6,
+					"cacheRead": 0,
+					"cacheWrite": 0,
+					"totalTokens": 10,
+				},
+			})),
+		);
+		assert_eq!(runtime.state().expect("goal state").goal.tokens_used, 10);
+		runtime.observe_tool_end("task", Some(&json!({ "accounting": [] })));
+		assert_eq!(
+			runtime.state().expect("goal state").goal.tokens_used,
+			10,
+			"an empty keyed batch contributes nothing"
+		);
+	}
+
+	/// Hub-only charge that was already persisted must not re-accrue when the
+	/// same key arrives again after the writer retires the transient entry and
+	/// re-seeds from the durable log.
+	#[test]
+	fn hub_only_duplicate_after_persist_charges_once() {
+		let runtime = GoalRuntime::with_clock(Box::new(|| 1_000));
+		runtime.create_goal("ship", None).expect("create goal");
+		runtime.begin_turn(Some("go"), TokenCounters::default());
+		let _ = runtime.take_pending();
+
+		let hub = json!({
+			"jobs": [{
+				"id": "task-1",
+				"resultKey": "ns1:task-1",
+				"usage": {
+					"input": 4,
+					"output": 6,
+					"cacheRead": 0,
+					"cacheWrite": 0,
+					"totalTokens": 10,
+				},
+			}],
+		});
+		runtime.observe_tool_end("hub", Some(&hub));
+		assert_eq!(runtime.state().expect("goal").goal.tokens_used, 10);
+		let pending = runtime.take_pending();
+		assert!(
+			pending.iter().any(|intent| matches!(
+				intent,
+				GoalPersist::BackgroundUsage {
+					result_key: Some(key),
+					..
+				} if key == "ns1:task-1"
+			)),
+			"hub-only must queue durable BackgroundUsage"
+		);
+
+		// Writer append succeeded: retire moves the key into the durable seed.
+		runtime.retire_durable_background_keys(["ns1:task-1"]);
+		assert_eq!(runtime.background_dedup_len(), 0);
+		assert_eq!(runtime.durable_background_dedup_len(), 1);
+		// Next turn would re-seed from the retained log scan.
+		runtime.seed_background_dedup(
+			["ns1:task-1".to_string()].into_iter().collect(),
+		);
+		assert_eq!(runtime.background_dedup_len(), 0);
+		assert_eq!(runtime.durable_background_dedup_len(), 1);
+
+		runtime.observe_tool_end("hub", Some(&hub));
+		runtime.observe_background_result(
+			"task-1",
+			Some("ns1:task-1"),
+			Some(&serde_json::from_value(json!({
+				"input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10,
+			})).expect("usage")),
+		);
+		assert_eq!(
+			runtime.state().expect("goal").goal.tokens_used,
+			10,
+			"durable seed suppresses hub/delivery duplicates"
+		);
+		assert!(
+			runtime.take_pending().iter().all(|intent| {
+				!matches!(
+					intent,
+					GoalPersist::BackgroundUsage {
+						result_key: Some(key),
+						..
+					} if key == "ns1:task-1"
+				)
+			}),
+			"no second BackgroundUsage for an already-durable key"
+		);
+	}
+
+	/// Reopen path: begin_turn clears, seed from durable keys, same resultKey
+	/// never charges again.
+	#[test]
+	fn reopen_seed_charges_exact_once() {
+		let runtime = GoalRuntime::with_clock(Box::new(|| 1_000));
+		runtime.create_goal("ship", None).expect("create goal");
+		let _ = runtime.take_pending();
+		runtime.begin_turn(Some("go"), TokenCounters::default());
+		runtime.seed_background_dedup(
+			["ns1:task-1".to_string()].into_iter().collect(),
+		);
+		assert_eq!(runtime.background_dedup_len(), 0);
+		assert_eq!(runtime.durable_background_dedup_len(), 1);
+
+		let usage: pi_agent::TokenUsage = serde_json::from_value(json!({
+			"input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10,
+		}))
+		.expect("usage");
+		runtime.observe_background_result("task-1", Some("ns1:task-1"), Some(&usage));
+		assert_eq!(runtime.state().expect("goal").goal.tokens_used, 0);
+		assert!(
+			!runtime.take_pending().iter().any(|intent| matches!(
+				intent,
+				GoalPersist::BackgroundUsage { .. }
+			)),
+			"seeded durable key must not re-persist"
+		);
+
+		runtime.observe_background_result("task-2", Some("ns1:task-2"), Some(&usage));
+		assert_eq!(runtime.state().expect("goal").goal.tokens_used, 10);
+	}
+
+	/// Long sequential goal: after each successful append retirement the
+	/// transient set does not keep every historical key — only the durable seed
+	/// (empty here) plus in-flight keys.
+	#[test]
+	fn long_sequential_goal_transient_set_not_monotonic() {
+		let runtime = GoalRuntime::with_clock(Box::new(|| 1_000));
+		runtime.create_goal("ship", None).expect("create goal");
+		let _ = runtime.take_pending();
+		runtime.begin_turn(Some("go"), TokenCounters::default());
+		assert_eq!(runtime.background_dedup_len(), 0);
+
+		let mut peak = 0usize;
+		for i in 0..32u64 {
+			let key = format!("ns1:task-{i}");
+			let usage: pi_agent::TokenUsage = serde_json::from_value(json!({
+				"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 2,
+			}))
+			.expect("usage");
+			runtime.observe_background_result(
+				&format!("task-{i}"),
+				Some(key.as_str()),
+				Some(&usage),
+			);
+			peak = peak.max(runtime.background_dedup_len());
+			// Successful append: retire the key that just became durable.
+			let _ = runtime.take_pending();
+			runtime.retire_durable_background_keys([key]);
+			assert_eq!(
+				runtime.background_dedup_len(),
+				0,
+				"after retirement no historical key remains in the in-flight set"
+			);
+		}
+		assert!(
+			peak <= 1,
+			"transient set must not grow with lifetime children; peak was {peak}"
+		);
+		assert_eq!(
+			runtime.state().expect("goal").goal.tokens_used,
+			64,
+			"each sequential child still accrues exactly once"
+		);
+	}
+
+	/// Partial overlapping batch still charges only unseen children, and each
+	/// fresh key queues its own BackgroundUsage for durable append.
+	#[test]
+	fn partial_overlap_batch_queues_only_unseen_background_usage() {
+		let runtime = GoalRuntime::with_clock(Box::new(|| 1_000));
+		runtime.create_goal("ship", None).expect("create goal");
+		runtime.begin_turn(Some("go"), TokenCounters::default());
+		let _ = runtime.take_pending();
+
+		let usage: pi_agent::TokenUsage = serde_json::from_value(json!({
+			"input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10,
+		}))
+		.expect("usage");
+		runtime.observe_background_result("task-9", Some("ns1:task-9"), Some(&usage));
+		let _ = runtime.take_pending();
+
+		runtime.observe_tool_end(
+			"task",
+			Some(&json!({
+				"usage": {
+					"input": 5, "output": 7, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 12,
+				},
+				"accounting": [
+					{ "resultKey": "ns1:task-9", "usage": {
+						"input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10,
+					}},
+					{ "resultKey": "ns1:task-10", "usage": {
+						"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 2,
+					}},
+				],
+			})),
+		);
+		assert_eq!(runtime.state().expect("goal").goal.tokens_used, 12);
+		let pending = runtime.take_pending();
+		let keys: Vec<_> = pending
+			.iter()
+			.filter_map(|intent| match intent {
+				GoalPersist::BackgroundUsage {
+					result_key: Some(key),
+					..
+				} => Some(key.as_str()),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(
+			keys,
+			vec!["ns1:task-10"],
+			"only the unseen child must queue durable BackgroundUsage"
+		);
+	}
+
 
 	/// Transition guards and their exact wording, plus the exit handshake.
 	#[test]

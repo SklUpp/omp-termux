@@ -270,6 +270,7 @@ fn read_selects_ranges_and_reports_unsupported_and_missing_paths() {
 	let dir = TempDir::new("read");
 	dir.write("lines.txt", "one\ntwo\nthree\n");
 	dir.write("data.zip", "PK");
+	dir.write("data.rar", "Rar!");
 
 	let mut out = Vec::new();
 	run_read("lines.txt:2-2", &dir.0, &mut out).expect("read range");
@@ -277,8 +278,17 @@ fn read_selects_ranges_and_reports_unsupported_and_missing_paths() {
 	assert!(output.contains("2|two"), "{output}");
 
 	let mut out = Vec::new();
-	let error = run_read("data.zip", &dir.0, &mut out).expect_err("archive unsupported");
-	assert!(error.contains("not supported"), "{error}");
+	let error = run_read("data.rar", &dir.0, &mut out).expect_err("archive unsupported");
+	assert!(error.contains("rar backend"), "{error}");
+
+	let mut out = Vec::new();
+	let error = run_read("data.zip", &dir.0, &mut out).expect_err("corrupt archive");
+	// A `PK`-only file is not a ZIP: either the backend rejects it or the
+	// Python prerequisite is missing on this host.
+	assert!(
+		error.contains("Archive read") || error.contains("Cannot start the archive backend"),
+		"{error}"
+	);
 
 	let mut out = Vec::new();
 	let error = run_read("missing.txt", &dir.0, &mut out).expect_err("missing");

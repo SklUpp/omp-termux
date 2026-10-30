@@ -189,6 +189,9 @@ impl TurnAck {
 pub enum AgentEvent {
 	/// Incremental assistant text, exactly as the provider streamed it.
 	MessageUpdate { delta: String },
+	/// Incremental public provider reasoning (TS `thinking_delta`), separate
+	/// from [`Self::MessageUpdate`] so the answer text is never polluted.
+	ThinkingUpdate { delta: String },
 	/// Provider finalization (assembler.finish()), BEFORE tool batch runs. Once per assistant message.
 	MessageEnd { message: Message, status: TurnStatus },
 	/// Tool invocation started before batch execution.
@@ -1368,6 +1371,16 @@ impl AgentLoop {
 					return Err(err.into());
 				}
 			};
+			// TS `openai-completions.ts:1160-1192` handles a chunk's reasoning
+			// before its content, so reasoning-first here keeps block order and
+			// `contentIndex` order identical for a chunk that carries both.
+			if let Some(delta) = &chunk.reasoning
+				&& !delta.is_empty()
+			{
+				let _ = events
+					.send(AgentEvent::ThinkingUpdate { delta: delta.clone() })
+					.await;
+			}
 			if let Some(delta) = &chunk.content
 				&& !delta.is_empty()
 			{

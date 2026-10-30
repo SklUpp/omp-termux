@@ -634,7 +634,10 @@ mod tests {
 				&scope.resolve_context(std::path::Path::new("/w"), &signal),
 			))
 			.expect_err("unknown");
-		assert_eq!(error, "Unknown protocol: nope://\nSupported: local://, notes://");
+		assert_eq!(
+			error,
+			"Unknown protocol: nope://\nSupported: issue://, local://, notes://, pr://, ssh://"
+		);
 
 		bridge.clear_schemes();
 		assert!(!router.can_handle("notes://a"));

@@ -21,6 +21,9 @@ pub fn now_ms() -> u64 {
 pub fn content_block(part: &ContentPart) -> Value {
 	match part {
 		ContentPart::Text { text } => json!({ "type": "text", "text": text }),
+		ContentPart::Thinking { thinking } => {
+			json!({ "type": "thinking", "thinking": thinking })
+		},
 		ContentPart::Image { data, mime_type } => {
 			json!({ "type": "image", "data": data, "mimeType": mime_type })
 		},
@@ -121,6 +124,25 @@ pub fn message_update(
 		"type": "message_update",
 		"message": snapshot,
 		"assistantMessageEvent": event,
+	})
+}
+
+/// `message_update` frame for a public reasoning delta. Same un-gated JSON path
+/// as `text_delta`: the flag gates only the text render, never this stream.
+pub fn thinking_update(
+	message: &Message,
+	delta: &str,
+	api: &str,
+	provider: &str,
+	model: &str,
+	stop_reason: &str,
+	timestamp_ms: u64,
+) -> Value {
+	let snapshot = assistant_message(message, api, provider, model, stop_reason, timestamp_ms);
+	json!({
+		"type": "message_update",
+		"message": snapshot,
+		"assistantMessageEvent": { "type": "thinking_delta", "delta": delta },
 	})
 }
 

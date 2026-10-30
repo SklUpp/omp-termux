@@ -42,6 +42,43 @@ pub struct HttpTransport {
     timeout_ms: u64,
 }
 
+/// Fire-and-forget `notifications/cancelled`; never blocks the timeout/abort path.
+struct HttpCancelGuard {
+    transport: HttpTransport,
+    request_id: Value,
+    active: bool,
+}
+
+impl HttpCancelGuard {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+
+    fn disarm_and_notify(&mut self) {
+        self.active = false;
+        let transport = self.transport.clone();
+        let request_id = self.request_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = transport
+                    .notify(
+                        "notifications/cancelled",
+                        Some(json!({ "requestId": request_id })),
+                    )
+                    .await;
+            });
+        }
+    }
+}
+
+impl Drop for HttpCancelGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.disarm_and_notify();
+        }
+    }
+}
+
 impl HttpTransport {
     pub fn new(config: &MCPHttpServerConfig) -> Self {
         let client = reqwest::Client::builder()
@@ -218,6 +255,13 @@ impl McpTransport for HttpTransport {
                 json!(format!("req_{}", self.next_id.fetch_add(1, Ordering::SeqCst)))
             }
         };
+        // Lives for the whole request: Drop sends cancel on abort; success/timeout paths disarm.
+        let mut cancel_guard = HttpCancelGuard {
+            transport: self.clone(),
+            request_id: id_val.clone(),
+            active: true,
+        };
+
 
         let req_body = json!({
             "jsonrpc": "2.0",
@@ -251,9 +295,20 @@ impl McpTransport for HttpTransport {
             }
         });
 
-        let response = self
+        let response = match self
             .post_with_redirect_policy(&self.url, &req_body, &generated_headers, remaining_timeout)
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                if matches!(e, McpError::Timeout(_)) {
+                    cancel_guard.disarm_and_notify();
+                } else {
+                    cancel_guard.disarm();
+                }
+                return Err(e);
+            }
+        };
 
         if let Some(sid_val) = response.headers().get("mcp-session-id") {
             if let Ok(s) = sid_val.to_str() {
@@ -271,6 +326,7 @@ impl McpTransport for HttpTransport {
             .to_string();
 
         if !status.is_success() {
+            cancel_guard.disarm();
             let body = read_bounded_body(response, MAX_MCP_FRAME_SIZE).await.unwrap_or_default();
             return Err(McpError::Http {
                 status: status.as_u16(),
@@ -406,25 +462,52 @@ impl McpTransport for HttpTransport {
 
             if let Some(dur) = remaining_for_stream {
                 match tokio::time::timeout(dur, read_sse_future).await {
-                    Ok(res) => res,
-                    Err(_) => Err(McpError::Timeout(format!(
-                        "HTTP SSE stream timed out after {:?}",
-                        dur
-                    ))),
+                    Ok(res) => {
+                        if matches!(res, Err(McpError::Timeout(_))) {
+                            cancel_guard.disarm_and_notify();
+                        } else {
+                            cancel_guard.disarm();
+                        }
+                        res
+                    }
+                    Err(_) => {
+                        cancel_guard.disarm_and_notify();
+                        Err(McpError::Timeout(format!(
+                            "HTTP SSE stream timed out after {:?}",
+                            dur
+                        )))
+                    }
                 }
             } else {
-                read_sse_future.await
+                let res = read_sse_future.await;
+                cancel_guard.disarm();
+                res
             }
         } else {
-            let full_text = read_bounded_body(response, MAX_MCP_FRAME_SIZE).await.map_err(|e| {
-                McpError::AcceptedStreamError(format!("Failed to read accepted HTTP JSON response body: {}", e))
-            })?;
-            let parsed: Value = serde_json::from_str(&full_text).map_err(|e| {
-                McpError::Protocol(format!("Failed to parse JSON response: {}", e))
-            })?;
+            let full_text = match read_bounded_body(response, MAX_MCP_FRAME_SIZE).await {
+                Ok(t) => t,
+                Err(e) => {
+                    cancel_guard.disarm();
+                    return Err(McpError::AcceptedStreamError(format!(
+                        "Failed to read accepted HTTP JSON response body: {}",
+                        e
+                    )));
+                }
+            };
+            let parsed: Value = match serde_json::from_str(&full_text) {
+                Ok(v) => v,
+                Err(e) => {
+                    cancel_guard.disarm();
+                    return Err(McpError::Protocol(format!(
+                        "Failed to parse JSON response: {}",
+                        e
+                    )));
+                }
+            };
 
             let resp_id = parsed.get("id");
             if resp_id != Some(&id_val) {
+                cancel_guard.disarm();
                 return Err(McpError::Protocol(format!(
                     "Mismatched JSON-RPC response ID: expected {:?}, got {:?}",
                     id_val, resp_id
@@ -432,6 +515,7 @@ impl McpTransport for HttpTransport {
             }
 
             if let Some(err) = parsed.get("error") {
+                cancel_guard.disarm();
                 let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
                 let message = err
                     .get("message")
@@ -442,6 +526,7 @@ impl McpTransport for HttpTransport {
                 return Err(McpError::JsonRpc { code, message, data });
             }
 
+            cancel_guard.disarm();
             Ok(parsed.get("result").cloned().unwrap_or(Value::Null))
         }
     }

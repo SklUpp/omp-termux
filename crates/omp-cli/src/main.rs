@@ -341,6 +341,88 @@ fn run() -> std::result::Result<(), CliError> {
 			let mut out = io::BufWriter::new(stdout.lock());
 			return process_cli::run(&request, &mut out).map_err(CliError::fail);
 		},
+		Some(Command::Search { query, recency, limit }) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			let config = Config::load_run(&cli.config, Some(base.as_path()))
+				.map_err(|err| CliError::fail(err.to_string()))?;
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			run_search_command(
+				&query.join(" "),
+				recency.as_deref(),
+				*limit,
+				&config,
+				&base,
+				&mut out,
+			)?;
+			return Ok(());
+		},
+		Some(Command::Export { session, output }) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			let path = run_export_command(
+				session.as_deref(),
+				output.as_deref(),
+				&base,
+				cli.session_dir.as_deref(),
+			)?;
+			println!("Exported to: {path}");
+			return Ok(());
+		},
+		Some(Command::Stats { session }) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			run_stats_command(
+				session.as_deref(),
+				&base,
+				cli.session_dir.as_deref(),
+				&mut out,
+			)?;
+			return Ok(());
+		},
+		Some(Command::Render { session, output }) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			run_render_command(
+				session.as_deref(),
+				output.as_deref(),
+				&base,
+				cli.session_dir.as_deref(),
+			)?;
+			return Ok(());
+		},
+		Some(Command::Cleanse { session, confirm }) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			run_cleanse_command(
+				session.as_deref(),
+				*confirm,
+				&base,
+				cli.session_dir.as_deref(),
+			)?;
+			return Ok(());
+		},
+		Some(Command::Commit { message }) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			run_commit_command(message.as_deref(), &base)?;
+			return Ok(());
+		},
 		Some(Command::Completions { shell }) => {
 			return completions::run(shell.as_deref()).map_err(|message| CliError::fail(message));
 		},
@@ -858,7 +940,10 @@ fn run() -> std::result::Result<(), CliError> {
 	reporter.session_header(&reporter_id, &session.cwd)?;
 
 	if matches!(cli.command.as_ref(), Some(Command::Repl)) {
-		return run_repl(&mut session, mode, &mut reporter).map_err(CliError::from);
+		let result = run_repl(&mut session, mode, &mut reporter).map_err(CliError::from);
+		// Post-shutdown child accounting reaches the log before it closes.
+		session.finish(&native_runner);
+		return result;
 	}
 
 	let piped_stdin = read_piped_stdin()?;
@@ -869,8 +954,17 @@ fn run() -> std::result::Result<(), CliError> {
 		&& piped_stdin.is_none()
 		&& !cli.print;
 	if repl_mode {
-		return run_repl(&mut session, mode, &mut reporter).map_err(CliError::from);
+		let result = run_repl(&mut session, mode, &mut reporter).map_err(CliError::from);
+		// Post-shutdown child accounting reaches the log before it closes.
+		session.finish(&native_runner);
+		return result;
 	}
+
+	// TS `packages/coding-agent/src/main.ts:1551` applies `--print-thoughts`
+	// only when `!isInteractive`: the REPL renders no reasoning through it, and
+	// it flushes `finish()` per turn, so the gate belongs here, after the REPL
+	// branches and not at reporter construction.
+	let mut reporter = reporter.with_print_thoughts(cli.print_thoughts);
 
 	let mut remaining_prompts = cli.prompt.clone();
 	let initial_prompt = if !remaining_prompts.is_empty() {
@@ -912,15 +1006,19 @@ fn run() -> std::result::Result<(), CliError> {
 	for (ctx, prompt, parts) in prompts_to_run {
 		if let Err(error) = session.turn(ctx, prompt, parts, mode, &mut reporter) {
 			reporter.finish().ok();
+			session.finish(&native_runner);
 			return Err(CliError::from(error));
 		}
 		// Opt-in headless continuation (`goal.continuationModes`); the default
 		// `["interactive"]` leaves this a no-op.
 		if let Err(error) = session.drive_goal_continuation(mode, &mut reporter) {
 			reporter.finish().ok();
+			session.finish(&native_runner);
 			return Err(CliError::from(error));
 		}
 	}
+	// Last chance for a child that settled after the final turn boundary.
+	session.finish(&native_runner);
 	reporter.finish().map_err(CliError::from)
 }
 
@@ -1045,8 +1143,13 @@ fn invalidate_inherited_cache_key(
 /// writer on the same log, so transitions are queued and applied here by the
 /// one owner. Headless has no live `goal_updated` subscriber: the typed events
 /// are consumed so the queue cannot grow across turns.
+///
+/// After a successful `background-usage` append the matching keys move from
+/// the in-flight set into the turn-scoped durable seed; other in-flight keys
+/// stay until they append or the next turn seed.
 fn apply_goal_intents(store: &mut SessionStore, goal_runtime: &GoalRuntime) {
 	let _ = goal_runtime.take_events();
+	let mut retired = Vec::new();
 	for intent in goal_runtime.take_pending() {
 		let result = match intent {
 			GoalPersist::ModeChange { mode, data } => store.append_mode_change(mode, data),
@@ -1054,10 +1157,23 @@ fn apply_goal_intents(store: &mut SessionStore, goal_runtime: &GoalRuntime) {
 			GoalPersist::BackgroundUsage { id, result_key, usage } => {
 				if store.enabled() {
 					let mut data = serde_json::json!({ "id": id, "usage": usage });
+					let retire_key = result_key
+						.as_deref()
+						.filter(|key| !key.is_empty())
+						.map(str::to_string)
+						.or_else(|| (!id.is_empty()).then_some(id.clone()));
 					if let Some(result_key) = result_key {
 						data["resultKey"] = serde_json::Value::String(result_key);
 					}
-					store.append_custom(goal::BACKGROUND_USAGE_CUSTOM_TYPE, Some(data))
+					match store.append_custom(goal::BACKGROUND_USAGE_CUSTOM_TYPE, Some(data)) {
+						Ok(entry_id) => {
+							if let Some(key) = retire_key {
+								retired.push(key);
+							}
+							Ok(entry_id)
+						},
+						Err(err) => Err(err),
+					}
 				} else {
 					Ok(String::new())
 				}
@@ -1066,6 +1182,9 @@ fn apply_goal_intents(store: &mut SessionStore, goal_runtime: &GoalRuntime) {
 		if let Err(err) = result {
 			eprintln!("warning: {err}");
 		}
+	}
+	if !retired.is_empty() {
+		goal_runtime.retire_durable_background_keys(retired);
 	}
 }
 
@@ -1193,6 +1312,16 @@ impl Session<'_> {
 	/// so no second writer ever touches the log.
 	fn apply_goal_pending(&mut self) {
 		apply_goal_intents(&mut self.store, &self.goal);
+	}
+
+	/// Final durable drain before this session's log closes.
+	///
+	/// Stops every runner-owned supervisor first, so a background child that
+	/// outlived the last turn has already settled its real usage into the
+	/// accounting ledger, then writes that queue into the session log.
+	fn finish(&mut self, runner: &runtime::PiAgentRunner) {
+		runner.shutdown();
+		self.apply_goal_pending();
 	}
 
 	/// Complete-exit (TS `#exitGoalMode(reason: "completed")`): the goal tool
@@ -1345,7 +1474,7 @@ impl Session<'_> {
 			extra_tools: self.goal_extra_tools(),
 			acp_bridge: None,
 			extra_mcp_servers: Vec::new(),
-			internal_urls: None,
+			internal_urls: Some(Arc::new(pi_agent::tools::InternalUrlRouter::new())),
 			url_scope: None,
 			subagent_observer: None,
 			child_session_root: None,
@@ -1472,6 +1601,8 @@ impl Session<'_> {
 		self
 			.goal
 			.begin_turn(hidden_custom_type.is_none().then_some(full_prompt.as_str()), seed);
+		self.goal
+			.seed_background_dedup(session::durable_background_keys(&self.store));
 
 		let (turn_parts, user_content) = if has_images {
 			let mut assembled = Vec::new();
@@ -1586,7 +1717,20 @@ impl Session<'_> {
 						.as_millis() as u64;
 
 					let mut parts = Vec::new();
-					if !message.content.is_empty() {
+					// Keep the streamed block order end to end: the persisted
+					// content array is the same order the deltas indexed.
+					for part in &message.parts {
+						match part {
+							pi_agent::ContentPart::Thinking { thinking } => {
+								parts.push(ContentPart::thinking(thinking.clone()));
+							},
+							pi_agent::ContentPart::Text { text } => {
+								parts.push(ContentPart::text(text.clone()));
+							},
+							pi_agent::ContentPart::Image { .. } => {},
+						}
+					}
+					if message.parts.is_empty() && !message.content.is_empty() {
 						parts.push(ContentPart::text(message.content.clone()));
 					}
 					for tc in &message.tool_calls {
@@ -2162,6 +2306,531 @@ fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Resul
 		}
 	}
 	Ok(ProcessedCliFiles { text, images })
+}
+
+/// Headless `omp search`/`omp q`: invoke `WebSearchTool` with host searxng config.
+fn run_search_command(
+	query: &str,
+	recency: Option<&str>,
+	limit: Option<u32>,
+	config: &Config,
+	cwd: &Path,
+	out: &mut dyn Write,
+) -> std::result::Result<(), CliError> {
+	let query = query.trim();
+	if query.is_empty() {
+		return Err(CliError::fail("Error: Query is required"));
+	}
+	use pi_agent::Tool as _;
+	use serde_json::json;
+	let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+	let tool = pi_agent::tools::WebSearchTool::new(config.searxng.clone().with_env_overrides(&env));
+	let mut args = json!({ "query": query });
+	if let Some(recency) = recency {
+		args["recency"] = json!(recency);
+	}
+	if let Some(limit) = limit {
+		args["limit"] = json!(limit);
+	}
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.map_err(|err| CliError::fail(format!("Failed to start runtime: {err}")))?;
+	let ctx = pi_agent::AgentContext::new(cwd.to_path_buf());
+	let result = runtime
+		.block_on(tool.execute(&args, &ctx))
+		.map_err(|err| CliError::fail(format!("Error: {err}")))?;
+	if result.is_error {
+		return Err(CliError::fail(format!("Error: {}", result.content)));
+	}
+	out.write_all(result.content.as_bytes())
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	if !result.content.is_empty() && !result.content.ends_with('\n') {
+		out.write_all(b"\n")
+			.map_err(|err| CliError::fail(err.to_string()))?;
+	}
+	out.flush().map_err(|err| CliError::fail(err.to_string()))?;
+	Ok(())
+}
+
+/// Headless `omp export`: open session via `SessionStore`, render HTML, write file.
+fn run_export_command(
+	session: Option<&str>,
+	output: Option<&Path>,
+	cwd: &Path,
+	session_dir: Option<&Path>,
+) -> std::result::Result<String, CliError> {
+	let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) else {
+		return Err(CliError::usage(
+			"Usage: omp export <session.jsonl|id> [--output <path>]\n\
+			 Exports a session log to standalone HTML without starting a live session.",
+		));
+	};
+	let session_path = if session.contains('/') || session.contains('\\') || session.ends_with(".jsonl")
+	{
+		let path = dirs::absolute(cwd, Path::new(session));
+		if !path.is_file() {
+			return Err(CliError::fail(format!("File not found: {session}")));
+		}
+		path
+	} else {
+		match session::resolve_resumable_session(session, cwd, session_dir, true) {
+			Ok(Some(path)) => path,
+			_ => {
+				return Err(CliError::fail(format!(
+					"Session \"{session}\" not found.\nPass a session JSONL path or id."
+				)));
+			},
+		}
+	};
+	let dir = session_path.parent().map(PathBuf::from);
+	let id = session_path
+		.file_stem()
+		.and_then(|s| s.to_str())
+		.map(str::to_string);
+	let store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: cwd.to_path_buf(),
+		model: None,
+		provider: None,
+		dir,
+		id,
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	if !store.enabled() {
+		let reason = store.corrupt_reason().unwrap_or("persistence disabled");
+		return Err(CliError::fail(format!(
+			"cannot open session log {}: {reason}",
+			session_path.display()
+		)));
+	}
+	let out_path = match output {
+		Some(path) => {
+			if path.is_absolute() {
+				path.to_path_buf()
+			} else {
+				dirs::absolute(cwd, path)
+			}
+		},
+		None => session_path.with_extension("html"),
+	};
+	let html = render_session_html(&store);
+	if let Some(parent) = out_path.parent() {
+		if !parent.as_os_str().is_empty() {
+			std::fs::create_dir_all(parent).map_err(|err| {
+				CliError::fail(format!("cannot create {}: {err}", parent.display()))
+			})?;
+		}
+	}
+	std::fs::write(&out_path, html).map_err(|err| {
+		CliError::fail(format!("cannot write {}: {err}", out_path.display()))
+	})?;
+	Ok(out_path.display().to_string())
+}
+
+fn html_escape_text(text: &str) -> String {
+	text.replace('&', "&amp;")
+		.replace('<', "&lt;")
+		.replace('>', "&gt;")
+		.replace('"', "&quot;")
+}
+
+/// Minimal HTML transcript mirroring `rpc/session.rs` `render_html`, over `SessionStore`.
+fn render_session_html(store: &SessionStore) -> String {
+	let entries: Vec<&MessageEntry> = if store.has_branch_context() {
+		store.branch_messages()
+	} else {
+		store.messages().iter().collect()
+	};
+	let mut body = String::new();
+	for entry in entries {
+		let role = entry.message.role.as_str();
+		let text = entry.message.content.text();
+		body.push_str(&format!(
+			"<article class=\"{role}\"><h2>{role}</h2><pre>{}</pre></article>\n",
+			html_escape_text(&text)
+		));
+	}
+	let title = store
+		.header()
+		.and_then(|header| header.title.as_deref())
+		.unwrap_or("OMP session");
+	let title = html_escape_text(title);
+	format!(
+		"<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{title}</title>\
+		 <style>body{{font-family:system-ui,sans-serif;max-width:52rem;margin:2rem auto;padding:0 1rem;}}\
+		 article{{border-top:1px solid #ddd;padding:1rem 0}}pre{{white-space:pre-wrap}}\
+		 .user h2{{color:#0b6}}.assistant h2{{color:#06c}}</style></head><body>\
+		 <h1>{title}</h1>\n{body}</body></html>\n"
+	)
+}
+
+/// Resolve a session path/id (or most recent) into an open `SessionStore`.
+fn open_headless_session(
+	session: Option<&str>,
+	cwd: &Path,
+	session_dir: Option<&Path>,
+	required: bool,
+) -> std::result::Result<(PathBuf, SessionStore), CliError> {
+	let session_path = match session.map(str::trim).filter(|s| !s.is_empty()) {
+		Some(session) => {
+			if session.contains('/') || session.contains('\\') || session.ends_with(".jsonl") {
+				let path = dirs::absolute(cwd, Path::new(session));
+				if !path.is_file() {
+					return Err(CliError::fail(format!("File not found: {session}")));
+				}
+				path
+			} else {
+				match session::resolve_resumable_session(session, cwd, session_dir, true) {
+					Ok(Some(path)) => path,
+					_ => {
+						return Err(CliError::fail(format!(
+							"Session \"{session}\" not found.\nPass a session JSONL path or id."
+						)));
+					},
+				}
+			}
+		},
+		None => {
+			if required {
+				return Err(CliError::usage(
+					"session argument is required (path or id)",
+				));
+			}
+			match session::continue_recent(cwd, session_dir) {
+				Ok(Some(path)) => path,
+				Ok(None) => {
+					return Err(CliError::fail(
+						"No sessions found.\nPass a session JSONL path or id.",
+					));
+				},
+				Err(err) => return Err(CliError::fail(err)),
+			}
+		},
+	};
+	let dir = session_path.parent().map(PathBuf::from);
+	let id = session_path
+		.file_stem()
+		.and_then(|s| s.to_str())
+		.map(str::to_string);
+	let store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: cwd.to_path_buf(),
+		model: None,
+		provider: None,
+		dir,
+		id,
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	if !store.enabled() {
+		let reason = store.corrupt_reason().unwrap_or("persistence disabled");
+		return Err(CliError::fail(format!(
+			"cannot open session log {}: {reason}",
+			session_path.display()
+		)));
+	}
+	Ok((session_path, store))
+}
+
+/// Headless `omp stats`: print token / tool / duration table for one session.
+fn run_stats_command(
+	session: Option<&str>,
+	cwd: &Path,
+	session_dir: Option<&Path>,
+	out: &mut impl Write,
+) -> std::result::Result<(), CliError> {
+	let (session_path, store) = open_headless_session(session, cwd, session_dir, false)?;
+	let messages = store.messages();
+	let usage = store.session_usage();
+	let mut reasoning = 0u64;
+	let mut cost = 0.0f64;
+	let mut tool_calls = 0usize;
+	let mut user_messages = 0usize;
+	let mut assistant_messages = 0usize;
+	let mut tool_results = 0usize;
+	let mut first_ts: Option<&str> = None;
+	let mut last_ts: Option<&str> = None;
+	for entry in messages {
+		if first_ts.is_none() && !entry.timestamp.is_empty() {
+			first_ts = Some(entry.timestamp.as_str());
+		}
+		if !entry.timestamp.is_empty() {
+			last_ts = Some(entry.timestamp.as_str());
+		}
+		match entry.message.role.as_str() {
+			"user" => user_messages += 1,
+			"assistant" => {
+				assistant_messages += 1;
+				if let Some(u) = &entry.message.usage {
+					reasoning = reasoning.saturating_add(u.reasoning_tokens.unwrap_or(0));
+					if let Some(c) = &u.cost {
+						cost += c.total;
+					}
+				}
+				for part in entry.message.content.parts() {
+					if part.kind == "toolCall" {
+						tool_calls += 1;
+					}
+				}
+			},
+			"toolResult" => tool_results += 1,
+			_ => {},
+		}
+	}
+	let duration = match (first_ts, last_ts) {
+		(Some(a), Some(b)) => format_iso_span(a, b),
+		_ => "unknown".to_string(),
+	};
+	let session_id = store.id();
+	writeln!(out, "Session:  {session_id}").map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "File:     {}", session_path.display())
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "Duration: {duration}").map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out).map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "Messages").map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  user         {user_messages}")
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  assistant    {assistant_messages}")
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  tool calls   {tool_calls}")
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  tool results {tool_results}")
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  total        {}", messages.len())
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out).map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "Tokens").map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  input        {}", usage.input)
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  output       {}", usage.output)
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  reasoning    {reasoning}")
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  cache read   {}", usage.cache_read)
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  cache write  {}", usage.cache_write)
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  total        {}", usage.total_tokens)
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	if cost > 0.0 {
+		writeln!(out, "  cost         ${cost:.4}")
+			.map_err(|err| CliError::fail(err.to_string()))?;
+	}
+	out.flush().map_err(|err| CliError::fail(err.to_string()))?;
+	Ok(())
+}
+
+fn format_iso_span(start: &str, end: &str) -> String {
+	fn rough_secs(iso: &str) -> Option<i64> {
+		let (date, time) = iso.split_once('T')?;
+		let mut d = date.split('-');
+		let y: i64 = d.next()?.parse().ok()?;
+		let mo: i64 = d.next()?.parse().ok()?;
+		let da: i64 = d.next()?.parse().ok()?;
+		let time = time.trim_end_matches('Z');
+		let (hms, frac) = time
+			.split_once('.')
+			.map_or((time, 0i64), |(h, f)| (h, f.chars().take(3).collect::<String>().parse().unwrap_or(0)));
+		let mut t = hms.split(':');
+		let h: i64 = t.next()?.parse().ok()?;
+		let mi: i64 = t.next()?.parse().ok()?;
+		let s: i64 = t.next()?.parse().ok()?;
+		// Approximate days since epoch (enough for duration deltas).
+		let days = y * 365 + (y / 4) + mo * 30 + da;
+		Some(days * 86_400 + h * 3600 + mi * 60 + s + frac / 1000)
+	}
+	match (rough_secs(start), rough_secs(end)) {
+		(Some(a), Some(b)) if b >= a => {
+			let secs = (b - a) as u64;
+			let h = secs / 3600;
+			let m = (secs % 3600) / 60;
+			let s = secs % 60;
+			if h > 0 {
+				format!("{h}h {m}m {s}s")
+			} else if m > 0 {
+				format!("{m}m {s}s")
+			} else {
+				format!("{s}s")
+			}
+		},
+		_ => "unknown".to_string(),
+	}
+}
+
+/// Headless `omp render`: plain-text transcript (stdout or `--output`).
+fn run_render_command(
+	session: Option<&str>,
+	output: Option<&Path>,
+	cwd: &Path,
+	session_dir: Option<&Path>,
+) -> std::result::Result<(), CliError> {
+	let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) else {
+		return Err(CliError::usage(
+			"Usage: omp render <session.jsonl|id> [--output <path>]\n\
+			 Renders a session log to plain text without starting a live session.",
+		));
+	};
+	let (_path, store) = open_headless_session(Some(session), cwd, session_dir, true)?;
+	let text = render_session_text(&store);
+	match output {
+		Some(path) => {
+			let out_path = if path.is_absolute() {
+				path.to_path_buf()
+			} else {
+				dirs::absolute(cwd, path)
+			};
+			if let Some(parent) = out_path.parent() {
+				if !parent.as_os_str().is_empty() {
+					std::fs::create_dir_all(parent).map_err(|err| {
+						CliError::fail(format!("cannot create {}: {err}", parent.display()))
+					})?;
+				}
+			}
+			std::fs::write(&out_path, text).map_err(|err| {
+				CliError::fail(format!("cannot write {}: {err}", out_path.display()))
+			})?;
+			println!("Rendered to: {}", out_path.display());
+		},
+		None => {
+			print!("{text}");
+			if !text.ends_with('\n') {
+				println!();
+			}
+		},
+	}
+	Ok(())
+}
+
+fn render_session_text(store: &SessionStore) -> String {
+	let entries: Vec<&MessageEntry> = if store.has_branch_context() {
+		store.branch_messages()
+	} else {
+		store.messages().iter().collect()
+	};
+	let title = store
+		.header()
+		.and_then(|header| header.title.as_deref())
+		.unwrap_or("OMP session");
+	let mut out = String::new();
+	out.push_str("# ");
+	out.push_str(title);
+	out.push_str("\n\n");
+	for entry in entries {
+		let role = entry.message.role.as_str();
+		let text = entry.message.content.text();
+		out.push_str("## ");
+		out.push_str(role);
+		out.push('\n');
+		if !text.is_empty() {
+			out.push_str(&text);
+			if !text.ends_with('\n') {
+				out.push('\n');
+			}
+		}
+		out.push('\n');
+	}
+	out
+}
+
+/// Headless `omp cleanse`: redact secrets in the JSONL and rewrite in place.
+fn run_cleanse_command(
+	session: Option<&str>,
+	confirm: bool,
+	cwd: &Path,
+	session_dir: Option<&Path>,
+) -> std::result::Result<(), CliError> {
+	if !confirm {
+		return Err(CliError::usage(
+			"Usage: omp cleanse <session.jsonl|id> --confirm\n\
+			 Refusing to rewrite without --confirm.",
+		));
+	}
+	let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) else {
+		return Err(CliError::usage(
+			"Usage: omp cleanse <session.jsonl|id> --confirm\n\
+			 Removes API keys and tokens from a session log.",
+		));
+	};
+	let (session_path, _store) = open_headless_session(Some(session), cwd, session_dir, true)?;
+	let raw = std::fs::read_to_string(&session_path).map_err(|err| {
+		CliError::fail(format!("cannot read {}: {err}", session_path.display()))
+	})?;
+	let mut changed = 0usize;
+	let mut out = String::with_capacity(raw.len());
+	for line in raw.lines() {
+		if line.is_empty() {
+			out.push('\n');
+			continue;
+		}
+		let redacted = omp_cli::auth::error::redact(line);
+		if redacted != line {
+			changed += 1;
+		}
+		out.push_str(&redacted);
+		out.push('\n');
+	}
+	std::fs::write(&session_path, out).map_err(|err| {
+		CliError::fail(format!("cannot write {}: {err}", session_path.display()))
+	})?;
+	println!(
+		"Cleansed {} ({} line{} rewritten)",
+		session_path.display(),
+		changed,
+		if changed == 1 { "" } else { "s" }
+	);
+	Ok(())
+}
+
+/// Headless `omp commit`: `git add -A` then `git commit` in the cwd.
+fn run_commit_command(
+	message: Option<&str>,
+	cwd: &Path,
+) -> std::result::Result<(), CliError> {
+	let msg = message
+		.map(str::trim)
+		.filter(|s| !s.is_empty())
+		.unwrap_or("omp commit");
+	let status = std::process::Command::new("git")
+		.args(["rev-parse", "--is-inside-work-tree"])
+		.current_dir(cwd)
+		.stdout(std::process::Stdio::null())
+		.stderr(std::process::Stdio::null())
+		.status()
+		.map_err(|err| CliError::fail(format!("git not available: {err}")))?;
+	if !status.success() {
+		return Err(CliError::fail(format!(
+			"not a git repository: {}",
+			cwd.display()
+		)));
+	}
+	let add = std::process::Command::new("git")
+		.args(["add", "-A"])
+		.current_dir(cwd)
+		.status()
+		.map_err(|err| CliError::fail(format!("git add failed: {err}")))?;
+	if !add.success() {
+		return Err(CliError::fail(format!(
+			"git add -A exited {}",
+			add.code().unwrap_or(-1)
+		)));
+	}
+	let commit = std::process::Command::new("git")
+		.args(["commit", "-m", msg])
+		.current_dir(cwd)
+		.status()
+		.map_err(|err| CliError::fail(format!("git commit failed: {err}")))?;
+	if !commit.success() {
+		return Err(CliError::fail(format!(
+			"git commit exited {}",
+			commit.code().unwrap_or(-1)
+		)));
+	}
+	println!("Committed: {msg}");
+	Ok(())
 }
 
 #[cfg(test)]

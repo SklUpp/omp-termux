@@ -17,7 +17,7 @@ use std::{
 };
 
 use pi_agent::{
-	AgentEvent, Message, TurnStatus,
+	AgentEvent, Message, StreamBlockKind, TurnStatus,
 	supervisor::{SubagentEvent, SubagentObserver},
 };
 use serde_json::{Value, json};
@@ -42,7 +42,34 @@ struct RegistryObserver {
 	sink:     Arc<dyn FrameSink>,
 	/// Streamed assistant text per child id: TS `message_update` carries the
 	/// accumulated message, not just the delta. Cleared when the turn closes.
-	text:     Mutex<BTreeMap<String, String>>,
+	text:     Mutex<BTreeMap<String, StreamBuffer>>,
+}
+
+/// Accumulated content blocks for one child stream, in first-occurrence order so
+/// the snapshot matches the finalized message for any provider order.
+#[derive(Default)]
+struct StreamBuffer {
+	blocks: Vec<(StreamBlockKind, String)>,
+}
+
+impl StreamBuffer {
+	/// Append a delta, opening a new block when the kind flips.
+	fn append(&mut self, kind: StreamBlockKind, delta: &str) {
+		match self.blocks.last_mut() {
+			Some((current, text)) if *current == kind => text.push_str(delta),
+			_ => self.blocks.push((kind, delta.to_string())),
+		}
+	}
+
+	/// Answer text across all text blocks.
+	fn text(&self) -> String {
+		self
+			.blocks
+			.iter()
+			.filter(|(kind, _)| *kind == StreamBlockKind::Text)
+			.map(|(_, text)| text.as_str())
+			.collect()
+	}
 }
 
 impl SubagentObserver for RegistryObserver {
@@ -105,8 +132,8 @@ impl SubagentObserver for RegistryObserver {
 			},
 			SubagentEvent::Event { id, event } => {
 				let mut buffers = self.text.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-				let text = buffers.entry(id.clone()).or_default();
-				for mapped in agent_event_frames(event, text) {
+				let buffer = buffers.entry(id.clone()).or_default();
+				for mapped in agent_event_frames(event, buffer) {
 					let payload = json!({ "id": id, "event": mapped });
 					self.registry.handle_event(&payload, self.sink.as_ref());
 				}
@@ -127,13 +154,18 @@ impl SubagentObserver for RegistryObserver {
 /// was accepted. Native `api`/`provider`/`model` are unknown for a child (the
 /// native message does not carry them), so they are emitted empty rather than
 /// invented.
-fn agent_event_frames(event: &AgentEvent, text: &mut String) -> Vec<Value> {
+fn agent_event_frames(event: &AgentEvent, buffer: &mut StreamBuffer) -> Vec<Value> {
 	let now = event_wire::now_ms();
 	match event {
 		AgentEvent::MessageUpdate { delta } => {
-			text.push_str(delta);
-			let snapshot = Message::assistant(text.clone());
+			buffer.append(StreamBlockKind::Text, delta);
+			let snapshot = stream_snapshot(buffer);
 			vec![event_wire::message_update(&snapshot, Some(delta), "", "", "", "", now)]
+		},
+		AgentEvent::ThinkingUpdate { delta } => {
+			buffer.append(StreamBlockKind::Thinking, delta);
+			let snapshot = stream_snapshot(buffer);
+			vec![event_wire::thinking_update(&snapshot, delta, "", "", "", "", now)]
 		},
 		AgentEvent::MessageEnd { message, status } => vec![event_wire::message_end(
 			event_wire::assistant_message(message, "", "", "", stop_reason(status), now),
@@ -196,7 +228,7 @@ fn agent_event_frames(event: &AgentEvent, text: &mut String) -> Vec<Value> {
 				),
 				"toolResults": tool_results,
 			});
-			text.clear();
+			buffer.blocks.clear();
 			vec![frame]
 		},
 		AgentEvent::UserSteer { parts } => event_wire::user_message_pair(parts, now).to_vec(),
@@ -204,6 +236,27 @@ fn agent_event_frames(event: &AgentEvent, text: &mut String) -> Vec<Value> {
 		// its own goal runtime, so the mapper has no frame to emit.
 		AgentEvent::BackgroundResult { .. } => Vec::new(),
 	}
+}
+
+/// Message snapshot for a child stream: blocks stay separate and in streamed
+/// order, exactly like the finalized message.
+fn stream_snapshot(buffer: &StreamBuffer) -> Message {
+	let mut message = Message::assistant(buffer.text());
+	if buffer
+		.blocks
+		.iter()
+		.any(|(kind, _)| *kind == StreamBlockKind::Thinking)
+	{
+		message.parts = buffer
+			.blocks
+			.iter()
+			.map(|(kind, text)| match kind {
+				StreamBlockKind::Thinking => pi_agent::ContentPart::thinking(text.clone()),
+				StreamBlockKind::Text => pi_agent::ContentPart::Text { text: text.clone() },
+			})
+			.collect();
+	}
+	message
 }
 
 /// TS `stopReason` of a native turn status (the words
@@ -708,8 +761,8 @@ mod tests {
 	/// The single frame a single-frame mapping produces; asserts the count so an
 	/// accidental extra frame cannot slip past the per-variant assertions.
 	fn single(event: &AgentEvent) -> Value {
-		let mut text = String::new();
-		let mut frames = agent_event_frames(event, &mut text);
+		let mut buffer = StreamBuffer::default();
+		let mut frames = agent_event_frames(event, &mut buffer);
 		assert_eq!(frames.len(), 1, "expected one frame for {event:?}");
 		frames.remove(0)
 	}
@@ -1086,7 +1139,7 @@ mod tests {
 		);
 
 		let steer = {
-			let mut text = String::new();
+			let mut buffer = StreamBuffer::default();
 			agent_event_frames(
 				&AgentEvent::UserSteer {
 					parts: vec![
@@ -1097,7 +1150,7 @@ mod tests {
 						},
 					],
 				},
-				&mut text,
+				&mut buffer,
 			)
 		};
 		assert_eq!(steer.len(), 2);

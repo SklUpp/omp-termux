@@ -16,5 +16,8 @@ pub use naming::{
 pub use redact::{redact_headers_for_log, redact_url_for_log};
 pub use timeout::{describe_mcp_timeout, is_mcp_timeout_enabled, resolve_mcp_timeout_ms};
 pub use types::*;
-pub use client::{connect_to_server, is_retriable_connection_error, McpConnection};
+pub use client::{
+	connect_to_server, get_active_session, is_retriable_connection_error, list_active_sessions,
+	register_active_session, unregister_active_session, McpConnection,
+};
 pub use transports::McpTransport;

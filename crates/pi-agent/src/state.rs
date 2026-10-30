@@ -45,6 +45,25 @@ pub struct TokenUsage {
 	pub reasoning_tokens: Option<u64>,
 }
 
+impl TokenUsage {
+	/// Sum one reported snapshot into this aggregate, saturating so a
+	/// pathological provider report can never wrap. `reasoning_tokens` stays
+	/// `None` only while no report carried the counter: unknown is not zero.
+	pub fn merge(&mut self, usage: TokenUsage) {
+		self.input = self.input.saturating_add(usage.input);
+		self.output = self.output.saturating_add(usage.output);
+		self.cache_read = self.cache_read.saturating_add(usage.cache_read);
+		self.cache_write = self.cache_write.saturating_add(usage.cache_write);
+		self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+		self.reasoning_tokens = match (self.reasoning_tokens, usage.reasoning_tokens) {
+			(Some(total), Some(reported)) => Some(total.saturating_add(reported)),
+			(Some(total), None) => Some(total),
+			(None, Some(reported)) => Some(reported),
+			(None, None) => None,
+		};
+	}
+}
+
 /// A tool invocation request by model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -253,6 +272,10 @@ impl ImagePart {
 pub enum ContentPart {
 	#[serde(rename = "text")]
 	Text { text: String },
+	/// Provider-supplied public reasoning block (TS `ThinkingContent`). Never
+	/// replayed outbound and never mixed into the answer text.
+	#[serde(rename = "thinking")]
+	Thinking { thinking: String },
 	#[serde(rename = "image")]
 	Image {
 		#[serde(rename = "data", alias = "data_base64")]
@@ -265,6 +288,21 @@ pub enum ContentPart {
 impl ContentPart {
 	pub fn text(text: impl Into<String>) -> Self {
 		Self::Text { text: text.into() }
+	}
+
+	pub fn thinking(thinking: impl Into<String>) -> Self {
+		Self::Thinking { thinking: thinking.into() }
+	}
+
+	pub fn is_thinking(&self) -> bool {
+		matches!(self, Self::Thinking { .. })
+	}
+
+	pub fn as_thinking(&self) -> Option<&str> {
+		match self {
+			Self::Thinking { thinking } => Some(thinking),
+			_ => None,
+		}
 	}
 
 	pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Result<Self, String> {

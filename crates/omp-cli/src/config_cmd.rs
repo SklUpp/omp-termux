@@ -317,6 +317,12 @@ fn project_layer(cwd: &Path) -> Result<Value> {
 	}
 	filter_project_model_roles(&mut layer);
 	migrate_settings(&mut layer);
+	// The web-search endpoint and its credentials are host settings; the runtime
+	// ignores project `searxng.*` (see `Config::apply_project_layers`), so the
+	// effective view must not report a repository-controlled endpoint either.
+	if let Value::Map(entries) = &mut layer {
+		entries.retain(|(key, _)| key != "searxng");
+	}
 	Ok(layer)
 }
 

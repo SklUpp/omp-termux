@@ -16,6 +16,7 @@ use pi_agent::mcp::{
 use pi_agent::tools::task_isolation::{
 	IsolationCommitStyle, IsolationMergeMode, IsolationMode,
 };
+use pi_agent::tools::web_search::SearxngConfig;
 
 use crate::{
 	Error, Result,
@@ -537,6 +538,8 @@ pub struct Config {
 	pub plan:                 PlanConfig,
 	/// `eval.*` backend enablement and interpreter groups.
 	pub eval_config:          EvalConfig,
+	/// `searxng.*`: the web-search endpoint and its credentials.
+	pub searxng:              SearxngConfig,
 	/// `task.isolation.mode`; `None` means unset (defaults to `none`).
 	pub task_isolation_mode:  Option<IsolationMode>,
 	/// `task.isolation.apply`; `None` means unset (defaults to `true`).
@@ -570,6 +573,10 @@ pub struct Config {
 	pub max_concurrency:      Option<usize>,
 	/// `task.maxEffort`.
 	pub max_effort:           Option<String>,
+	/// Ephemeral `--external-thinking` (not persisted).
+	pub external_thinking:    bool,
+	/// Ephemeral `--service-tier` (OpenAI wire; `none`/empty omit).
+	pub service_tier:         Option<String>,
 	/// Paths that contributed, base first.
 	pub sources:              Vec<PathBuf>,
 }
@@ -603,6 +610,26 @@ impl Config {
 		self.goal.merge(overlay.goal);
 		self.plan.merge(overlay.plan);
 		self.eval_config.merge(overlay.eval_config);
+		// `searxng.*` merges per leaf so an explicit host overlay can add
+		// credentials to a globally configured endpoint (and vice versa).
+		// Project layers never reach here with `searxng` set: see
+		// `apply_project_layers`.
+		for (slot, value) in [
+			(&mut self.searxng.endpoint, overlay.searxng.endpoint),
+			(&mut self.searxng.token, overlay.searxng.token),
+			(&mut self.searxng.basic_username, overlay.searxng.basic_username),
+			(&mut self.searxng.basic_password, overlay.searxng.basic_password),
+			(&mut self.searxng.categories, overlay.searxng.categories),
+			(&mut self.searxng.engines, overlay.searxng.engines),
+			(&mut self.searxng.language, overlay.searxng.language),
+		] {
+			if value.is_some() {
+				*slot = value;
+			}
+		}
+		if overlay.searxng.safesearch.is_some() {
+			self.searxng.safesearch = overlay.searxng.safesearch;
+		}
 		if overlay.task_isolation_mode.is_some() {
 			self.task_isolation_mode = overlay.task_isolation_mode;
 		}
@@ -645,6 +672,12 @@ impl Config {
 		}
 		if overlay.max_effort.is_some() {
 			self.max_effort = overlay.max_effort;
+		}
+		if overlay.external_thinking {
+			self.external_thinking = true;
+		}
+		if overlay.service_tier.is_some() {
+			self.service_tier = overlay.service_tier;
 		}
 		if !overlay.allow.is_empty() {
 			self.allow = overlay.allow;
@@ -730,7 +763,10 @@ impl Config {
 		let settings_path = project_dir.join("settings.json");
 		if settings_path.is_file() {
 			match Self::load_settings_json(&settings_path) {
-				Ok(Some(overlay)) => config.merge(overlay),
+				Ok(Some(mut overlay)) => {
+					Self::drop_project_searxng(&mut overlay, &settings_path);
+					config.merge(overlay);
+				},
 				Ok(None) => {
 					eprintln!(
 						"warning: skipping malformed project settings {}",
@@ -753,9 +789,28 @@ impl Config {
 		// `PI_CONFIG_FILES` overlays are fatal for the same contract reason.
 		let project_config = project_dir.join("config.yml");
 		if project_config.is_file() {
-			config.merge(Self::load_file(&project_config)?);
+			let mut overlay = Self::load_file(&project_config)?;
+			Self::drop_project_searxng(&mut overlay, &project_config);
+			config.merge(overlay);
 		}
 		Ok(())
+	}
+
+	/// Repository-controlled layers must never set the web-search endpoint or
+	/// its credentials: `web_search` is auto-classified as a read tool, so a
+	/// project endpoint would receive whatever credentials the host configured
+	/// for its own endpoint. Host layers stay authoritative — the agent-dir
+	/// base config, `PI_CONFIG_FILES`, explicit `--config`, and the
+	/// `SEARXNG_*` environment.
+	fn drop_project_searxng(overlay: &mut Self, path: &Path) {
+		if overlay.searxng != SearxngConfig::default() {
+			eprintln!(
+				"warning: ignoring searxng.* from project {}: the web-search endpoint and its \
+				 credentials are host settings",
+				path.display()
+			);
+			overlay.searxng = SearxngConfig::default();
+		}
 	}
 
 	/// Project `settings.json` is a settings-schema document, not the legacy
@@ -915,6 +970,7 @@ impl Config {
 		for (role, flag, env_var) in [
 			("smol", cli.smol.as_deref(), "PI_SMOL_MODEL"),
 			("slow", cli.slow.as_deref(), "PI_SLOW_MODEL"),
+			("plan", cli.plan.as_deref(), "PI_PLAN_MODEL"),
 		] {
 			let pattern = match flag {
 				Some(value) if value.is_empty() => continue,
@@ -928,6 +984,12 @@ impl Config {
 		}
 		if cli.no_lsp {
 			self.lsp.enabled = Some(false);
+		}
+		if cli.external_thinking {
+			self.external_thinking = true;
+		}
+		if let Some(tier) = &cli.service_tier {
+			self.service_tier = Some(tier.clone());
 		}
 	}
 }
@@ -1047,6 +1109,28 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	}
 	if let Some(enabled) = settings_leaf(value, "plan", "enabled", "plan.enabled") {
 		config.plan.enabled = expect_bool(enabled, "plan.enabled", path)?;
+	}
+	// `searxng.*` feeds the `web_search` tool; environment fallbacks are applied
+	// by the runtime, which is the only place that may read `SEARXNG_*`.
+	if let Some(searxng) = value.get("searxng").and_then(Value::as_map) {
+		for (key, item) in searxng {
+			let dotted = format!("searxng.{key}");
+			match key.as_str() {
+				"endpoint" => config.searxng.endpoint = expect_text(item, &dotted, path)?,
+				"token" => config.searxng.token = expect_text(item, &dotted, path)?,
+				"basicUsername" => {
+					config.searxng.basic_username = expect_text(item, &dotted, path)?;
+				},
+				"basicPassword" => {
+					config.searxng.basic_password = expect_text(item, &dotted, path)?;
+				},
+				"categories" => config.searxng.categories = expect_text(item, &dotted, path)?,
+				"engines" => config.searxng.engines = expect_text(item, &dotted, path)?,
+				"language" => config.searxng.language = expect_text(item, &dotted, path)?,
+				"safesearch" => config.searxng.safesearch = expect_i32(item, &dotted, path)?,
+				_ => {},
+			}
+		}
 	}
 	if let Some(modes) =
 		settings_leaf(value, "goal", "continuationModes", "goal.continuationModes")

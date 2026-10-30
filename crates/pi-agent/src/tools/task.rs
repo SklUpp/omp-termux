@@ -436,6 +436,7 @@ impl TaskTool {
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
 				usage: None,
+				result_key: None,
 			};
 		};
 		let mut reservation = ReservationGuard::new(
@@ -443,6 +444,10 @@ impl TaskTool {
 			child_id.clone(),
 			child_cancel.clone(),
 		);
+		// Captured while the record is unreserved-but-immutable: this result
+		// carries its own accounting key from here on, so no consumer has to look
+		// the record up later (a settled record may already be pruned).
+		let spawn_result_key = self.supervisor.capture_result_key(&child_id);
 
 		let _permit = match tokio::select! {
 			biased;
@@ -479,6 +484,7 @@ impl TaskTool {
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
 				usage: None,
+				result_key: None,
 				};
 			}
 		};
@@ -512,6 +518,7 @@ impl TaskTool {
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
 				usage: None,
+				result_key: None,
 			};
 		}
 
@@ -742,6 +749,7 @@ impl TaskTool {
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
 				usage: None,
+				result_key: None,
 			};
 		}
 
@@ -785,6 +793,10 @@ impl TaskTool {
 
 		let duration_ms = start.elapsed().as_millis() as u64;
 		let outstanding_id = child_id.clone();
+		// Usage this child's completed provider requests already reported. The
+		// loop drops its turns when it fails or is interrupted, so an aborted
+		// child would otherwise report nothing at all.
+		let observed_usage = self.supervisor.observed_usage(&outstanding_id);
 
 		let mut terminal_mark = None;
 		let mut result = match outcome {
@@ -895,6 +907,7 @@ impl TaskTool {
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
 				usage: child_usage(&turn_results),
+				result_key: None,
 				}
 			},
 			Err(AgentError::Interrupted) => {
@@ -923,7 +936,8 @@ impl TaskTool {
 				isolation: None,
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
-				usage: None,
+				usage: observed_usage,
+				result_key: None,
 				}
 			},
 			Err(err) => {
@@ -953,10 +967,14 @@ impl TaskTool {
 				isolation: None,
 				isolation_artifacts: IsolationArtifacts::default(),
 				merge_summary: None,
-				usage: None,
+				usage: observed_usage,
+				result_key: None,
 				}
 			},
 		};
+		// The result carries the key captured at reservation, never a lookup that
+		// runs after the record could have been pruned.
+		result.result_key = spawn_result_key;
 		if let Some((sandbox, baseline, policy)) = isolation {
 			let artifacts_dir = self
 				.supervisor
@@ -1013,7 +1031,12 @@ impl TaskTool {
 						.mark_failed(&outstanding_id, duration_ms, &message);
 				},
 				TerminalMark::Aborted(reason) => {
-					self.supervisor.mark_aborted(&outstanding_id, &reason);
+					// An abort can follow real completed turns (yield-abort, a
+					// cancelled isolation finalize): carry their usage instead of
+					// settling an unknown abort.
+					self
+						.supervisor
+						.mark_aborted_with_usage(&outstanding_id, &reason, result.usage);
 				},
 			}
 		}
@@ -1057,6 +1080,9 @@ impl TaskTool {
 		};
 		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(16);
 		let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+		// Captured while the record is unreserved-but-immutable: a late usage
+		// fill must prove it addresses this exact record, never a later one.
+		let spawn_result_key = self.supervisor.capture_result_key(&child_id);
 		let supervisor = self.supervisor.clone();
 		// Per-`TaskTool` (per-session) permits: nested spawns use their own
 		// semaphore, so a parent holding a permit while waiting for descendants
@@ -1066,7 +1092,11 @@ impl TaskTool {
 		let cwd = ctx.cwd.clone();
 		let task_id = child_id.clone();
 		let cancel = child_cancel.clone();
-		let mut lifecycle = SettlementGuard::new(supervisor.clone(), task_id.clone());
+		let mut lifecycle = SettlementGuard::new(
+			supervisor.clone(),
+			task_id.clone(),
+			spawn_result_key.clone(),
+		);
 
 		let handle = tokio::spawn(async move {
 			// Wait until the reservation is registered as active, so an early
@@ -1111,6 +1141,7 @@ impl TaskTool {
 				start,
 				outcome,
 				item_for_settle,
+				spawn_result_key,
 			);
 			supervisor.dispose_eval_owner(&eval_owner).await;
 			lifecycle.disarm();
@@ -1547,9 +1578,18 @@ fn settle_background_result(
 	start: Instant,
 	outcome: Result<BackgroundOutcome, AgentError>,
 	item: TaskItemSpec,
+	result_key: Option<String>,
 ) {
 	let duration_ms = start.elapsed().as_millis() as u64;
 	let agent = item.agent.name.clone();
+	// Real usage the child's completed requests already reported. A cancelled
+	// child loop returns no turns, and whatever settles here keeps only this.
+	let observed = supervisor.observed_usage(&id);
+	let fill = |usage: Option<TokenUsage>| {
+		if let Some(key) = result_key.as_deref() {
+			supervisor.fill_aborted_usage(&id, key, usage);
+		}
+	};
 	match outcome {
 		Ok(BackgroundOutcome {
 			turns,
@@ -1560,6 +1600,9 @@ fn settle_background_result(
 			supervisor.append_child_transcript(&id, &messages);
 			if cancelled {
 				supervisor.mark_aborted(&id, "cancelled during isolation finalize");
+				// The turns ran and their provider requests were charged: keep
+				// that usage (write-once) instead of reporting an unknown abort.
+				fill(child_usage(&turns));
 				return;
 			}
 			let (base, aborted, reason) = summarize_turns(&turns);
@@ -1568,6 +1611,7 @@ fn settle_background_result(
 					&id,
 					reason.as_deref().unwrap_or("aborted by yield"),
 				);
+				fill(child_usage(&turns));
 				return;
 			}
 			// Reported turns count even when the child later fails validation;
@@ -1611,10 +1655,16 @@ fn settle_background_result(
 			supervisor.enqueue_delivery(&id, envelope);
 		},
 		Err(AgentError::Interrupted) => {
+			// The loop discarded its turns on cancellation, but every request it
+			// completed was charged: `observed` carries exactly those counters,
+			// and stays `None` when nothing completed (unknown, never zero).
 			supervisor.mark_aborted(&id, "aborted");
+			fill(observed);
 		},
 		Err(error) => {
 			let message = error.to_string();
+			// Requests that already completed were charged even though the loop
+			// never returned their turns.
 			let envelope = task_result_envelope(
 				&id,
 				&agent,
@@ -1622,9 +1672,9 @@ fn settle_background_result(
 				duration_ms,
 				&message,
 				None,
-				None,
+				observed.as_ref(),
 			);
-			supervisor.mark_failed(&id, duration_ms, &envelope);
+			supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, observed);
 			supervisor.enqueue_delivery(&id, envelope);
 		},
 	}
@@ -1777,7 +1827,12 @@ impl Drop for ReservationGuard {
 			return;
 		}
 		self.token.cancel();
-		self.supervisor.mark_aborted(&self.id, "aborted by parent");
+		// The future was dropped while waiting for a permit: any request it had
+		// already completed still counts, so settle observed usage, not a blank
+		// abort.
+		self
+			.supervisor
+			.abort_with_observed_usage(&self.id, "aborted by parent");
 		self.supervisor.unregister_active_child(&self.id);
 	}
 }
@@ -1789,12 +1844,13 @@ impl Drop for ReservationGuard {
 struct SettlementGuard {
 	supervisor: Arc<Supervisor>,
 	id:         String,
+	result_key: Option<String>,
 	armed:      bool,
 }
 
 impl SettlementGuard {
-	fn new(supervisor: Arc<Supervisor>, id: String) -> Self {
-		Self { supervisor, id, armed: true }
+	fn new(supervisor: Arc<Supervisor>, id: String, result_key: Option<String>) -> Self {
+		Self { supervisor, id, result_key, armed: true }
 	}
 
 	fn disarm(&mut self) {
@@ -1809,6 +1865,20 @@ impl Drop for SettlementGuard {
 		}
 		if !self.supervisor.mark_aborted(&self.id, "panicked before settlement") {
 			self.supervisor.release_outstanding_if_undelivered(&self.id);
+		} else {
+			let result_key = self
+				.result_key
+				.clone()
+				.or_else(|| self.supervisor.capture_result_key(&self.id));
+			if let Some(key) = result_key.as_deref() {
+				// Provider requests that completed before this child was aborted were
+				// charged, and their frames are the only record left: keep them.
+				self.supervisor.fill_aborted_usage(
+					&self.id,
+					key,
+					self.supervisor.observed_usage(&self.id),
+				);
+			}
 		}
 		self.supervisor.unregister_active_child(&self.id);
 		// A child that panics or aborts before its explicit settlement still
@@ -2276,6 +2346,7 @@ fn single_failure(
 		isolation_artifacts: IsolationArtifacts::default(),
 		merge_summary: None,
 		usage: None,
+		result_key: None,
 	}
 }
 
@@ -2354,6 +2425,12 @@ pub struct SingleResult {
 	/// provider reported nothing (unknown, never a zero-filled stand-in).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub usage: Option<TokenUsage>,
+	/// Immutable accounting key captured when this child was reserved, kept off
+	/// the wire (the `task` content shape is upstream parity). [`TaskTool::usage_details`]
+	/// copies it beside `usage`, so the result carries its own identity instead of
+	/// a late supervisor lookup that a pruned record can no longer answer.
+	#[serde(skip)]
+	pub result_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2398,18 +2475,7 @@ pub struct TaskToolDetails {
 /// Adds one reported snapshot into an optional aggregate. An aggregate that
 /// stays `None` means "the provider never reported", never "zero".
 fn merge_usage(total: &mut Option<TokenUsage>, usage: TokenUsage) {
-	let entry = total.get_or_insert_with(TokenUsage::default);
-	entry.input = entry.input.saturating_add(usage.input);
-	entry.output = entry.output.saturating_add(usage.output);
-	entry.cache_read = entry.cache_read.saturating_add(usage.cache_read);
-	entry.cache_write = entry.cache_write.saturating_add(usage.cache_write);
-	entry.total_tokens = entry.total_tokens.saturating_add(usage.total_tokens);
-	entry.reasoning_tokens = match (entry.reasoning_tokens, usage.reasoning_tokens) {
-		(Some(total), Some(reported)) => Some(total.saturating_add(reported)),
-		(Some(total), None) => Some(total),
-		(None, Some(reported)) => Some(reported),
-		(None, None) => None,
-	};
+	total.get_or_insert_with(TokenUsage::default).merge(usage);
 }
 
 /// Provider-reported usage summed over one child's turns.
@@ -2519,6 +2585,41 @@ impl Tool for TaskTool {
 }
 
 impl TaskTool {
+	/// Child accounting payload for a blocking `task` result: one entry per
+	/// child with that child's **own** reported counters, keyed by the immutable
+	/// key captured at reservation.
+	///
+	/// Both child-usage sinks — the live goal runtime and the durable session
+	/// reader — charge only the keys they have not seen yet, so a batch that
+	/// partially overlaps an earlier ledger/delivery charges exactly the unseen
+	/// children instead of the whole aggregate. The top-level `usage` stays
+	/// beside it for host consumers (budget advisory) and is never the charging
+	/// unit when `accounting` is present.
+	///
+	/// A batch with no keyed child (an unreachable shape now that the key travels
+	/// with the result) falls back to the legacy keyless aggregate, which only
+	/// old logs also use.
+	fn usage_details(&self, details: &TaskToolDetails) -> Option<Value> {
+		let accounting: Vec<Value> = details
+			.results
+			.iter()
+			.filter_map(|result| {
+				let key = result.result_key.as_deref().filter(|key| !key.is_empty())?;
+				let usage = result.usage?;
+				Some(json!({ "resultKey": key, "usage": usage }))
+			})
+			.collect();
+		let usage = details.usage;
+		if accounting.is_empty() {
+			return usage.map(|usage| json!({ "usage": usage }));
+		}
+		let mut payload = json!({ "accounting": accounting });
+		if let Some(usage) = usage {
+			payload["usage"] = json!(usage);
+		}
+		Some(payload)
+	}
+
 	/// Spawn body shared by [`Tool::execute`] and
 	/// [`Tool::execute_with_call_id`]; the latter supplies the real model call
 	/// id so every child carries `parentToolCallId`.
@@ -2759,7 +2860,7 @@ impl TaskTool {
 			let serialized = serde_json::to_string(&details).map_err(|e| {
 				ToolError::ExecutionFailed(format!("Failed to serialize TaskToolDetails: {e}"))
 			})?;
-			let usage_details = details.usage.map(|usage| json!({ "usage": usage }));
+			let usage_details = self.usage_details(&details);
 			return Ok(ToolResult {
 				tool_call_id: String::new(),
 				content: serialized,
@@ -2800,7 +2901,7 @@ impl TaskTool {
 		let content = serde_json::to_string(&details).map_err(|e| {
 			ToolError::ExecutionFailed(format!("Failed to serialize TaskToolDetails: {e}"))
 		})?;
-		let usage_details = details.usage.map(|usage| json!({ "usage": usage }));
+		let usage_details = self.usage_details(&details);
 
 		Ok(ToolResult {
 			tool_call_id: String::new(),
@@ -2863,6 +2964,7 @@ mod tests {
 			isolation_artifacts: IsolationArtifacts::default(),
 			merge_summary: None,
 			usage,
+			result_key: None,
 		};
 		assert_eq!(batch_usage(&[result(None)]), None);
 		let batch = batch_usage(&[
@@ -3121,14 +3223,14 @@ mod tests {
 			"read".to_string(),
 			"grep".to_string(),
 			"glob".to_string(),
-			"web_search".to_string(),
+			"checkpoint".to_string(),
 			"yield".to_string(),
 		]);
 		let error = context
 			.prepare_registry("scout-1", &scout, None)
 			.err()
-			.expect("missing web_search");
-		assert!(error.contains("web_search"));
+			.expect("missing checkpoint");
+		assert!(error.contains("checkpoint"));
 		assert!(error.contains("does not implement"));
 
 		let mut supported = scout.clone();
@@ -3306,6 +3408,89 @@ mod tests {
 		.await;
 		assert_eq!(result, 42);
 		assert!(child.is_cancelled());
+	}
+
+	/// Normal hub cancellation: the child loop returns `Interrupted` and drops
+	/// its turns, so the counters already reported on its `MessageEnd` frames are
+	/// the only surviving evidence of what the provider charged. Settling must
+	/// account exactly those, once, under the spawn-time key — never a zero
+	/// stand-in and never a second entry.
+	#[test]
+	fn interrupted_background_child_accounts_reported_partial_usage() {
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::new(NullProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		supervisor.enable_accounting();
+		let (id, _token) = supervisor
+			.reserve_child_full(ChildSpawn {
+				name: "bg",
+				index: 0,
+				agent: "task",
+				agent_source: "builtin",
+				task: "work",
+				parent_id: None,
+				parent_tool_call_id: None,
+				detached: true,
+			})
+			.expect("reserve");
+		let key = supervisor.capture_result_key(&id).expect("spawn-time key");
+		let mut message = Message::assistant("partial");
+		message.usage = Some(TokenUsage {
+			input: 11,
+			output: 7,
+			..TokenUsage::default()
+		});
+		assert!(
+			supervisor.report_event(
+				&id,
+				AgentEvent::MessageEnd {
+					message,
+					status: crate::state::TurnStatus::ToolUse,
+				},
+			),
+			"a live child's frame is forwarded"
+		);
+		assert_eq!(
+			supervisor
+				.observed_usage(&id)
+				.map(|usage| (usage.input, usage.output)),
+			Some((11, 7)),
+			"only the completed request is observed"
+		);
+
+		let item = TaskItemSpec {
+			name: "bg".to_string(),
+			agent: model_agent(),
+			task: "work".to_string(),
+			context: None,
+			output_schema: None,
+			schema_mode: SchemaMode::default(),
+			schema_error: None,
+			effort: None,
+			isolation: IsolationRequest::default(),
+		};
+		settle_background_result(
+			Arc::clone(&supervisor),
+			id.clone(),
+			Instant::now(),
+			Err(AgentError::Interrupted),
+			item,
+			Some(key.clone()),
+		);
+
+		let entries = supervisor.take_accounting();
+		assert_eq!(entries.len(), 1, "a cancelled child is accounted once");
+		assert_eq!((entries[0].usage.input, entries[0].usage.output), (11, 7));
+		assert_eq!(entries[0].result_key, key);
+		assert!(
+			supervisor.take_accounting().is_empty(),
+			"the settlement never queues a duplicate"
+		);
 	}
 
 	/// `completion(model = "default")` inside a child eval session must use the
