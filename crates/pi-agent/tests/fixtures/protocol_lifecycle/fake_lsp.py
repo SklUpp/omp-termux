@@ -61,23 +61,42 @@ def read_message():
     return json.loads(body.decode("utf-8"))
 
 
-def publish(uri, version, messages):
+FIXTURE_DIAGNOSTIC_MARKER = "fixture-diag"
+
+
+def diagnostics_for(version, text):
+    if FIXTURE_DIAGNOSTIC_MARKER in text:
+        return [
+            {
+                "range": {
+                    "start": {"line": 2, "character": 4},
+                    "end": {"line": 2, "character": 9},
+                },
+                "severity": 1,
+                "source": "fixture",
+                "code": "E42",
+                "message": "fixture undefined name",
+            }
+        ]
+    return [
+        {
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 1},
+            },
+            "severity": 1,
+            "message": "seen-v%s" % version,
+        }
+    ]
+
+
+def publish(uri, version, diagnostics):
     notify(
         "textDocument/publishDiagnostics",
         {
             "uri": uri,
             "version": version,
-            "diagnostics": [
-                {
-                    "range": {
-                        "start": {"line": 0, "character": 0},
-                        "end": {"line": 0, "character": 1},
-                    },
-                    "severity": 1,
-                    "message": message,
-                }
-                for message in messages
-            ],
+            "diagnostics": diagnostics,
         },
     )
 
@@ -89,7 +108,7 @@ def delayed(request):
 
 
 def main():
-    log("argv", {"argv": sys.argv})
+    log("argv", {"argv": sys.argv, "pid": os.getpid()})
     while True:
         message = read_message()
         if message is None:
@@ -134,10 +153,37 @@ def main():
                     }
                 },
             )
+        elif method == "textDocument/references":
+            document = params.get("textDocument") or {}
+            uri = document.get("uri", "")
+            respond(
+                message,
+                [
+                    {
+                        "uri": uri,
+                        "range": {
+                            "start": {"line": 1, "character": 6},
+                            "end": {"line": 1, "character": 11},
+                        },
+                    },
+                    {
+                        "uri": uri,
+                        "range": {
+                            "start": {"line": 2, "character": 0},
+                            "end": {"line": 2, "character": 5},
+                        },
+                    },
+                ],
+            )
         elif method in ("textDocument/didOpen", "textDocument/didChange"):
             document = params.get("textDocument") or {}
             version = document.get("version", 1)
-            publish(document.get("uri", ""), version, ["seen-v%s" % version])
+            if method == "textDocument/didChange":
+                changes = params.get("contentChanges") or []
+                text = changes[0].get("text", "") if changes else ""
+            else:
+                text = document.get("text", "")
+            publish(document.get("uri", ""), version, diagnostics_for(version, text))
         elif method == "textDocument/didClose":
             document = params.get("textDocument") or {}
             publish(document.get("uri", ""), None, [])

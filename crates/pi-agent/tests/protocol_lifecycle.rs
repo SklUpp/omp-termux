@@ -36,7 +36,7 @@ use pi_agent::{
 		utils::file_to_uri,
 	},
 	state::AgentContext,
-	Tool,
+	Tool, ToolError,
 };
 
 // =============================================================================
@@ -93,6 +93,30 @@ async fn bounded<F: Future<Output = ()>>(label: &str, seconds: u64, future: F) {
 	if tokio::time::timeout(Duration::from_secs(seconds), future).await.is_err() {
 		panic!("{label} timed out after {seconds}s");
 	}
+}
+
+fn logged_pid(entries: &[Value]) -> u32 {
+	entries
+		.iter()
+		.find(|entry| entry["dir"] == "argv")
+		.and_then(|entry| entry["msg"]["pid"].as_u64())
+		.and_then(|pid| u32::try_from(pid).ok())
+		.expect("fixture must log its pid in the startup argv entry")
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+	let Ok(pid) = i32::try_from(pid) else {
+		return false;
+	};
+	// SAFETY: signal 0 only probes whether the pid exists; it delivers nothing.
+	unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+	// The pid probe needs `kill(2)`; other hosts only assert manager teardown.
+	false
 }
 
 fn read_log(path: &Path) -> Vec<Value> {
@@ -1036,9 +1060,10 @@ async fn lsp_tool_hover_rename_and_owned_release() {
 		}
 
 		// Runner teardown: this session owns the private fixture server, so
-		// release sends shutdown + exit and the client leaves the registry.
-		// `release` awaits the process exit, so the wire log and registry are
-		// final here: no sleep-based polling.
+		// release sends shutdown + exit, waits for the process exit, and the
+		// client leaves the registry. The fixture logs its own pid, so the
+		// ownership claim covers the real child process, not just the registry.
+		let fixture_pid = logged_pid(&read_log(&log));
 		session.release().await;
 		let entries = read_log(&log);
 		assert!(
@@ -1055,6 +1080,75 @@ async fn lsp_tool_hover_rename_and_owned_release() {
 				.all(|client| !client.file_types.iter().any(|kind| kind.as_str() == extension)),
 			"released client must leave the registry"
 		);
+		assert!(
+			wait_until(Duration::from_secs(2), || !process_alive(fixture_pid)).await,
+			"release must reap the owned language server pid {fixture_pid}"
+		);
+	})
+	.await;
+}
+
+#[tokio::test]
+async fn lsp_tool_references_and_diagnostics_report_fixture_locations() {
+	let Some(python) = require_python() else { return };
+	bounded("lsp tool inspection", 40, async move {
+		let dir = TestDir::new("lsp-inspect");
+		let log = dir.path().join("lsp.log");
+		let extension = ".ltoolc";
+		write_lsp_project(dir.path(), &python, &fixture("fake_lsp.py"), &log, extension);
+		let references_file = format!("refs{extension}");
+		let diagnostics_file = format!("diag{extension}");
+		std::fs::write(dir.path().join(&references_file), "alpha\nvalue = 1\nvalue + 1\n")
+			.expect("references source");
+		std::fs::write(
+			dir.path().join(&diagnostics_file),
+			"# fixture-diag\nalpha\nvalue = 2\n",
+		)
+		.expect("diagnostics source");
+
+		let session = LspSession::new(false);
+		let tool = LspTool::with_session(Arc::clone(&session));
+		let ctx = AgentContext::new(dir.path().to_path_buf());
+
+		let references = tool
+			.execute(
+				&json!({"action": "references", "file": &references_file, "line": 2, "symbol": "value"}),
+				&ctx,
+			)
+			.await
+			.expect("references");
+		assert!(!references.is_error, "{}", references.content);
+		assert!(
+			references.content.starts_with("Found 2 reference(s):"),
+			"{}",
+			references.content
+		);
+		assert!(
+			references.content.contains(&format!("  {references_file}:2:7")),
+			"reference at line 2 column 7 missing: {}",
+			references.content
+		);
+		assert!(
+			references.content.contains(&format!("  {references_file}:3:1")),
+			"reference at line 3 column 1 missing: {}",
+			references.content
+		);
+
+		let diagnostics = tool
+			.execute(&json!({"action": "diagnostics", "file": &diagnostics_file}), &ctx)
+			.await
+			.expect("diagnostics");
+		assert!(!diagnostics.is_error, "{}", diagnostics.content);
+		assert!(diagnostics.content.contains("1 error(s)"), "{}", diagnostics.content);
+		assert!(
+			diagnostics.content.contains(&format!(
+				"# {diagnostics_file}\n  3:5 [error] [fixture] fixture undefined name (E42)"
+			)),
+			"diagnostic location/severity/code mismatch: {}",
+			diagnostics.content
+		);
+
+		session.release().await;
 	})
 	.await;
 }
@@ -1197,6 +1291,160 @@ async fn debug_tool_shares_root_session_and_isolates_children() {
 				"missing {command} on the DAP wire"
 			);
 		}
+	})
+	.await;
+}
+
+#[tokio::test]
+async fn debug_tool_breakpoint_continue_stack_trace_and_disconnect_cleanup() {
+	let Some(python) = require_python() else { return };
+	bounded("debug tool inspection", 40, async move {
+		let dir = TestDir::new("debug-inspect");
+		let log = dir.path().join("dap.log");
+		write_dap_project(dir.path(), &python, &fixture("fake_dap.py"), &log);
+		std::fs::write(dir.path().join("main.py"), "print(1)\n").expect("program");
+
+		let manager = Arc::new(DapSessionManager::new());
+		let tool = DapTool::shared(manager.clone());
+		let ctx = AgentContext::new(dir.path().to_path_buf());
+
+		let launch = tool
+			.execute(
+				&json!({"action": "launch", "adapter": "fixture", "program": "main.py", "timeout": 10}),
+				&ctx,
+			)
+			.await
+			.expect("launch");
+		assert!(!launch.is_error, "{}", launch.content);
+		assert!(launch.content.contains("main.py"), "{}", launch.content);
+
+		let breakpoint = tool
+			.execute(
+				&json!({"action": "set_breakpoint", "file": "main.py", "line": 5}),
+				&ctx,
+			)
+			.await
+			.expect("set_breakpoint");
+		assert!(!breakpoint.is_error, "{}", breakpoint.content);
+		assert!(
+			breakpoint.content.contains("- line 5: verified"),
+			"breakpoint verdict missing: {}",
+			breakpoint.content
+		);
+
+		let continued = tool
+			.execute(&json!({"action": "continue", "timeout": 10}), &ctx)
+			.await
+			.expect("continue");
+		assert!(!continued.is_error, "{}", continued.content);
+		assert!(
+			continued.content.contains("Stop reason: breakpoint"),
+			"continue must surface the stopped event reason: {}",
+			continued.content
+		);
+		assert!(
+			continued.content.contains("Continue stopped at /tmp/main.py:3:1."),
+			"continue must report the fixture stop location: {}",
+			continued.content
+		);
+
+		let stack = tool
+			.execute(&json!({"action": "stack_trace", "levels": 1}), &ctx)
+			.await
+			.expect("stack_trace");
+		assert!(!stack.is_error, "{}", stack.content);
+		assert!(
+			stack.content.contains("- #11 main @ /tmp/main.py:3:1"),
+			"stack frame source line mismatch: {}",
+			stack.content
+		);
+
+		assert_eq!(manager.list_sessions().len(), 1);
+		let adapter_pid = logged_pid(&read_log(&log));
+
+		let terminate = tool
+			.execute(&json!({"action": "terminate"}), &ctx)
+			.await
+			.expect("terminate");
+		assert!(!terminate.is_error, "{}", terminate.content);
+		assert!(
+			terminate.content.contains("Debug session terminated."),
+			"{}",
+			terminate.content
+		);
+		assert!(
+			manager.list_sessions().is_empty(),
+			"terminate must dispose the adapter session"
+		);
+		assert!(
+			wait_until(Duration::from_secs(2), || !process_alive(adapter_pid)).await,
+			"terminate must reap the owned adapter pid {adapter_pid}"
+		);
+
+		let entries = read_log(&log);
+		for command in ["setBreakpoints", "continue", "stackTrace", "disconnect"] {
+			assert!(
+				incoming_request_index(&entries, command).is_some(),
+				"missing {command} on the DAP wire"
+			);
+		}
+	})
+	.await;
+}
+
+#[tokio::test]
+async fn debug_tool_cancellation_aborts_pending_request_and_cleanup_reaps_adapter() {
+	let Some(python) = require_python() else { return };
+	bounded("debug tool cancellation", 40, async move {
+		let dir = TestDir::new("debug-cancel");
+		let log = dir.path().join("dap.log");
+		write_dap_project(dir.path(), &python, &fixture("fake_dap.py"), &log);
+		std::fs::write(dir.path().join("main.py"), "print(1)\n").expect("program");
+
+		let manager = Arc::new(DapSessionManager::new());
+		let tool = DapTool::shared(manager.clone());
+		let ctx = AgentContext::new(dir.path().to_path_buf());
+		tool.execute(
+			&json!({"action": "launch", "adapter": "fixture", "program": "main.py", "timeout": 10}),
+			&ctx,
+		)
+		.await
+		.expect("launch");
+		let adapter_pid = logged_pid(&read_log(&log));
+
+		let pending_tool = DapTool::shared(manager.clone());
+		let pending_ctx = ctx.clone();
+		let pending = tokio::spawn(async move {
+			pending_tool
+				.execute(
+					&json!({"action": "custom_request", "command": "hang", "timeout": 30}),
+					&pending_ctx,
+				)
+				.await
+		});
+		assert!(
+			wait_until(Duration::from_secs(2), || incoming_request_index(&read_log(&log), "hang").is_some())
+				.await,
+			"cancellable request never reached the fixture"
+		);
+
+		ctx.cancellation_token.cancel();
+		let error = pending.await.expect("pending task").expect_err("cancelled request must abort");
+		assert!(matches!(error, ToolError::Aborted(_)), "unexpected abort error: {error:?}");
+		assert_eq!(
+			manager.list_sessions().len(),
+			1,
+			"cancelling a pending request must not silently drop the owned session"
+		);
+
+		tool.execute(&json!({"action": "terminate"}), &ctx)
+			.await
+			.expect("terminate after cancel");
+		assert!(manager.list_sessions().is_empty(), "cleanup must dispose the adapter session");
+		assert!(
+			wait_until(Duration::from_secs(2), || !process_alive(adapter_pid)).await,
+			"cleanup must reap the owned adapter pid {adapter_pid}"
+		);
 	})
 	.await;
 }

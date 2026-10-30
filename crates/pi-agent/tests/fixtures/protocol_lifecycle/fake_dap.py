@@ -102,7 +102,7 @@ def run_in_terminal_arguments():
 
 
 def main():
-    log("argv", {"argv": sys.argv})
+    log("argv", {"argv": sys.argv, "pid": os.getpid()})
     adapter_id = ""
     pending_launch = None
     while True:
@@ -137,6 +137,28 @@ def main():
                     {"request": "launch", "configuration": {"program": "child"}},
                 )
             pending_launch = message
+        elif command == "setBreakpoints":
+            source = arguments.get("source") or {}
+            respond(
+                message,
+                {
+                    "breakpoints": [
+                        {
+                            "id": index + 1,
+                            "verified": True,
+                            "line": entry.get("line", 0),
+                            "source": {"path": source.get("path", "")},
+                        }
+                        for index, entry in enumerate(arguments.get("breakpoints") or [])
+                    ]
+                },
+            )
+        elif command == "continue":
+            respond(message, {"allThreadsContinued": True})
+            time.sleep(0.05)
+            event("stopped", {"reason": "breakpoint", "threadId": 7, "allThreadsStopped": True})
+        elif command == "hang":
+            continue
         elif command == "configurationDone":
             respond(message, {})
             if pending_launch is not None:
