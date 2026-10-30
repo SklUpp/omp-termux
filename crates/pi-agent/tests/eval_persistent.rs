@@ -340,6 +340,11 @@ async fn artifact_publish_denial_surfaces_as_tool_error() {
 		.expect("denied artifact cell");
 	assert!(denied.is_error, "artifact denial stayed invisible: {}", denied.content);
 	assert!(
+		denied.content.contains("artifact unavailable"),
+		"denial not visible to the model: {}",
+		denied.content
+	);
+	assert!(
 		denied.content.contains("output truncated"),
 		"cell text lost: {}",
 		denied.content

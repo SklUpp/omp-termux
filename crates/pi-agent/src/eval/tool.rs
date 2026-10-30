@@ -559,6 +559,11 @@ impl CellJob {
 				},
 			}
 		}
+		// The provider only sees `content`; a details-only notice is invisible to
+		// the model, so surface the denial before the preserved cell text.
+		if let Some(error) = &artifact_error {
+			cell_output = format!("{error}\n{cell_output}");
+		}
 		let meta = sink.meta(artifact);
 		let events = status_events
 			.lock()

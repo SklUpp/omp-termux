@@ -395,9 +395,10 @@ fn split_diagnostic_message(message: &str) -> Option<(String, String)> {
 					.position(|byte| !byte.is_ascii_digit())
 					.unwrap_or(bytes.len() - after_line - 1);
 				if column_end > 0 {
-					let rest_start = after_line + 1 + column_end;
 					let file = message[..index].replace('\\', "/");
-					let rest = message[rest_start..].trim_start().to_string();
+					// TS keeps `line:column` in the message body; only the path
+					// prefix before the first colon is stripped.
+					let rest = message[index + 1..].trim_start().to_string();
 					return Some((file, rest));
 				}
 			}
