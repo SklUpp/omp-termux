@@ -200,6 +200,9 @@ fn agent_event_frames(event: &AgentEvent, text: &mut String) -> Vec<Value> {
 			vec![frame]
 		},
 		AgentEvent::UserSteer { parts } => event_wire::user_message_pair(parts, now).to_vec(),
+		// The child has no host-visible history and the root accounts usage from
+		// its own goal runtime, so the mapper has no frame to emit.
+		AgentEvent::BackgroundResult { .. } => Vec::new(),
 	}
 }
 

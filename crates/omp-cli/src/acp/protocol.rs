@@ -260,6 +260,10 @@ pub struct LineError {
 	/// Id echoed in the error response; `None` becomes `null`.
 	pub id:    Option<JsonRpcId>,
 	pub error: RequestError,
+	/// True when the frame has no `method` member, so it is a malformed
+	/// *answer* to one of our requests, not a malformed peer request. The
+	/// transport fails a matching pending call instead of echoing `-32600`.
+	pub response_shaped: bool,
 }
 
 /// Decode one newline-delimited frame.
@@ -273,16 +277,24 @@ pub struct LineError {
 /// frame with `undefined`, and this crate never fabricates a result.
 pub fn parse_line(line: &str) -> Result<Option<Incoming>, LineError> {
 	let value: Value = serde_json::from_str(line).map_err(|error| LineError {
-		id:    None,
-		error: RequestError::parse_error().with_detail(error.to_string()),
+		id:              None,
+		error:           RequestError::parse_error().with_detail(error.to_string()),
+		response_shaped: false,
 	})?;
 	let Some(object) = value.as_object() else {
-		return Err(LineError { id: None, error: RequestError::invalid_request() });
+		return Err(LineError {
+			id:              None,
+			error:           RequestError::invalid_request(),
+			response_shaped: false,
+		});
 	};
+	let response_shaped = !object.contains_key("method");
 	let id = match object.get("id") {
 		Some(raw) => Some(JsonRpcId::from_json(raw).ok_or_else(|| LineError {
-			id:    None,
-			error: RequestError::invalid_request().with_detail("id must be a string, number or null"),
+			id:              None,
+			error:           RequestError::invalid_request()
+				.with_detail("id must be a string, number or null"),
+			response_shaped,
 		})?),
 		None => None,
 	};
@@ -290,6 +302,7 @@ pub fn parse_line(line: &str) -> Result<Option<Incoming>, LineError> {
 		return Err(LineError {
 			id,
 			error: RequestError::invalid_request().with_detail("jsonrpc must be \"2.0\""),
+			response_shaped,
 		});
 	}
 	let Some(method) = object.get("method") else {
@@ -298,16 +311,20 @@ pub fn parse_line(line: &str) -> Result<Option<Incoming>, LineError> {
 		};
 		if let Some(error) = object.get("error") {
 			let error = parse_error_object(error).ok_or_else(|| LineError {
-				id:    Some(id.clone()),
-				error: RequestError::invalid_request().with_detail("malformed error member"),
+				id:              Some(id.clone()),
+				error:           RequestError::invalid_request()
+					.with_detail("malformed error member"),
+				response_shaped,
 			})?;
 			return Ok(Some(Incoming::Response { id, outcome: Err(error) }));
 		}
 		return match object.get("result") {
 			Some(result) => Ok(Some(Incoming::Response { id, outcome: Ok(result.clone()) })),
 			None => Err(LineError {
-				id:    Some(id),
-				error: RequestError::invalid_request().with_detail("response without result or error"),
+				id:              Some(id),
+				error:           RequestError::invalid_request()
+					.with_detail("response without result or error"),
+				response_shaped,
 			}),
 		};
 	};
@@ -315,6 +332,7 @@ pub fn parse_line(line: &str) -> Result<Option<Incoming>, LineError> {
 		return Err(LineError {
 			id,
 			error: RequestError::invalid_request().with_detail("method must be a string"),
+			response_shaped,
 		});
 	};
 	let method = method.to_string();
@@ -490,14 +508,20 @@ mod tests {
 	#[test]
 	fn parse_and_envelope_failures_name_the_id_to_answer() {
 		assert_eq!(parse_line("not json").expect_err("parse").id, None);
+		assert!(!parse_line("not json").expect_err("parse").response_shaped);
 		let error = parse_line(r#"{"jsonrpc":"1.0","id":4,"method":"ping"}"#).expect_err("envelope");
 		assert_eq!(error.id, Some(JsonRpcId::number(4)));
 		assert_eq!(error.error.code, INVALID_REQUEST);
+		assert!(!error.response_shaped, "a malformed request is not an answer");
+		let error = parse_line(r#"{"jsonrpc":"1.0","id":4}"#).expect_err("envelope");
+		assert_eq!(error.error.code, INVALID_REQUEST);
+		assert!(error.response_shaped, "no method means a malformed answer");
 		let error = parse_line(r#"{"jsonrpc":"2.0","id":{},"method":"ping"}"#).expect_err("id");
 		assert_eq!(error.error.code, INVALID_REQUEST);
 		assert_eq!(error.id, None);
 		let error = parse_line(r#"{"jsonrpc":"2.0","id":8}"#).expect_err("response without result");
 		assert_eq!(error.id, Some(JsonRpcId::number(8)));
+		assert!(error.response_shaped);
 		// Upstream ignores envelopes with neither method nor id.
 		assert_eq!(parse_line(r#"{"jsonrpc":"2.0"}"#).expect("parse"), None);
 	}

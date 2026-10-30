@@ -20,7 +20,7 @@ use crate::{
 	lsp::LspTool,
 	mailbox::Mailbox,
 	provider::ModelProvider,
-	state::{Message, StagedPreviewPolicy, ToolApprover},
+	state::{AcpClientBridge, Message, StagedPreviewPolicy, TokenUsage, ToolApprover},
 	tools::{
 		AstGrepTool, BashTool, EditTool, HubTool, PendingStore, TaskTool, ThinkTool, WriteTool,
 		YieldTool,
@@ -118,6 +118,21 @@ fn now_ms() -> u64 {
 /// once even when several callers race.
 pub trait BackgroundResultSink: Send + Sync {
 	fn take_background_results(&self) -> Vec<String>;
+
+	/// Rich view for hosts that account delivered child usage at the boundary.
+	///
+	/// Shares one consumption with [`take_background_results`]: whichever view
+	/// drains an id first removes it, so a host wrapper may call this while the
+	/// loop calls the text view and still see every delivery once. The default
+	/// carries no identity or usage (a sink with no supervisor behind it);
+	/// supervisor-backed sinks override it.
+	fn take_background_deliveries(&self) -> Vec<BackgroundDelivery> {
+		self
+			.take_background_results()
+			.into_iter()
+			.map(|text| BackgroundDelivery { id: String::new(), text, usage: None })
+			.collect()
+	}
 }
 
 /// One undelivered background result, scoped to the agent that spawned it.
@@ -126,6 +141,23 @@ struct PendingDelivery {
 	id: String,
 	owner: Option<String>,
 	text: String,
+	/// Summed reported usage retained from the settled job record at enqueue
+	/// time. `None` when the child (or the host-owned eval job) reported none.
+	usage: Option<TokenUsage>,
+}
+
+/// A delivered background result with the identity and reported usage that
+/// make root accounting exact.
+///
+/// `id` is the exactly-once key: the supervisor marks a result consumed under
+/// the same lock that removes it, so an id reaches a consumer through the
+/// auto-delivery path or the hub snapshot path, never both. `usage` is absent
+/// when nothing was reported — never a zero-filled stand-in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackgroundDelivery {
+	pub id: String,
+	pub text: String,
+	pub usage: Option<TokenUsage>,
 }
 
 struct OwnerResultSink {
@@ -136,6 +168,10 @@ struct OwnerResultSink {
 impl BackgroundResultSink for OwnerResultSink {
 	fn take_background_results(&self) -> Vec<String> {
 		self.supervisor.take_results_for(self.owner.as_deref())
+	}
+
+	fn take_background_deliveries(&self) -> Vec<BackgroundDelivery> {
+		self.supervisor.take_deliveries_for(self.owner.as_deref())
 	}
 }
 
@@ -203,6 +239,14 @@ pub struct ChildRecord {
 	/// True for background spawns (`task` with async), false for synchronous
 	/// ones. Mirrors the upstream `detached` flag on lifecycle/progress frames.
 	pub detached: bool,
+	/// Summed provider-reported usage over this child's own turns, taken from
+	/// each turn's assistant [`Message::usage`]. `None` when the provider
+	/// reported nothing at all (unknown, never a zero-filled stand-in). The
+	/// delivered `<task-result>` envelope carries the same counters once, so a
+	/// root consumer never has to guess which of the record and the text is
+	/// authoritative.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub usage: Option<TokenUsage>,
 }
 
 /// One reserve request with every field observability needs. `reserve_child`
@@ -418,6 +462,10 @@ pub struct Supervisor {
 	/// Host-mounted eval tool factory. Root binds after the final registry is
 	/// assembled; children bind per owner so each gets a fresh eval session.
 	eval_binder: Mutex<Option<Arc<dyn EvalToolBinder>>>,
+	/// ACP reverse-call bridge for this connection. Children inherit it so
+	/// their `read`/`write`/`bash` route through the same client capabilities
+	/// as the root; `None` keeps every descendant local.
+	acp_bridge: Mutex<Option<Arc<dyn AcpClientBridge>>>,
 	/// Settings for child-scoped `lsp`/`debug` instances (see
 	/// [`ChildToolSettings`]). Set by the host from `lsp.shared` and
 	/// `tools.maxTimeout` on every root turn.
@@ -524,6 +572,7 @@ impl Supervisor {
 			agent_catalog: Mutex::new(None),
 			processes: Mutex::new(None),
 			eval_binder: Mutex::new(None),
+			acp_bridge: Mutex::new(None),
 			child_tool_settings: Mutex::new(ChildToolSettings::default()),
 			task_isolation: Mutex::new(TaskIsolationSettings::default()),
 			process_root: {
@@ -764,10 +813,13 @@ impl Supervisor {
 		let sink = Arc::new(NativeSnapshotSink::new(snapshots.clone()));
 		let router = self.internal_urls();
 		let url_scope = self.url_scope_for(owner);
+		let acp_bridge = self.acp_bridge();
 
 		if registry.get("read").is_some() {
 			registry.remove("read");
-			let read = ReadTool::with_snapshot_sink(sink.clone()).with_display_inputs(resolved.display);
+			let read = ReadTool::with_snapshot_sink(sink.clone())
+				.with_display_inputs(resolved.display)
+				.with_acp_bridge(acp_bridge.clone());
 			registry.register(Arc::new(match &router {
 				Some(router) => read.with_internal_urls(Arc::clone(router), Arc::clone(&url_scope)),
 				None => read,
@@ -798,7 +850,7 @@ impl Supervisor {
 		}
 		if registry.get("write").is_some() {
 			registry.remove("write");
-			let write = WriteTool::with_pending(Arc::clone(&pending));
+			let write = WriteTool::with_pending(Arc::clone(&pending)).with_acp_bridge(acp_bridge);
 			registry.register(Arc::new(match &router {
 				Some(router) => write.with_internal_urls(Arc::clone(router), Arc::clone(&url_scope)),
 				None => write,
@@ -836,6 +888,19 @@ impl Supervisor {
 	pub fn eval_binder(&self) -> Option<Arc<dyn EvalToolBinder>> {
 		self
 			.eval_binder
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone()
+	}
+
+	/// Install/replace the ACP reverse-call bridge for this connection.
+	pub fn set_acp_bridge(&self, bridge: Option<Arc<dyn AcpClientBridge>>) {
+		*self.acp_bridge.lock().unwrap_or_else(|poison| poison.into_inner()) = bridge;
+	}
+
+	pub fn acp_bridge(&self) -> Option<Arc<dyn AcpClientBridge>> {
+		self
+			.acp_bridge
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner())
 			.clone()
@@ -968,6 +1033,17 @@ impl Supervisor {
 	/// A result is enqueued only after the child settles, so this never yields
 	/// a still-running job.
 	pub fn take_results_for(&self, owner: Option<&str>) -> Vec<String> {
+		self
+			.take_deliveries_for(owner)
+			.into_iter()
+			.map(|delivery| delivery.text)
+			.collect()
+	}
+
+	/// Rich view of [`Self::take_results_for`]: the same single consumption
+	/// (one lock, one `consumed` mark per id) with the identity and reported
+	/// usage a root consumer needs. Calling either view drains the other.
+	pub fn take_deliveries_for(&self, owner: Option<&str>) -> Vec<BackgroundDelivery> {
 		let mut state = self.state.lock().unwrap();
 		let mut taken = Vec::new();
 		let mut index = 0;
@@ -977,7 +1053,11 @@ impl Supervisor {
 					state.consumed.insert(delivery.id.clone());
 					state.outstanding.remove(&delivery.id);
 					state.pending_bytes = state.pending_bytes.saturating_sub(delivery.text.len());
-					taken.push(delivery.text);
+					taken.push(BackgroundDelivery {
+						id: delivery.id,
+						text: delivery.text,
+						usage: delivery.usage,
+					});
 				}
 			} else {
 				index += 1;
@@ -1015,8 +1095,11 @@ impl Supervisor {
 		if text.len() > remaining {
 			text = truncate_to_bytes(&text, remaining);
 		}
+		let usage = state.records.get(id).and_then(|record| record.usage);
 		state.pending_bytes += text.len();
-		state.pending.push_back(PendingDelivery { id: id.to_string(), owner, text });
+		state
+			.pending
+			.push_back(PendingDelivery { id: id.to_string(), owner, text, usage });
 	}
 
 	/// Enqueue a non-task background result (eval auto-background) scoped to an
@@ -1057,7 +1140,12 @@ impl Supervisor {
 			return false;
 		}
 		state.pending_bytes += text.len();
-		state.pending.push_back(PendingDelivery { id: id.to_string(), owner, text });
+		state.pending.push_back(PendingDelivery {
+			id: id.to_string(),
+			owner,
+			text,
+			usage: None,
+		});
 		true
 	}
 
@@ -1218,10 +1306,10 @@ impl Supervisor {
 		if reg.get("bash").is_some() {
 			reg.remove("bash");
 			let backend_owner = self.process_owner(owner);
-			reg.register(Arc::new(BashTool::with_processes(
-				Arc::clone(&processes),
-				backend_owner,
-			)));
+			reg.register(Arc::new(
+				BashTool::with_processes(Arc::clone(&processes), backend_owner)
+					.with_acp_bridge(self.acp_bridge()),
+			));
 		}
 		reg.register(Arc::new(YieldTool::new()));
 		reg.register(Arc::new(ThinkTool::new()));
@@ -1430,6 +1518,7 @@ impl Supervisor {
 				agent_source: spawn.agent_source.to_string(),
 				parent_tool_call_id: spawn.parent_tool_call_id.map(str::to_string),
 				detached: spawn.detached,
+				usage: None,
 			};
 			state.order.push(id.clone());
 			state.records.insert(id.clone(), record.clone());
@@ -1706,11 +1795,36 @@ impl Supervisor {
 	}
 
 	pub fn mark_completed(&self, id: &str, duration_ms: u64, output: &str) {
-		self.settle_child(id, duration_ms, Some(output), None);
+		self.settle_child(id, duration_ms, Some(output), None, None);
+	}
+
+	/// Complete a job while retaining the child's reported usage. The caller
+	/// passes the same counters it renders into the delivered envelope, so the
+	/// record and the text never disagree.
+	pub fn mark_completed_with_usage(
+		&self,
+		id: &str,
+		duration_ms: u64,
+		output: &str,
+		usage: Option<TokenUsage>,
+	) {
+		self.settle_child(id, duration_ms, Some(output), None, usage);
 	}
 
 	pub fn mark_failed(&self, id: &str, duration_ms: u64, error: &str) {
-		self.settle_child(id, duration_ms, None, Some(error));
+		self.settle_child(id, duration_ms, None, Some(error), None);
+	}
+
+	/// Fail a job after it already reported usage. Turns that ran before the
+	/// failure keep contributing, exactly like the blocking `task` result.
+	pub fn mark_failed_with_usage(
+		&self,
+		id: &str,
+		duration_ms: u64,
+		error: &str,
+		usage: Option<TokenUsage>,
+	) {
+		self.settle_child(id, duration_ms, None, Some(error), usage);
 	}
 
 	pub fn mark_aborted(&self, id: &str, reason: &str) -> bool {
@@ -1746,7 +1860,14 @@ impl Supervisor {
 		changed
 	}
 
-	fn settle_child(&self, id: &str, duration_ms: u64, output: Option<&str>, error: Option<&str>) {
+	fn settle_child(
+		&self,
+		id: &str,
+		duration_ms: u64,
+		output: Option<&str>,
+		error: Option<&str>,
+		usage: Option<TokenUsage>,
+	) {
 		let _emission = self.emission_gate();
 		let (changed, record) = {
 			let mut state = self.state.lock().unwrap();
@@ -1764,6 +1885,7 @@ impl Supervisor {
 						},
 						_ => return,
 					}
+					record.usage = usage;
 					true
 				},
 				_ => false,
@@ -2158,5 +2280,82 @@ mod process_wiring_tests {
 		assert!(!supervisor.enqueue_owner_result(None, "eval-a", "late".to_string()));
 		// No sink attached means background delivery is unavailable.
 		assert!(!supervisor.background_ready());
+	}
+
+	/// A completed background child keeps the summed usage on its retained
+	/// record, delivers the body exactly once, and a later snapshot consumption
+	/// hides only the body — never the counters.
+	#[test]
+	fn settled_child_usage_is_retained_and_delivered_exactly_once() {
+		let supervisor = supervisor();
+		let (id, _token) = supervisor
+			.reserve_child("bg", 0, "task", "work", None)
+			.expect("reserve");
+		let usage = Some(crate::state::TokenUsage {
+			input: 9,
+			output: 4,
+			..crate::state::TokenUsage::default()
+		});
+		supervisor.mark_completed_with_usage(&id, 5, "<task-result/>", usage);
+		supervisor.enqueue_delivery(&id, "<task-result/>".to_string());
+		let record = |supervisor: &Arc<Supervisor>| {
+			supervisor
+				.children()
+				.into_iter()
+				.find(|record| record.id == id)
+				.expect("retained record")
+		};
+		assert_eq!(record(&supervisor).usage, usage);
+		let delivered = supervisor.take_deliveries_for(None);
+		assert_eq!(delivered.len(), 1);
+		assert_eq!(delivered[0].id, id, "identity is the exactly-once key");
+		assert_eq!(delivered[0].text, "<task-result/>");
+		assert_eq!(delivered[0].usage, usage);
+		assert!(
+			supervisor.take_results_for(None).is_empty(),
+			"the text and rich views share one consumption"
+		);
+		assert_eq!(
+			record(&supervisor).usage,
+			usage,
+			"delivery must not clear the retained counters"
+		);
+	}
+
+	/// A child that reports usage and then fails validation still contributes
+	/// those counters: the failure is about the output shape, not the spend.
+	#[test]
+	fn failed_after_reported_usage_keeps_the_counters() {
+		let supervisor = supervisor();
+		let (id, _token) = supervisor
+			.reserve_child("bg", 0, "task", "work", None)
+			.expect("reserve");
+		let usage = Some(crate::state::TokenUsage {
+			input: 3,
+			output: 2,
+			cache_write: 1,
+			..crate::state::TokenUsage::default()
+		});
+		let envelope = "<task-result status=\"failed\"><usage input=\"3\" /></task-result>";
+		supervisor.mark_failed_with_usage(&id, 7, envelope, usage);
+		supervisor.enqueue_delivery(&id, envelope.to_string());
+		let record = supervisor
+			.children()
+			.into_iter()
+			.find(|record| record.id == id)
+			.expect("retained record");
+		assert_eq!(record.status, ChildStatus::Failed);
+		assert_eq!(record.usage, usage);
+
+		// A snapshot consumption is the single delivery: the queued copy is
+		// gone, yet the record still reports the counters once.
+		assert!(supervisor.consume_results(std::slice::from_ref(&id)).is_empty());
+		assert!(supervisor.take_results_for(None).is_empty());
+		let record = supervisor
+			.children()
+			.into_iter()
+			.find(|record| record.id == id)
+			.expect("retained record");
+		assert_eq!(record.usage, usage);
 	}
 }

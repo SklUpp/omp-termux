@@ -5,6 +5,7 @@
 //! skills); this crate only reads them and hands a [`agent::RunRequest`] to a
 //! registered [`agent::AgentRunner`].
 
+pub mod acp;
 pub mod agent;
 pub mod agents;
 pub mod approve;

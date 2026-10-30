@@ -27,8 +27,8 @@ pub use provider::{
 	ToolCallDelta, ToolChoice, normalize_usage, parse_sse_line, sse_stream, to_openai_messages,
 };
 pub use state::{
-	AgentConfig, AgentContext, AgentState, ContentPart, ImagePart, Message, Role, TokenUsage,
-	ToolApprover, ToolCall, ToolResult, TurnResult, TurnStatus,
+	AcpClientBridge, AcpClientError, AgentConfig, AgentContext, AgentState, ContentPart, ImagePart,
+	Message, Role, TokenUsage, ToolApprover, ToolCall, ToolResult, TurnResult, TurnStatus,
 };
 pub use tokenizer::Tokenizer;
 pub use supervisor::{

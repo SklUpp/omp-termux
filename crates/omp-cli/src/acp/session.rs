@@ -156,9 +156,10 @@ impl AcpRuntime {
 		&self,
 		cwd: PathBuf,
 		caps: &ClientCapabilities,
+		mcp_servers: Vec<crate::config::DiscoveredMcpServer>,
 	) -> Result<Arc<AcpSession>, RequestError> {
 		let dir = compute_default_session_dir(&cwd, Some(&self.recipe.sessions_root));
-		self.open(cwd, caps, None, dir, true)
+		self.open(cwd, caps, None, dir, true, mcp_servers)
 	}
 
 	/// Open an existing stored session by id. `cwd` must match the requested
@@ -168,6 +169,7 @@ impl AcpRuntime {
 		id: &str,
 		cwd: PathBuf,
 		caps: &ClientCapabilities,
+		mcp_servers: Vec<crate::config::DiscoveredMcpServer>,
 	) -> Result<Arc<AcpSession>, RequestError> {
 		let stored = session_list::find_session(id, &cwd, Some(&self.recipe.sessions_root))
 			.ok_or_else(|| {
@@ -178,7 +180,7 @@ impl AcpRuntime {
 			.parent()
 			.map(Path::to_path_buf)
 			.unwrap_or_else(|| compute_default_session_dir(&cwd, Some(&self.recipe.sessions_root)));
-		let session = self.open(cwd, caps, Some(stored.id.clone()), dir, false)?;
+		let session = self.open(cwd, caps, Some(stored.id.clone()), dir, false, mcp_servers)?;
 		Ok(session)
 	}
 
@@ -188,6 +190,7 @@ impl AcpRuntime {
 		source: &AcpSession,
 		cwd: PathBuf,
 		caps: &ClientCapabilities,
+		mcp_servers: Vec<crate::config::DiscoveredMcpServer>,
 	) -> Result<Arc<AcpSession>, RequestError> {
 		let source_path = source.persisted_path().ok_or_else(|| {
 			RequestError::new(
@@ -200,7 +203,7 @@ impl AcpRuntime {
 			.map_err(|error| RequestError::new(INTERNAL_ERROR, error))?;
 		let header = read_session_header(&forked)
 			.ok_or_else(|| RequestError::new(INTERNAL_ERROR, "cannot read forked session header"))?;
-		let opened = self.open(cwd, caps, Some(header.id), dir, false)?;
+		let opened = self.open(cwd, caps, Some(header.id), dir, false, mcp_servers)?;
 		Ok(opened)
 	}
 
@@ -211,6 +214,7 @@ impl AcpRuntime {
 		id: Option<String>,
 		dir: PathBuf,
 		fresh: bool,
+		mcp_servers: Vec<crate::config::DiscoveredMcpServer>,
 	) -> Result<Arc<AcpSession>, RequestError> {
 		let store_options = SessionOptions {
 			enabled: true,
@@ -279,7 +283,7 @@ impl AcpRuntime {
 			next_id: Arc::new(AtomicU64::new(1)),
 		})));
 
-		let session = RpcSession::open(
+		let mut session = RpcSession::open(
 			launch,
 			approvals,
 			host_tools,
@@ -290,6 +294,19 @@ impl AcpRuntime {
 		)
 		.map_err(|error| RequestError::new(INTERNAL_ERROR, error.to_string()))?;
 		let id = session.session_id();
+		// Native `read`/`write`/`bash` calls route through the client only for
+		// the capabilities this session advertised; the bridge is copied into
+		// every `RunRequest` and onto the root/child tool instances.
+		session.set_acp_bridge(Some(Arc::new(super::bridge::AcpToolBridge::new(
+			AcpReverseClient::new(
+				id.clone(),
+				caps.clone(),
+				self.reverse.clone(),
+				self.transport.clone(),
+			),
+			caps.clone(),
+		))));
+		session.set_mcp_servers(mcp_servers);
 		let record = Arc::new(AcpSession {
 			id: id.clone(),
 			cwd,
@@ -306,6 +323,23 @@ impl AcpRuntime {
 		});
 		// The permission broker and ask channel share this slot.
 		record.permission.bind_session(&id);
+		// Restore plan mode from the shared `mode_change` slot. Only `"plan"`
+		// restores (goal/vibe/none leave plan off), and only while the feature
+		// is enabled.
+		if record.plan_enabled() {
+			let restored = {
+				let session = record.lock();
+				match session.latest_mode_change() {
+					Some((mode, data)) => plan::restore_from_mode_change(&mode, data.as_ref()),
+					None => None,
+				}
+			};
+			if let Some(state) = restored {
+				let mut gate = record.lock_plan();
+				gate.state = Some(state);
+				gate.generation = gate.generation.wrapping_add(1);
+			}
+		}
 		Ok(record)
 	}
 }
@@ -414,17 +448,36 @@ impl AcpSession {
 		self.plan.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	/// `session/set_mode` and the `mode` config option.
-	pub fn set_mode(&self, mode_id: &str) -> Result<Value, RequestError> {
+	/// Apply a mode id: the exclusive TS `mode_change` slot accepts `plan` only
+	/// while no Goal holds it, and every accepted change is persisted.
+	fn apply_mode(&self, mode_id: &str) -> Result<(), RequestError> {
+		if mode_id == plan::ACP_PLAN_MODE_ID && self.lock().goal.has_goal() {
+			return Err(RequestError::new(
+				INTERNAL_ERROR,
+				"Unsupported ACP mode: plan (a Goal session holds the exclusive mode slot)",
+			));
+		}
+		let persisted = {
+			let mut gate = self.lock_plan();
+			gate
+				.set_mode(mode_id)
+				.map_err(|message| RequestError::new(INTERNAL_ERROR, message))?;
+			gate.persisted_mode_change()
+		};
 		self
-			.lock_plan()
-			.set_mode(mode_id)
-			.map_err(|message| RequestError::new(INTERNAL_ERROR, message))?;
-		let update = json!({
+			.lock()
+			.append_mode_change(persisted.0, persisted.1)
+			.map_err(|error| RequestError::new(INTERNAL_ERROR, error.to_string()))?;
+		self.emit_update(json!({
 			"sessionUpdate": "current_mode_update",
 			"currentModeId": self.lock_plan().current_mode_id(),
-		});
-		self.emit_update(update);
+		}));
+		Ok(())
+	}
+
+	/// `session/set_mode` and the `mode` config option.
+	pub fn set_mode(&self, mode_id: &str) -> Result<Value, RequestError> {
+		self.apply_mode(mode_id)?;
 		let config = self.config_options();
 		self.emit_update(json!({
 			"sessionUpdate": "config_option_update",
@@ -445,17 +498,7 @@ impl AcpSession {
 			.as_str()
 			.ok_or_else(|| RequestError::invalid_params())?;
 		match config_id {
-			"mode" => {
-				self
-					.lock_plan()
-					.set_mode(text)
-					.map_err(|message| RequestError::new(INTERNAL_ERROR, message))?;
-				let current = self.lock_plan().current_mode_id();
-				self.emit_update(json!({
-					"sessionUpdate": "current_mode_update",
-					"currentModeId": current,
-				}));
-			},
+			"mode" => self.apply_mode(text)?,
 			"model" => {
 				let (provider, model_id) = text.split_once('/').ok_or_else(|| {
 					RequestError::new(INTERNAL_ERROR, format!("Unknown ACP model: {text}"))
@@ -565,6 +608,12 @@ impl AcpSession {
 	#[must_use]
 	pub fn session_name(&self) -> Option<String> {
 		self.lock().state(None).session_name
+	}
+
+	/// Replace the client-supplied MCP servers for later turns of an
+	/// already-loaded session (`session/load|resume` on a managed id).
+	pub fn set_mcp_servers(&self, servers: Vec<crate::config::DiscoveredMcpServer>) {
+		self.lock().set_mcp_servers(servers);
 	}
 
 	/// `session/prompt`.
@@ -735,7 +784,7 @@ impl AcpSession {
 								},
 								_ => {},
 							}
-							if !(token.is_cancelled() || self.gate.cancel_requested()) {
+							if !self.gate.cancel_requested() {
 								for update in map_event(&event, &mut map, &self.cwd, &self.next_message_id)
 								{
 									self.emit_update(update);
@@ -753,7 +802,7 @@ impl AcpSession {
 				stream_error = Some(error.to_string());
 			},
 		}
-		let cancelled = token.is_cancelled() || self.gate.cancel_requested();
+		let cancelled = self.gate.cancel_requested();
 		let outcome =
 			TurnOutcome { error: stream_error.clone().filter(|_| !cancelled), aborted: cancelled };
 		session.finish_turn(&mut prepared, &outcome);
@@ -820,6 +869,11 @@ impl AcpSession {
 
 	/// Plan state for the runner-side guard/composition.
 	#[must_use]
+	pub fn plan_enabled(&self) -> bool {
+		self.lock_plan().enabled
+	}
+
+	#[must_use]
 	pub fn plan_state(&self) -> Option<plan::AcpPlanState> {
 		self.lock_plan().state.clone()
 	}
@@ -839,11 +893,14 @@ impl AcpSession {
 		self.lock_plan().reminder_pending()
 	}
 
-	/// Replay persisted branch messages as `session/update` notifications.
+	/// Replay persisted wire messages as `session/update` notifications.
+	///
+	/// `branch_messages()` is the user-only `{entryId,text}` view; the mapper
+	/// needs the full role-bearing wire shape, which `wire_messages()` keeps.
 	pub fn replay_history(&self) {
 		let session = self.lock();
-		for message in session.branch_messages() {
-			for update in replay_message(&message, &self.cwd, &self.next_message_id) {
+		for message in session.wire_messages() {
+			for update in replay_message(message, &self.cwd, &self.next_message_id) {
 				self.emit_update(update);
 			}
 		}
@@ -1395,6 +1452,7 @@ struct AcpPermissionBroker {
 	reverse: ReverseCaller,
 	mode: ApprovalMode,
 	allow: Arc<BTreeSet<String>>,
+	cwd: PathBuf,
 	token: Arc<Mutex<Option<CancellationToken>>>,
 	decisions: Arc<Mutex<BTreeMap<String, PersistedDecision>>>,
 	next_id: Arc<AtomicU64>,

@@ -46,7 +46,7 @@ use super::{
 	internal_urls::{self, InternalResource, InternalUrlRouter},
 	tool_result,
 };
-use crate::state::{AgentContext, ToolResult};
+use crate::state::{AcpClientBridge, AcpClientError, AgentContext, ToolResult};
 
 /// Shared read caps (`packages/coding-agent/src/session/streaming-output.ts`).
 pub(super) const DEFAULT_MAX_LINES: u64 = 3000;
@@ -151,6 +151,8 @@ pub struct ReadTool {
 	router:  Option<Arc<InternalUrlRouter>>,
 	/// Per-session scope handed to handlers; never mutated after construction.
 	scope:   Arc<internal_urls::UrlScope>,
+	/// ACP client reverse bridge; `None` keeps every read local.
+	acp:     Option<Arc<dyn AcpClientBridge>>,
 }
 
 impl Default for ReadTool {
@@ -166,6 +168,7 @@ impl ReadTool {
 			display: None,
 			router:  None,
 			scope:   Arc::new(internal_urls::UrlScope::default()),
+			acp:     None,
 		}
 	}
 
@@ -176,7 +179,17 @@ impl ReadTool {
 			display: None,
 			router:  None,
 			scope:   Arc::new(internal_urls::UrlScope::default()),
+			acp:     None,
 		}
+	}
+
+	/// Mount an ACP client bridge. Live reads then go through
+	/// `fs/read_text_file` when the client advertised it; construction without
+	/// this call keeps the filesystem path unchanged.
+	#[must_use]
+	pub fn with_acp_bridge(mut self, bridge: Option<Arc<dyn AcpClientBridge>>) -> Self {
+		self.acp = bridge;
+		self
 	}
 
 	/// Mount the session's internal URL router with its per-session scope.
@@ -375,6 +388,60 @@ impl Tool for ReadTool {
 			Ok(parsed) => parsed,
 			Err(message) => return Ok(tool_result(message, true)),
 		};
+
+		// ACP `fs/read_text_file` owns the read only when the client
+		// advertised it. `Unsupported` (the gate raced the advertise) falls
+		// back to the filesystem; a cancelled or failed remote call is
+		// reported, never retried natively, because the client may already
+		// hold different bytes than this process could see.
+		if let Some(bridge) = &self.acp
+			&& bridge.supports_fs_read()
+			&& !matches!(&parsed, Sel::Image | Sel::Conflicts)
+		{
+			let path = target.display().to_string();
+			let remote = match bridge
+				.read_text_file(&path, None, None, &ctx.cancellation_token)
+				.await
+			{
+				Ok(content) => Some(content),
+				Err(AcpClientError::Unsupported) => None,
+				Err(AcpClientError::Cancelled) => {
+					return Ok(tool_result(format!("Read {path} cancelled"), true));
+				},
+				Err(error) => {
+					return Ok(tool_result(format!("Failed to read {path}: {error}"), true));
+				},
+			};
+			if let Some(source_bytes) = remote {
+				let source = TextSource::Memory { url: &path, bytes: source_bytes.as_bytes() };
+				let raw_selector = is_raw(&parsed);
+				let display_mode = self.display_mode(raw_selector, false);
+				let outcome = match &parsed {
+					Sel::Lines { ranges, raw } if ranges.len() > 1 => {
+						read_multi_range(&source, ranges, *raw, None, display_mode, ctx).await
+					},
+					Sel::Lines { ranges, raw } => {
+						read_single_range(&source, ranges[0], *raw, None, display_mode, ctx).await
+					},
+					Sel::Raw | Sel::None => {
+						read_single_range(
+							&source,
+							LineRange { start_line: 1, end_line: None },
+							raw_selector,
+							None,
+							display_mode,
+							ctx,
+						)
+						.await
+					},
+					Sel::Conflicts | Sel::Image => unreachable!("excluded above"),
+				};
+				return match outcome {
+					Ok(result) => Ok(result),
+					Err(message) => Ok(tool_result(message, true)),
+				};
+			}
+		}
 
 		let mut suffix_resolution: Option<(String, String)> = None;
 		let meta = match tokio::fs::metadata(&target).await {

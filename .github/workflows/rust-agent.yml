@@ -52,6 +52,11 @@ jobs:
         if: failure()
         timeout-minutes: 5
         run: python3 scripts/julia-bootstrap-diagnostic.py
+      # None of the support crates are dependencies of pi-agent/omp-cli, so the
+      # two steps above never compile or run their tests. Isolation, parsing,
+      # walking and shell keep their own suites here, or they stay dark.
+      - name: Test support crates
+        run: cargo test --locked -p pi-iso -p pi-ast -p pi-walker -p pi-shell
 
   test-native-grep:
     name: Native grep and matcher tests (linux x86_64)

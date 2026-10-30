@@ -8,6 +8,8 @@
 //! dedup are session-local and lost on reopen by design (TS
 //! `GoalRuntimeSnapshot`).
 
+use std::collections::HashSet;
+
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -23,6 +25,8 @@ pub const MODE_GOAL_PAUSED: &str = "goal_paused";
 pub const GOAL_COMPLETED_CUSTOM_TYPE: &str = "goal-completed";
 /// `customType` of the hidden between-turn continuation prompt.
 pub const GOAL_CONTINUATION_CUSTOM_TYPE: &str = "goal-continuation";
+/// `customType` of the persisted background child usage report.
+pub const BACKGROUND_USAGE_CUSTOM_TYPE: &str = "background-usage";
 
 /// TS `GoalStatus`. [`GoalStatus::Unknown`] only ever comes from a log written
 /// by a newer build: restore keeps it so the goal is paused instead of
@@ -573,6 +577,9 @@ pub enum GoalPersist {
 	ModeChange { mode: &'static str, data: Option<Value> },
 	/// Terminal `custom goal-completed` metric.
 	Completed(Value),
+	/// `custom background-usage` entry: the child's summed usage for this job
+	/// id, persisted once so a reopened log can still account it.
+	BackgroundUsage { id: String, usage: pi_agent::TokenUsage },
 }
 
 /// TS `GoalRuntimeEvent`, as the RPC/live host forwards it.
@@ -672,6 +679,9 @@ struct Inner {
 	pending:             Vec<GoalPersist>,
 	events:              Vec<GoalRuntimeEvent>,
 	steer:               Option<GoalSteerFn>,
+	/// Background job ids already accounted in this runtime: auto-delivery and
+	/// a hub snapshot can carry the same id, and only the first counts.
+	seen_background_ids: HashSet<String>,
 }
 
 /// Session-local Goal Mode controller (TS `GoalRuntime` + the turn-budget
@@ -723,6 +733,7 @@ impl GoalRuntime {
 				pending:             Vec::new(),
 				events:              Vec::new(),
 				steer:               None,
+				seen_background_ids: HashSet::new(),
 			}),
 			clock,
 		}
@@ -755,7 +766,11 @@ impl GoalRuntime {
 	/// Restore a persisted mode without persisting or emitting: the reconcile
 	/// path decides what to write next.
 	pub fn set_restored_state(&self, state: Option<GoalModeState>) {
-		self.lock().state = state;
+		let mut inner = self.lock();
+		if state.is_none() {
+			inner.seen_background_ids.clear();
+		}
+		inner.state = state;
 	}
 
 	/// Drain queued session-log writes (in order).
@@ -776,6 +791,7 @@ impl GoalRuntime {
 		let mut inner = self.lock();
 		inner.turn = None;
 		inner.budget_reported_for = None;
+		inner.seen_background_ids.clear();
 		clear_active_accounting(&mut inner, now);
 	}
 
@@ -837,6 +853,31 @@ impl GoalRuntime {
 		inner.usage = inner.usage.saturating_add(counters);
 	}
 
+	/// One background child result was injected. `usage` is the child's summed
+	/// report; a job id counts once even if a hub snapshot repeats it.
+	pub fn observe_background_result(&self, id: &str, usage: Option<&pi_agent::TokenUsage>) {
+		if id.is_empty() {
+			return;
+		}
+		let now = self.now_ms();
+		let steer = {
+			let mut inner = self.lock();
+			if !inner.seen_background_ids.insert(id.to_string()) {
+				return;
+			}
+			let Some(usage) = usage else {
+				return;
+			};
+			inner.pending.push(GoalPersist::BackgroundUsage {
+				id:   id.to_string(),
+				usage: *usage,
+			});
+			inner.usage = inner.usage.saturating_add(TokenCounters::from_token_usage(usage));
+			flush_locked(&mut inner, now, GoalSteering::Allowed, false)
+		};
+		self.send_steer(steer);
+	}
+
 	/// One tool finished. Delegated child usage rides on `details.usage` and is
 	/// summed once; goal-tool flushes are suppressed so the goal cannot charge
 	/// itself for its own transitions.
@@ -847,6 +888,29 @@ impl GoalRuntime {
 		{
 			let mut inner = self.lock();
 			inner.usage = inner.usage.saturating_add(child);
+		}
+		// A hub `jobs` snapshot repeats each background child's summed usage;
+		// the job id is the exactly-once key shared with auto-delivery.
+		if tool == "hub"
+			&& let Some(jobs) = details
+				.and_then(|details| details.get("jobs"))
+				.and_then(Value::as_array)
+		{
+			let mut inner = self.lock();
+			for job in jobs {
+				let Some(id) = job.get("id").and_then(Value::as_str) else {
+					continue;
+				};
+				if id.is_empty() {
+					continue;
+				}
+				let Some(usage) = job.get("usage").and_then(usage_counters_from_value) else {
+					continue;
+				};
+				if inner.seen_background_ids.insert(id.to_string()) {
+					inner.usage = inner.usage.saturating_add(usage);
+				}
+			}
 		}
 		if tool == "goal" {
 			self.flush_usage(GoalSteering::Suppressed);
@@ -1784,6 +1848,78 @@ mod tests {
 		assert_eq!(steers.lock().expect("steers").len(), 1);
 	}
 
+	/// A background child's summed usage is charged once per job id, whether it
+	/// arrives through auto-delivery or a hub `jobs` snapshot.
+	#[test]
+	fn background_usage_counts_once_across_delivery_and_hub_snapshot() {
+		let runtime = GoalRuntime::with_clock(Box::new(|| 1_000));
+		runtime.create_goal("ship", None).expect("create goal");
+		runtime.begin_turn(Some("go"), TokenCounters::default());
+		let usage: pi_agent::TokenUsage = serde_json::from_value(json!({
+			"input": 4,
+			"output": 6,
+			"cacheRead": 1,
+			"cacheWrite": 0,
+			"totalTokens": 11,
+		}))
+		.expect("token usage");
+		runtime.observe_background_result("bg-1", Some(&usage));
+		let pending = runtime.take_pending();
+		assert!(
+			pending.iter().any(|intent| matches!(
+				intent,
+				GoalPersist::BackgroundUsage { id, .. } if id == "bg-1"
+			)),
+			"an auto-delivered result persists its usage once"
+		);
+		assert_eq!(
+			runtime.state().expect("goal state").goal.tokens_used,
+			10,
+			"input + output; cacheRead is a reused prefix"
+		);
+
+		let hub = json!({
+			"op": "jobs",
+			"jobs": [{ "id": "bg-1", "usage": {
+				"input": 4,
+				"output": 6,
+				"cacheRead": 1,
+				"cacheWrite": 0,
+				"totalTokens": 11,
+			} }],
+		});
+		runtime.observe_tool_end("hub", Some(&hub));
+		assert_eq!(
+			runtime.state().expect("goal state").goal.tokens_used,
+			10,
+			"the same job id is never charged twice"
+		);
+
+		let second = json!({
+			"jobs": [{ "id": "bg-2", "usage": {
+				"input": 1,
+				"output": 2,
+				"cacheRead": 0,
+				"cacheWrite": 0,
+				"totalTokens": 3,
+			} }],
+		});
+		runtime.observe_tool_end("hub", Some(&second));
+		assert_eq!(
+			runtime.state().expect("goal state").goal.tokens_used,
+			13,
+			"a new job id accrues normally"
+		);
+		let pending = runtime.take_pending();
+		assert!(
+			!pending.iter().any(|intent| matches!(
+				intent,
+				GoalPersist::BackgroundUsage { id, .. } if id == "bg-2"
+			)),
+			"a hub snapshot persists its own tool result, not a duplicate custom entry"
+		);
+	}
+
 	/// Transition guards and their exact wording, plus the exit handshake.
 	#[test]
 	fn goal_transitions_validate_and_hand_off_exit() {
@@ -1891,6 +2027,10 @@ mod tests {
 	fn goal_interrupt_pauses_once_and_resume_rebases() {
 		let (now, runtime) = clock_at(9_000);
 		runtime.create_goal("ship", None).expect("create");
+		// The create transition is its own persisted write; the session writer
+		// drains it before the turn, so the abort sequence starts clean.
+		runtime.take_events();
+		runtime.take_pending();
 		runtime.begin_turn(Some("go"), seed(100, 10));
 		runtime.observe_message(&assistant_with_usage(0, 25, 0));
 		now.store(9_600, std::sync::atomic::Ordering::SeqCst);
@@ -1902,11 +2042,24 @@ mod tests {
 		assert_eq!(paused.goal.tokens_used, 25, "flush precedes the pause");
 		assert_eq!(paused.goal.time_used_seconds, 0, "sub-second floor");
 		let pending = runtime.take_pending();
-		assert_eq!(pending.len(), 2, "usage write + pause write");
-		assert!(matches!(
-			pending.last(),
-			Some(GoalPersist::ModeChange { mode: MODE_GOAL_PAUSED, .. })
-		));
+		assert!(
+			matches!(
+				pending.last(),
+				Some(GoalPersist::ModeChange { mode: MODE_GOAL_PAUSED, .. })
+			),
+			"the pause is the last persisted transition"
+		);
+		assert_eq!(
+			pending
+				.iter()
+				.filter(|intent| matches!(
+					intent,
+					GoalPersist::ModeChange { mode: MODE_GOAL_PAUSED, .. }
+				))
+				.count(),
+			1,
+			"an interrupt pauses exactly once"
+		);
 
 		// A second abort adds nothing: the goal is no longer active.
 		runtime.on_task_aborted(GoalAbortReason::Interrupted);

@@ -463,6 +463,8 @@ fn fake_request(prompt: &str) -> RunRequest {
 		tools_enabled: false,
 		cancellation_token: None,
 		extra_tools: Vec::new(),
+		acp_bridge: None,
+		extra_mcp_servers: Vec::new(),
 		internal_urls: None,
 		url_scope: None,
 		subagent_observer: None,

@@ -141,6 +141,9 @@ struct RunnerSession {
 	internal_urls:   Mutex<Option<Arc<pi_agent::tools::internal_urls::InternalUrlRouter>>>,
 	/// Immutable URL scope (session file + `local://` root) for this run.
 	url_scope:       Mutex<Arc<pi_agent::tools::internal_urls::UrlScope>>,
+	/// ACP reverse-call bridge for this run (set by the ACP transport); the
+	/// rebuilt root registry and the supervisor's children mount it.
+	acp_bridge:      Mutex<Option<Arc<dyn pi_agent::AcpClientBridge>>>,
 }
 
 /// Shared LSP ownership scope plus the transport preference it was built with.
@@ -174,7 +177,25 @@ impl RunnerSession {
 			debug_timeout: Mutex::new(None),
 			internal_urls: Mutex::new(None),
 			url_scope: Mutex::new(Arc::new(pi_agent::tools::internal_urls::UrlScope::default())),
+			acp_bridge: Mutex::new(None),
 		}
+	}
+
+	/// Install this run's ACP reverse-call bridge; `None` keeps every tool
+	/// local (RPC, print, REPL).
+	fn set_acp_bridge(&self, bridge: Option<Arc<dyn pi_agent::AcpClientBridge>>) {
+		*self
+			.acp_bridge
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = bridge;
+	}
+
+	fn acp_bridge(&self) -> Option<Arc<dyn pi_agent::AcpClientBridge>> {
+		self
+			.acp_bridge
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone()
 	}
 
 	/// Root DAP session tree shared by every turn of this runner.
@@ -843,12 +864,27 @@ impl AgentRunner for PiAgentRunner {
 		}));
 
 		let mcp_spawn = if request.tools_enabled {
-			match self.runtime.block_on(load_and_filter_mcp_tools_detailed(
-				&request.cwd,
-				&request.config,
-				&request.approvals,
-				&cancellation_token,
-			)) {
+			let extra_mcp = request.extra_mcp_servers.clone();
+			match self.runtime.block_on(async {
+				if extra_mcp.is_empty() {
+					load_and_filter_mcp_tools_detailed(
+						&request.cwd,
+						&request.config,
+						&request.approvals,
+						&cancellation_token,
+					)
+					.await
+				} else {
+					load_and_filter_mcp_tools_with_extra_detailed(
+						&request.cwd,
+						&extra_mcp,
+						&request.config,
+						&request.approvals,
+						&cancellation_token,
+					)
+					.await
+				}
+			}) {
 				Ok(spawn) => spawn,
 				Err(err) => {
 					drop(discovery_sig_reg);
@@ -898,6 +934,8 @@ impl AgentRunner for PiAgentRunner {
 		// supervisor shares the same router with every child registry.
 		session.set_internal_urls(request.internal_urls.clone());
 		session.set_url_scope(request.url_scope.clone());
+		session.set_acp_bridge(request.acp_bridge.as_ref().map(|handle| Arc::clone(&handle.0)));
+		let acp_bridge = session.acp_bridge();
 		// `lsp.shared`/`tools.maxTimeout` are applied before the registry is built
 		// so the root tool instances carry this turn's transport and cap.
 		session.set_lsp_shared(request.config.lsp.shared(), &self.runtime);
@@ -1036,6 +1074,9 @@ impl AgentRunner for PiAgentRunner {
 			};
 			supervisor.set_edit_options(edit_options);
 			supervisor.set_display_resolver(Arc::clone(&display_resolver));
+			// Children inherit the same reverse bridge as the root; a later
+			// turn without ACP clears it again.
+			supervisor.set_acp_bridge(acp_bridge.clone());
 			supervisor.set_child_tool_settings(ChildToolSettings {
 				lsp_shared: request.config.lsp.shared(),
 				debug_max_timeout: request.config.max_tool_timeout_secs,
@@ -1367,6 +1408,13 @@ impl AgentRunner for PiAgentRunner {
 							let _ = steering_tx_err.try_send(SteeringEvent::Interrupt);
 							abort_after_grace(dialog_abort_clone);
 							return;
+						}
+					},
+					// A background child result is already in history; it only
+					// feeds goal accounting once per job id. No host `Event`.
+					AgentEvent::BackgroundResult { id, text: _, usage } => {
+						if let Some(goal) = &goal_runtime {
+							goal.observe_background_result(&id, usage.as_ref());
 						}
 					},
 					AgentEvent::TurnEnd { message, tool_results, status } => {
@@ -2368,11 +2416,13 @@ fn build_registry_with_display(
 		|| Arc::new(pi_agent::tools::internal_urls::UrlScope::default()),
 		|session| session.url_scope(),
 	);
+	let acp_bridge = session.and_then(|session| session.acp_bridge());
 	for name in tools {
 		let tool: Arc<dyn Tool> = match *name {
 			"read" => {
 				let read = ReadTool::with_snapshot_sink(read_sink.clone())
-					.with_display_inputs(resolved.display);
+					.with_display_inputs(resolved.display)
+					.with_acp_bridge(acp_bridge.clone());
 				Arc::new(match &internal_urls {
 					Some(router) => read.with_internal_urls(Arc::clone(router), Arc::clone(&url_scope)),
 					None => read,
@@ -2390,7 +2440,8 @@ fn build_registry_with_display(
 				resolved.display,
 			)),
 			"write" => {
-				let write = WriteTool::with_pending(Arc::clone(&pending));
+				let write = WriteTool::with_pending(Arc::clone(&pending))
+					.with_acp_bridge(acp_bridge.clone());
 				Arc::new(match &internal_urls {
 					Some(router) => write.with_internal_urls(Arc::clone(router), Arc::clone(&url_scope)),
 					None => write,
@@ -2404,7 +2455,7 @@ fn build_registry_with_display(
 					resolved.edit_tool,
 				)),
 			},
-			"bash" => Arc::new(BashTool::new()),
+			"bash" => Arc::new(BashTool::new().with_acp_bridge(acp_bridge.clone())),
 			"todo" => Arc::new(TodoTool::restored(todo_phases.clone(), session_persisted)),
 			"ask" => Arc::new(AskTool::new()),
 			// Session-scoped: the LSP owner scope and the debug session tree live
@@ -3051,6 +3102,10 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 		// `checkpoint`/`rewind` mount only when `checkpoint.enabled` supplies a
 		// controller, but `--tools` may always name them.
 		valid.extend(["checkpoint", "rewind"].map(str::to_string));
+		// `goal` mounts only when `goal.enabled` and the mount predicate holds
+		// (`has_goal` or selected), but a restricted `--tools` selection may
+		// always name it (#9444).
+		valid.push(crate::goal_tool::GOAL_TOOL_NAME.to_string());
 		valid.extend(all_server_names.iter().cloned());
 		// MCP tool ids are only enumerable after a server responds; a name that
 		// matches no builtin, no delegation tool, and no configured server cannot
@@ -3197,6 +3252,9 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 		// `checkpoint`/`rewind` are not default builtins: they mount only when
 		// `checkpoint.enabled` supplies a controller, but `--tools` may name them.
 		known_tools.extend(["checkpoint", "rewind"].map(str::to_string));
+		// `goal` likewise mounts only under its own predicate, but `--tools` may
+		// name it so a restricted selection keeps the restored goal manageable.
+		known_tools.push(crate::goal_tool::GOAL_TOOL_NAME.to_string());
 		for tool in &unique_tools {
 			known_tools.push(tool.name().to_string());
 		}
@@ -3270,6 +3328,44 @@ pub async fn load_and_filter_mcp_tools(
 ) -> Result<Vec<McpTool>> {
 	let res = load_and_filter_mcp_tools_detailed(cwd, config, approvals, cancel_token).await?;
 	Ok(res.tools)
+}
+
+/// Merge ACP client-supplied MCP servers into file discovery, then run the
+/// exact same filter/spawn/approval gate as configured servers.
+///
+/// A client may not shadow a server the user configured under the same name:
+/// the duplicate is a hard error, never a silent override.
+pub async fn load_and_filter_mcp_tools_with_extra_detailed(
+	cwd: &Path,
+	extra: &[crate::config::DiscoveredMcpServer],
+	config: &crate::config::Config,
+	approvals: &crate::approve::Approvals,
+	cancel_token: &pi_agent::CancellationToken,
+) -> Result<McpSpawnResult> {
+	let agent_dir = crate::dirs::agent_dir();
+	let report = crate::config::discover_mcp_servers_with_paths(cwd, &agent_dir);
+	for warning in &report.warnings {
+		eprintln!("{warning}");
+	}
+	let mut servers = report.servers;
+	for server in extra {
+		if servers.iter().any(|existing| existing.name == server.name) {
+			return Err(Error::new(format!(
+				"MCP server `{}` is declared both by configuration and by the ACP client",
+				server.name
+			)));
+		}
+		servers.push(server.clone());
+	}
+	filter_and_spawn_mcp_servers_with_paths_detailed(
+		servers,
+		cwd,
+		&agent_dir,
+		config,
+		approvals,
+		cancel_token,
+	)
+	.await
 }
 
 pub async fn load_and_filter_mcp_tools_with_paths_detailed(
@@ -3773,6 +3869,8 @@ mod tests {
 			session_id: None,
 			cancellation_token: None,
 			extra_tools: Vec::new(),
+			acp_bridge: None,
+			extra_mcp_servers: Vec::new(),
 			internal_urls: None,
 			url_scope: None,
 			subagent_observer: None,

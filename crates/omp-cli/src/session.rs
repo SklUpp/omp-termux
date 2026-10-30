@@ -1,7 +1,7 @@
 //! Session persistence: TypeScript v3 JSONL logs, 256-byte title slots,
 //! encoded directory layouts, terminal breadcrumbs, and legacy v1 compatibility.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use pi_agent::tools::todo::{TodoPhase, USER_TODO_EDIT_CUSTOM_TYPE};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::Event;
-use crate::goal::GOAL_COMPLETED_CUSTOM_TYPE;
+use crate::goal::{BACKGROUND_USAGE_CUSTOM_TYPE, GOAL_COMPLETED_CUSTOM_TYPE};
 use crate::{dirs, output};
 
 /// Directory under the agent dir that holds CLI session logs.
@@ -1347,10 +1347,13 @@ impl SessionStore {
 	///
 	/// Like TS `entryUsage` (`session-manager.ts`), a `task` tool result also
 	/// contributes the subagent usage persisted in its `details.usage` (present
-	/// only in TS-written/imported logs; native Rust never writes it).
+	/// only in TS-written/imported logs; native Rust never writes it). A `hub`
+	/// `jobs` snapshot and a `background-usage` custom entry describe the same
+	/// background child, so the job `id` counts once.
 	#[must_use]
 	pub fn session_usage(&self) -> SessionUsage {
 		let mut total = SessionUsage::default();
+		let mut seen_background_ids: HashSet<String> = HashSet::new();
 		for entry in &self.messages {
 			match entry.message.role.as_str() {
 				"assistant" => {
@@ -1366,7 +1369,54 @@ impl SessionStore {
 						total.add(&usage);
 					}
 				},
+				"toolResult" if entry.message.tool_name.as_deref() == Some("hub") => {
+					let jobs = entry
+						.message
+						.extra
+						.get("details")
+						.and_then(|details| details.get("jobs"))
+						.and_then(serde_json::Value::as_array);
+					for job in jobs.into_iter().flatten() {
+						let Some(id) = job.get("id").and_then(serde_json::Value::as_str) else {
+							continue;
+						};
+						let Some(usage) = job
+							.get("usage")
+							.and_then(|usage| serde_json::from_value::<Usage>(usage.clone()).ok())
+						else {
+							continue;
+						};
+						if seen_background_ids.insert(id.to_string()) {
+							total.add(&usage);
+						}
+					}
+				},
 				_ => {},
+			}
+		}
+		// A `background-usage` custom entry is the durable form of the same child
+		// report; the job id keeps a hub snapshot above from counting it twice.
+		for entry in &self.entries {
+			if entry.kind != "custom"
+				|| entry.extra.get("customType").and_then(serde_json::Value::as_str)
+					!= Some(BACKGROUND_USAGE_CUSTOM_TYPE)
+			{
+				continue;
+			}
+			let Some(data) = entry.extra.get("data") else {
+				continue;
+			};
+			let Some(id) = data.get("id").and_then(serde_json::Value::as_str) else {
+				continue;
+			};
+			let Some(usage) = data
+				.get("usage")
+				.and_then(|usage| serde_json::from_value::<Usage>(usage.clone()).ok())
+			else {
+				continue;
+			};
+			if seen_background_ids.insert(id.to_string()) {
+				total.add(&usage);
 			}
 		}
 		total
@@ -1714,6 +1764,32 @@ impl SessionStore {
 		}
 		self.append_entry(SessionEntry {
 			kind: "mode_change".to_string(),
+			id: id.clone(),
+			parent_id: self.leaf_id().map(str::to_string),
+			timestamp: output::iso8601(SystemTime::now()),
+			extra: serde_json::Value::Object(extra),
+		})?;
+		Ok(id)
+	}
+
+	/// TS `appendCustomEntry(customType, data)`: a plain `custom` entry (never
+	/// `custom_message`, so it never replays into the model context).
+	pub fn append_custom(
+		&mut self,
+		custom_type: &str,
+		data: Option<serde_json::Value>,
+	) -> Result<String, String> {
+		let id = format!("entry-{}", output::session_id());
+		let mut extra = serde_json::Map::new();
+		extra.insert(
+			"customType".to_string(),
+			serde_json::Value::String(custom_type.to_string()),
+		);
+		if let Some(data) = data.filter(|data| !data.is_null()) {
+			extra.insert("data".to_string(), data);
+		}
+		self.append_entry(SessionEntry {
+			kind: "custom".to_string(),
 			id: id.clone(),
 			parent_id: self.leaf_id().map(str::to_string),
 			timestamp: output::iso8601(SystemTime::now()),
@@ -4128,6 +4204,54 @@ mod tests {
 		assert_eq!(usage.assistant_messages, 0, "task usage is not an assistant message");
 		assert_eq!(usage.reported_messages, 0);
 		assert!(usage.is_known(), "subagent usage is still reported usage");
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn session_usage_counts_background_child_once_across_hub_and_custom_entry() {
+		const TS: &str = "2026-01-01T00:00:00.000Z";
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("background-usage")));
+		assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+		let usage = serde_json::json!({
+			"input": 4,
+			"output": 6,
+			"cacheRead": 1,
+			"cacheWrite": 0,
+			"totalTokens": 11,
+		});
+		let mut hub =
+			SessionMessage::tool_result("c1", "hub", MessageContent::Text("jobs".to_string()), false, 1);
+		hub.extra.insert(
+			"details".to_string(),
+			serde_json::json!({
+				"op": "jobs",
+				"jobs": [{ "id": "bg-1", "usage": usage.clone() }],
+			}),
+		);
+		store
+			.append_messages(&[MessageEntry::new("h1", None, TS, hub)])
+			.expect("append hub snapshot");
+		store
+			.append_custom(
+				BACKGROUND_USAGE_CUSTOM_TYPE,
+				Some(serde_json::json!({ "id": "bg-1", "usage": usage })),
+			)
+			.expect("append background usage");
+		let counted = store.session_usage();
+		assert_eq!(
+			(
+				counted.input,
+				counted.output,
+				counted.cache_read,
+				counted.cache_write,
+				counted.total_tokens
+			),
+			(4, 6, 1, 0, 11),
+			"one job id contributes its usage once, not once per entry kind"
+		);
+		assert_eq!(counted.assistant_messages, 0);
+		assert!(counted.is_known(), "background child usage is reported usage");
 		fs::remove_dir_all(dir).ok();
 	}
 

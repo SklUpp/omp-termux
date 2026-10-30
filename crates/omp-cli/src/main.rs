@@ -8,9 +8,10 @@ use std::time::Duration;
 use clap::Parser;
 use omp_cli::{
 	Error, Result,
+	acp,
 	agent::{self, AgentRunner, ExtraTool, RunRequest},
 	agents,
-	approve::Approvals,
+	approve::{ApprovalMode, Approvals},
 	args::{Command, normalize_continue_session_args, parse_cli, refused_verb_message},
 	catalog::Catalog,
 	completions,
@@ -676,6 +677,42 @@ fn run() -> std::result::Result<(), CliError> {
 		}
 	};
 
+	// `omp acp`: JSON-RPC 2.0 ACP over stdio. One `AcpRuntime` owns the
+	// transport writer; sessions are opened by the client through
+	// `session/new|load|resume|fork`, never from a positional prompt.
+	if let Some(Command::Acp { .. }) = &cli.command {
+		let auth = acp::AcpAuth::open(dirs::agent_dir().join("agent.db"))
+			.map_err(|err| CliError::fail(format!("cannot open agent.db for ACP: {err}")))?;
+		let runner: Arc<dyn AgentRunner> = native_runner.clone();
+		let mut recipe = acp::AcpRecipe::new(
+			runner,
+			session.config.clone(),
+			session.prompts.clone(),
+			session.skills.clone(),
+			Arc::clone(&session.catalog),
+			auth.resolver(),
+		);
+		// Default `AlwaysAsk` lets `AcpPermissionBroker` gate `bash/edit/delete/move`
+		// via `session/request_permission` unless `--approval-mode yolo` is set.
+		recipe.approval_mode = session.config.approval_mode.unwrap_or_default();
+		recipe.allow = session.config.allow.clone();
+		recipe.model = session.model.clone();
+		recipe.provider = session.provider.clone();
+		recipe.api_key = session.api_key.clone();
+		recipe.thinking = session.thinking;
+		recipe.max_time = session.max_time;
+		recipe.max_turns = session.max_turns;
+		recipe.tools_enabled = session.tools_enabled;
+		recipe.sessions_root = session
+			.session_dir
+			.clone()
+			.unwrap_or_else(SessionOptions::default_sessions_root);
+		recipe.plan_enabled = session.config.plan.enabled();
+		return acp::run(recipe, io::stdin().lock(), io::stdout(), Duration::from_secs(2))
+			.map(|_| ())
+			.map_err(|err| CliError::fail(err.to_string()));
+	}
+
 	// `--mode rpc`: the process speaks NDJSON command/event frames on stdout.
 	// `RpcMode` owns that single writer and its `ready` frame, so this path
 	// never builds a `Reporter`, never reads the terminal (approval and `ask`
@@ -1014,6 +1051,16 @@ fn apply_goal_intents(store: &mut SessionStore, goal_runtime: &GoalRuntime) {
 		let result = match intent {
 			GoalPersist::ModeChange { mode, data } => store.append_mode_change(mode, data),
 			GoalPersist::Completed(data) => store.append_goal_completed(data),
+			GoalPersist::BackgroundUsage { id, usage } => {
+				if store.enabled() {
+					store.append_custom(
+						goal::BACKGROUND_USAGE_CUSTOM_TYPE,
+						Some(serde_json::json!({ "id": id, "usage": usage })),
+					)
+				} else {
+					Ok(String::new())
+				}
+			},
 		};
 		if let Err(err) = result {
 			eprintln!("warning: {err}");
@@ -1170,7 +1217,13 @@ impl Session<'_> {
 	fn reconcile_goal_mode(&mut self) {
 		let goal_enabled = self.config.goal.enabled();
 		match goal::plan_restore(&self.store, goal_enabled) {
-			RestorePlan::Idle => self.goal.clear_accounting(),
+			// No goal on the active branch: drop any restored live goal so a
+			// resumed log without one cannot inherit a previous goal. The
+			// headless session is single-store, so this only guards reloads.
+			RestorePlan::Idle => {
+				self.goal.set_restored_state(None);
+				self.goal.clear_accounting();
+			},
 			RestorePlan::ClearGoalMode => {
 				self.goal.set_restored_state(None);
 				self.goal.clear_accounting();
@@ -1289,6 +1342,8 @@ impl Session<'_> {
 			tools_enabled: self.tools_enabled,
 			cancellation_token: None,
 			extra_tools: self.goal_extra_tools(),
+			acp_bridge: None,
+			extra_mcp_servers: Vec::new(),
 			internal_urls: None,
 			url_scope: None,
 			subagent_observer: None,
@@ -1430,7 +1485,7 @@ impl Session<'_> {
 			(Vec::new(), MessageContent::Text(full_prompt.clone()))
 		};
 
-		let user_id = format!("msg-{}", output::session_id());
+		let mut user_id = format!("msg-{}", output::session_id());
 		let parent_id = self.store.leaf_id().map(str::to_string);
 
 		let user_entry = MessageEntry::new(
@@ -1443,13 +1498,16 @@ impl Session<'_> {
 			if let Some(custom_type) = hidden_custom_type {
 				// Hidden continuation: never replayed as a user prompt, but it is
 				// part of the branch context a resumed session rebuilds.
-				if let Err(err) = self.store.append_custom_message(
+				// The continuation entries chain to the persisted `custom_message`
+				// entry, never to the unpersisted `msg-...` id above.
+				match self.store.append_custom_message(
 					custom_type,
 					&full_prompt,
 					false,
 					serde_json::Value::Null,
 				) {
-					eprintln!("warning: {err}");
+					Ok(id) => user_id = id,
+					Err(err) => eprintln!("warning: {err}"),
 				}
 			} else if let Err(err) = user_entry.validate() {
 				eprintln!("warning: {err}");

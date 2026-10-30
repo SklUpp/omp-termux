@@ -191,6 +191,12 @@ pub struct RunRequest {
 	/// registered — or repeated in this batch — is a hard error, never a silent
 	/// replacement of a builtin.
 	pub extra_tools: Vec<ExtraTool>,
+	/// ACP reverse-call bridge mounted on this turn's `read`/`write`/`bash`
+	/// tools and inherited by child registries. `None` keeps every tool local.
+	pub acp_bridge: Option<AcpBridgeHandle>,
+	/// ACP `session/new|load|resume|fork` client-supplied MCP servers, merged
+	/// with file-discovered servers before the existing launch/approval gate.
+	pub extra_mcp_servers: Vec<crate::config::DiscoveredMcpServer>,
 	/// Session internal URL router: the RPC host `scheme://` handlers plus any
 	/// scheme the runner installs. Shared with child agents so a child resolves
 	/// exactly what the root does; `None` disables every non-filesystem source.
@@ -236,6 +242,16 @@ impl std::fmt::Debug for ResolverHandle {
 /// installed.
 #[derive(Clone)]
 pub struct ObserverHandle(pub std::sync::Arc<dyn pi_agent::supervisor::SubagentObserver>);
+
+/// ACP reverse-call bridge for one turn. Wrapper keeps `RunRequest: Debug`.
+#[derive(Clone)]
+pub struct AcpBridgeHandle(pub std::sync::Arc<dyn pi_agent::AcpClientBridge>);
+
+impl std::fmt::Debug for AcpBridgeHandle {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("AcpBridgeHandle")
+	}
+}
 
 impl std::fmt::Debug for ObserverHandle {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

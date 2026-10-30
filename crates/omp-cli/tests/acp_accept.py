@@ -153,9 +153,10 @@ class Client:
         self.data = root / "data"
         self.state = root / "state"
         self.tmp = root / "tmp"
-        for path in (self.config, self.data, self.state, self.tmp):
+        self.agent_dir = self.config / "agent"
+        for path in (self.config, self.agent_dir, self.data, self.state, self.tmp):
             path.mkdir(parents=True, exist_ok=True)
-        (self.config / "config.yml").write_text(
+        (self.agent_dir / "config.yml").write_text(
             "defaultModel: mock/mock-model\n"
             "providers:\n"
             "  mock:\n"
@@ -164,7 +165,11 @@ class Client:
             "    apiKey: test-key\n",
             encoding="utf-8",
         )
-        (self.config / "models.yml").write_text(
+        (self.agent_dir / "models.json").write_text(
+            '{"mock":{"mock-model":{"id":"mock-model","provider":"mock","contextWindow":128000}}}\n',
+            encoding="utf-8",
+        )
+        (self.agent_dir / "models.yml").write_text(
             "providers:\n"
             "  mock:\n"
             f"    baseUrl: \"{provider.base_url}\"\n"
@@ -178,7 +183,7 @@ class Client:
         env = dict(os.environ)
         env.update(
             PI_CONFIG_DIR=str(self.config),
-            PI_CODING_AGENT_DIR=str(self.config / "agent"),
+            PI_CODING_AGENT_DIR=str(self.agent_dir),
             HOME=str(root),
             XDG_DATA_HOME=str(self.data),
             XDG_STATE_HOME=str(self.state),
@@ -549,7 +554,7 @@ def run(binary: str) -> None:
     finally:
         client.kill()
         provider.stop()
-        shutil.rmtree(root, ignore_errors=True)
+        print(f"acp_accept artifacts retained at: {root}")
 
 
 def chunk_text(chunks):

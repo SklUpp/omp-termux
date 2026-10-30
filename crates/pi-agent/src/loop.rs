@@ -10,7 +10,7 @@ use crate::{
 	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
 	state::{
 		AgentConfig, AgentContext, AgentState, ContentPart, Message, Role, SoftToolRequirement,
-		ToolApprover, ToolCall, ToolPolicy, ToolResult, TurnResult, TurnStatus,
+		TokenUsage, ToolApprover, ToolCall, ToolPolicy, ToolResult, TurnResult, TurnStatus,
 	},
 	supervisor::BackgroundResultSink,
 	tools::{registry::ToolRegistry, scheduler::ToolScheduler},
@@ -217,6 +217,13 @@ pub enum AgentEvent {
 	/// that was not injected — so the host can persist it at that position and
 	/// mirror it instead of losing the accepted instruction.
 	UserSteer { parts: Vec<ContentPart> },
+	/// One finished background result was injected as a user message at this
+	/// boundary. Emitted after the message is in history, exactly once per
+	/// `id`: the supervisor's consumption mark is the only authority, and the
+	/// same id can never arrive through auto-delivery and the hub snapshot path.
+	/// `usage` is the child's summed provider report (`None` = unreported), so a
+	/// host accounts it once per id instead of re-deriving it from the text.
+	BackgroundResult { id: String, text: String, usage: Option<TokenUsage> },
 }
 
 /// Announce one accepted steering message to the host event stream.
@@ -539,11 +546,26 @@ impl AgentLoop {
 
 	/// Push undelivered background results and buffered peer mail as user
 	/// messages. Called only between turns, so history never has an unanswered
-	/// tool call.
-	fn inject_boundary_messages(&self, state: &mut AgentState) {
+	/// tool call. Each delivered result also reaches the host as
+	/// [`AgentEvent::BackgroundResult`] once per id, carrying the child's
+	/// reported usage so root accounting never parses the envelope.
+	async fn inject_boundary_messages(
+		&self,
+		state: &mut AgentState,
+		events: Option<&mpsc::Sender<AgentEvent>>,
+	) {
 		if let Some(sink) = &self.background_results {
-			for text in sink.take_background_results() {
-				state.messages.push(Message::user(text));
+			for delivery in sink.take_background_deliveries() {
+				state.messages.push(Message::user(delivery.text.clone()));
+				if let Some(events) = events {
+					let _ = events
+						.send(AgentEvent::BackgroundResult {
+							id: delivery.id,
+							text: delivery.text,
+							usage: delivery.usage,
+						})
+						.await;
+				}
 			}
 		}
 		if let Some((mailbox, agent_id)) = &self.peer_inbox {
@@ -663,7 +685,7 @@ impl AgentLoop {
 		}
 		state.messages.push(user_message);
 		let _presence = PresenceGuard::install(&self.peer_inbox);
-		self.inject_boundary_messages(state);
+		self.inject_boundary_messages(state, events.as_ref()).await;
 		let ctx = AgentContext::with_approver(
 			self.config.cwd.clone(),
 			cancellation_token.clone(),
@@ -687,7 +709,7 @@ impl AgentLoop {
 			}
 			// Results that settled while the previous assistant turn ran land
 			// before this one, exactly once.
-			self.inject_boundary_messages(state);
+			self.inject_boundary_messages(state, events.as_ref()).await;
 
 			// Peek the session queue before compaction so the reminder is part
 			// of this request and stays in the newest history. A requirement

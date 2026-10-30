@@ -2,7 +2,7 @@
 
 Cold-start handoff: [`rust-cli-project-context.md`](rust-cli-project-context.md) — goal, verified state, authorizations, agent/worktree rules, runtime anchors, FIX subset. This plan remains the authoritative inventory; do not duplicate its per-ID tables there.
 
-Status (2026-10-30): objective is full plan completion; the historical FIX-only queue is not the scope limit. Published HEAD `abe3d8c274`, Actions `40944110426`: Android/native grep PASS, host FAIL on a stale JSON-result assertion. Local correction passed its unit/live-SSE/CLI checks, not full CI. Inventory tables below carry 2026-10-30 presence corrections; per-ID behavior depth remains un-audited. Target remains a separate Rust artifact on Termux/aarch64 Bionic; installed Bun-based CLI remains unchanged.
+Status (2026-10-30): objective is full plan completion; the historical FIX-only queue is not the scope limit. Accepted local slices now include task isolation, RPC/URI/auth integration, continue selectors, explicit bounded LSP/DAP/eval teardown, full headless/RPC Goal Mode + turn budgets (`+Nk[!]`, background child usage dedup, 53/53 actual CLI/RPC acceptance + 2/2 eval hard-budget unit regressions), and `omp acp` stdio transport + session adapter + reverse bridge (42/42 unit regressions + `acp_accept.py` E2E OK; pi-agent plan write-guard/propose policy slice remains open). CI workflow now also runs `pi-iso`, `pi-ast`, `pi-walker`, and `pi-shell`. Target remains a separate Rust artifact on Termux/aarch64 Bionic; installed Bun-based CLI remains unchanged.
 
 ## Baseline and axis facts (2026-10-29 run snapshot; source axes corrected 2026-10-30)
 
@@ -101,7 +101,7 @@ Disposition vocabulary: **implemented** (registered + behavior path + consumer t
 | ID (aliases) | Current source state | Evidence / behavior | Acceptance | Gap / prerequisite |
 |---|---|---|---|---|
 | `launch` | partial | Default path with no subcommand; text/json modes; `runtime` run path; TEST `tests/live_sse_integration.rs`; SMOKE0f601 PTY | open | `acp`/`rpc-ui` parse-reject; `rpc` present (`output.rs:14-24`); many launch flags missing. |
-| `acp` | missing; startup-refused | Not in clap `Command`; refused before boot with the missing reason (`args.rs:423-450`, `main.rs:118-121`) | open | ACP stdio server absent; the refusal guard is not an implementation. |
+| `acp` | implemented (adapter + reverse bridge; plan write-guard slice open) | `Command::Acp` (`crates/omp-cli/src/acp/*`, `main.rs:683`); 42/42 unit tests + `tests/acp_accept.py` E2E OK (initialize, new/load/resume/fork/list/close, prompt streaming, permission broker + `allow_always`, cancel, mode/config, malformed/unknown recovery, EOF cleanup) | partial (stdio + reverse bridge verified; pi-agent plan write-guard / `xd://propose` policy slice open) | Plan mode runtime write-guard (`local://` only) and `xd://propose` tool policy composition remain open. |
 | `auth-broker` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Local loopback port / auth store. |
 | `auth-gateway` | missing; startup-refused | No Rust command; startup refusal names the missing reason | open | Broker reachability / proxy port. |
 | `agents` | partial | `args.rs:408-426`, `agents.rs`, `main.rs:144-168`; unpack/list subset; catalog smoke in history | open | No plugin agents (`agents.rs:5-7`); catalog-only validation. |
@@ -185,7 +185,7 @@ Presence axis (2026-10-30, read-only source audit): 19 of 32 canonical IDs sourc
 | ID | Reachability | Behavior | Acceptance | Gap |
 |---|---|---|---|---|
 | `yield` | reachable | `YieldTool` registered only in `child_registry` (`crates/pi-agent/src/supervisor.rs:944`); result/error/streaming forms | open | Not at root; no standalone channel. |
-| `goal` | deferred | No Rust `GoalTool`; eval `budget()` errors (`crates/omp-cli/src/eval_host.rs:407-414`) | open | Goal Mode unavailable by design. |
+| `goal` | implemented (headless/RPC) | `GoalTool` five TS ops (`create/get/complete/resume/drop`), `GoalRuntime`, `--tools goal` vocab, Idle session-switch/branch reset, background child usage dedup, eval `budget()` + `+Nk!` hard `agent()` gate (`crates/omp-cli/src/goal.rs`, `goal_tool.rs`, `eval_host.rs`) | verified (12/12 `goal::tests`, 1/1 `goal_tool::tests`, 2/2 `eval_host` hard/advisory budget, 53/53 actual CLI/RPC `goal_acceptance.py`) | TUI `/goal` menus/interview are outside the headless boundary; see `docs/goal-mode.md`. |
 | `think` | reachable | `ThinkTool` always on supervisor root+child (`crates/pi-agent/src/supervisor.rs:891,945`) | open | Upstream gates on externalThinking; Rust always-on — known divergence. |
 
 ### Wire APIs (14)

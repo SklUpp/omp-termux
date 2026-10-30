@@ -19,8 +19,8 @@ use super::{
 	capabilities,
 	protocol::{self, ClientCapabilities, INTERNAL_ERROR, RequestError},
 	session::{
-		AcpRecipe, AcpRuntime, SessionManager, absolute_cwd, extensions_payload, list_payload,
-		usage_payload,
+		AcpRecipe, AcpRuntime, AcpSession, SessionManager, absolute_cwd, extensions_payload,
+		list_payload, usage_payload,
 	},
 	session_list,
 	transport::{Dispatcher, Transport},
@@ -109,8 +109,8 @@ impl AcpAgent {
 					.and_then(Value::as_str)
 					.ok_or_else(RequestError::invalid_params)?;
 				let cwd = absolute_cwd(cwd)?;
-				reject_mcp_servers(params)?;
-				let session = self.runtime().new_session(cwd, &self.caps())?;
+				let mcp = mcp_servers(params)?;
+				let session = self.runtime().new_session(cwd, &self.caps(), mcp)?;
 				let response = session.protocol_response();
 				self.manager.insert(Arc::clone(&session));
 				session.schedule_bootstrap();
@@ -119,7 +119,7 @@ impl AcpAgent {
 			"session/load" => {
 				let id = session_id(params)?;
 				let cwd = absolute_cwd(cwd_param(params)?)?;
-				reject_mcp_servers(params)?;
+				let mcp = mcp_servers(params)?;
 				let session = match self.manager.get(&id) {
 					Some(session) => {
 						if session.cwd() != cwd.as_path() {
@@ -132,10 +132,11 @@ impl AcpAgent {
 								),
 							));
 						}
+						session.set_mcp_servers(mcp);
 						session
 					},
 					None => {
-						let session = self.runtime().load_session(&id, cwd, &self.caps())?;
+						let session = self.runtime().load_session(&id, cwd, &self.caps(), mcp)?;
 						self.manager.insert(Arc::clone(&session));
 						session
 					},
@@ -163,7 +164,7 @@ impl AcpAgent {
 			"session/resume" => {
 				let id = session_id(params)?;
 				let cwd = absolute_cwd(cwd_param(params)?)?;
-				reject_mcp_servers(params)?;
+				let mcp = mcp_servers(params)?;
 				let session = match self.manager.get(&id) {
 					Some(session) => {
 						if session.cwd() != cwd.as_path() {
@@ -176,10 +177,11 @@ impl AcpAgent {
 								),
 							));
 						}
+						session.set_mcp_servers(mcp);
 						session
 					},
 					None => {
-						let session = self.runtime().load_session(&id, cwd, &self.caps())?;
+						let session = self.runtime().load_session(&id, cwd, &self.caps(), mcp)?;
 						self.manager.insert(Arc::clone(&session));
 						session
 					},
@@ -194,13 +196,12 @@ impl AcpAgent {
 			"session/fork" => {
 				let id = session_id(params)?;
 				let cwd = absolute_cwd(cwd_param(params)?)?;
-				reject_mcp_servers(params)?;
+				let mcp = mcp_servers(params)?;
 				let source = match self.manager.get(&id) {
 					Some(session) => session,
 					None => {
-						let session = self
-							.runtime()
-							.load_session(&id, cwd.clone(), &self.caps())?;
+						let session =
+							self.runtime().load_session(&id, cwd.clone(), &self.caps(), mcp.clone())?;
 						session
 					},
 				};
@@ -210,7 +211,7 @@ impl AcpAgent {
 						format!("ACP session fork is unavailable while a prompt is in progress: {id}"),
 					));
 				}
-				let forked = self.runtime().fork_session(&source, cwd, &self.caps())?;
+				let forked = self.runtime().fork_session(&source, cwd, &self.caps(), mcp)?;
 				let response = json!({
 					"sessionId": forked.id(),
 					"configOptions": forked.config_options(),
@@ -343,33 +344,49 @@ fn cwd_param(params: Option<&Value>) -> Result<&str, RequestError> {
 		.ok_or_else(RequestError::invalid_params)
 }
 
-/// Dynamic ACP MCP servers have no native manager in this build. A non-empty
-/// request must not pretend to connect, so it fails with the reason instead of
-/// silently dropping the servers.
-fn reject_mcp_servers(params: Option<&Value>) -> Result<(), RequestError> {
+/// Parse ACP `mcpServers` into the native discovery shape.
+///
+/// Accepts exactly the transports the native manager launches (`stdio`, `http`,
+/// `sse`); any other `type` fails, matching the upstream defensive reject.
+/// Validation and env expansion reuse [`crate::config::parse_and_validate_mcp_server`],
+/// so client-supplied servers pass the same schema gate as configured ones.
+fn mcp_servers(
+	params: Option<&Value>,
+) -> Result<Vec<crate::config::DiscoveredMcpServer>, RequestError> {
 	let Some(servers) = params
 		.and_then(|params| params.get("mcpServers"))
 		.and_then(Value::as_array)
 	else {
-		return Ok(());
+		return Ok(Vec::new());
 	};
-	if servers.is_empty() {
-		return Ok(());
-	}
+	let mut parsed = Vec::with_capacity(servers.len());
+	let mut seen = std::collections::BTreeSet::new();
 	for server in servers {
-		if let Some(kind) = server.get("type").and_then(Value::as_str)
-			&& !matches!(kind, "http" | "sse" | "stdio")
-		{
+		let name = server
+			.get("name")
+			.and_then(Value::as_str)
+			.ok_or_else(|| RequestError::new(INTERNAL_ERROR, "mcpServers entry requires a name"))?;
+		if !crate::config::is_valid_mcp_server_name(name) {
 			return Err(RequestError::new(
 				INTERNAL_ERROR,
-				format!("Unsupported MCP server transport: {kind}"),
+				format!("Invalid MCP server name: {name}"),
 			));
 		}
+		if !seen.insert(name.to_string()) {
+			return Err(RequestError::new(
+				INTERNAL_ERROR,
+				format!("Duplicate MCP server name: {name}"),
+			));
+		}
+		let config = crate::config::parse_and_validate_mcp_server(name, server)
+			.map_err(|message| RequestError::new(INTERNAL_ERROR, message))?;
+		parsed.push(crate::config::DiscoveredMcpServer {
+			name: name.to_string(),
+			config,
+			source_path: std::path::PathBuf::from("<acp>"),
+		});
 	}
-	Err(RequestError::new(
-		INTERNAL_ERROR,
-		"ACP client-supplied MCP servers are not supported by this build",
-	))
+	Ok(parsed)
 }
 
 /// Transport-facing dispatcher. Holds the agent weakly so the transport's

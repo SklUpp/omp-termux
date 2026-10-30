@@ -473,8 +473,7 @@ const EXCLUDED_VERBS: [(&str, &str); 6] = [
 
 /// Known upstream verbs this binary does not implement yet, including the
 /// upstream registry aliases `img` and `q`.
-const MISSING_VERBS: [&str; 27] = [
-	"acp",
+const MISSING_VERBS: [&str; 26] = [
 	"auth-broker",
 	"auth-gateway",
 	"bench",
@@ -506,9 +505,10 @@ const MISSING_VERBS: [&str; 27] = [
 /// Refusal for a known upstream verb that would otherwise be absorbed as prompt
 /// text, or `None` when argv is not such an invocation.
 ///
-/// `omp acp` currently parses as the prompt "acp": there is no such clap
-/// subcommand, so `main` falls through to the agent runtime and starts config,
-/// session, provider, and tool setup for text the user meant as a command.
+/// A missing verb such as `omp compress` would otherwise parse as the prompt
+/// "compress": there is no such clap subcommand, so `main` falls through to the
+/// agent runtime and starts config, session, provider, and tool setup for text
+/// the user meant as a command.
 /// Scanning mirrors the TypeScript `leadingSubcommandIndex`: leading launch flags
 /// and the values they consume are skipped (the value category comes from the
 /// clap definition, so it cannot drift from the real surface, including combined
@@ -765,6 +765,14 @@ fn flag_value_kind(arg: &clap::Arg) -> FlagValueKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
+	/// Serve the Agent Client Protocol over stdio.
+	Acp {
+		/// Terminal-auth entry point advertised to ACP clients
+		/// (`ACP_TERMINAL_AUTH_FLAG`); no TUI in this build.
+		#[arg(long = "acp-terminal-auth", hide = true)]
+		terminal_auth: bool,
+	},
+
 	/// Read prompts from stdin until `/exit`.
 	Repl,
 
@@ -1414,7 +1422,7 @@ mod tests {
 
 	#[test]
 	fn known_missing_verbs_are_refused_not_absorbed_as_prompts() {
-		for verb in ["acp", "browser-relay", "auth-broker", "img", "q"] {
+		for verb in ["compress", "browser-relay", "auth-broker", "img", "q"] {
 			let message = refusal(&[verb]).unwrap_or_else(|| panic!("{verb} must be refused"));
 			assert!(message.contains(&format!("`omp {verb}`")), "{message}");
 			assert!(!message.contains("excluded"), "{verb} is missing, not excluded: {message}");
@@ -1461,16 +1469,16 @@ mod tests {
 		assert_eq!(refusal(&["--resume", "acp"]), None);
 		assert_eq!(refusal(&["--model=acp", "hello"]), None);
 		// A leading valueless flag does not turn the following verb into a prompt.
-		assert!(refusal(&["--no-tools", "acp"]).is_some());
+		assert!(refusal(&["--no-tools", "stats"]).is_some());
 		assert!(refusal(&["-p", "compress"]).is_some());
-		assert!(refusal(&["-c", "acp"]).is_some());
+		assert!(refusal(&["-c", "stats"]).is_some());
 		// Combined short flags: valueless ones keep the verb in the command slot…
-		assert!(refusal(&["-pc", "acp"]).is_some());
-		assert!(refusal(&["-cp", "acp"]).is_some());
+		assert!(refusal(&["-pc", "stats"]).is_some());
+		assert!(refusal(&["-cp", "stats"]).is_some());
 		// …while a value-taking flag at the tail consumes the next token, and the
 		// attached form (`-rc` = resume "c") consumes only the cluster tail.
-		assert_eq!(refusal(&["-pr", "acp"]), None);
-		assert!(refusal(&["-rc", "acp"]).is_some());
+		assert_eq!(refusal(&["-pr", "stats"]), None);
+		assert!(refusal(&["-rc", "stats"]).is_some());
 		// A recognized subcommand keeps its own dispatch.
 		assert_eq!(refusal(&["models", "acp"]), None);
 		assert_eq!(refusal(&["read", "acp"]), None);
@@ -1490,17 +1498,17 @@ mod tests {
 		}
 		// Once an operand leads, a later `--help` does not rescue the verb: this
 		// build cannot help with a command it does not have.
-		assert!(refusal(&["acp", "--help"]).is_some());
-		assert!(refusal(&["--print", "acp", "--help"]).is_some());
+		assert!(refusal(&["stats", "--help"]).is_some());
+		assert!(refusal(&["--print", "stats", "--help"]).is_some());
 		// A help character consumed as a flag value is not a request.
-		assert!(refusal(&["-rh", "acp"]).is_some());
-		assert!(refusal(&["--system-prompt", "--help", "acp"]).is_some());
-		assert!(refusal(&["--resume=--help", "acp"]).is_some());
+		assert!(refusal(&["-rh", "stats"]).is_some());
+		assert!(refusal(&["--system-prompt", "--help", "stats"]).is_some());
+		assert!(refusal(&["--resume=--help", "stats"]).is_some());
 		// An attached cluster value ends that flag, not the scan: a later `--help`
 		// is still the leading help request.
-		assert_eq!(refusal(&["-rh", "--help", "acp"]), None);
-		assert_eq!(refusal(&["-rc", "--help", "acp"]), None);
-		assert!(refusal(&["-rc", "acp"]).is_some());
+		assert_eq!(refusal(&["-rh", "--help", "stats"]), None);
+		assert_eq!(refusal(&["-rc", "--help", "stats"]), None);
+		assert!(refusal(&["-rc", "stats"]).is_some());
 	}
 
 	#[test]

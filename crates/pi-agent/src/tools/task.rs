@@ -1564,6 +1564,9 @@ fn settle_background_result(
 				);
 				return;
 			}
+			// Reported turns count even when the child later fails validation;
+			// an unreported child stays `None` (unknown, never zero-filled).
+			let usage = child_usage(&turns);
 			let finalized = finalize_output(&item, &turns, &base, false);
 			let (output, _) = cap_result_text(&finalized.output);
 			if finalized.failed {
@@ -1574,8 +1577,9 @@ fn settle_background_result(
 					duration_ms,
 					&output,
 					None,
+					usage.as_ref(),
 				);
-				supervisor.mark_failed(&id, duration_ms, &envelope);
+				supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, usage);
 				supervisor.enqueue_delivery(&id, envelope);
 				return;
 			}
@@ -1595,8 +1599,9 @@ fn settle_background_result(
 				duration_ms,
 				&output,
 				merge_summary.as_deref(),
+				usage.as_ref(),
 			);
-			supervisor.mark_completed(&id, duration_ms, &envelope);
+			supervisor.mark_completed_with_usage(&id, duration_ms, &envelope, usage);
 			supervisor.enqueue_delivery(&id, envelope);
 		},
 		Err(AgentError::Interrupted) => {
@@ -1610,6 +1615,7 @@ fn settle_background_result(
 				"failed (exit 1)",
 				duration_ms,
 				&message,
+				None,
 				None,
 			);
 			supervisor.mark_failed(&id, duration_ms, &envelope);
@@ -1649,6 +1655,11 @@ where
 /// `<task-result>` envelope from `prompts/tools/task-summary.md`. No
 /// `agent://`/`history://` pointer is emitted: this build has no transcript
 /// resolver, so a link would be fake.
+///
+/// `usage` carries the child's summed provider-reported counters (the same
+/// value retained on the job record). It is rendered before `<output>` so the
+/// queued-body byte cap can truncate the body without ever dropping the
+/// counters.
 fn task_result_envelope(
 	id: &str,
 	agent: &str,
@@ -1656,16 +1667,41 @@ fn task_result_envelope(
 	duration_ms: u64,
 	output: &str,
 	merge_summary: Option<&str>,
+	usage: Option<&TokenUsage>,
 ) -> String {
 	let mut envelope = format!(
-		"<task-result id=\"{id}\" agent=\"{agent}\" status=\"{status}\" duration=\"{}\">\n<output>\n{output}\n</output>",
+		"<task-result id=\"{id}\" agent=\"{agent}\" status=\"{status}\" duration=\"{}\">",
 		format_duration_ms(duration_ms)
 	);
+	if let Some(usage) = usage {
+		envelope.push('\n');
+		envelope.push_str(&usage_element(usage));
+	}
+	envelope.push_str(&format!("\n<output>\n{output}\n</output>"));
 	if let Some(summary) = merge_summary.filter(|summary| !summary.is_empty()) {
 		envelope.push_str(&format!("\n<merge-summary>\n{summary}\n</merge-summary>"));
 	}
 	envelope.push_str("\n</task-result>");
 	envelope
+}
+
+/// `<usage ... />` child element of the task-result envelope. A reported
+/// counter is always printed (a zero inside a reported snapshot is real);
+/// `totalTokens`/`reasoningTokens` appear only when the provider reported
+/// them, so an absent value is never fabricated as zero.
+fn usage_element(usage: &TokenUsage) -> String {
+	let mut element = format!(
+		"<usage input=\"{}\" output=\"{}\" cacheRead=\"{}\" cacheWrite=\"{}\"",
+		usage.input, usage.output, usage.cache_read, usage.cache_write
+	);
+	if usage.total_tokens > 0 {
+		element.push_str(&format!(" totalTokens=\"{}\"", usage.total_tokens));
+	}
+	if let Some(reasoning) = usage.reasoning_tokens {
+		element.push_str(&format!(" reasoningTokens=\"{reasoning}\""));
+	}
+	element.push_str(" />");
+	element
 }
 
 fn format_duration_ms(milliseconds: u64) -> String {
@@ -2830,6 +2866,51 @@ mod tests {
 		])
 		.expect("batch usage");
 		assert_eq!((batch.input, batch.output), (4, 6));
+	}
+
+	/// The background delivery envelope carries the child's reported counters
+	/// exactly once, before `<output>`, so the queued-body cap can never drop
+	/// them; an unreported child adds no element (never zero-filled).
+	#[test]
+	fn task_result_envelope_carries_reported_usage_once_before_output() {
+		let usage = TokenUsage {
+			input: 11,
+			output: 7,
+			cache_read: 3,
+			cache_write: 2,
+			total_tokens: 23,
+			reasoning_tokens: Some(4),
+		};
+		let envelope = task_result_envelope(
+			"task-1",
+			"scout",
+			"completed",
+			1_500,
+			"body",
+			None,
+			Some(&usage),
+		);
+		assert_eq!(envelope.matches("<usage").count(), 1, "usage appears exactly once");
+		assert!(envelope.contains("input=\"11\""));
+		assert!(envelope.contains("cacheRead=\"3\""));
+		assert!(envelope.contains("totalTokens=\"23\""));
+		assert!(envelope.contains("reasoningTokens=\"4\""));
+		assert!(
+			envelope.find("<usage").expect("usage") < envelope.find("<output>").expect("output"),
+			"counters render before the capped body"
+		);
+
+		let unreported =
+			task_result_envelope("task-2", "scout", "completed", 1, "body", None, None);
+		assert!(!unreported.contains("<usage"), "no report, no zero-filled element");
+
+		// Even a body past the per-result cap keeps the counters.
+		let long = "x".repeat(crate::supervisor::MAX_RESULT_BYTES + 16);
+		let huge =
+			task_result_envelope("task-3", "scout", "completed", 1, &long, None, Some(&usage));
+		let (capped, truncated) = cap_result_text(&huge);
+		assert!(truncated);
+		assert!(capped.contains("<usage input=\"11\""));
 	}
 
 	struct NullProvider;

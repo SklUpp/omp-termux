@@ -660,6 +660,7 @@ mod tests {
 			limits: DelegationLimits::default(),
 			artifacts_dir,
 			next_artifact: Mutex::new(None),
+			goal: None,
 		}
 	}
 
@@ -1067,5 +1068,80 @@ mod tests {
 		assert!(bridged.get("think").is_some());
 		assert!(bridged.get("yield").is_some());
 		assert!(bridged.get("eval").is_none());
+	}
+
+	/// Counts child eval binds; a blocked `agent()` must never reach one.
+	struct BindRecorder {
+		binds: Arc<std::sync::atomic::AtomicUsize>,
+	}
+
+	#[async_trait]
+	impl EvalToolBinder for BindRecorder {
+		fn bind(&self, _registry: &mut ToolRegistry, _owner: Option<&str>) {
+			self.binds.fetch_add(1, Ordering::SeqCst);
+		}
+	}
+
+	fn supervisored_host(goal: Arc<crate::goal::GoalRuntime>) -> (CliEvalHost, Arc<Supervisor>) {
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::new(UnusedProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		let mut eval_host = host(None);
+		eval_host.supervisor = Some(Arc::downgrade(&supervisor));
+		eval_host.goal = Some(goal);
+		(eval_host, supervisor)
+	}
+
+	#[tokio::test]
+	async fn hard_turn_budget_reports_and_blocks_eval_agent_before_spawn() {
+		let goal = Arc::new(crate::goal::GoalRuntime::new());
+		goal.begin_turn(Some("do work +1k!"), crate::goal::TokenCounters::default());
+		goal.record_eval_subagent_output(1000);
+		let (eval_host, supervisor) = supervisored_host(Arc::clone(&goal));
+		let binds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let binder: Arc<dyn EvalToolBinder> = Arc::new(BindRecorder { binds: Arc::clone(&binds) });
+		supervisor.set_eval_binder(Some(binder));
+		let ctx = AgentContext::new(PathBuf::from("."));
+
+		let budget = eval_host.budget(Value::Null, &ctx).await.expect("budget");
+		assert_eq!(budget, json!({"total": 1000, "spent": 1000, "hard": true}));
+
+		// The gate runs before argument validation and spawning: a bogus key
+		// must not leak a different error, and no child eval owner may bind.
+		let error = eval_host
+			.agent(json!({"prompt": "work", "bogus": true}), &ctx)
+			.await
+			.expect_err("hard budget must block agent()");
+		assert_eq!(
+			error,
+			"agent() blocked: turn token budget exhausted (1000/1000 output tokens). \
+			 Raise or drop the +Nk! ceiling to continue."
+		);
+		assert_eq!(binds.load(Ordering::SeqCst), 0, "blocked agent() must not spawn a child");
+	}
+
+	#[tokio::test]
+	async fn advisory_turn_budget_reports_soft_and_never_blocks_eval_agent() {
+		let goal = Arc::new(crate::goal::GoalRuntime::new());
+		goal.begin_turn(Some("do work +1k"), crate::goal::TokenCounters::default());
+		goal.record_eval_subagent_output(1500);
+		let (eval_host, _supervisor) = supervisored_host(goal);
+		let ctx = AgentContext::new(PathBuf::from("."));
+
+		let budget = eval_host.budget(Value::Null, &ctx).await.expect("budget");
+		assert_eq!(budget, json!({"total": 1000, "spent": 1500, "hard": false}));
+
+		// Spend over an advisory ceiling passes the gate and reaches
+		// `run_eval_agent`'s own validation.
+		let error = eval_host
+			.agent(json!({"prompt": "work", "bogus": true}), &ctx)
+			.await
+			.expect_err("invalid argument");
+		assert!(error.contains("unknown argument"), "advisory spend must not block: {error}");
 	}
 }

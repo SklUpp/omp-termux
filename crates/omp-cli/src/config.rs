@@ -389,6 +389,29 @@ impl CheckpointConfig {
 	}
 }
 
+/// `plan` settings group: ACP plan mode enablement (`plan.enabled`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanConfig {
+	/// `plan.enabled`; absent means [`Self::DEFAULT_ENABLED`] (`true`).
+	pub enabled: Option<bool>,
+}
+
+impl PlanConfig {
+	/// Upstream `plan.enabled` default (`settings-schema.ts:4743`).
+	pub const DEFAULT_ENABLED: bool = true;
+
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(Self::DEFAULT_ENABLED)
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+	}
+}
+
 /// `goal` settings group: Goal Mode and its headless continuation policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GoalConfig {
@@ -510,6 +533,8 @@ pub struct Config {
 	pub checkpoint:           CheckpointConfig,
 	/// `goal.*`: Goal Mode enablement and continuation policy.
 	pub goal:                 GoalConfig,
+	/// `plan.*`: ACP plan-mode enablement.
+	pub plan:                 PlanConfig,
 	/// `eval.*` backend enablement and interpreter groups.
 	pub eval_config:          EvalConfig,
 	/// `task.isolation.mode`; `None` means unset (defaults to `none`).
@@ -576,6 +601,7 @@ impl Config {
 		self.debug.merge(overlay.debug);
 		self.checkpoint.merge(overlay.checkpoint);
 		self.goal.merge(overlay.goal);
+		self.plan.merge(overlay.plan);
 		self.eval_config.merge(overlay.eval_config);
 		if overlay.task_isolation_mode.is_some() {
 			self.task_isolation_mode = overlay.task_isolation_mode;
@@ -1000,6 +1026,9 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	}
 	if let Some(enabled) = settings_leaf(value, "goal", "enabled", "goal.enabled") {
 		config.goal.enabled = expect_bool(enabled, "goal.enabled", path)?;
+	}
+	if let Some(enabled) = settings_leaf(value, "plan", "enabled", "plan.enabled") {
+		config.plan.enabled = expect_bool(enabled, "plan.enabled", path)?;
 	}
 	if let Some(modes) =
 		settings_leaf(value, "goal", "continuationModes", "goal.continuationModes")

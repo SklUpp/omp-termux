@@ -19,6 +19,14 @@ use serde_json::Value;
 
 use super::{protocol::{self, RequestError}, transport::{REPLY_POLL, Reply, Transport}};
 
+/// Reply budget used when a caller passes `None`.
+///
+/// Every reverse call is bounded: an ACP client that never answers must not
+/// wedge a turn forever. `600 s` is the existing RPC prompt budget
+/// (`rpc/auth.rs` `LOGIN_PROMPT_TIMEOUT`, upstream `rpc-mode.ts` 600_000 ms); a
+/// sender that legitimately needs longer passes an explicit [`Duration`].
+pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// A reverse call that produced no peer result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReverseError {
@@ -65,16 +73,17 @@ impl ReverseCaller {
 		Self { transport }
 	}
 
-	/// Request with no deadline and no cancellation signal.
+	/// Request bounded by [`DEFAULT_REPLY_TIMEOUT`] and no cancellation signal.
 	pub fn request(&self, method: &str, params: Option<Value>) -> Result<Value, ReverseError> {
 		self.request_cancellable(method, params, None, &|| false)
 	}
 
 	/// Request bounded by `timeout` and the caller's cancellation signal.
 	///
-	/// The wait polls every `REPLY_POLL` so a cancellation set by another
-	/// thread is observed without a second waker; a reply that races the signal
-	/// wins, matching the RPC dialog bridge.
+	/// `None` means [`DEFAULT_REPLY_TIMEOUT`], never "unbounded". The wait polls
+	/// every `REPLY_POLL` so a cancellation set by another thread is observed
+	/// without a second waker; a reply that races the signal wins, matching the
+	/// RPC dialog bridge.
 	pub fn request_cancellable(
 		&self,
 		method: &str,
@@ -82,7 +91,7 @@ impl ReverseCaller {
 		timeout: Option<Duration>,
 		cancelled: &dyn Fn() -> bool,
 	) -> Result<Value, ReverseError> {
-		let deadline = timeout.map(|timeout| Instant::now() + timeout);
+		let deadline = Instant::now() + timeout.unwrap_or(DEFAULT_REPLY_TIMEOUT);
 		if cancelled() {
 			return Err(ReverseError::Cancelled);
 		}
@@ -105,10 +114,7 @@ impl ReverseCaller {
 			});
 		}
 		loop {
-			let wait = match deadline {
-				Some(deadline) => deadline.saturating_duration_since(Instant::now()).min(REPLY_POLL),
-				None => REPLY_POLL,
-			};
+			let wait = deadline.saturating_duration_since(Instant::now()).min(REPLY_POLL);
 			match replies.recv_timeout(wait) {
 				Ok(Reply::Result(value)) => return Ok(value),
 				Ok(Reply::Error(error)) => return Err(ReverseError::Remote(error)),
@@ -131,7 +137,7 @@ impl ReverseCaller {
 						self.transport.unregister(&id);
 						return Err(ReverseError::Cancelled);
 					}
-					if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+					if Instant::now() >= deadline {
 						// A reply that raced the deadline wins, as above.
 						match replies.try_recv() {
 							Ok(Reply::Result(value)) => return Ok(value),
@@ -162,7 +168,7 @@ mod tests {
 	use serde_json::json;
 
 	use crate::acp::{
-		protocol::RequestError,
+		protocol::{self, RequestError},
 		transport::{Transport, test_support::{RecordingWriter, line, transport_with}},
 	};
 
@@ -227,6 +233,25 @@ mod tests {
 				assert_eq!(error.message, "\"Method not found\": terminal/create");
 				assert_eq!(error.data, Some(json!({ "method": "terminal/create" })));
 			},
+			other => panic!("unexpected {other:?}"),
+		}
+		assert_eq!(transport.pending_len(), 0);
+	}
+
+	#[test]
+	fn malformed_response_for_a_pending_call_fails_it_instead_of_leaking() {
+		let (caller, writer, transport) = caller_and_writer();
+		let handle = thread::spawn(move || {
+			caller.request("fs/read_text_file", Some(json!({ "path": "p" })))
+		});
+		let frame = writer.wait_frame(|frame| frame["method"] == json!("fs/read_text_file"));
+
+		// Right id, not a legal response: the call fails with the envelope
+		// error instead of waiting for a deadline that would leak the slot.
+		transport.handle_line(&line(json!({ "jsonrpc": "2.0", "id": frame["id"] })));
+		let error = handle.join().expect("join").expect_err("malformed response fails the call");
+		match error {
+			ReverseError::Remote(error) => assert_eq!(error.code, protocol::INVALID_REQUEST),
 			other => panic!("unexpected {other:?}"),
 		}
 		assert_eq!(transport.pending_len(), 0);

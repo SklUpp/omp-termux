@@ -648,6 +648,107 @@ impl ToolPolicy for StagedPreviewPolicy {
 	}
 }
 
+/// Outcome of one ACP reverse call.
+///
+/// Tools fall back to their native implementation only for [`Self::Unsupported`]
+/// (the client did not advertise the capability). A remote failure may have
+/// produced a side effect — a write or a started command — so retrying it
+/// natively could duplicate it; [`Self::Cancelled`] must never retry either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpClientError {
+	/// The client did not advertise this method, or refused to serve it.
+	Unsupported,
+	/// The request was sent and failed.
+	Remote(String),
+	/// The turn was cancelled before a result arrived.
+	Cancelled,
+}
+
+impl std::fmt::Display for AcpClientError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Unsupported => f.write_str("ACP client did not advertise this capability"),
+			Self::Remote(message) => write!(f, "ACP client call failed: {message}"),
+			Self::Cancelled => f.write_str("ACP client call cancelled"),
+		}
+	}
+}
+
+impl std::error::Error for AcpClientError {}
+
+/// Reverse calls the ACP client advertised for one session.
+///
+/// Mounted on the native `read`/`write`/`bash` tool instances by the host
+/// composition (root registry plus the supervisor's child registries). Methods
+/// are async because the transport answers on another thread; implementations
+/// MUST NOT block a Tokio worker while waiting (use `spawn_blocking`).
+#[async_trait]
+pub trait AcpClientBridge: Send + Sync {
+	/// `clientCapabilities.fs.readTextFile`.
+	fn supports_fs_read(&self) -> bool {
+		false
+	}
+
+	/// `clientCapabilities.fs.writeTextFile`.
+	fn supports_fs_write(&self) -> bool {
+		false
+	}
+
+	/// `clientCapabilities.terminal`.
+	fn supports_terminal(&self) -> bool {
+		false
+	}
+
+	async fn read_text_file(
+		&self,
+		path: &str,
+		line: Option<u64>,
+		limit: Option<u64>,
+		cancel: &CancellationToken,
+	) -> Result<String, AcpClientError>;
+
+	async fn write_text_file(
+		&self,
+		path: &str,
+		content: &str,
+		cancel: &CancellationToken,
+	) -> Result<(), AcpClientError>;
+
+	async fn terminal_create(
+		&self,
+		command: &str,
+		args: Vec<String>,
+		env: Vec<(String, String)>,
+		cwd: Option<&str>,
+		output_byte_limit: Option<u64>,
+		cancel: &CancellationToken,
+	) -> Result<String, AcpClientError>;
+
+	async fn terminal_output(
+		&self,
+		terminal_id: &str,
+		cancel: &CancellationToken,
+	) -> Result<serde_json::Value, AcpClientError>;
+
+	async fn terminal_wait_for_exit(
+		&self,
+		terminal_id: &str,
+		cancel: &CancellationToken,
+	) -> Result<serde_json::Value, AcpClientError>;
+
+	async fn terminal_kill(
+		&self,
+		terminal_id: &str,
+		cancel: &CancellationToken,
+	) -> Result<serde_json::Value, AcpClientError>;
+
+	async fn terminal_release(
+		&self,
+		terminal_id: &str,
+		cancel: &CancellationToken,
+	) -> Result<serde_json::Value, AcpClientError>;
+}
+
 /// Tool approval gate checked prior to executing side-effecting operations.
 #[async_trait]
 pub trait ToolApprover: Send + Sync {

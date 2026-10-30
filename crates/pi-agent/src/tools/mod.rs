@@ -53,7 +53,7 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::state::{AgentContext, ToolResult};
+use crate::state::{AcpClientBridge, AcpClientError, AgentContext, ToolResult};
 use crate::tools::process::{ProcessBackend, ProcessError, ProcessSpec, RestartPolicy};
 
 /// Captured stdout+stderr budget for one bash call.
@@ -316,17 +316,28 @@ fn reject_unsupported_bash_args(args: &Value, run_async: bool) -> Result<(), Too
 pub struct BashTool {
 	processes: Option<Arc<dyn ProcessBackend>>,
 	owner: Option<String>,
+	/// ACP client reverse bridge; `None` keeps every command local.
+	acp: Option<Arc<dyn AcpClientBridge>>,
 }
 
 impl BashTool {
 	#[must_use]
 	pub fn new() -> Self {
-		Self { processes: None, owner: None }
+		Self { processes: None, owner: None, acp: None }
 	}
 
 	#[must_use]
 	pub fn with_processes(processes: Arc<dyn ProcessBackend>, owner: Option<String>) -> Self {
-		Self { processes: Some(processes), owner }
+		Self { processes: Some(processes), owner, acp: None }
+	}
+
+	/// Mount an ACP client bridge. Foreground commands then run through
+	/// `terminal/*` when the client advertised the capability; asynchronous
+	/// jobs keep the native process supervisor because ACP has no job handle.
+	#[must_use]
+	pub fn with_acp_bridge(mut self, bridge: Option<Arc<dyn AcpClientBridge>>) -> Self {
+		self.acp = bridge;
+		self
 	}
 
 	/// Background path: `$SHELL -c <command>` under the shared manager.
@@ -414,6 +425,107 @@ impl BashTool {
 			details: Some(details),
 		})
 	}
+
+	/// Foreground path through ACP `terminal/*`. `Ok(None)` means the client
+	/// did not advertise the capability and the caller may run natively.
+	///
+	/// Once `terminal/create` returns an id the command may be running on the
+	/// client: every later failure (including cancellation) kills and releases
+	/// the terminal and is reported. It is never retried locally, because a
+	/// native rerun could execute the command twice.
+	async fn execute_terminal(
+		&self,
+		bridge: &Arc<dyn AcpClientBridge>,
+		command: &str,
+		args: &Value,
+		ctx: &AgentContext,
+	) -> Result<Option<ToolResult>, ToolError> {
+		let env = bash_env(args.get("env"), &ctx.env)?;
+		let cwd_arg = match args.get("cwd") {
+			None | Some(Value::Null) => None,
+			Some(Value::String(cwd)) => Some(cwd.as_str()),
+			Some(_) => return Err(ToolError::InvalidArguments("'cwd' must be a string".to_string())),
+		};
+		let cwd = match resolve_bash_cwd(cwd_arg, ctx) {
+			Ok(cwd) => cwd,
+			Err(message) => return Ok(Some(tool_result(message, true))),
+		};
+		if let Some(error) = invalid_bash_cwd(&cwd).await {
+			return Ok(Some(error));
+		}
+		let shell = env
+			.get("SHELL")
+			.map(String::as_str)
+			.filter(|shell| !shell.trim().is_empty())
+			.unwrap_or("sh")
+			.to_string();
+		let env_pairs: Vec<(String, String)> = env.into_iter().collect();
+		let cwd_text = cwd.to_string_lossy().to_string();
+		let terminal = match bridge
+			.terminal_create(
+				&shell,
+				vec!["-c".to_string(), command.to_string()],
+				env_pairs,
+				Some(&cwd_text),
+				Some(MAX_BASH_OUTPUT_BYTES as u64),
+				&ctx.cancellation_token,
+			)
+			.await
+		{
+			Ok(id) => id,
+			Err(AcpClientError::Unsupported) => return Ok(None),
+			Err(AcpClientError::Cancelled) => {
+				return Ok(Some(tool_result("bash cancelled", true)));
+			},
+			Err(error) => {
+				return Ok(Some(tool_result(format!("Error running bash command: {error}"), true)));
+			},
+		};
+		let wait = bridge
+			.terminal_wait_for_exit(&terminal, &ctx.cancellation_token)
+			.await;
+		if wait.is_err() || ctx.cancellation_token.is_cancelled() {
+			// Cleanup must reach the wire even when the turn token is already
+			// cancelled: a cancelled reverse call never writes its frame.
+			let cleanup = CancellationToken::new();
+			let _ = bridge.terminal_kill(&terminal, &cleanup).await;
+			let _ = bridge.terminal_release(&terminal, &cleanup).await;
+			return match wait {
+				Ok(_) => Ok(Some(tool_result("bash cancelled", true))),
+				Err(AcpClientError::Unsupported) => Ok(Some(tool_result(
+					"ACP client did not advertise terminal/wait_for_exit",
+					true,
+				))),
+				Err(AcpClientError::Cancelled) => Ok(Some(tool_result("bash cancelled", true))),
+				Err(error) => {
+					Ok(Some(tool_result(format!("Error running bash command: {error}"), true)))
+				},
+			};
+		}
+		let output = bridge.terminal_output(&terminal, &ctx.cancellation_token).await;
+		let cleanup = CancellationToken::new();
+		let _ = bridge.terminal_release(&terminal, &cleanup).await;
+		let captured = match output {
+			Ok(value) => value.get("output").and_then(Value::as_str).unwrap_or("").to_string(),
+			Err(AcpClientError::Unsupported) => String::new(),
+			Err(AcpClientError::Cancelled) => return Ok(Some(tool_result("bash cancelled", true))),
+			Err(error) => {
+				return Ok(Some(tool_result(format!("Error reading bash output: {error}"), true)));
+			},
+		};
+		let exit = wait.unwrap_or(Value::Null);
+		let exit_code = exit.get("exitCode").and_then(Value::as_i64);
+		let signal = exit.get("signal").and_then(Value::as_str);
+		let status = format!(
+			"exit code: {} | cancelled: false | timed out: false",
+			exit_code.map_or_else(|| signal.unwrap_or("unknown").to_string(), |code| code.to_string())
+		);
+		let content = if captured.is_empty() { status } else { format!("{captured}\n[{status}]") };
+		// A missing exit code with no signal means the client reported no
+		// status; treat that as failure rather than success.
+		let is_error = exit_code != Some(0) || (exit_code.is_none() && signal.is_none());
+		Ok(Some(tool_result(content, is_error)))
+	}
 }
 
 impl Default for BashTool {
@@ -492,6 +604,17 @@ impl Tool for BashTool {
 		reject_unsupported_bash_args(args, run_async)?;
 		if run_async {
 			return self.execute_background(command, args, ctx).await;
+		}
+
+		// Foreground commands belong to the client when it advertised
+		// `terminal`; asynchronous jobs keep the native supervisor (ACP has no
+		// job handle or follow-up stream).
+		if let Some(bridge) = &self.acp
+			&& bridge.supports_terminal()
+		{
+			if let Some(result) = self.execute_terminal(bridge, command, args, ctx).await? {
+				return Ok(result);
+			}
 		}
 
 		let timeout_ms = bash_timeout_ms(args.get("timeout"))?;
@@ -849,6 +972,8 @@ pub struct WriteTool {
 	router:  Option<Arc<InternalUrlRouter>>,
 	/// Per-session scope handed to handlers; never mutated after construction.
 	scope:   Arc<UrlScope>,
+	/// ACP client reverse bridge; `None` keeps every write local.
+	acp:     Option<Arc<dyn AcpClientBridge>>,
 }
 
 impl Default for WriteTool {
@@ -857,6 +982,7 @@ impl Default for WriteTool {
 			pending: None,
 			router:  None,
 			scope:   Arc::new(UrlScope::default()),
+			acp:     None,
 		}
 	}
 }
@@ -869,6 +995,15 @@ impl WriteTool {
 	/// Mount the session's staging queue on this tool.
 	pub fn with_pending(pending: Arc<pending::PendingStore>) -> Self {
 		Self { pending: Some(pending), ..Self::default() }
+	}
+
+	/// Mount an ACP client bridge. Live writes then go through
+	/// `fs/write_text_file` when the client advertised it. A failed remote
+	/// write is never repeated locally: the client may already have written.
+	#[must_use]
+	pub fn with_acp_bridge(mut self, bridge: Option<Arc<dyn AcpClientBridge>>) -> Self {
+		self.acp = bridge;
+		self
 	}
 
 	/// Mount the session's internal URL router with its per-session scope.
@@ -1006,6 +1141,39 @@ impl Tool for WriteTool {
 		}
 
 		let target = ctx.cwd.join(path);
+		// ACP `fs/write_text_file` owns the write when the client advertised
+		// it. Only `Unsupported` falls through to the local filesystem: after
+		// a remote attempt (including a remote error or a cancellation) the
+		// client may already hold the bytes, and a native retry would write
+		// twice.
+		if let Some(bridge) = &self.acp
+			&& bridge.supports_fs_write()
+		{
+			if ctx.cancellation_token.is_cancelled() {
+				return Ok(tool_result(format!("Write to {} cancelled", target.display()), true));
+			}
+			match bridge
+				.write_text_file(&target.display().to_string(), content, &ctx.cancellation_token)
+				.await
+			{
+				Ok(()) => {
+					return Ok(tool_result(
+						format!("Successfully wrote {} bytes to {}", content.len(), target.display()),
+						false,
+					));
+				},
+				Err(AcpClientError::Unsupported) => {},
+				Err(AcpClientError::Cancelled) => {
+					return Ok(tool_result(format!("Write to {} cancelled", target.display()), true));
+				},
+				Err(error) => {
+					return Ok(tool_result(
+						format!("Failed to write {}: {error}", target.display()),
+						true,
+					));
+				},
+			}
+		}
 		if ctx.cancellation_token.is_cancelled() {
 			return Ok(tool_result(format!("Write to {} cancelled", target.display()), true));
 		}

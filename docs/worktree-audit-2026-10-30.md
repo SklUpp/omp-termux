@@ -102,3 +102,9 @@ Do not merge either copy: no needed missing implementation was identified. Histo
 
 The 20 intermediate files contain exact old bytes not proven stored in Git. Their behavior is superseded, but removing the directories still discards those historical bytes. Archive first if exact historical recovery matters. No directory, build output or ref was deleted, moved or archived by this audit.
 
+## Current retained-tree audit at `e868c405a4`
+
+Five physical source trees were present in the final read-only sweep. Two active slices (`t401179558/m`, FullGoalRuntime; `t0e073d1c0/m`, AcpTransportSlice) are unfinished and therefore not merged. `t94fb43aa1/m` production changes are integrated; its workspace-root continue smoke script is intentionally retained. `tf5493458e/m` is a stale Goal persistence backup, lacking the parent's module export and numeric/test repairs; do not merge it over current code. `tb04124386/m` is the deferred inspect-image copy; its output/SSE/image/docs edits are integrated, and every dirty runtime child-credential hunk was located in current main (`runtime.rs:929-936,1691-1698,1876-1972,4030-4129`). No missing production hunk was identified in these retained historical trees.
+
+The parent ran `git status --short --untracked-files=normal` for all five trees; known untracked source files were `goal.rs` in the stale persistence copy and `inspect_image.rs` in the deferred copy, both present in main. This is an integration audit, not cleanup approval. Some previously observed tree directories were absent on later reads; actor/cause is unknown. No deletion was performed by this audit. Two active pipelines remain outside the all-transferred claim; their future edits still require review and integration.
+

@@ -30,7 +30,7 @@ use crate::{
 	mailbox::{
 		DEFAULT_IRC_TIMEOUT_MS, IrcMessage, MAIN_AGENT_ID, format_incoming,
 	},
-	state::{AgentContext, ToolResult},
+	state::{AgentContext, TokenUsage, ToolResult},
 	supervisor::{CancelAttempt, ChildRecord, ChildStatus, Supervisor},
 };
 
@@ -198,6 +198,13 @@ pub struct HubJobSnapshot {
 	pub result_text: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub error_text: Option<String>,
+	/// Summed reported child usage, shown only by the snapshot call that
+	/// consumes this job's body (the same one that carries `resultText` /
+	/// `errorText`). `id` is the exactly-once key: a consumed job never shows
+	/// the body here *and* in the auto-delivery path, so `usage` can never be
+	/// counted twice for one job. Absent when the child reported nothing.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,6 +336,7 @@ fn snapshot(record: &ChildRecord, consumed: bool) -> HubJobSnapshot {
 			}
 			.filter(|_| !consumed)
 		},
+		usage: record.usage.filter(|_| !consumed),
 	}
 }
 

@@ -207,6 +207,7 @@ impl Kernel {
 		timeout: Duration,
 		cancellation: &CancellationToken,
 	) -> Result<(), EvalError> {
+		self.started_seen.store(false, Ordering::SeqCst);
 		let token = CancellationToken::new();
 		let (combined, task) = combine(cancellation.clone(), token.clone());
 		let _combined_task = AbortOnDrop(task);

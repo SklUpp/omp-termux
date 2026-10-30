@@ -302,6 +302,12 @@ pub struct RpcSession {
 	pub(crate) observer: Arc<dyn SubagentObserver>,
 	/// Session goal/budget controller (Goal Mode accounting + `+Nk` window).
 	pub(crate) goal:     Arc<crate::goal::GoalRuntime>,
+	/// ACP client reverse bridge installed by the ACP transport; copied into
+	/// every `RunRequest` so native tools can call the client. `None` for RPC.
+	pub(crate) acp_bridge: Option<crate::agent::AcpBridgeHandle>,
+	/// ACP client-supplied MCP servers for this session (validated by the
+	/// adapter); merged with file discovery by the runner's existing gate.
+	pub(crate) mcp_servers: Vec<crate::config::DiscoveredMcpServer>,
 }
 
 impl RpcSession {
@@ -421,6 +427,8 @@ impl RpcSession {
 			internal_urls,
 			observer,
 			goal: Arc::new(crate::goal::GoalRuntime::new()),
+			acp_bridge: None,
+			mcp_servers: Vec::new(),
 		};
 		session.reconcile_goal_mode();
 		Ok(session)
@@ -802,6 +810,39 @@ impl RpcSession {
 					.and_then(|connection| connection.api.clone())
 			});
 		Some((provider, api, base.to_string()))
+	}
+
+	// ------------------------------------------------------------------ acp --
+
+	/// Install the ACP client reverse bridge this session's turns hand to the
+	/// native tools. The ACP driver calls this once per session; RPC leaves it
+	/// `None`.
+	pub fn set_acp_bridge(
+		&mut self,
+		bridge: Option<std::sync::Arc<dyn pi_agent::AcpClientBridge>>,
+	) {
+		self.acp_bridge = bridge.map(crate::agent::AcpBridgeHandle);
+	}
+
+	/// Replace the ACP-supplied MCP servers this session merges into each run.
+	pub fn set_mcp_servers(&mut self, servers: Vec<crate::config::DiscoveredMcpServer>) {
+		self.mcp_servers = servers;
+	}
+
+	/// Persist the shared exclusive `mode_change` slot (`"plan"`, `"none"`, or
+	/// the goal modes). Plan and Goal cannot hold it at once.
+	pub fn append_mode_change(&mut self, mode: &str, data: Option<Value>) -> Result<()> {
+		self.store.append_mode_change(mode, data).map(|_| ()).map_err(Error::new)
+	}
+
+	/// Last `mode_change` on the active branch, cloned for callers that must
+	/// not borrow the store.
+	#[must_use]
+	pub fn latest_mode_change(&self) -> Option<(String, Option<Value>)> {
+		self
+			.store
+			.latest_mode_change()
+			.map(|(mode, data)| (mode.to_string(), data.cloned()))
 	}
 
 	// --------------------------------------------------------------- models --
@@ -1243,6 +1284,16 @@ impl RpcSession {
 				crate::goal::GoalPersist::Completed(data) => {
 					self.store.append_goal_completed(data)
 				},
+				crate::goal::GoalPersist::BackgroundUsage { id, usage } => {
+					if self.store.enabled() {
+						self.store.append_custom(
+							crate::goal::BACKGROUND_USAGE_CUSTOM_TYPE,
+							Some(json!({ "id": id, "usage": usage })),
+						)
+					} else {
+						Ok(String::new())
+					}
+				},
 			};
 			if let Err(err) = result {
 				eprintln!("warning: {err}");
@@ -1277,7 +1328,12 @@ impl RpcSession {
 	/// TS `#reconcileModeFromSession` over the active branch.
 	pub fn reconcile_goal_mode(&mut self) -> Vec<Value> {
 		match crate::goal::plan_restore(&self.store, self.config.goal.enabled()) {
-			crate::goal::RestorePlan::Idle => self.goal.clear_accounting(),
+			// No goal on the active branch: a previous session's live goal must
+			// not leak into a new/switched/branched log (#9444).
+			crate::goal::RestorePlan::Idle => {
+				self.goal.set_restored_state(None);
+				self.goal.clear_accounting();
+			},
 			crate::goal::RestorePlan::ClearGoalMode => {
 				self.goal.set_restored_state(None);
 				self.goal.clear_accounting();
@@ -1469,6 +1525,8 @@ impl RpcSession {
 			// Goal tool first, then the live host tool set; both mount after every
 			// builtin/ask/checkpoint/eval tool and a duplicate name is a hard error.
 			extra_tools,
+			acp_bridge: self.acp_bridge.clone(),
+			extra_mcp_servers: self.mcp_servers.clone(),
 			internal_urls: Some(Arc::clone(&self.internal_urls)),
 			url_scope: Some(self.url_scope()),
 			subagent_observer: Some(crate::agent::ObserverHandle(Arc::clone(&self.observer))),
@@ -1624,6 +1682,13 @@ impl RpcSession {
 			Ok(history) => self.history = history,
 			Err(err) => eprintln!("warning: cannot rebuild session history: {err}"),
 		}
+		// Auto-title writes the slot after the first prompt; the cached name
+		// from `open` would otherwise leave turn-end `session_info_update` stale.
+		self.session_name = self
+			.store
+			.title_slot()
+			.map(|slot| slot.title.clone())
+			.or_else(|| self.store.header().and_then(|header| header.title.clone()));
 	}
 
 	/// Apply one streamed turn event to session state. Returns `true` when the

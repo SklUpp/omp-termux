@@ -714,3 +714,98 @@ async fn settled_pending_results_keep_slots_until_consumed() {
 		"remaining bodies stay deliverable"
 	);
 }
+
+/// A sink that only exposes the rich view: the loop must use it, so a text-only
+/// regressions fails loudly instead of silently dropping identity/usage.
+struct UsageSink {
+	calls: AtomicUsize,
+}
+
+impl BackgroundResultSink for UsageSink {
+	fn take_background_results(&self) -> Vec<String> {
+		Vec::new()
+	}
+
+	fn take_background_deliveries(&self) -> Vec<pi_agent::supervisor::BackgroundDelivery> {
+		if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+			return Vec::new();
+		}
+		vec![pi_agent::supervisor::BackgroundDelivery {
+			id: "task-usage".to_string(),
+			text: "<task-result id=\"task-usage\" status=\"completed\">\n<usage input=\"5\" output=\"2\" />\n\
+			       <output>\nbody\n</output>\n</task-result>"
+				.to_string(),
+			usage: Some(pi_agent::state::TokenUsage {
+				input: 5,
+				output: 2,
+				..pi_agent::state::TokenUsage::default()
+			}),
+		}]
+	}
+}
+
+/// The host sees every injected background result once, with its job identity
+/// and reported usage, at the same boundary that injects the text.
+#[tokio::test]
+async fn background_delivery_reaches_the_host_once_with_identity_and_usage(
+) -> Result<(), AgentError> {
+	let captured = Arc::new(Mutex::new(Vec::<Message>::new()));
+	let provider = Arc::new(TestProvider {
+		reply:    "done".to_string(),
+		gate:     None,
+		entered:  None,
+		captured: Some(captured.clone()),
+	});
+	let agent = AgentLoop::new(
+		AgentConfig {
+			max_turns: 2,
+			context_limit: 100_000,
+			system_prompt: None,
+			cwd: std::env::temp_dir(),
+		},
+		provider,
+		ToolRegistry::new(),
+	)
+	.with_background_results(Arc::new(UsageSink { calls: AtomicUsize::new(0) }));
+	let mut state = pi_agent::state::AgentState::default();
+	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
+	let turns = agent
+		.run_dialog_message_with_cancel(
+			Message::user("go"),
+			&mut state,
+			None,
+			Some(events_tx),
+			tokio_util::sync::CancellationToken::new(),
+		)
+		.await?;
+	assert_eq!(turns.len(), 1);
+
+	let mut delivered = Vec::new();
+	while let Ok(event) = events_rx.try_recv() {
+		if let pi_agent::loop_module::AgentEvent::BackgroundResult { id, text, usage } = event {
+			delivered.push((id, text, usage));
+		}
+	}
+	assert_eq!(delivered.len(), 1, "one event per delivered result");
+	assert_eq!(delivered[0].0, "task-usage", "identity travels with the event");
+	assert!(delivered[0].1.contains("body"));
+	assert_eq!(
+		delivered[0].2,
+		Some(pi_agent::state::TokenUsage {
+			input: 5,
+			output: 2,
+			..pi_agent::state::TokenUsage::default()
+		}),
+		"reported usage travels once, unmodified"
+	);
+	let seen = captured.lock().unwrap().clone();
+	assert_eq!(
+		seen
+			.iter()
+			.filter(|message| message.content.contains("task-usage"))
+			.count(),
+		1,
+		"the delivered text is injected exactly once"
+	);
+	Ok(())
+}
