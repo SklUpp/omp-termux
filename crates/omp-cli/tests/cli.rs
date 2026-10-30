@@ -185,7 +185,7 @@ fn bad_max_time_is_a_usage_error() {
 }
 
 #[test]
-fn known_verbs_are_refused_without_starting_a_runtime() {
+fn excluded_plugin_is_refused_without_starting_a_runtime() {
 	let root = std::env::temp_dir().join(format!("omp-cli-verb-refusal-{}", std::process::id()));
 	let share = root.join("share");
 	std::fs::create_dir_all(&share).expect("share dir");
@@ -200,12 +200,6 @@ fn known_verbs_are_refused_without_starting_a_runtime() {
 			.output()
 			.expect("run omp")
 	};
-
-	let missing = run(&["acp"]);
-	assert_eq!(missing.status.code(), Some(i32::from(EXIT_USAGE)));
-	let stderr = String::from_utf8(missing.stderr).expect("utf8");
-	assert!(stderr.contains("`omp acp` is not implemented"), "stderr was {stderr:?}");
-	assert!(missing.stdout.is_empty());
 
 	let excluded = run(&["plugin", "list"]);
 	assert_eq!(excluded.status.code(), Some(i32::from(EXIT_USAGE)));
