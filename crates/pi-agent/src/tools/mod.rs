@@ -2983,6 +2983,7 @@ mod plan_mode_tool_tests {
 	async fn write_blocks_working_tree_but_allows_plan_targets() {
 		let cwd = temp_cwd("write");
 		let artifacts = cwd.join("artifacts");
+		std::fs::create_dir_all(&artifacts).expect("artifact root");
 		let ctx = AgentContext::new(cwd.clone()).with_plan(Some(guard(&artifacts)));
 		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
 
@@ -3080,6 +3081,7 @@ mod plan_mode_tool_tests {
 	async fn local_hashline_edit_updates_the_artifact() {
 		let cwd = temp_cwd("local-edit");
 		let artifacts = cwd.join("artifacts");
+		std::fs::create_dir_all(&artifacts).expect("artifact root");
 		let store = Arc::new(hashline::SnapshotStore::new());
 		write_artifact(&artifacts, "demo-plan.md", b"# Plan\nstep one\n", &CancellationToken::new())
 			.await
