@@ -6,6 +6,7 @@ pub mod edit_variants;
 pub mod hashline;
 pub mod hub;
 pub mod internal_urls;
+pub mod internal_urls_github;
 pub mod pending;
 pub mod process;
 pub mod read;
