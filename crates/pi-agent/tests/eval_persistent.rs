@@ -32,6 +32,21 @@ struct TestHost {
 	deliveries: Mutex<Vec<(String, String)>>,
 	agent_calls: Mutex<usize>,
 	agent_delay: Mutex<Duration>,
+	/// Simulated host-level publish refusal (Android `link(2)` EACCES and
+	/// friends); `None` publishes one synthetic artifact.
+	artifact_error: Mutex<Option<String>>,
+	/// Simulated absent session artifacts directory.
+	artifacts_disabled: Mutex<bool>,
+}
+
+impl TestHost {
+	fn deny_artifacts(&self, error: Option<String>) {
+		*self.artifact_error.lock().unwrap_or_else(|poison| poison.into_inner()) = error;
+	}
+
+	fn disable_artifacts(&self) {
+		*self.artifacts_disabled.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+	}
 }
 
 #[async_trait]
@@ -84,6 +99,21 @@ impl EvalHost for TestHost {
 	}
 
 	async fn write_artifact(&self, _kind: &str, _bytes: &[u8]) -> Result<Option<ArtifactRef>, String> {
+		if *self
+			.artifacts_disabled
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+		{
+			return Ok(None);
+		}
+		let denied = self
+			.artifact_error
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone();
+		if let Some(error) = denied {
+			return Err(error);
+		}
 		Ok(Some(ArtifactRef { id: "artifact-test".to_string(), path: None }))
 	}
 
@@ -272,6 +302,67 @@ async fn output_truncation_emits_artifact_metadata() {
 	let details = cell_details(&result);
 	assert_eq!(details["meta"]["truncated"], true);
 	assert_eq!(details["meta"]["artifactId"], "artifact-test");
+	teardown(&runtime, cwd).await;
+}
+
+/// A genuine filesystem `EACCES` for the artifacts directory, or `None` when
+/// the process may still write into a mode-000 directory (root).
+#[cfg(unix)]
+fn artifact_denial(root: &std::path::Path) -> Option<String> {
+	use std::os::unix::fs::PermissionsExt;
+
+	let locked = root.join("artifacts");
+	std::fs::create_dir_all(&locked).ok()?;
+	std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).ok()?;
+	let denied = std::fs::write(locked.join("1.eval.log"), b"x").err();
+	let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
+	denied
+		.filter(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+		.map(|error| error.to_string())
+}
+
+/// A host publish refusal (Android `link(2)` EACCES) must reach the consumer
+/// as a tool error while the truncated cell text stays intact. `Ok(None)`
+/// stays a non-error: no artifacts directory simply means no artifact.
+#[cfg(unix)]
+#[tokio::test]
+async fn artifact_publish_denial_surfaces_as_tool_error() {
+	let Some((tool, runtime, ctx, cwd, host)) = py_harness(512).await else { return };
+	let Some(denial) = artifact_denial(&cwd) else {
+		eprintln!("skipping artifact denial regression: filesystem does not deny mode-000 writes");
+		teardown(&runtime, cwd).await;
+		return;
+	};
+	host.deny_artifacts(Some(denial));
+	let denied = tool
+		.execute(&json!({"language": "py", "code": "print('a' * 5000)"}), &ctx)
+		.await
+		.expect("denied artifact cell");
+	assert!(denied.is_error, "artifact denial stayed invisible: {}", denied.content);
+	assert!(
+		denied.content.contains("output truncated"),
+		"cell text lost: {}",
+		denied.content
+	);
+	let details = cell_details(&denied);
+	assert_eq!(details["isError"], true);
+	assert_eq!(details["cells"][0]["status"], "error");
+	assert_eq!(details["meta"]["truncated"], true);
+	assert!(details["meta"].get("artifactId").is_none(), "{}", details["meta"]);
+	let notice = details["notice"].as_str().unwrap_or_default();
+	assert!(notice.contains("artifact unavailable"), "{notice}");
+	assert!(notice.contains("Permission denied"), "{notice}");
+
+	host.deny_artifacts(None);
+	host.disable_artifacts();
+	let disabled = tool
+		.execute(&json!({"language": "py", "code": "print('a' * 5000)"}), &ctx)
+		.await
+		.expect("disabled artifact cell");
+	assert!(!disabled.is_error, "disabled artifacts must not fail: {}", disabled.content);
+	let details = cell_details(&disabled);
+	assert!(details["meta"].get("artifactId").is_none(), "{}", details["meta"]);
+	assert!(details.get("notice").is_none(), "{details}");
 	teardown(&runtime, cwd).await;
 }
 

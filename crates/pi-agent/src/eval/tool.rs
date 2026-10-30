@@ -22,7 +22,7 @@ use crate::{
 
 use super::{
 	bridge::EVAL_TIMEOUT_PAUSE_OP,
-	host::{ArtifactRef, EvalHost},
+	host::EvalHost,
 	idle::{CellControl, IdleTimeout},
 	output::{LIVE_TAIL_BYTES, OutputSink, dimension_note, format_display_outputs_for_text},
 	runtime::{EvalRuntime, KernelMode, background_wait, session_cwd},
@@ -542,20 +542,23 @@ impl CellJob {
 			};
 		}
 
-		let artifact = if sink.truncated() {
-			match sink.artifact() {
-				Some(bytes) => self
-					.host
-					.write_artifact("eval", bytes)
-					.await
-					.ok()
-					.flatten()
-					.map(|artifact: ArtifactRef| (artifact.id, artifact.path)),
-				None => None,
+		let mut artifact = None;
+		let mut artifact_error = None;
+		if sink.truncated() && let Some(bytes) = sink.artifact() {
+			match self.host.write_artifact("eval", bytes).await {
+				Ok(Some(published)) => artifact = Some((published.id, published.path)),
+				// An absent session artifacts directory legitimately disables
+				// publication; the elided bytes are simply unrecoverable.
+				Ok(None) => {},
+				// A real publish refusal (e.g. Android `link(2)` EACCES) means
+				// the elided bytes have no artifact at all. Report it instead of
+				// presenting the truncated output as complete.
+				Err(error) => {
+					is_error = true;
+					artifact_error = Some(format!("artifact unavailable: {error}"));
+				},
 			}
-		} else {
-			None
-		};
+		}
 		let meta = sink.meta(artifact);
 		let events = status_events
 			.lock()
@@ -583,7 +586,7 @@ impl CellJob {
 			meta: Some(meta),
 			language: Some(EvalBackendId::of(self.language)),
 			languages: Some(vec![EvalBackendId::of(self.language)]),
-			notice: None,
+			notice: artifact_error,
 			r#async: None,
 		};
 		Ok(ToolResult {
@@ -780,6 +783,11 @@ impl Tool for EvalTool {
 			if let Some(details) = result.details.as_mut()
 				&& let Some(object) = details.as_object_mut()
 			{
+				// Keep a pre-existing (artifact denial) notice visible.
+				let notice = match object.get("notice").and_then(Value::as_str) {
+					Some(existing) => format!("{existing}\n{notice}"),
+					None => notice,
+				};
 				object.insert("notice".to_string(), Value::String(notice));
 			}
 		}
