@@ -216,6 +216,10 @@ pub struct Approvals {
 	/// Injected approval input (tests, embedders). `None` reads the process
 	/// terminal, which stays interactive-only.
 	input: Option<ApprovalInput>,
+	/// Alternate approver for transports that ask a remote peer (ACP
+	/// `session/request_permission`). The alternate owns the policy decision;
+	/// this matrix is not consulted when it is installed.
+	approver: Option<std::sync::Arc<dyn pi_agent::ToolApprover>>,
 }
 
 impl std::fmt::Debug for Approvals {
@@ -225,6 +229,7 @@ impl std::fmt::Debug for Approvals {
 			.field("allow", &self.allow)
 			.field("has_ask", &self.ask.is_some())
 			.field("has_input", &self.input.is_some())
+			.field("has_approver", &self.approver.is_some())
 			.finish()
 	}
 }
@@ -232,7 +237,19 @@ impl std::fmt::Debug for Approvals {
 impl Approvals {
 	#[must_use]
 	pub fn new(mode: ApprovalMode, allow: impl IntoIterator<Item = String>) -> Self {
-		Self { mode, allow: allow.into_iter().collect(), ask: None, input: None }
+		Self {
+			mode,
+			allow: allow.into_iter().collect(),
+			ask: None,
+			input: None,
+			approver: None,
+		}
+	}
+
+	/// Install or clear the alternate approver. The alternate decides the whole
+	/// approval outcome, including honouring `mode`/`allow` when it wants to.
+	pub fn set_approver(&mut self, approver: Option<std::sync::Arc<dyn pi_agent::ToolApprover>>) {
+		self.approver = approver;
 	}
 
 	/// Install or clear an injected approval input. Injected input never consults
@@ -257,12 +274,19 @@ impl Approvals {
 	pub fn without_ask(&self) -> Self {
 		let mut clone = self.clone();
 		clone.ask = None;
+		// A child must never inherit the parent's remote approver: that would
+		// prompt the ACP client for delegated work. Without it the matrix
+		// applies and Ask-tier work fails closed on closed stdin.
+		clone.approver = None;
 		clone
 	}
 
 	#[must_use]
 	pub fn ask_channel(&self) -> Option<std::sync::Arc<dyn pi_agent::tools::ask::AskChannel>> {
-		self.ask.clone()
+		self
+			.ask
+			.clone()
+			.or_else(|| self.approver.as_ref().and_then(|approver| approver.ask_channel()))
 	}
 
 	/// Authorize a registered MCP tool name if the exact colon tool allow
@@ -334,6 +358,9 @@ impl pi_agent::ToolApprover for Approvals {
 	}
 
 	async fn approve(&self, name: &str, args: &serde_json::Value) -> std::result::Result<(), String> {
+		if let Some(approver) = self.approver.as_ref() {
+			return approver.approve(name, args).await;
+		}
 		let tier = classify_tool(name, args);
 		match self.decide_tier(name, tier) {
 			Decision::Auto => Ok(()),
