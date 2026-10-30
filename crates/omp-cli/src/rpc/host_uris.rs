@@ -636,7 +636,7 @@ mod tests {
 			.expect_err("unknown");
 		assert_eq!(
 			error,
-			"Unknown protocol: nope://\nSupported: issue://, local://, notes://, pr://, ssh://"
+			"Unknown protocol: nope://\nSupported: issue://, local://, mcp://, notes://, pr://, ssh://"
 		);
 
 		bridge.clear_schemes();
