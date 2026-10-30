@@ -181,9 +181,24 @@ impl Tool for AstEditTool {
 		if ctx.cancellation_token.is_cancelled() {
 			return Ok(tool_result("AST edit cancelled", true));
 		}
-
 		let ops = parse_ops(args)?;
 		let paths = parse_paths(args)?;
+		// Classify what the preview would rewrite, never an unrelated extra
+		// argument: an artifact preview is unsupported, a working-tree target is
+		// refused while plan mode is active.
+		{
+			let targets: Vec<crate::state::PlanWriteTarget<'_>> = paths
+				.iter()
+				.map(|path| {
+					crate::state::PlanWriteTarget::new(path, crate::state::PlanWriteOp::Update)
+				})
+				.collect();
+			if let Some(message) =
+				ctx.plan.as_ref().and_then(|guard| guard.write_error("ast_edit", &targets))
+			{
+				return Err(ToolError::Rejected(message));
+			}
+		}
 		let max_files = max_ast_files(&ctx.env);
 
 		let path_count = paths.len();

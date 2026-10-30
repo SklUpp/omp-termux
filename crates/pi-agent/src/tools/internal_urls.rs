@@ -393,6 +393,9 @@ impl ProtocolHandler for LocalRootHandler {
 		let relative = relative.to_string();
 		let name = relative.clone();
 		let href = url.href.clone();
+		// Real path of the verified target: `read` records its snapshot under
+		// this key so `edit` can address the artifact by the same identity.
+		let source_path = root.join(&relative);
 		let (bytes, size) = tokio::task::spawn_blocking(move || read_contained(&root, &relative))
 			.await
 			.map_err(|error| format!("{href}: local read task failed: {error}"))??;
@@ -400,6 +403,7 @@ impl ProtocolHandler for LocalRootHandler {
 		let content = decode_utf8(&bytes, truncated, &url.href)?;
 		let mut resource = InternalResource::text(&url.href, content);
 		resource.content_type = content_type_for(Path::new(&name)).to_string();
+		resource.source_path = Some(source_path);
 		// The reported size is the file's own length, never the truncated read.
 		resource.size = usize::try_from(size).unwrap_or(usize::MAX);
 		if truncated {
@@ -430,7 +434,8 @@ fn decode_utf8(bytes: &[u8], truncated: bool, href: &str) -> Result<String, Stri
 /// Read `relative` below `root` through descriptors only, capped at
 /// [`SNAPSHOT_MAX_BYTES`] plus one byte so the caller can tell it was cut.
 #[cfg(unix)]
-fn read_contained(root: &Path, relative: &str) -> Result<(Vec<u8>, u64), String> {
+pub(crate) fn read_contained(root: &Path, relative: &str) -> Result<(Vec<u8>, u64), String> {
+	crate::tools::validate_artifact_relative(relative)?;
 	use std::{
 		ffi::CString,
 		io::Read,
@@ -514,7 +519,8 @@ fn read_contained(root: &Path, relative: &str) -> Result<(Vec<u8>, u64), String>
 }
 
 #[cfg(not(unix))]
-fn read_contained(_root: &Path, relative: &str) -> Result<(Vec<u8>, u64), String> {
+pub(crate) fn read_contained(_root: &Path, relative: &str) -> Result<(Vec<u8>, u64), String> {
+	crate::tools::validate_artifact_relative(relative)?;
 	Err(format!(
 		"local://{relative} needs descriptor-relative traversal; unsupported on this platform"
 	))

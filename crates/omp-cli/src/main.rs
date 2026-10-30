@@ -1051,12 +1051,13 @@ fn apply_goal_intents(store: &mut SessionStore, goal_runtime: &GoalRuntime) {
 		let result = match intent {
 			GoalPersist::ModeChange { mode, data } => store.append_mode_change(mode, data),
 			GoalPersist::Completed(data) => store.append_goal_completed(data),
-			GoalPersist::BackgroundUsage { id, usage } => {
+			GoalPersist::BackgroundUsage { id, result_key, usage } => {
 				if store.enabled() {
-					store.append_custom(
-						goal::BACKGROUND_USAGE_CUSTOM_TYPE,
-						Some(serde_json::json!({ "id": id, "usage": usage })),
-					)
+					let mut data = serde_json::json!({ "id": id, "usage": usage });
+					if let Some(result_key) = result_key {
+						data["resultKey"] = serde_json::Value::String(result_key);
+					}
+					store.append_custom(goal::BACKGROUND_USAGE_CUSTOM_TYPE, Some(data))
 				} else {
 					Ok(String::new())
 				}
@@ -1351,6 +1352,8 @@ impl Session<'_> {
 			goal: Some(Arc::clone(&self.goal)),
 			goal_context,
 			credential_resolver: None,
+			plan_mode: Default::default(),
+			continuation: false,
 		}
 	}
 

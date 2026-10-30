@@ -9,8 +9,9 @@ use crate::{
 	mailbox::{Mailbox, format_incoming},
 	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
 	state::{
-		AgentConfig, AgentContext, AgentState, ContentPart, Message, Role, SoftToolRequirement,
-		TokenUsage, ToolApprover, ToolCall, ToolPolicy, ToolResult, TurnResult, TurnStatus,
+		AgentConfig, AgentContext, AgentState, ContentPart, Exhaustion, Message, Role,
+		SoftToolRequirement, TokenUsage, ToolApprover, ToolCall, ToolPolicy, ToolResult, TurnResult,
+		TurnStatus,
 	},
 	supervisor::BackgroundResultSink,
 	tools::{registry::ToolRegistry, scheduler::ToolScheduler},
@@ -223,7 +224,14 @@ pub enum AgentEvent {
 	/// same id can never arrive through auto-delivery and the hub snapshot path.
 	/// `usage` is the child's summed provider report (`None` = unreported), so a
 	/// host accounts it once per id instead of re-deriving it from the text.
-	BackgroundResult { id: String, text: String, usage: Option<TokenUsage> },
+	/// `result_key` is the durable accounting key (`resultKey` when present,
+	/// else `id`); it is absent only for a sink with no supervisor behind it.
+	BackgroundResult {
+		id: String,
+		result_key: Option<String>,
+		text: String,
+		usage: Option<TokenUsage>,
+	},
 }
 
 /// Announce one accepted steering message to the host event stream.
@@ -478,6 +486,12 @@ pub struct AgentLoop {
 	policy: Option<Arc<dyn ToolPolicy>>,
 	/// Turn-end persistence/rewind handshake with the session owner.
 	turn_ack: Option<Arc<TurnAck>>,
+	/// Session plan-mode guard copied into every tool call context of this run.
+	plan: Option<Arc<dyn crate::state::PlanModeGuard>>,
+	/// Detached plan continuation: history already carries the persisted
+	/// developer reminder, so no caller message is appended and the first
+	/// request is the policy's one-shot forced choice.
+	continuation: bool,
 }
 
 impl AgentLoop {
@@ -497,6 +511,8 @@ impl AgentLoop {
 			peer_inbox: None,
 			policy,
 			turn_ack: None,
+			plan: None,
+			continuation: false,
 		}
 	}
 
@@ -517,7 +533,26 @@ impl AgentLoop {
 			peer_inbox: None,
 			policy,
 			turn_ack: None,
+			plan: None,
+			continuation: false,
 		}
+	}
+
+	/// Install the session plan-mode guard for this run; it rides on every
+	/// tool-call [`AgentContext`], so concurrent sessions never share it.
+	#[must_use]
+	pub fn with_plan(mut self, plan: Option<Arc<dyn crate::state::PlanModeGuard>>) -> Self {
+		self.plan = plan;
+		self
+	}
+
+	/// Mark this run as the detached plan-reminder continuation: no new caller
+	/// message is appended and the first request uses the policy's forced
+	/// choice once.
+	#[must_use]
+	pub fn with_continuation(mut self, continuation: bool) -> Self {
+		self.continuation = continuation;
+		self
 	}
 
 	/// Attach the per-turn ack channel used by the session owner for
@@ -561,6 +596,7 @@ impl AgentLoop {
 					let _ = events
 						.send(AgentEvent::BackgroundResult {
 							id: delivery.id,
+							result_key: delivery.result_key,
 							text: delivery.text,
 							usage: delivery.usage,
 						})
@@ -683,7 +719,9 @@ impl AgentLoop {
 		{
 			state.messages.insert(0, Message::system(system.clone()));
 		}
-		state.messages.push(user_message);
+		if !self.continuation {
+			state.messages.push(user_message);
+		}
 		let _presence = PresenceGuard::install(&self.peer_inbox);
 		self.inject_boundary_messages(state, events.as_ref()).await;
 		let ctx = AgentContext::with_approver(
@@ -691,9 +729,11 @@ impl AgentLoop {
 			cancellation_token.clone(),
 			self.scheduler.approver().cloned(),
 		)
-		.with_progress(events.clone());
+		.with_progress(events.clone())
+		.with_plan(self.plan.clone());
 		let mut turn_results = Vec::new();
 		let mut soft = SoftRequirementState::default();
+		let mut continuation_pending = self.continuation;
 
 		while state.total_turns < self.config.max_turns {
 			if let Some(rx) = &mut steering_rx {
@@ -720,7 +760,11 @@ impl AgentLoop {
 				.as_ref()
 				.and_then(|policy| policy.requirement())
 				.filter(|requirement| self.registry.get(&requirement.tool_name).is_some());
-			if !cancellation_token.is_cancelled()
+			if continuation_pending {
+				// The reminder is already persisted; adopt the head without
+				// injecting it a second time.
+				soft.sync(soft_req.as_ref());
+			} else if !cancellation_token.is_cancelled()
 				&& soft.sync(soft_req.as_ref())
 				&& let Some(requirement) = &soft_req
 			{
@@ -735,14 +779,30 @@ impl AgentLoop {
 			}
 			let schemas = self.registry.schemas();
 			// A compliant turn pays zero tool_choice change; only the escalated
-			// turn forces `write`, and only for the single request below.
-			let tool_choice = match (&soft_req, soft.force_next) {
+			// turn forces a choice, and only for the single request below. The
+			// policy owns that choice: a staged preview names `write`, while the
+			// plan gate requires any tool call.
+			let mut tool_choice = match (&soft_req, soft.force_next) {
 				(Some(requirement), true) => {
 					soft.force_next = false;
-					ToolChoice::Tool { name: requirement.tool_name.clone() }
+					self.policy.as_ref().map_or(
+						ToolChoice::Tool { name: requirement.tool_name.clone() },
+						|policy| policy.choice(requirement),
+					)
 				},
 				_ => ToolChoice::Auto,
 			};
+			if continuation_pending {
+				continuation_pending = false;
+				if let (Some(policy), Some(requirement)) = (self.policy.as_ref(), soft_req.as_ref())
+				{
+					// One-shot upstream `required`: consuming it also spends the
+					// policy's escalation budget so an ignored reply yields.
+					tool_choice = policy.choice(requirement);
+					soft.escalations = policy.escalation_limit(requirement);
+					soft.force_next = false;
+				}
+			}
 			let mut pending_injections = Vec::new();
 			let assistant = self
 				.next_assistant(
@@ -787,14 +847,32 @@ impl AgentLoop {
 			if soft_non_compliant
 				&& let Some(requirement) = &soft_req
 			{
-				if soft.escalations >= MAX_SOFT_TOOL_ESCALATIONS {
-					return Err(AgentError::Internal(format!(
-						"Soft tool requirement '{}' was not satisfied after \
-						 {MAX_SOFT_TOOL_ESCALATIONS} forced turns; aborting to avoid an unbounded force loop.",
-						requirement.tool_name
-					)));
-				}
-				let notice = format!(
+				let limit = self
+					.policy
+					.as_ref()
+					.map_or(MAX_SOFT_TOOL_ESCALATIONS, |policy| {
+						policy.escalation_limit(requirement)
+					});
+				let exhausted = soft.escalations >= limit;
+				let yield_to_user = exhausted
+					&& assistant.tool_calls.is_empty()
+					&& self.policy.as_ref().is_some_and(|policy| {
+						policy.exhaustion(requirement) == Exhaustion::EndTurn
+					});
+				if yield_to_user {
+					// The policy asks for a normal hand-back instead of an abort.
+					// Dropping the head lets the end-turn path below run unchanged.
+					soft.escalations = 0;
+					soft.force_next = false;
+				} else {
+					if exhausted {
+						return Err(AgentError::Internal(format!(
+							"Soft tool requirement '{}' was not satisfied after \
+							 {limit} forced turns; aborting to avoid an unbounded force loop.",
+							requirement.tool_name
+						)));
+					}
+					let notice = format!(
 					"Not executed: call the `{}` tool to resolve the pending action before using other tools.",
 					requirement.tool_name
 				);
@@ -867,7 +945,8 @@ impl AgentLoop {
 					tool_results: results,
 					is_completed: false,
 				});
-				continue;
+					continue;
+				}
 			}
 
 			if assistant.tool_calls.is_empty() {

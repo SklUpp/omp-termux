@@ -233,6 +233,21 @@ fn task_tool_usage(message: &SessionMessage) -> Option<Usage> {
 	serde_json::from_value(usage.clone()).ok()
 }
 
+/// Durable accounting key for one background job: `resultKey` alone when the
+/// writer recorded one, else the legacy raw `id`.
+///
+/// Never consulted together: a log written before namespacing holds only `id`,
+/// and a reopened CLI reuses raw ids, so testing `id` while a `resultKey` is
+/// present would merge two distinct runs and silently undercount.
+pub(crate) fn background_usage_key(value: &serde_json::Value) -> Option<&str> {
+	value
+		.get("resultKey")
+		.and_then(serde_json::Value::as_str)
+		.filter(|key| !key.is_empty())
+		.or_else(|| value.get("id").and_then(serde_json::Value::as_str))
+		.filter(|key| !key.is_empty())
+}
+
 /// Provider-side orchestration tokens (`Usage.orchestration`, kept verbatim in
 /// [`Usage::extra`] from TS-written logs): billed, but not part of the
 /// conversation prompt/cache buckets.
@@ -1349,7 +1364,8 @@ impl SessionStore {
 	/// contributes the subagent usage persisted in its `details.usage` (present
 	/// only in TS-written/imported logs; native Rust never writes it). A `hub`
 	/// `jobs` snapshot and a `background-usage` custom entry describe the same
-	/// background child, so the job `id` counts once.
+	/// background child, so they share one key: `resultKey` when present, else
+	/// the legacy job `id`.
 	#[must_use]
 	pub fn session_usage(&self) -> SessionUsage {
 		let mut total = SessionUsage::default();
@@ -1377,7 +1393,7 @@ impl SessionStore {
 						.and_then(|details| details.get("jobs"))
 						.and_then(serde_json::Value::as_array);
 					for job in jobs.into_iter().flatten() {
-						let Some(id) = job.get("id").and_then(serde_json::Value::as_str) else {
+						let Some(key) = background_usage_key(job) else {
 							continue;
 						};
 						let Some(usage) = job
@@ -1386,7 +1402,10 @@ impl SessionStore {
 						else {
 							continue;
 						};
-						if seen_background_ids.insert(id.to_string()) {
+						// The key is inserted only for a job that carries usage,
+						// so a running snapshot never suppresses the later
+						// auto-delivered report.
+						if seen_background_ids.insert(key.to_string()) {
 							total.add(&usage);
 						}
 					}
@@ -1406,7 +1425,7 @@ impl SessionStore {
 			let Some(data) = entry.extra.get("data") else {
 				continue;
 			};
-			let Some(id) = data.get("id").and_then(serde_json::Value::as_str) else {
+			let Some(key) = background_usage_key(data) else {
 				continue;
 			};
 			let Some(usage) = data
@@ -1415,7 +1434,7 @@ impl SessionStore {
 			else {
 				continue;
 			};
-			if seen_background_ids.insert(id.to_string()) {
+			if seen_background_ids.insert(key.to_string()) {
 				total.add(&usage);
 			}
 		}
@@ -4252,6 +4271,220 @@ mod tests {
 		);
 		assert_eq!(counted.assistant_messages, 0);
 		assert!(counted.is_known(), "background child usage is reported usage");
+		fs::remove_dir_all(dir).ok();
+	}
+
+	/// A reopened CLI restarts the job sequence, so two runs both call their
+	/// first background child `task-1`; their namespaced keys keep both counted.
+	#[test]
+	fn session_usage_counts_distinct_runs_with_same_raw_job_id() {
+		let dir = temp_dir();
+		let run = |input: u64, key: &str| {
+			serde_json::json!({
+				"id": "task-1",
+				"resultKey": key,
+				"usage": {
+					"input": input,
+					"output": 1,
+					"cacheRead": 0,
+					"cacheWrite": 0,
+					"totalTokens": input + 1,
+				},
+			})
+		};
+		for (input, key) in [(4, "ns1:task-1"), (7, "ns2:task-1")] {
+			let mut store =
+				SessionStore::open(&options(dir.clone(), Some("reopened-runs")));
+			assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+			store
+				.append_custom(BACKGROUND_USAGE_CUSTOM_TYPE, Some(run(input, key)))
+				.expect("append background usage");
+		}
+		let reopened = SessionStore::open(&options(dir.clone(), Some("reopened-runs")));
+		let counted = reopened.session_usage();
+		assert_eq!(counted.input, 11, "both runs count despite the repeated raw id");
+		assert_eq!(counted.output, 2);
+		assert_eq!(counted.total_tokens, 13);
+		fs::remove_dir_all(dir).ok();
+	}
+
+	/// A legacy `id`-only entry and a later namespaced entry for the same raw id
+	/// are two contributions: the key is never `resultKey || id`.
+	#[test]
+	fn session_usage_counts_legacy_and_namespaced_runs_once_each() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("legacy-mix")));
+		assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+		store
+			.append_custom(
+				BACKGROUND_USAGE_CUSTOM_TYPE,
+				Some(serde_json::json!({
+					"id": "task-1",
+					"usage": { "input": 1, "output": 2, "cacheRead": 0, "cacheWrite": 0 },
+				})),
+			)
+			.expect("legacy entry");
+		// An old log can only be followed by new writes at the leaf.
+		store
+			.append_custom(
+				BACKGROUND_USAGE_CUSTOM_TYPE,
+				Some(serde_json::json!({
+					"id": "task-1",
+					"resultKey": "ns2:task-1",
+					"usage": { "input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0 },
+				})),
+			)
+			.expect("namespaced entry");
+		let counted = store.session_usage();
+		assert_eq!(
+			(counted.input, counted.output),
+			(5, 8),
+			"the legacy id must not swallow the namespaced run"
+		);
+		fs::remove_dir_all(dir).ok();
+	}
+
+	/// Hub and custom records of one consumed job share `resultKey`, so their
+	/// usage counts once even though the raw id repeats.
+	#[test]
+	fn session_usage_counts_same_result_key_once_across_hub_and_custom() {
+		const TS: &str = "2026-01-01T00:00:00.000Z";
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("key-shared")));
+		assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+		let usage = serde_json::json!({
+			"input": 4,
+			"output": 6,
+			"cacheRead": 1,
+			"cacheWrite": 0,
+			"totalTokens": 11,
+		});
+		let mut hub =
+			SessionMessage::tool_result("c1", "hub", MessageContent::Text("jobs".to_string()), false, 1);
+		hub.extra.insert(
+			"details".to_string(),
+			serde_json::json!({
+				"op": "jobs",
+				"jobs": [{
+					"id": "task-1",
+					"resultKey": "ns1:task-1",
+					"usage": usage.clone(),
+				}],
+			}),
+		);
+		store
+			.append_messages(&[MessageEntry::new("h1", None, TS, hub)])
+			.expect("append hub snapshot");
+		store
+			.append_custom(
+				BACKGROUND_USAGE_CUSTOM_TYPE,
+				Some(serde_json::json!({
+					"id": "task-1",
+					"resultKey": "ns1:task-1",
+					"usage": usage,
+				})),
+			)
+			.expect("append background usage");
+		let counted = store.session_usage();
+		assert_eq!(
+			(counted.input, counted.output, counted.total_tokens),
+			(4, 6, 11),
+			"one namespaced job contributes once across both entry kinds"
+		);
+		fs::remove_dir_all(dir).ok();
+	}
+
+	/// A synchronous `task` child is counted from its own `details.usage`; the
+	/// `hub` snapshot of that record carries neither usage nor key, so replay
+	/// cannot charge the same spend twice.
+	#[test]
+	fn session_usage_does_not_double_count_sync_child_from_hub_snapshot() {
+		const TS: &str = "2026-01-01T00:00:00.000Z";
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("sync-hub")));
+		assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+		let mut task = SessionMessage::tool_result(
+			"c1",
+			"task",
+			MessageContent::Text("done".to_string()),
+			false,
+			1,
+		);
+		task.extra.insert(
+			"details".to_string(),
+			serde_json::json!({
+				"usage": { "input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0 },
+			}),
+		);
+		store
+			.append_messages(&[MessageEntry::new("t1", None, TS, task)])
+			.expect("append task result");
+		let mut hub = SessionMessage::tool_result(
+			"c2",
+			"hub",
+			MessageContent::Text("jobs".to_string()),
+			false,
+			2,
+		);
+		hub.extra.insert(
+			"details".to_string(),
+			serde_json::json!({
+				"op": "jobs",
+				"jobs": [{ "id": "task-1", "status": "completed" }],
+			}),
+		);
+		store
+			.append_messages(&[MessageEntry::new("h1", Some("t1".to_string()), TS, hub)])
+			.expect("append sync snapshot");
+		let counted = store.session_usage();
+		assert_eq!(
+			(counted.input, counted.output),
+			(4, 6),
+			"the sync child contributes exactly once"
+		);
+		fs::remove_dir_all(dir).ok();
+	}
+
+	/// A running snapshot may carry the key but no usage; it must not claim the
+	/// key and suppress the settled custom report that follows.
+	#[test]
+	fn session_usage_ignores_result_key_without_usage() {
+		const TS: &str = "2026-01-01T00:00:00.000Z";
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("no-usage-key")));
+		assert!(store.enabled(), "store: {:?}", store.corrupt_reason());
+		let mut hub =
+			SessionMessage::tool_result("c1", "hub", MessageContent::Text("jobs".to_string()), false, 1);
+		hub.extra.insert(
+			"details".to_string(),
+			serde_json::json!({
+				"op": "jobs",
+				"jobs": [{
+					"id": "task-1",
+					"resultKey": "ns1:task-1",
+					"status": "running",
+				}],
+			}),
+		);
+		store
+			.append_messages(&[MessageEntry::new("h1", None, TS, hub)])
+			.expect("append running snapshot");
+		store
+			.append_custom(
+				BACKGROUND_USAGE_CUSTOM_TYPE,
+				Some(serde_json::json!({
+					"id": "task-1",
+					"resultKey": "ns1:task-1",
+					"usage": { "input": 4, "output": 6, "cacheRead": 0, "cacheWrite": 0 },
+				})),
+			)
+			.expect("append settled usage");
+		let counted = store.session_usage();
+		assert_eq!(
+			(counted.input, counted.output),
+			(4, 6),
+			"an unreported snapshot never consumes the key"
+		);
 		fs::remove_dir_all(dir).ok();
 	}
 

@@ -88,6 +88,9 @@ struct Prepared {
 	/// Resolved absolute move destination and its canonical identity.
 	move_dest: Option<PathBuf>,
 	dest_canonical: Option<String>,
+	/// Sandbox-relative path when this section lives in the plan artifact root;
+	/// reads and the update commit then go through descriptor-relative helpers.
+	artifact: Option<String>,
 }
 
 enum Outcome {
@@ -121,6 +124,23 @@ pub async fn execute(
 		Ok(sections) => sections,
 		Err(message) => return Ok(tool_result(format!("Failed to edit: {message}"), true)),
 	};
+	execute_sections(store, registers, noop_guard, options, sections, None, input, ctx).await
+}
+
+/// Execute already-parsed sections. `artifact_root` marks sections that live in
+/// the plan sandbox: their reads and update commit go through descriptor-
+/// relative helpers instead of path-based filesystem calls.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_sections(
+	store: &SnapshotStore,
+	registers: &Mutex<BTreeMap<String, Vec<String>>>,
+	noop_guard: &NoopGuard,
+	options: &EditToolOptions,
+	sections: Vec<PatchSection>,
+	artifact_root: Option<&Path>,
+	input: &str,
+	ctx: &AgentContext,
+) -> Result<ToolResult, ToolError> {
 	if sections.is_empty() {
 		return Ok(tool_result("No hashline sections found in input.".to_string(), true));
 	}
@@ -142,7 +162,18 @@ pub async fn execute(
 	let mut prepared = Vec::with_capacity(sections.len());
 	let mut states = Vec::with_capacity(sections.len());
 	for section in sections {
-		match prepare(section, &ctx.cwd, &ctx.cancellation_token, &mut batch, store, options, &mut budget).await {
+		match prepare(
+			section,
+			&ctx.cwd,
+			&ctx.cancellation_token,
+			&mut batch,
+			store,
+			options,
+			&mut budget,
+			artifact_root,
+		)
+		.await
+		{
 			Ok(entry) => {
 				if let Err(message) = budget.charge_bytes(clipboard::batch_bytes(&batch)) {
 					return Ok(tool_result(format!("Failed to edit: {message}"), true));
@@ -180,7 +211,7 @@ pub async fn execute(
 	let mut landed: Vec<String> = Vec::new();
 	for (index, entry) in prepared.into_iter().enumerate() {
 		let canonical = entry.canonical.clone();
-		match commit(entry, &ctx.cancellation_token, store).await {
+		match commit(entry, &ctx.cancellation_token, store, artifact_root).await {
 			Ok(outcome) => {
 				let mut session = registers
 					.lock()
@@ -330,6 +361,7 @@ async fn read_target(path: &Path, token: &CancellationToken) -> Result<String, P
 		.map_err(|_| PrepareError::Failed(format!("{} is not valid UTF-8", path.display())))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare(
 	section: PatchSection,
 	cwd: &Path,
@@ -338,6 +370,7 @@ async fn prepare(
 	store: &SnapshotStore,
 	options: &EditToolOptions,
 	budget: &mut Budget,
+	artifact_root: Option<&Path>,
 ) -> Result<Prepared, PrepareError> {
 	let parsed: ParsedPatch = parser::parse_section_body(&section.diff)?;
 	if section.interleaved && clipboard::has_clipboard_edit(&parsed.edits) {
@@ -348,13 +381,33 @@ async fn prepare(
 		.clone()
 		.ok_or_else(|| PrepareError::Failed(missing_tag_message(&section.path)))?;
 
-	if !section.file_path.exists() {
-		return Err(PrepareError::Failed(format!(
-			"File not found: {}. Use the write tool to create new files.",
-			section.path
-		)));
-	}
-	let raw = read_target(&section.file_path, token).await?;
+	let artifact = artifact_root
+		.and_then(|root| section.file_path.strip_prefix(root).ok())
+		.map(|relative| relative.to_string_lossy().into_owned());
+	let raw = match (&artifact, artifact_root) {
+		(Some(relative), Some(root)) => {
+			let (bytes, _) = crate::tools::internal_urls::read_contained(root, relative)
+				.map_err(PrepareError::Failed)?;
+			if bytes.len() > MAX_EDIT_BYTES {
+				return Err(PrepareError::Failed(format!(
+					"{} is {} bytes, the edit limit is {MAX_EDIT_BYTES}",
+					section.path,
+					bytes.len()
+				)));
+			}
+			String::from_utf8(bytes)
+				.map_err(|_| PrepareError::Failed(format!("{} is not valid UTF-8", section.path)))?
+		},
+		_ => {
+			if !section.file_path.exists() {
+				return Err(PrepareError::Failed(format!(
+					"File not found: {}. Use the write tool to create new files.",
+					section.path
+				)));
+			}
+			read_target(&section.file_path, token).await?
+		},
+	};
 
 	let canonical = snapshot::canonical_key(&section.file_path);
 	let mut move_dest: Option<PathBuf> = None;
@@ -508,6 +561,7 @@ async fn prepare(
 		source_id,
 		move_dest,
 		dest_canonical,
+		artifact,
 	})
 }
 
@@ -665,6 +719,7 @@ fn resolve_relative(path: &str, cwd: &Path) -> PathBuf {
 async fn assert_prepared_target(
 	prepared: &Prepared,
 	token: &CancellationToken,
+	artifact_root: Option<&Path>,
 ) -> Result<(), CommitError> {
 	let path = &prepared.section.file_path;
 	let now_canonical = snapshot::canonical_key(path);
@@ -678,12 +733,29 @@ async fn assert_prepared_target(
 	// Compare against the exact validated bytes: a 16-bit content tag cannot
 	// prove identity, only a recorded snapshot can.
 	let canonical_path = PathBuf::from(&prepared.canonical);
-	let raw = read_target(&canonical_path, token).await.map_err(|_| {
-		CommitError::Failed(format!(
-			"{} changed or disappeared after the batch was prepared; refusing to write. Re-read and retry.",
-			prepared.section.path
-		))
-	})?;
+	let raw = match (&prepared.artifact, artifact_root) {
+		(Some(relative), Some(root)) => {
+			let (bytes, _) = crate::tools::internal_urls::read_contained(root, relative)
+				.map_err(|_| {
+					CommitError::Failed(format!(
+						"{} changed or disappeared after the batch was prepared; refusing to write. Re-read and retry.",
+						prepared.section.path
+					))
+				})?;
+			String::from_utf8(bytes).map_err(|_| {
+				CommitError::Failed(format!(
+					"{} is no longer valid UTF-8; refusing to write. Re-read and retry.",
+					prepared.section.path
+				))
+			})?
+		},
+		_ => read_target(&canonical_path, token).await.map_err(|_| {
+			CommitError::Failed(format!(
+				"{} changed or disappeared after the batch was prepared; refusing to write. Re-read and retry.",
+				prepared.section.path
+			))
+		})?,
+	};
 	if raw != prepared.source_raw {
 		let now_tag = hash::compute_file_hash(&hash::normalize_to_lf(
 			hash::strip_bom(&raw).1,
@@ -718,11 +790,19 @@ async fn commit(
 	prepared: Prepared,
 	token: &CancellationToken,
 	store: &SnapshotStore,
+	artifact_root: Option<&Path>,
 ) -> Result<Outcome, CommitError> {
 	if token.is_cancelled() {
 		return Err(CommitError::Cancelled);
 	}
 	let target = prepared.section.file_path.clone();
+	// Defense in depth: the guard already refuses rename/delete, artifact or
+	// not, before this point.
+	if prepared.artifact.is_some() && prepared.file_op.is_some() {
+		return Err(CommitError::Failed(
+			"Plan mode: renaming or deleting plan artifacts is not allowed.".to_string(),
+		));
+	}
 
 	if matches!(&prepared.file_op, Some(FileOp::Rem)) {
 		// Type-check before reading/validating: a replacement directory must
@@ -737,7 +817,7 @@ async fn commit(
 				prepared.section.path
 			)));
 		}
-		assert_prepared_target(&prepared, token).await?;
+		assert_prepared_target(&prepared, token, artifact_root).await?;
 		tokio::fs::remove_file(&target).await.map_err(|err| {
 			CommitError::Failed(format!(
 				"Failed to delete {}: {err}. The file is still present.",
@@ -749,7 +829,7 @@ async fn commit(
 	}
 
 	if let Some(FileOp::Move(dest)) = &prepared.file_op {
-		assert_prepared_target(&prepared, token).await?;
+		assert_prepared_target(&prepared, token, artifact_root).await?;
 		let dest_path = prepared.move_dest.clone().ok_or_else(|| {
 			CommitError::Failed(format!(
 				"Internal error: the move target for {} was not recorded.",
@@ -779,7 +859,9 @@ async fn commit(
 				)),
 				other => other,
 			})?;
-		assert_prepared_target(&prepared, token).await.map_err(|err| match err {
+		assert_prepared_target(&prepared, token, artifact_root)
+			.await
+			.map_err(|err| match err {
 			CommitError::Failed(message) => CommitError::Failed(format!(
 				"{message} Destination {} was already written; source is still present \
 				 (partial move).",
@@ -819,7 +901,7 @@ async fn commit(
 		return Ok(Outcome::Noop { path: prepared.section.path, warnings: prepared.warnings });
 	}
 
-	assert_prepared_target(&prepared, token).await?;
+	assert_prepared_target(&prepared, token, artifact_root).await?;
 	if token.is_cancelled() {
 		return Err(CommitError::Cancelled);
 	}
@@ -829,7 +911,25 @@ async fn commit(
 		hash::restore_line_endings(&prepared.after, prepared.line_ending)
 	);
 	let canonical_target = PathBuf::from(&prepared.canonical);
-	write_file(&canonical_target, persisted.as_bytes(), token).await?;
+	if let Some(relative) = &prepared.artifact {
+		let root = artifact_root.ok_or_else(|| {
+			CommitError::Failed(format!(
+				"Internal error: the sandbox root for {} was not passed to the commit.",
+				prepared.section.path
+			))
+		})?;
+		crate::tools::write_artifact(root, relative, persisted.as_bytes(), token)
+			.await
+			.map_err(|err| match err.kind() {
+				std::io::ErrorKind::Interrupted => CommitError::Cancelled,
+				_ => CommitError::Failed(format!(
+					"Failed to write {}: {err}",
+					prepared.section.path
+				)),
+			})?;
+	} else {
+		write_file(&canonical_target, persisted.as_bytes(), token).await?;
+	}
 	let tag = store
 		.record(&prepared.canonical, &prepared.after, None)
 		.unwrap_or_else(|| hash::compute_file_hash(&prepared.after));
@@ -953,12 +1053,13 @@ mod bind_tests {
 			&store,
 			&EditToolOptions::default(),
 			&mut budget,
+			None,
 		)
 		.await
 		.expect("prepare");
 
 		std::fs::write(&path, "externally replaced\n").unwrap();
-		let err = commit(prepared, &token, &store).await.err().expect("must reject");
+		let err = commit(prepared, &token, &store, None).await.err().expect("must reject");
 		match err {
 			CommitError::Failed(message) => {
 				assert!(message.contains("changed after the batch was prepared"), "{message}")
@@ -993,13 +1094,14 @@ mod bind_tests {
 			&store,
 			&EditToolOptions::default(),
 			&mut budget,
+			None,
 		)
 		.await
 		.expect("prepare");
 
 		std::fs::remove_file(&link).unwrap();
 		std::os::unix::fs::symlink(&other, &link).unwrap();
-		let err = commit(prepared, &token, &store).await.err().expect("must reject");
+		let err = commit(prepared, &token, &store, None).await.err().expect("must reject");
 		match err {
 			CommitError::Failed(message) => assert!(message.contains("retargeted"), "{message}"),
 			CommitError::Cancelled => panic!("unexpected cancel"),
@@ -1029,6 +1131,7 @@ mod bind_tests {
 			&store,
 			&EditToolOptions::default(),
 			&mut budget,
+			None,
 		)
 		.await
 		.expect("prepare");
@@ -1045,7 +1148,7 @@ mod bind_tests {
 		}
 		let collision = collision.expect("find a 16-bit tag collision");
 		std::fs::write(&path, &collision).unwrap();
-		let err = commit(prepared, &token, &store).await.err().expect("must reject");
+		let err = commit(prepared, &token, &store, None).await.err().expect("must reject");
 		match err {
 			CommitError::Failed(message) => {
 				assert!(message.contains("changed after the batch was prepared"), "{message}")
@@ -1076,12 +1179,13 @@ mod bind_tests {
 			&store,
 			&EditToolOptions::default(),
 			&mut budget,
+			None,
 		)
 		.await
 		.expect("prepare");
 
 		std::fs::write(&path, "replacement\n").unwrap();
-		let err = commit(prepared, &token, &store).await.err().expect("must reject");
+		let err = commit(prepared, &token, &store, None).await.err().expect("must reject");
 		match err {
 			CommitError::Failed(message) => {
 				assert!(message.contains("changed after the batch was prepared"), "{message}")
@@ -1112,6 +1216,7 @@ mod bind_tests {
 			&store,
 			&EditToolOptions::default(),
 			&mut budget,
+			None,
 		)
 		.await
 		.expect("prepare");
@@ -1119,7 +1224,7 @@ mod bind_tests {
 		std::fs::remove_file(&path).unwrap();
 		std::fs::create_dir(&path).unwrap();
 		std::fs::write(path.join("kept.txt"), "inside\n").unwrap();
-		let err = commit(prepared, &token, &store).await.err().expect("must reject");
+		let err = commit(prepared, &token, &store, None).await.err().expect("must reject");
 		match err {
 			CommitError::Failed(message) => {
 				assert!(message.contains("no longer a regular file or symlink"), "{message}")
@@ -1151,10 +1256,11 @@ mod bind_tests {
 			&store,
 			&EditToolOptions::default(),
 			&mut budget,
+			None,
 		)
 		.await
 		.expect("prepare");
-		commit(prepared, &token, &store).await.expect("commit");
+		commit(prepared, &token, &store, None).await.expect("commit");
 		let moved = dir.join("moved.txt");
 		use std::os::unix::fs::MetadataExt;
 		assert_eq!(std::fs::metadata(&moved).unwrap().mode() & 0o777, 0o600);

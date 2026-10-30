@@ -52,6 +52,9 @@ pub enum ToolChoice {
 	/// Force exactly this tool. Only adapters that support forced selection may
 	/// accept it; the name must be non-empty and offered in the same request.
 	Tool { name: String },
+	/// Require any tool call. Unlike [`Self::Tool`] the model picks which one;
+	/// adapters that cannot express it fall back to their own policy.
+	Required,
 }
 
 /// Delta chunk emitted by streaming completions.
@@ -296,6 +299,7 @@ impl OpenAiCompatibleProvider {
 	) -> Result<OpenAiChatRequest, ProviderError> {
 		let tool_choice = match tool_choice {
 			ToolChoice::Auto => None,
+			ToolChoice::Required => Some(OpenAiToolChoice::Mode(OpenAiToolChoiceMode::Required)),
 			ToolChoice::Tool { name } => {
 				if name.trim().is_empty() {
 					return Err(ProviderError::InvalidToolChoice(
@@ -315,6 +319,7 @@ impl OpenAiCompatibleProvider {
 					)));
 				}
 				Some(OpenAiToolChoice::Function {
+					kind:     OpenAiToolChoiceKind::Function,
 					function: OpenAiToolChoiceFunction { name: name.clone() },
 				})
 			},
@@ -531,11 +536,32 @@ pub struct OpenAiStreamOptions {
 	pub include_usage: bool,
 }
 
-/// OpenAI chat-completions `tool_choice` for a forced function.
+/// OpenAI chat-completions `tool_choice`: a bare mode string (`"required"`) or
+/// a forced function object (`{"type":"function",…}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum OpenAiToolChoice {
-	Function { function: OpenAiToolChoiceFunction },
+	/// Bare mode string, e.g. `"required"`.
+	Mode(OpenAiToolChoiceMode),
+	Function {
+		#[serde(rename = "type")]
+		kind:     OpenAiToolChoiceKind,
+		function: OpenAiToolChoiceFunction,
+	},
+}
+
+/// String-mode `tool_choice` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiToolChoiceMode {
+	Required,
+}
+
+/// Object discriminator for the forced-function form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiToolChoiceKind {
+	Function,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -867,6 +893,7 @@ pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Pr
 			Role::User => "user",
 			Role::Assistant => "assistant",
 			Role::Tool => unreachable!(),
+			Role::Developer => "developer",
 		};
 
 		let tool_calls = if m.tool_calls.is_empty() {
@@ -1238,6 +1265,21 @@ mod tests {
 		let payload = serde_json::to_value(provider.request(&[], &[], &ToolChoice::Auto, true).expect("request"))
 			.expect("serialize");
 		assert!(payload.get("prompt_cache_key").is_none(), "got: {payload}");
+	}
+
+	#[test]
+	fn required_tool_choice_serializes_as_bare_mode_string() {
+		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "key", "model-x")
+			.expect("build");
+		let tools = vec![serde_json::json!({
+			"type": "function",
+			"function": { "name": "read", "parameters": { "type": "object" } }
+		})];
+		let request = provider
+			.request(&[], &tools, &ToolChoice::Required, true)
+			.expect("request");
+		let payload = serde_json::to_value(request).expect("serialize");
+		assert_eq!(payload["tool_choice"], serde_json::json!("required"));
 	}
 
 	#[test]

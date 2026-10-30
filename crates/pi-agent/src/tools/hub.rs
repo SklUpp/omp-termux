@@ -205,6 +205,12 @@ pub struct HubJobSnapshot {
 	/// counted twice for one job. Absent when the child reported nothing.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub usage: Option<TokenUsage>,
+	/// Durable accounting key accompanying [`Self::usage`] on the consuming
+	/// snapshot. A synchronous `task` result already carries `details.usage` and
+	/// is counted from that message, so a `hub` snapshot exposes neither usage
+	/// nor key for non-detached records. Absent whenever `usage` is absent.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub result_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +321,12 @@ fn snapshot(record: &ChildRecord, consumed: bool) -> HubJobSnapshot {
 			.unwrap_or_default(),
 		_ => record.duration_ms.unwrap_or_default(),
 	};
+	// Only a detached background job is counted from a hub snapshot: a
+	// synchronous `task` result already persists `details.usage` and is charged
+	// from that message, so exposing it again here would double count.
+	let accounting_usage = record
+		.usage
+		.filter(|_| record.detached && !consumed);
 	HubJobSnapshot {
 		id: record.id.clone(),
 		name: record.name.clone(),
@@ -336,7 +348,10 @@ fn snapshot(record: &ChildRecord, consumed: bool) -> HubJobSnapshot {
 			}
 			.filter(|_| !consumed)
 		},
-		usage: record.usage.filter(|_| !consumed),
+		usage: accounting_usage,
+		result_key: accounting_usage
+			.map(|_| record.result_key.clone())
+			.filter(|key| !key.is_empty()),
 	}
 }
 
@@ -360,15 +375,19 @@ fn format_duration(milliseconds: u64) -> String {
 }
 
 fn details_result(details: &HubToolDetails) -> Result<ToolResult, ToolError> {
-	let content = serde_json::to_string(details).map_err(|err| {
+	let value = serde_json::to_value(details).map_err(|err| {
 		ToolError::ExecutionFailed(format!("Failed to serialize hub details: {err}"))
 	})?;
+	let content = value.to_string();
 	Ok(ToolResult {
 		tool_call_id: String::new(),
 		content,
 		is_error: false,
 		terminate: false,
-		details: None,
+		// Hosts account a consumed job's usage from structured details (the
+		// same shape this tool already returns as JSON text), never by parsing
+		// the content string.
+		details: Some(value),
 	})
 }
 
@@ -1193,16 +1212,7 @@ impl HubTool {
 			jobs,
 			cancelled: None,
 		};
-		let serialized = serde_json::to_string(&details).map_err(|err| {
-			ToolError::ExecutionFailed(format!("Failed to serialize hub details: {err}"))
-		})?;
-		Ok(ToolResult {
-			tool_call_id: String::new(),
-			content: serialized,
-			is_error: false,
-			terminate: false,
-			details: None,
-		})
+		details_result(&details)
 	}
 
 	async fn execute_cancel(
@@ -1274,16 +1284,7 @@ impl HubTool {
 			jobs,
 			cancelled: Some(cancelled),
 		};
-		let serialized = serde_json::to_string(&details).map_err(|err| {
-			ToolError::ExecutionFailed(format!("Failed to serialize hub details: {err}"))
-		})?;
-		Ok(ToolResult {
-			tool_call_id: String::new(),
-			content: serialized,
-			is_error: false,
-			terminate: false,
-			details: None,
-		})
+		details_result(&details)
 	}
 
 	async fn execute_wait(
@@ -1511,16 +1512,7 @@ impl HubTool {
 			jobs,
 			cancelled: None,
 		};
-		let serialized = serde_json::to_string(&details).map_err(|err| {
-			ToolError::ExecutionFailed(format!("Failed to serialize hub details: {err}"))
-		})?;
-		Ok(ToolResult {
-			tool_call_id: String::new(),
-			content: serialized,
-			is_error: false,
-			terminate: false,
-			details: None,
-		})
+		details_result(&details)
 	}
 
 	fn message_timeout_result(
@@ -1852,16 +1844,7 @@ impl HubTool {
 			jobs: Vec::new(),
 			cancelled: None,
 		};
-		let serialized = serde_json::to_string(&details).map_err(|err| {
-			ToolError::ExecutionFailed(format!("Failed to serialize hub details: {err}"))
-		})?;
-		Ok(ToolResult {
-			tool_call_id: String::new(),
-			content: serialized,
-			is_error: false,
-			terminate: false,
-			details: None,
-		})
+		details_result(&details)
 	}
 
 	fn execute_list(
@@ -1938,16 +1921,7 @@ impl HubTool {
 			jobs: Vec::new(),
 			cancelled: None,
 		};
-		let serialized = serde_json::to_string(&details).map_err(|err| {
-			ToolError::ExecutionFailed(format!("Failed to serialize hub details: {err}"))
-		})?;
-		Ok(ToolResult {
-			tool_call_id: String::new(),
-			content: serialized,
-			is_error: false,
-			terminate: false,
-			details: None,
-		})
+		details_result(&details)
 	}
 }
 
@@ -1961,7 +1935,7 @@ mod backend_snapshot_tests {
 	use crate::{
 		provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
 		state::Message,
-		supervisor::DelegationLimits,
+		supervisor::{ChildSpawn, DelegationLimits},
 		tools::{process::ProcessManager, registry::ToolRegistry},
 	};
 
@@ -2010,5 +1984,55 @@ mod backend_snapshot_tests {
 			Arc::ptr_eq(&tool.processes(), &snapshot),
 			"child hub must keep the spawn-time backend"
 		);
+	}
+
+	/// A hub snapshot is a real accounting route only for a detached background
+	/// job: the consuming snapshot carries `usage` plus the namespaced
+	/// `resultKey`, and a synchronous record stays excluded because its `task`
+	/// result already persists `details.usage`.
+	#[test]
+	fn hub_snapshot_exposes_usage_and_key_only_for_detached_records() {
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::with_builtins(),
+			Arc::new(QuietProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			true,
+		);
+		let usage = TokenUsage { input: 4, output: 6, ..TokenUsage::default() };
+		let record = |detached: bool| {
+			let mut spawn = ChildSpawn::new("bg", 0, "task", "work");
+			spawn.detached = detached;
+			let (id, _token) = supervisor.reserve_child_full(spawn).expect("reserve");
+			supervisor.mark_completed_with_usage(&id, 1, "body", Some(usage));
+			supervisor
+				.children()
+				.into_iter()
+				.find(|record| record.id == id)
+				.expect("retained record")
+		};
+
+		let background = record(true);
+		let consuming = snapshot(&background, false);
+		assert_eq!(consuming.usage, Some(usage));
+		assert_eq!(consuming.result_key, Some(background.result_key.clone()));
+		assert_eq!(
+			serde_json::to_value(&consuming).expect("json")["resultKey"],
+			serde_json::json!(background.result_key.clone()),
+			"structured details expose the camelCase accounting key"
+		);
+
+		let sync = record(false);
+		let sync_snapshot = snapshot(&sync, false);
+		assert_eq!(
+			sync_snapshot.usage, None,
+			"a sync `task` result is counted from its own details.usage"
+		);
+		assert_eq!(sync_snapshot.result_key, None);
+
+		let delivered = snapshot(&background, true);
+		assert_eq!(delivered.usage, None, "a consumed job never repeats usage");
+		assert_eq!(delivered.result_key, None);
 	}
 }

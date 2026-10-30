@@ -48,12 +48,15 @@ use std::{
 };
 
 use async_trait::async_trait;
-use regex::{Regex, RegexBuilder};
+use regex::RegexBuilder;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::state::{AcpClientBridge, AcpClientError, AgentContext, ToolResult};
+use crate::state::{
+	AcpClientBridge, AcpClientError, AgentContext, PlanWriteOp, PlanWriteTarget, ProposeHandler,
+	ToolResult,
+};
 use crate::tools::process::{ProcessBackend, ProcessError, ProcessSpec, RestartPolicy};
 
 /// Captured stdout+stderr budget for one bash call.
@@ -958,6 +961,294 @@ pub(crate) async fn write_atomic_with_mode(
 	Ok(())
 }
 
+/// Reject `.`/`..`/empty components of a sandbox-relative path. `openat` and
+/// `O_NOFOLLOW` do not block `..`, so every contained helper validates first.
+pub(crate) fn validate_artifact_relative(relative: &str) -> Result<(), String> {
+	if relative.is_empty() {
+		return Err("local:// needs a file name".to_string());
+	}
+	for part in relative.split('/') {
+		if part.is_empty() || part == "." || part == ".." {
+			return Err(format!("local://{relative} escapes the artifact root"));
+		}
+	}
+	Ok(())
+}
+
+/// Contained UTF-8 read of one artifact, for hosts that resolve a `local:`
+/// URL outside the read tool.
+pub fn read_local_artifact(root: &Path, relative: &str) -> Result<String, String> {
+	validate_artifact_relative(relative)?;
+	let (bytes, _) = internal_urls::read_contained(root, relative)?;
+	String::from_utf8(bytes).map_err(|_| format!("local://{relative} is not UTF-8 text"))
+}
+
+/// Validated relative path of a `local://<path>` target. Traversal, empty
+/// components and other schemes yield `None`.
+#[must_use]
+pub fn local_artifact_relative(path: &str) -> Option<String> {
+	let url = internal_urls::InternalUrl::parse(path)?;
+	if url.scheme != internal_urls::LOCAL_SCHEME {
+		return None;
+	}
+	let relative = format!("{}{}", url.host, url.path);
+	let relative = relative.trim_start_matches('/');
+	if relative.is_empty() {
+		return None;
+	}
+	if relative.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+		return None;
+	}
+	Some(relative.to_string())
+}
+
+/// Write `bytes` to `relative` below `root` through descriptors only.
+///
+/// Every existing component is opened with `O_NOFOLLOW`, missing directories
+/// are created with `mkdirat`, and the leaf is published by `renameat` from an
+/// unpublished temp file in the same directory, so no component or leaf symlink
+/// is ever followed. Cancellation is re-checked under the same commit-state lock
+/// `write_atomic` uses, immediately before the rename.
+///
+/// This does not confine a directory that another same-UID process relocates
+/// after it is opened: the walk pins inodes, it is not an isolation boundary.
+pub async fn write_artifact(
+	root: &Path,
+	relative: &str,
+	bytes: &[u8],
+	token: &CancellationToken,
+) -> std::io::Result<()> {
+	if token.is_cancelled() {
+		return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+	}
+	let write_token = token.child_token();
+	let commit_state = Arc::new(Mutex::new(CommitState::default()));
+	let mut abort_guard = AbortGuard::new(write_token.clone(), commit_state.clone());
+	let root = root.to_path_buf();
+	let relative = relative.to_string();
+	let bytes = bytes.to_vec();
+	tokio::task::spawn_blocking(move || {
+		write_artifact_sync(&root, &relative, &bytes, &write_token, &commit_state)
+	})
+	.await
+	.map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))??;
+	abort_guard.disarm();
+	Ok(())
+}
+
+#[cfg(unix)]
+fn write_artifact_sync(
+	root: &Path,
+	relative: &str,
+	bytes: &[u8],
+	token: &CancellationToken,
+	commit_state: &Arc<Mutex<CommitState>>,
+) -> std::io::Result<()> {
+	use std::{
+		ffi::CString,
+		io::Write,
+		os::{
+			fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+			unix::ffi::OsStrExt,
+		},
+	};
+
+	fn interrupted() -> std::io::Error {
+		std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled")
+	}
+	fn last_error() -> std::io::Error {
+		std::io::Error::last_os_error()
+	}
+	fn cstring(part: &str) -> std::io::Result<CString> {
+		CString::new(part).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				format!("local artifact component contains a NUL: {part:?}"),
+			)
+		})
+	}
+
+	if token.is_cancelled() {
+		return Err(interrupted());
+	}
+	validate_artifact_relative(relative).map_err(|message| {
+		std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+	})?;
+	let root_c = CString::new(root.as_os_str().as_bytes()).map_err(|_| {
+		std::io::Error::new(
+			std::io::ErrorKind::InvalidInput,
+			"local artifact root contains a NUL",
+		)
+	})?;
+	// SAFETY: `root_c` is NUL-terminated; the returned descriptor is owned here.
+	let root_fd = unsafe {
+		libc::open(
+			root_c.as_ptr(),
+			libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+		)
+	};
+	if root_fd < 0 {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::NotFound,
+			format!("local artifact root {}: {}", root.display(), last_error()),
+		));
+	}
+	// SAFETY: `root_fd` is a fresh descriptor this call owns.
+	let mut dir = unsafe { OwnedFd::from_raw_fd(root_fd) };
+
+	let mut parts: Vec<&str> = relative.split('/').filter(|part| !part.is_empty()).collect();
+	let Some(name) = parts.pop() else {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidInput,
+			format!("local://{relative} needs a file name"),
+		));
+	};
+	for part in parts {
+		if token.is_cancelled() {
+			return Err(interrupted());
+		}
+		let c_part = cstring(part)?;
+		// SAFETY: `dir` is open and `c_part` is NUL-terminated.
+		let mut fd = unsafe {
+			libc::openat(
+				dir.as_raw_fd(),
+				c_part.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if fd < 0 {
+			let missing = last_error();
+			if missing.raw_os_error() != Some(libc::ENOENT) {
+				return Err(missing);
+			}
+			// A raced symlink makes `mkdirat` fail with EEXIST and the reopen
+			// below reject it; the component is never followed.
+			if unsafe { libc::mkdirat(dir.as_raw_fd(), c_part.as_ptr(), 0o755) } != 0 {
+				let mkdir = last_error();
+				if mkdir.raw_os_error() != Some(libc::EEXIST) {
+					return Err(mkdir);
+				}
+			}
+			fd = unsafe {
+				libc::openat(
+					dir.as_raw_fd(),
+					c_part.as_ptr(),
+					libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+				)
+			};
+			if fd < 0 {
+				return Err(last_error());
+			}
+		}
+		// SAFETY: fresh descriptor, ownership moves into the guard.
+		dir = unsafe { OwnedFd::from_raw_fd(fd) };
+	}
+
+	let c_name = cstring(name)?;
+	let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+	// SAFETY: `dir` and `c_name` are valid for this call.
+	let stat_rc = unsafe {
+		libc::fstatat(dir.as_raw_fd(), c_name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW)
+	};
+	let mode: libc::mode_t = if stat_rc == 0 {
+		let kind = stat.st_mode & libc::S_IFMT;
+		if kind == libc::S_IFLNK {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::PermissionDenied,
+				format!("local://{relative} is a symlink"),
+			));
+		}
+		if kind == libc::S_IFDIR {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::IsADirectory,
+				format!("local://{relative} is a directory"),
+			));
+		}
+		stat.st_mode & 0o777
+	} else {
+		let err = last_error();
+		if err.raw_os_error() != Some(libc::ENOENT) {
+			return Err(err);
+		}
+		0o644
+	};
+
+	let temp = format!(
+		".omp-tmp-{}-{}",
+		std::process::id(),
+		TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+	);
+	let c_temp = cstring(&temp)?;
+	// SAFETY: `dir` and `c_temp` are valid; the descriptor is owned below.
+	let temp_fd = unsafe {
+		libc::openat(
+			dir.as_raw_fd(),
+			c_temp.as_ptr(),
+			libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			0o600,
+		)
+	};
+	if temp_fd < 0 {
+		return Err(last_error());
+	}
+	// SAFETY: fresh descriptor, ownership moves into the `File`.
+	let mut temp_file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(temp_fd) });
+	let dir_fd: RawFd = dir.as_raw_fd();
+	let cleanup = || {
+		// SAFETY: the parent descriptor stays open for this call.
+		unsafe { libc::unlinkat(dir_fd, c_temp.as_ptr(), 0) };
+	};
+
+	let written = (|| -> std::io::Result<()> {
+		for chunk in bytes.chunks(64 * 1024) {
+			if token.is_cancelled() {
+				return Err(interrupted());
+			}
+			temp_file.write_all(chunk)?;
+		}
+		temp_file.flush()?;
+		if unsafe { libc::fchmod(temp_file.as_raw_fd(), mode) } != 0 {
+			return Err(last_error());
+		}
+		Ok(())
+	})();
+	if let Err(error) = written {
+		cleanup();
+		return Err(error);
+	}
+
+	{
+		let mut lock = commit_state.lock().unwrap_or_else(|poison| poison.into_inner());
+		if lock.cancelled || token.is_cancelled() {
+			cleanup();
+			return Err(interrupted());
+		}
+		// SAFETY: both names are NUL-terminated and live in `dir`; `renameat`
+		// replaces the leaf name without following it.
+		if unsafe { libc::renameat(dir_fd, c_temp.as_ptr(), dir_fd, c_name.as_ptr()) } != 0 {
+			let error = last_error();
+			cleanup();
+			return Err(error);
+		}
+		lock.committed = true;
+	}
+	Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_artifact_sync(
+	_root: &Path,
+	_relative: &str,
+	_bytes: &[u8],
+	_token: &CancellationToken,
+	_commit_state: &Arc<Mutex<CommitState>>,
+) -> std::io::Result<()> {
+	Err(std::io::Error::new(
+		std::io::ErrorKind::Unsupported,
+		"local:// writes need descriptor-relative traversal; unsupported on this platform",
+	))
+}
+
 /// Builtin file writing tool.
 ///
 /// A write to `xd://resolve` or `xd://reject` is not a filesystem write: it
@@ -974,6 +1265,9 @@ pub struct WriteTool {
 	scope:   Arc<UrlScope>,
 	/// ACP client reverse bridge; `None` keeps every write local.
 	acp:     Option<Arc<dyn AcpClientBridge>>,
+	/// Plan-approval handler for `xd://propose`; mounted only in plan mode.
+	/// The write guard itself rides on `AgentContext.plan`, never here.
+	propose: Option<Arc<dyn ProposeHandler>>,
 }
 
 impl Default for WriteTool {
@@ -983,6 +1277,7 @@ impl Default for WriteTool {
 			router:  None,
 			scope:   Arc::new(UrlScope::default()),
 			acp:     None,
+			propose: None,
 		}
 	}
 }
@@ -1018,6 +1313,14 @@ impl WriteTool {
 		self
 	}
 
+	/// Mount the `xd://propose` handler. `None` outside plan mode, which keeps
+	/// the device failing with the upstream wording.
+	#[must_use]
+	pub fn with_propose(mut self, propose: Option<Arc<dyn ProposeHandler>>) -> Self {
+		self.propose = propose;
+		self
+	}
+
 	/// Dispatch an `xd://resolve|reject` write. Never touches the filesystem.
 	async fn dispatch_pending(
 		&self,
@@ -1046,6 +1349,26 @@ impl WriteTool {
 		let Some(store) = &self.pending else {
 			return Err(ToolError::ExecutionFailed("xd:// is not mounted in this session.".to_string()));
 		};
+		// Deferred mutation boundary: a staged action is never applied while the
+		// live guard says plan mode is active. `reject` stays available.
+		if device == pending::RESOLVE_DEVICE
+			&& let Some(guard) = ctx.plan.as_ref()
+		{
+			let declared = store.peek().map(|action| action.targets()).unwrap_or_default();
+			let owned: Vec<String> = declared;
+			let wildcard = [PlanWriteTarget::new("", PlanWriteOp::DeferredApply)];
+			let targets: Vec<PlanWriteTarget<'_>> = if owned.is_empty() {
+				wildcard.to_vec()
+			} else {
+				owned
+					.iter()
+					.map(|path| PlanWriteTarget::new(path, PlanWriteOp::DeferredApply))
+					.collect()
+			};
+			if let Some(message) = guard.write_error("ast_edit", &targets) {
+				return Err(ToolError::Rejected(message));
+			}
+		}
 		let reason = content.trim();
 		let mut result = if device == pending::RESOLVE_DEVICE {
 			store.resolve(ctx, reason).await?
@@ -1105,14 +1428,54 @@ impl Tool for WriteTool {
 			.get("content")
 			.and_then(Value::as_str)
 			.ok_or_else(|| ToolError::InvalidArguments("missing 'content' parameter".to_string()))?;
+		if pending::is_propose_device_path(path) {
+			// Plan approval is a device dispatch, never a filesystem write.
+			let Some(handler) = &self.propose else {
+				return Err(ToolError::Rejected(format!(
+					"No plan is awaiting approval — {0} only accepts a plan title while plan mode is active.",
+					pending::PROPOSE_DEVICE_PATH
+				)));
+			};
+			return handler.propose(content, ctx).await;
+		}
 		if let Some(target) = pending::parse_xd_target(path) {
 			return self.dispatch_pending(path, target, content, ctx).await;
+		}
+		// Plan mode keeps the working tree read-only; the host classifies the
+		// resolved target (local:// artifacts stay writable).
+		let targets = [PlanWriteTarget::new(path, PlanWriteOp::Update)];
+		if let Some(message) = ctx
+			.plan
+			.as_ref()
+			.and_then(|guard| guard.write_error("write", &targets))
+		{
+			return Err(ToolError::Rejected(message));
 		}
 		if content.len() > MAX_WRITE_BYTES {
 			return Err(ToolError::InvalidArguments(format!(
 				"content is {} bytes, the limit is {MAX_WRITE_BYTES}",
 				content.len()
 			)));
+		}
+
+		// Plan mode allows the `local://` artifact sandbox. That scheme's handler
+		// is read-only, so an active guard's sandbox root owns the bytes; the sink
+		// walks descriptors and never follows a component or leaf symlink.
+		if let Some(root) = ctx.plan.as_ref().and_then(|guard| guard.artifact_root())
+			&& let Some(relative) = local_artifact_relative(path)
+		{
+			return match write_artifact(&root, &relative, content.as_bytes(), &ctx.cancellation_token)
+				.await
+			{
+				Ok(()) => Ok(tool_result(
+					format!("Successfully wrote {} bytes to {path}", content.len()),
+					false,
+				)),
+				Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+					Ok(tool_result(format!("Write to {path} cancelled"), true))
+				},
+				Err(err) => Ok(tool_result(format!("Failed to write {path}: {err}"), true)),
+			};
 		}
 
 		// Internal URLs never become files: a mounted handler owns the write,
@@ -1298,13 +1661,171 @@ impl Tool for EditTool {
 	}
 
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+		let guard = ctx.plan.clone();
+		let artifact_root = guard.as_ref().and_then(|guard| guard.artifact_root());
 		let mode = self.mode();
-		if mode != edit_variants::EditMode::Hashline {
-			return edit_variants::execute(mode, args, ctx).await;
-		}
 		let options = *self.options.lock().unwrap_or_else(|poison| poison.into_inner());
-		hashline::execute(self.store.as_ref(), &self.registers, &self.noop_guard, &options, args, ctx).await
+
+		if mode == edit_variants::EditMode::Hashline {
+			let input = args.get("input").and_then(Value::as_str).unwrap_or_default();
+			let mut sections = match hashline::parser::split_patch_sections(
+				input,
+				Some(ctx.cwd.as_path()),
+			) {
+				Ok(sections) => sections,
+				Err(message) => {
+					// An unparsable payload while plan mode is active is an
+					// unclassifiable mutation: fail closed through the host.
+					if let Some(guard) = &guard
+						&& artifact_root.is_some()
+						&& let Some(blocked) = guard.write_error("edit", &[])
+					{
+						return Err(ToolError::Rejected(blocked));
+					}
+					return Ok(tool_result(format!("Failed to edit: {message}"), true));
+				},
+			};
+			if let Some(guard) = &guard {
+				let mut ops: Vec<(String, PlanWriteOp, Option<String>)> = Vec::new();
+				for section in &sections {
+					let file_op = hashline::parser::parse_section_body(&section.diff)
+						.ok()
+						.and_then(|parsed| parsed.file_op);
+					ops.push(match file_op {
+						Some(hashline::parser::FileOp::Rem) => {
+							(section.path.clone(), PlanWriteOp::Delete, None)
+						},
+						Some(hashline::parser::FileOp::Move(dest)) => {
+							(section.path.clone(), PlanWriteOp::Rename, Some(dest))
+						},
+						None => (section.path.clone(), PlanWriteOp::Update, None),
+					});
+				}
+				let targets: Vec<PlanWriteTarget<'_>> = ops
+					.iter()
+					.map(|(path, op, rename_to)| PlanWriteTarget {
+						path:      path.as_str(),
+						op:        *op,
+						rename_to: rename_to.as_deref(),
+					})
+					.collect();
+				if let Some(message) = guard.write_error("edit", &targets) {
+					return Err(ToolError::Rejected(message));
+				}
+			}
+			// Artifact sections keep their authored URL in the tag lookup but
+			// execute against the sandbox path the same walk would produce.
+			if let Some(root) = artifact_root.as_deref() {
+				for section in &mut sections {
+					if let Some(relative) = local_artifact_relative(&section.path) {
+						section.file_path = root.join(relative);
+					}
+				}
+			}
+			return hashline::edit::execute_sections(
+				self.store.as_ref(),
+				&self.registers,
+				&self.noop_guard,
+				&options,
+				sections,
+				artifact_root.as_deref(),
+				input,
+				ctx,
+			)
+			.await;
+		}
+
+		if let Some(guard) = &guard {
+			// Non-hashline variants cannot route artifacts through the fd sink,
+			// so an authored local target is refused rather than written by a
+			// path helper. Operations and rename destinations are preserved.
+			let authored = edit_variant_targets(mode, args);
+			let touches_local = authored.iter().any(|(path, _, rename_to)| {
+				local_artifact_relative(path).is_some()
+					|| rename_to
+						.as_deref()
+						.is_some_and(|dest| local_artifact_relative(dest).is_some())
+			});
+			if artifact_root.is_some()
+				&& touches_local
+				&& let Some(blocked) = guard.write_error("edit", &[])
+			{
+				return Err(ToolError::Rejected(blocked));
+			}
+			let targets: Vec<PlanWriteTarget<'_>> = authored
+				.iter()
+				.map(|(path, op, rename_to)| PlanWriteTarget {
+					path:      path.as_str(),
+					op:        *op,
+					rename_to: rename_to.as_deref(),
+				})
+				.collect();
+			if let Some(message) = guard.write_error("edit", &targets) {
+				return Err(ToolError::Rejected(message));
+			}
+		}
+		edit_variants::execute(mode, args, ctx).await
 	}
+}
+
+/// Parsed targets of a non-hashline edit variant, used only for plan-mode
+/// classification (the variant itself resolves them). Operations and rename
+/// destinations are preserved so a delete/move cannot hide behind `Update`.
+fn edit_variant_targets(
+	mode: edit_variants::EditMode,
+	args: &Value,
+) -> Vec<(String, PlanWriteOp, Option<String>)> {
+	let mut targets = Vec::new();
+	if mode == edit_variants::EditMode::ApplyPatch {
+		if let Some(input) = args.get("input").and_then(Value::as_str)
+			&& let Ok(hunks) = edit_variants::apply_patch::parse_apply_patch(input)
+		{
+			for hunk in hunks {
+				let op = match hunk.op {
+					edit_variants::patch::Operation::Create => PlanWriteOp::Create,
+					edit_variants::patch::Operation::Delete => PlanWriteOp::Delete,
+					edit_variants::patch::Operation::Update => match &hunk.rename {
+						Some(_) => PlanWriteOp::Rename,
+						None => PlanWriteOp::Update,
+					},
+				};
+				targets.push((hunk.path, op, hunk.rename));
+			}
+			return targets;
+		}
+	}
+	let top_level = args.get("path").and_then(Value::as_str);
+	if let Some(edits) = args.get("edits").and_then(Value::as_array) {
+		// `patch`: every entry applies to the top-level `path`; an entry carries
+		// only `op`/`rename`/`diff`.
+		for edit in edits {
+			let path = top_level.unwrap_or_default();
+			let rename_to = edit
+				.get("rename")
+				.and_then(Value::as_str)
+				.map(str::to_string);
+			let op = match edit.get("op").and_then(Value::as_str) {
+				Some("delete") => PlanWriteOp::Delete,
+				Some("create") => PlanWriteOp::Create,
+				_ if rename_to.is_some() => PlanWriteOp::Rename,
+				_ => PlanWriteOp::Update,
+			};
+			targets.push((path.to_string(), op, rename_to));
+		}
+		return targets;
+	}
+	if let Some(path) = top_level {
+		targets.push((path.to_string(), PlanWriteOp::Update, None));
+	}
+	if mode == edit_variants::EditMode::Sloppy
+		&& let Some(input) = args.get("input").and_then(Value::as_str)
+	{
+		// Reuse the variant's own section extractor; no second parser.
+		for section in edit_variants::sloppy::split_sections(input) {
+			targets.push((section.path, PlanWriteOp::Update, None));
+		}
+	}
+	targets
 }
 
 fn normalize_path_like_input(input: &str) -> String {
@@ -2350,5 +2871,380 @@ mod internal_url_write_tests {
 		assert!(!result.is_error, "{}", result.content);
 		assert_eq!(result.content, "Successfully wrote 1 bytes to notes://a");
 		assert_eq!(writable.writes.load(Ordering::SeqCst), 1);
+	}
+}
+
+#[cfg(test)]
+mod plan_mode_tool_tests {
+	use std::sync::{Arc, Mutex};
+
+	use serde_json::json;
+
+	use super::*;
+	use crate::state::{AgentContext, PlanModeGuard, PlanWriteOp, PlanWriteTarget, ProposeHandler};
+
+	const READ_ONLY: &str =
+		"Plan mode: the working tree is read-only. Write your plan to a local://<slug>-plan.md file instead.";
+
+	/// Mirrors the host classification: only `local:` artifacts pass.
+	struct SandboxGuard {
+		root: PathBuf,
+	}
+
+	impl PlanModeGuard for SandboxGuard {
+		fn write_error(&self, _tool_name: &str, targets: &[PlanWriteTarget<'_>]) -> Option<String> {
+			if targets.is_empty() {
+				return Some(READ_ONLY.to_string());
+			}
+			for target in targets {
+				match target.op {
+					PlanWriteOp::Delete => {
+						return Some("Plan mode: deleting files is not allowed.".to_string());
+					},
+					PlanWriteOp::Rename => {
+						return Some("Plan mode: renaming files is not allowed.".to_string());
+					},
+					PlanWriteOp::DeferredApply => return Some(READ_ONLY.to_string()),
+					PlanWriteOp::Create | PlanWriteOp::Update => {
+						if local_artifact_relative(target.path).is_none() {
+							return Some(READ_ONLY.to_string());
+						}
+					},
+				}
+			}
+			None
+		}
+
+		fn artifact_root(&self) -> Option<PathBuf> {
+			Some(self.root.clone())
+		}
+	}
+
+	fn guard(root: &Path) -> Arc<dyn PlanModeGuard> {
+		Arc::new(SandboxGuard { root: root.to_path_buf() })
+	}
+
+	#[derive(Default)]
+	struct EchoPropose {
+		seen: Mutex<Vec<String>>,
+	}
+
+	#[async_trait]
+	impl ProposeHandler for EchoPropose {
+		async fn propose(
+			&self,
+			body: &str,
+			_ctx: &AgentContext,
+		) -> Result<ToolResult, ToolError> {
+			self
+				.seen
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.push(body.to_string());
+			Ok(tool_result("proposed", false))
+		}
+	}
+
+	#[derive(Default)]
+	struct DeclaredAction {
+		targets: Vec<String>,
+	}
+
+	#[async_trait]
+	impl PendingAction for DeclaredAction {
+		fn label(&self) -> &str {
+			"declared rewrite"
+		}
+
+		fn source_tool(&self) -> &str {
+			"ast_edit"
+		}
+
+		fn targets(&self) -> Vec<String> {
+			self.targets.clone()
+		}
+
+		async fn apply(&self, _ctx: &AgentContext, _reason: &str) -> Result<ToolResult, ToolError> {
+			Ok(tool_result("applied", false))
+		}
+	}
+
+	fn temp_cwd(label: &str) -> PathBuf {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos();
+		let path = std::env::temp_dir().join(format!("omp-plan-{label}-{nanos}"));
+		std::fs::create_dir_all(&path).expect("mkdir");
+		path
+	}
+
+	#[tokio::test]
+	async fn write_blocks_working_tree_but_allows_plan_targets() {
+		let cwd = temp_cwd("write");
+		let artifacts = cwd.join("artifacts");
+		let ctx = AgentContext::new(cwd.clone()).with_plan(Some(guard(&artifacts)));
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+
+		let blocked = tool
+			.execute(&json!({ "path": "src/main.rs", "content": "x" }), &ctx)
+			.await
+			.expect_err("working tree blocked");
+		assert_eq!(blocked.to_string(), READ_ONLY);
+		assert!(!cwd.join("src/main.rs").exists());
+
+		let local = tool
+			.execute(&json!({ "path": "local://demo-plan.md", "content": "# Plan\n" }), &ctx)
+			.await
+			.expect("local write");
+		assert!(!local.is_error, "{}", local.content);
+		assert_eq!(
+			std::fs::read_to_string(artifacts.join("demo-plan.md")).expect("plan file"),
+			"# Plan\n"
+		);
+	}
+
+	#[tokio::test]
+	async fn artifact_write_never_follows_symlinks() {
+		let cwd = temp_cwd("symlink");
+		let artifacts = cwd.join("artifacts");
+		let outside = cwd.join("outside");
+		std::fs::create_dir_all(&artifacts).expect("mkdir");
+		std::fs::create_dir_all(&outside).expect("mkdir");
+		let outside_file = outside.join("target.md");
+		std::fs::write(&outside_file, "untouched").expect("seed");
+		std::os::unix::fs::symlink(&outside_file, artifacts.join("leaf.md")).expect("leaf link");
+		std::os::unix::fs::symlink(&outside, artifacts.join("dir")).expect("dir link");
+
+		let leaf = write_artifact(&artifacts, "leaf.md", b"pwn", &CancellationToken::new())
+			.await
+			.expect_err("leaf symlink rejected");
+		assert!(leaf.to_string().contains("symlink"), "{leaf}");
+		assert_eq!(std::fs::read_to_string(&outside_file).expect("outside"), "untouched");
+
+		let nested = write_artifact(&artifacts, "dir/new/sub/plan.md", b"pwn", &CancellationToken::new())
+			.await
+			.expect_err("intermediate symlink rejected");
+		assert!(!nested.to_string().is_empty());
+		assert!(!outside.join("new").exists(), "no directory created outside the root");
+
+		// Contained reader and writer both reject `..` before touching disk.
+		assert!(read_local_artifact(&artifacts, "../outside/target.md").is_err());
+		assert!(write_artifact(&artifacts, "../outside/new.md", b"pwn", &CancellationToken::new())
+			.await
+			.is_err());
+		assert!(read_local_artifact(&artifacts, "leaf.md").is_err(), "leaf symlink read rejected");
+		assert!(!outside.join("new.md").exists());
+	}
+
+	#[tokio::test]
+	async fn edit_blocks_working_tree_and_classifies_parsed_targets() {
+		let cwd = temp_cwd("edit");
+		let artifacts = cwd.join("artifacts");
+		let store = Arc::new(hashline::SnapshotStore::new());
+		let edit = EditTool::new(Arc::clone(&store));
+
+		// No guard: the working-tree call proceeds to tag validation.
+		let unguarded = AgentContext::new(cwd.clone());
+		assert!(edit
+			.execute(&json!({ "input": "[a.txt#ABCD]\nPUT 1: x" }), &unguarded)
+			.await
+			.is_ok());
+
+		let ctx = AgentContext::new(cwd.clone()).with_plan(Some(guard(&artifacts)));
+		let blocked = edit
+			.execute(&json!({ "input": "[a.txt#ABCD]\nPUT 1: x" }), &ctx)
+			.await
+			.expect_err("working tree blocked");
+		assert_eq!(blocked.to_string(), READ_ONLY);
+
+		// Spoof: an unused local `path` cannot authorize a working-tree section.
+		let spoof = edit
+			.execute(
+				&json!({ "path": "local://safe.md", "input": "[src/file.rs#ABCD]\nPUT 1: x" }),
+				&ctx,
+			)
+			.await
+			.expect_err("spoofed path ignored");
+		assert_eq!(spoof.to_string(), READ_ONLY);
+
+		// Rename/delete sections are rejected even for artifacts.
+		let rename = edit
+			.execute(&json!({ "input": "[local://demo-plan.md#ABCD]\nMV other.md" }), &ctx)
+			.await
+			.expect_err("rename rejected");
+		assert!(rename.to_string().contains("renaming files"));
+	}
+
+	#[tokio::test]
+	async fn local_hashline_edit_updates_the_artifact() {
+		let cwd = temp_cwd("local-edit");
+		let artifacts = cwd.join("artifacts");
+		let store = Arc::new(hashline::SnapshotStore::new());
+		write_artifact(&artifacts, "demo-plan.md", b"# Plan\nstep one\n", &CancellationToken::new())
+			.await
+			.expect("seed artifact");
+		let path = artifacts.join("demo-plan.md");
+		let key = hashline::snapshot::canonical_key(&path);
+		let tag = store.record(&key, "# Plan\nstep one\n", None).expect("tag");
+
+		let ctx = AgentContext::new(cwd).with_plan(Some(guard(&artifacts)));
+		let edit = EditTool::new(Arc::clone(&store));
+		let result = edit
+			.execute(
+				&json!({ "input": format!("[local://demo-plan.md#{tag}]\nPUT 2: step two") }),
+				&ctx,
+			)
+			.await
+			.expect("local edit");
+		assert!(!result.is_error, "{}", result.content);
+		assert!(std::fs::read_to_string(&path)
+			.expect("artifact")
+			.contains("step two"));
+	}
+
+	#[tokio::test]
+	async fn apply_patch_spoof_is_rejected() {
+		let cwd = temp_cwd("apply");
+		let artifacts = cwd.join("artifacts");
+		let ctx = AgentContext::new(cwd).with_plan(Some(guard(&artifacts)));
+		let edit = EditTool::with_mode(
+			Arc::new(hashline::SnapshotStore::new()),
+			hashline::edit::EditToolOptions::default(),
+			edit_variants::EditMode::ApplyPatch,
+		);
+		let blocked = edit
+			.execute(
+				&json!({
+					"path": "local://safe.md",
+					"input": "*** Begin Patch\n*** Add File: src/new.rs\n+x\n*** End Patch"
+				}),
+				&ctx,
+			)
+			.await
+			.expect_err("spoofed envelope rejected");
+		assert_eq!(blocked.to_string(), READ_ONLY);
+	}
+
+	#[tokio::test]
+	async fn patch_delete_and_rename_keep_their_operations() {
+		let cwd = temp_cwd("patch");
+		let artifacts = cwd.join("artifacts");
+		let ctx = AgentContext::new(cwd).with_plan(Some(guard(&artifacts)));
+		let edit = EditTool::with_mode(
+			Arc::new(hashline::SnapshotStore::new()),
+			hashline::edit::EditToolOptions::default(),
+			edit_variants::EditMode::Patch,
+		);
+		let delete = edit
+			.execute(
+				&json!({ "path": "src/a.rs", "edits": [{ "op": "delete" }] }),
+				&ctx,
+			)
+			.await
+			.expect_err("delete rejected");
+		assert!(delete.to_string().contains("deleting files"));
+		let rename = edit
+			.execute(
+				&json!({
+					"path": "src/a.rs",
+					"edits": [{ "op": "update", "rename": "src/b.rs" }]
+				}),
+				&ctx,
+			)
+			.await
+			.expect_err("rename rejected");
+		assert!(rename.to_string().contains("renaming files"));
+	}
+
+	#[tokio::test]
+	async fn absolute_artifact_paths_are_rejected() {
+		let cwd = temp_cwd("absolute");
+		let artifacts = cwd.join("artifacts");
+		let ctx = AgentContext::new(cwd.clone()).with_plan(Some(guard(&artifacts)));
+		let write = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let escape = artifacts.join("../outside.txt").display().to_string();
+		let blocked = write
+			.execute(&json!({ "path": escape, "content": "pwn" }), &ctx)
+			.await
+			.expect_err("absolute escape rejected");
+		assert_eq!(blocked.to_string(), READ_ONLY);
+		assert!(!cwd.join("outside.txt").exists());
+		let inside = artifacts.join("plan.md").display().to_string();
+		assert!(write
+			.execute(&json!({ "path": inside, "content": "pwn" }), &ctx)
+			.await
+			.is_err(), "authored absolutes are never trusted");
+	}
+
+	#[tokio::test]
+	async fn ast_edit_spoof_and_deferred_apply_are_rejected() {
+		let cwd = temp_cwd("ast");
+		let artifacts = cwd.join("artifacts");
+		let ctx = AgentContext::new(cwd).with_plan(Some(guard(&artifacts)));
+		let tool = AstEditTool::new(
+			Arc::new(hashline::SnapshotStore::new()),
+			Arc::new(PendingStore::new()),
+		);
+		let blocked = tool
+			.execute(
+				&json!({ "path": "local://safe.md", "ops": [{ "pat": "a", "out": "b" }], "paths": ["x.ts"] }),
+				&ctx,
+			)
+			.await
+			.expect_err("spoofed paths rejected");
+		assert_eq!(blocked.to_string(), READ_ONLY);
+
+		let pending = Arc::new(PendingStore::new());
+		pending.register(Arc::new(DeclaredAction {
+			targets: vec!["src/file.rs".to_string()],
+		}));
+		let write = WriteTool::with_pending(Arc::clone(&pending));
+		let deferred = write
+			.execute(&json!({ "path": "xd://resolve", "content": "apply" }), &ctx)
+			.await
+			.expect_err("deferred apply refused");
+		assert_eq!(deferred.to_string(), READ_ONLY);
+		assert!(pending.peek_head().is_some(), "entry survives a refused resolve");
+		let rejected = write
+			.execute(&json!({ "path": "xd://reject", "content": "discard" }), &ctx)
+			.await
+			.expect("reject stays available");
+		assert!(!rejected.is_error);
+		assert!(pending.peek_head().is_none());
+	}
+
+	#[tokio::test]
+	async fn propose_dispatches_to_the_handler_or_fails_closed() {
+		let cwd = temp_cwd("propose");
+		let ctx = AgentContext::new(cwd.clone());
+
+		let bare = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let error = bare
+			.execute(&json!({ "path": "xd://propose", "content": "my-plan" }), &ctx)
+			.await
+			.expect_err("no handler mounted");
+		assert!(error.to_string().contains("No plan is awaiting approval"), "{error}");
+
+		let handler = Arc::new(EchoPropose::default());
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()))
+			.with_propose(Some(handler.clone()));
+		let result = tool
+			.execute(
+				&json!({ "path": "xd://propose", "content": "my-plan" }),
+				&ctx,
+			)
+			.await
+			.expect("handler dispatch");
+		assert_eq!(result.content, "proposed");
+		assert_eq!(
+			handler
+				.seen
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.as_slice(),
+			["my-plan".to_string()]
+		);
+		assert!(std::fs::read_dir(&cwd).expect("read dir").next().is_none());
 	}
 }

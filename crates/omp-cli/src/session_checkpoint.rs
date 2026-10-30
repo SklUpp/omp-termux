@@ -465,6 +465,16 @@ impl CheckpointHost {
 				if !emitted.insert(message.id.as_str()) {
 					continue;
 				}
+				if message.message.role == "developer" {
+					// Host-injected guidance is not a user turn: keep it verbatim
+					// so later requests still carry the plan reminder.
+					flush_run(&mut run, &mut messages)?;
+					let text = message.message.content.text();
+					if !text.trim().is_empty() {
+						messages.push(Message::developer(text));
+					}
+					continue;
+				}
 				run.push((*message).clone());
 				// Same assistant batch, sibling results are not branch
 				// ancestors; replay them right after the call message.

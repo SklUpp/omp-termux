@@ -29,6 +29,7 @@ fn context(cwd: &Path) -> AgentContext {
 		approver: None,
 		ask: None,
 		progress: None,
+		plan: None,
 	}
 }
 

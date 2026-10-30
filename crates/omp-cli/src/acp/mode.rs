@@ -409,6 +409,12 @@ impl Dispatcher for DispatcherHandle {
 		}
 	}
 
+	fn after_response(&self, method: &str, params: Option<&Value>) {
+		if let Some(agent) = self.agent.upgrade() {
+			Dispatcher::after_response(&*agent, method, params);
+		}
+	}
+
 	fn notify_control(&self, method: &str, params: Option<&Value>, notification: bool) -> bool {
 		match self.agent.upgrade() {
 			Some(agent) => Dispatcher::notify_control(&*agent, method, params, notification),
@@ -424,6 +430,15 @@ impl Dispatcher for DispatcherHandle {
 }
 
 impl Dispatcher for AcpAgent {
+	fn after_response(&self, method: &str, params: Option<&Value>) {
+		if method != "session/prompt" {
+			return;
+		}
+		if let Ok(session) = self.session(params) {
+			session.start_pending_continuation();
+		}
+	}
+
 	fn dispatch(
 		&self,
 		method: &str,

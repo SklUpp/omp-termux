@@ -469,7 +469,11 @@ fn fake_request(prompt: &str) -> RunRequest {
 		url_scope: None,
 		subagent_observer: None,
 		child_session_root: None,
+		goal: None,
+		goal_context: None,
 		credential_resolver: None,
+		plan_mode: Default::default(),
+		continuation: false,
 	}
 }
 

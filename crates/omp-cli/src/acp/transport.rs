@@ -105,6 +105,12 @@ pub trait Dispatcher: Send + Sync + 'static {
 		notification: bool,
 	) -> Result<Value, RequestError>;
 
+	/// Called right after a successful request response frame entered the
+	/// writer queue, so it is FIFO-ordered before any later session/update
+	/// frame. Used to start a detached post-response task (plan reminder
+	/// continuation); never for notifications or failures.
+	fn after_response(&self, _method: &str, _params: Option<&Value>) {}
+
 	/// Reader-thread control hook, called for every inbound request and
 	/// notification before it is queued (responses are correlated and never
 	/// reach it). `notification` distinguishes the two frame forms so the
@@ -452,12 +458,17 @@ impl Transport {
 				return;
 			};
 			let dispatch = inner.dispatch.as_ref();
-			let frame = match dispatch_guarded(dispatch, &method, params.as_ref(), notification) {
+			let outcome = dispatch_guarded(dispatch, &method, params.as_ref(), notification);
+			let ok = outcome.is_ok();
+			let frame = match outcome {
 				Ok(result) => reply_to.map(|id| protocol::result_frame(&id, result)),
 				Err(error) => reply_to.map(|id| protocol::error_frame(Some(&id), &error)),
 			};
 			if let Some(frame) = frame {
 				inner.write(frame);
+				if ok && !notification {
+					dispatch.after_response(&method, params.as_ref());
+				}
 			}
 		}));
 		if queued {

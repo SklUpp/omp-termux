@@ -42,7 +42,8 @@ reachable from headless/RPC and are not counted as supported ops.
 - Delegated child usage is added once per job: blocking `task` batches and eval
   `agent()` results carry `details.usage`; background jobs deliver usage via
   `AgentEvent::BackgroundResult` (persisted as `custom background-usage`) or
-  `hub` job snapshots, deduplicated by job id.
+  `hub` job snapshots. Both routes key a job by `resultKey` when present, else
+  the legacy `id`, so runs that reuse `task-1` after a reopen stay distinct.
 - Budget pressure flips the goal to `budget-limited`, steers the hidden limit
   prompt once per goal id, persists, and never completes the goal.
 

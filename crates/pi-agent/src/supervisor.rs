@@ -130,7 +130,9 @@ pub trait BackgroundResultSink: Send + Sync {
 		self
 			.take_background_results()
 			.into_iter()
-			.map(|text| BackgroundDelivery { id: String::new(), text, usage: None })
+			.map(|text| {
+				BackgroundDelivery { id: String::new(), result_key: None, text, usage: None }
+			})
 			.collect()
 	}
 }
@@ -139,6 +141,10 @@ pub trait BackgroundResultSink: Send + Sync {
 #[derive(Clone)]
 struct PendingDelivery {
 	id: String,
+	/// Canonical accounting key (see [`Supervisor::result_key`]). Composed by
+	/// the supervisor for every enqueue path, so the hosted eval job and a
+	/// `task` child use the same namespace rule.
+	result_key: Option<String>,
 	owner: Option<String>,
 	text: String,
 	/// Summed reported usage retained from the settled job record at enqueue
@@ -156,6 +162,9 @@ struct PendingDelivery {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundDelivery {
 	pub id: String,
+	/// Canonical accounting key. `None` only for a sink that has no supervisor
+	/// behind it (the trait default); consumers then fall back to `id`.
+	pub result_key: Option<String>,
 	pub text: String,
 	pub usage: Option<TokenUsage>,
 }
@@ -205,6 +214,12 @@ pub struct ChildRecord {
 	/// Immutable, supervisor-generated identity. This is the only value accepted
 	/// by `hub cancel`; the model-supplied name is a non-unique label.
 	pub id: String,
+	/// Canonical accounting key for this result: the supervisor's backend owner
+	/// namespace plus `id` (`process_owner(Some(id))`). A reopened CLI reuses
+	/// `task-1` under a fresh namespace, so durable accounting keys stay
+	/// distinct across runs. Retained here so every delivery path copies it.
+	#[serde(default, skip_serializing_if = "String::is_empty")]
+	pub result_key: String,
 	/// Model-supplied display name (`task.name`), never used for identity.
 	pub name: String,
 	pub index: usize,
@@ -992,6 +1007,13 @@ impl Supervisor {
 		owner.map(|id| format!("{}:{id}", self.process_owner_ns))
 	}
 
+	/// Canonical accounting key for one background result: the same namespaced
+	/// string `process_owner(Some(id))` builds. Distinct supervisors (including
+	/// a reopened CLI that restarts `task-{seq}` at zero) never collide.
+	fn result_key(&self, id: &str) -> String {
+		format!("{}:{id}", self.process_owner_ns)
+	}
+
 	pub fn processes(&self) -> Arc<dyn ProcessBackend> {
 		let mut slot = self.processes.lock().unwrap();
 		if let Some(processes) = slot.as_ref() {
@@ -1055,6 +1077,7 @@ impl Supervisor {
 					state.pending_bytes = state.pending_bytes.saturating_sub(delivery.text.len());
 					taken.push(BackgroundDelivery {
 						id: delivery.id,
+						result_key: delivery.result_key,
 						text: delivery.text,
 						usage: delivery.usage,
 					});
@@ -1096,10 +1119,11 @@ impl Supervisor {
 			text = truncate_to_bytes(&text, remaining);
 		}
 		let usage = state.records.get(id).and_then(|record| record.usage);
+		let result_key = state.records.get(id).map(|record| record.result_key.clone());
 		state.pending_bytes += text.len();
 		state
 			.pending
-			.push_back(PendingDelivery { id: id.to_string(), owner, text, usage });
+			.push_back(PendingDelivery { id: id.to_string(), result_key, owner, text, usage });
 	}
 
 	/// Enqueue a non-task background result (eval auto-background) scoped to an
@@ -1141,6 +1165,7 @@ impl Supervisor {
 		}
 		state.pending_bytes += text.len();
 		state.pending.push_back(PendingDelivery {
+			result_key: Some(self.result_key(id)),
 			id: id.to_string(),
 			owner,
 			text,
@@ -1502,6 +1527,7 @@ impl Supervisor {
 			let session_file = self.allocate_child_session(&id);
 			let record = ChildRecord {
 				id: id.clone(),
+				result_key: self.result_key(&id),
 				name: spawn.name.to_string(),
 				index: spawn.index,
 				agent: spawn.agent.to_string(),
@@ -2069,6 +2095,51 @@ mod process_wiring_tests {
 		let first = one.process_owner(Some("task-1"));
 		assert_eq!(first, Some(format!("{}:task-1", one.process_owner_ns)));
 		assert_ne!(first, two.process_owner(Some("task-1")));
+	}
+
+	/// Two supervisors both reserve `task-1` (a reopened CLI restarts the
+	/// sequence): the delivered accounting key is namespaced and matches
+	/// `process_owner`, so durable consumers never merge the two runs.
+	#[test]
+	fn take_deliveries_for_exposes_namespaced_result_key() {
+		let one = supervisor();
+		let two = supervisor();
+		for supervisor in [&one, &two] {
+			let (id, _token) = supervisor
+				.reserve_child("bg", 0, "task", "work", None)
+				.expect("reserve");
+			supervisor.mark_completed_with_usage(&id, 1, "<task-result/>", None);
+			supervisor.enqueue_delivery(&id, "<task-result/>".to_string());
+		}
+		let first = one.take_deliveries_for(None);
+		let second = two.take_deliveries_for(None);
+		assert_eq!(first.len(), 1);
+		assert_eq!(second.len(), 1);
+		assert_eq!(first[0].id, "task-1");
+		assert_eq!(first[0].result_key, one.process_owner(Some("task-1")));
+		assert_eq!(first[0].result_key, Some(one.result_key("task-1")));
+		assert_ne!(
+			first[0].result_key, second[0].result_key,
+			"reopened runs never share an accounting key"
+		);
+	}
+
+	/// The trait default carries no identity: a text-only sink must not look
+	/// like a namespaced delivery, so consumers fall back to the raw id.
+	#[test]
+	fn background_delivery_default_sink_falls_back_to_id() {
+		struct TextOnly;
+
+		impl BackgroundResultSink for TextOnly {
+			fn take_background_results(&self) -> Vec<String> {
+				vec!["<task-result/>".to_string()]
+			}
+		}
+
+		let deliveries = TextOnly.take_background_deliveries();
+		assert_eq!(deliveries.len(), 1);
+		assert_eq!(deliveries[0].id, "", "a text-only sink has no identity");
+		assert_eq!(deliveries[0].result_key, None, "no key is invented");
 	}
 
 	#[test]

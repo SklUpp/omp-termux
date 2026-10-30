@@ -732,6 +732,7 @@ impl BackgroundResultSink for UsageSink {
 		}
 		vec![pi_agent::supervisor::BackgroundDelivery {
 			id: "task-usage".to_string(),
+			result_key: Some("ns:task-usage".to_string()),
 			text: "<task-result id=\"task-usage\" status=\"completed\">\n<usage input=\"5\" output=\"2\" />\n\
 			       <output>\nbody\n</output>\n</task-result>"
 				.to_string(),
@@ -782,15 +783,26 @@ async fn background_delivery_reaches_the_host_once_with_identity_and_usage(
 
 	let mut delivered = Vec::new();
 	while let Ok(event) = events_rx.try_recv() {
-		if let pi_agent::loop_module::AgentEvent::BackgroundResult { id, text, usage } = event {
-			delivered.push((id, text, usage));
+		if let pi_agent::loop_module::AgentEvent::BackgroundResult {
+			id,
+			result_key,
+			text,
+			usage,
+		} = event
+		{
+			delivered.push((id, result_key, text, usage));
 		}
 	}
 	assert_eq!(delivered.len(), 1, "one event per delivered result");
 	assert_eq!(delivered[0].0, "task-usage", "identity travels with the event");
-	assert!(delivered[0].1.contains("body"));
 	assert_eq!(
-		delivered[0].2,
+		delivered[0].1.as_deref(),
+		Some("ns:task-usage"),
+		"the accounting key travels with the event"
+	);
+	assert!(delivered[0].2.contains("body"));
+	assert_eq!(
+		delivered[0].3,
 		Some(pi_agent::state::TokenUsage {
 			input: 5,
 			output: 2,

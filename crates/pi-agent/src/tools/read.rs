@@ -311,22 +311,42 @@ impl Tool for ReadTool {
 				Ok(resource) => resource,
 				Err(message) => return Ok(tool_result(message, true)),
 			};
-			let source = TextSource::Memory { url: base, bytes: resource.content.as_bytes() };
+			let source = TextSource::Memory {
+				url:   base,
+				bytes: resource.content.as_bytes(),
+				path:  resource.source_path.as_deref(),
+			};
 			let raw_selector = is_raw(&parsed);
 			let display_mode = self.display_mode(raw_selector, is_immutable_source(base));
 			let outcome = match &parsed {
 				Sel::Lines { ranges, raw } if ranges.len() > 1 => {
-					read_multi_range(&source, ranges, *raw, None, display_mode, ctx).await
+					read_multi_range(
+						&source,
+						ranges,
+						*raw,
+						self.sink.as_deref(),
+						display_mode,
+						ctx,
+					)
+					.await
 				},
 				Sel::Lines { ranges, raw } => {
-					read_single_range(&source, ranges[0], *raw, None, display_mode, ctx).await
+					read_single_range(
+						&source,
+						ranges[0],
+						*raw,
+						self.sink.as_deref(),
+						display_mode,
+						ctx,
+					)
+					.await
 				},
 				Sel::Raw | Sel::None => {
 					read_single_range(
 						&source,
 						LineRange { start_line: 1, end_line: None },
 						raw_selector,
-						None,
+						self.sink.as_deref(),
 						display_mode,
 						ctx,
 					)
@@ -413,7 +433,11 @@ impl Tool for ReadTool {
 				},
 			};
 			if let Some(source_bytes) = remote {
-				let source = TextSource::Memory { url: &path, bytes: source_bytes.as_bytes() };
+				let source = TextSource::Memory {
+					url:   &path,
+					bytes: source_bytes.as_bytes(),
+					path:  None,
+				};
 				let raw_selector = is_raw(&parsed);
 				let display_mode = self.display_mode(raw_selector, false);
 				let outcome = match &parsed {
@@ -1061,7 +1085,13 @@ fn internal_scheme(raw: &str) -> Option<String> {
 /// 50 KiB limits nor return a resource's unbounded `content` verbatim.
 enum TextSource<'a> {
 	File { path: &'a Path, size: u64 },
-	Memory { url: &'a str, bytes: &'a [u8] },
+	Memory {
+		url:   &'a str,
+		bytes: &'a [u8],
+		/// Real artifact path behind a `local://` read, when the handler
+		/// resolved one: snapshots key on it so `edit` can address the file.
+		path:  Option<&'a Path>,
+	},
 }
 
 impl<'a> TextSource<'a> {
@@ -1075,11 +1105,19 @@ impl<'a> TextSource<'a> {
 	fn path(&self) -> Option<&Path> {
 		match self {
 			Self::File { path, .. } => Some(path),
-			Self::Memory { .. } => None,
+			Self::Memory { path, .. } => *path,
 		}
 	}
 
 	/// Label shown as `resolvedPath` / in errors.
+	/// Authored URL of an internal resource, when this source came from one.
+	fn memory_url(&self) -> Option<&str> {
+		match self {
+			Self::Memory { url, .. } => Some(url),
+			Self::File { .. } => None,
+		}
+	}
+
 	fn label(&self) -> String {
 		match self {
 			Self::File { path, .. } => path.display().to_string(),
@@ -1670,7 +1708,13 @@ async fn read_single_range(
 				let seen: Vec<u64> = (0..window.lines.len() as u64)
 					.map(|offset| display_start + offset)
 					.collect();
-				if let Some(header) = record_snapshot_text(sink, path, &ctx.cwd, text, &seen) {
+				let header = match source.memory_url() {
+					// Internal artifacts keep their authored URL in the header;
+					// the snapshot key stays the real path so `edit` matches.
+					Some(url) => record_snapshot_text_display(sink, path, url, text, &seen),
+					None => record_snapshot_text(sink, path, &ctx.cwd, text, &seen),
+				};
+				if let Some(header) = header {
 					output = format!("{header}\n{output}");
 				}
 			}
@@ -1860,7 +1904,11 @@ async fn read_multi_range(
 	if hash_lines {
 		if let (Some(sink), Some(text), Some(path)) = (sink, snapshot_text.as_deref(), source.path()) {
 			if !seen_lines.is_empty() {
-				if let Some(header) = record_snapshot_text(sink, path, &ctx.cwd, text, &seen_lines) {
+				let header = match source.memory_url() {
+					Some(url) => record_snapshot_text_display(sink, path, url, text, &seen_lines),
+					None => record_snapshot_text(sink, path, &ctx.cwd, text, &seen_lines),
+				};
+				if let Some(header) = header {
 					output = format!("{header}\n{output}");
 				}
 			}
@@ -2058,6 +2106,24 @@ fn record_snapshot_text(
 		}
 	}
 	Some(sink.header(path, &tag, cwd))
+}
+
+/// Record a snapshot under its real path while displaying the authored URL.
+fn record_snapshot_text_display(
+	sink: &dyn ReadSnapshotSink,
+	path: &Path,
+	display: &str,
+	full_text: &str,
+	seen: &[u64],
+) -> Option<String> {
+	let tag = sink.record_file(path, full_text)?;
+	if !seen.is_empty() {
+		let seen_32: Option<Vec<u32>> = seen.iter().map(|line| u32::try_from(*line).ok()).collect();
+		if let Some(seen_32) = seen_32 {
+			sink.record_seen_lines(path, &tag, &seen_32);
+		}
+	}
+	Some(crate::tools::hashline::snapshot::format_header(display, &tag))
 }
 
 /// Bounded fallback for callers that did not buffer the file themselves
@@ -2831,6 +2897,28 @@ mod display_tests {
 		let result = read_with(&tool, &dir, "f.txt").await;
 		assert!(!result.is_error, "{}", result.content);
 		assert_eq!(result.content, "1|alpha\n2|beta");
+	}
+
+	#[tokio::test]
+	async fn local_url_reads_record_snapshot_and_emit_header() {
+		// A resolved `local://` file is an editable artifact: the internal read
+		// path must hand the sink through so the header carries the tag the
+		// later hashline edit needs (bg21: header was missing, edit unusable).
+		let dir = TempDir::new("local-url");
+		fs::write(dir.0.join("plan.md"), "# Smoke\n\nbody\n").expect("fixture");
+		let sink = Arc::new(TestSink::default());
+		let mut scope = UrlScope::default();
+		scope.local_roots.insert("local".to_string(), dir.0.clone());
+		let tool = ReadTool::with_snapshot_sink(sink.clone())
+			.with_display_inputs(FileDisplayInputs::new(EditMode::Hashline, true, false))
+			.with_internal_urls(Arc::new(InternalUrlRouter::new()), Arc::new(scope));
+		let result = read_with(&tool, &dir, "local://plan.md").await;
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(result.content, "[local://plan.md#0A1B]\n1:# Smoke\n2:\n3:body");
+		let files = sink.files.lock().expect("files");
+		assert_eq!(files.len(), 1);
+		assert_eq!(files[0].0, dir.0.join("plan.md"));
+		assert!(files[0].1.contains("# Smoke"));
 	}
 
 	#[tokio::test]

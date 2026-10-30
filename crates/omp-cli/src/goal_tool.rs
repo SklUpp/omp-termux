@@ -54,13 +54,34 @@ pub fn build_goal_tool_response(
 	}
 }
 
+/// Live "plan mode holds the exclusive mode slot" probe. `None` for sessions
+/// with no plan mode (RPC, print, REPL).
+pub type PlanModeProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// TS `interactive-mode.ts` guard: a Goal cannot be created or resumed while
+/// plan mode owns the mode slot.
+pub const EXIT_PLAN_MODE_FIRST: &str = "Exit plan mode first.";
+
 pub struct GoalTool {
-	runtime: Arc<GoalRuntime>,
+	runtime:   Arc<GoalRuntime>,
+	plan_mode: Option<PlanModeProbe>,
 }
 
 impl GoalTool {
 	pub fn new(runtime: Arc<GoalRuntime>) -> Self {
-		Self { runtime }
+		Self { runtime, plan_mode: None }
+	}
+
+	/// Mount the plan-mode probe; `create`/`resume` then refuse while plan mode
+	/// is active.
+	#[must_use]
+	pub fn with_plan_mode(mut self, probe: Option<PlanModeProbe>) -> Self {
+		self.plan_mode = probe;
+		self
+	}
+
+	fn plan_mode_active(&self) -> bool {
+		self.plan_mode.as_ref().is_some_and(|probe| probe())
 	}
 }
 
@@ -108,6 +129,10 @@ impl Tool for GoalTool {
 				"Unknown goal op '{op}'; expected one of {}",
 				GOAL_OPS.join(", ")
 			)));
+		}
+
+		if matches!(op, "create" | "resume") && self.plan_mode_active() {
+			return Err(ToolError::Rejected(EXIT_PLAN_MODE_FIRST.to_string()));
 		}
 
 		let response = match op {
@@ -335,5 +360,29 @@ mod tests {
 		assert!(unknown.to_string().contains("Unknown goal op 'restart'"));
 		let missing = run(&tool, json!({"objective": "x"})).await.expect_err("missing op");
 		assert!(missing.to_string().contains("Missing required parameter 'op'"));
+	}
+
+	/// Plan mode owns the exclusive mode slot: `create`/`resume` refuse.
+	#[tokio::test]
+	async fn goal_create_and_resume_refuse_while_plan_mode_is_active() {
+		use std::sync::atomic::{AtomicBool, Ordering};
+
+		let runtime = Arc::new(GoalRuntime::new());
+		let plan_active = Arc::new(AtomicBool::new(true));
+		let probe = Arc::clone(&plan_active);
+		let tool = GoalTool::new(Arc::clone(&runtime))
+			.with_plan_mode(Some(Arc::new(move || probe.load(Ordering::SeqCst))));
+
+		let refused = run(&tool, json!({"op": "create", "objective": "ship"}))
+			.await
+			.expect_err("create refused");
+		assert_eq!(refused.to_string(), EXIT_PLAN_MODE_FIRST);
+		let refused_resume = run(&tool, json!({"op": "resume"})).await.expect_err("resume refused");
+		assert_eq!(refused_resume.to_string(), EXIT_PLAN_MODE_FIRST);
+		// Read-only ops still answer while plan mode is active.
+		assert!(run(&tool, json!({"op": "get"})).await.is_ok());
+
+		plan_active.store(false, Ordering::SeqCst);
+		assert!(run(&tool, json!({"op": "create", "objective": "ship"})).await.is_ok());
 	}
 }

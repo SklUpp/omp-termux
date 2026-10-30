@@ -165,11 +165,15 @@ fn make_run_request(
 		extra_tools: Vec::new(),
 		acp_bridge: None,
 		extra_mcp_servers: Vec::new(),
+		goal: None,
+		goal_context: None,
 		internal_urls: None,
 		url_scope: None,
 		subagent_observer: None,
 		child_session_root: None,
 		credential_resolver: None,
+		plan_mode: Default::default(),
+		continuation: false,
 	}
 }
 

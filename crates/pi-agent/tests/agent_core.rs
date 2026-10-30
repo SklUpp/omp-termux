@@ -3108,6 +3108,155 @@ async fn soft_requirement_forces_one_write_request_on_the_wire_after_a_detour() 
 	assert_eq!(*applied.lock().expect("applied"), vec!["wire apply".to_string()]);
 }
 
+/// Test-only plan gate. `satisfies` is pure (any call is progress); the
+/// requirement clears only after the real write has created its file, so
+/// termination depends on actual post-execution state, not a cap.
+struct StatPlanPolicy {
+	pending: std::path::PathBuf,
+}
+
+impl pi_agent::state::ToolPolicy for StatPlanPolicy {
+	fn requirement(&self) -> Option<pi_agent::state::SoftToolRequirement> {
+		if self.pending.exists() {
+			return None;
+		}
+		Some(pi_agent::state::SoftToolRequirement {
+			id:         1,
+			generation: 1,
+			tool_name:  "ask".to_string(),
+			reminder:   Message::user("plan decision pending"),
+		})
+	}
+
+	fn satisfies(
+		&self,
+		_requirement: &pi_agent::state::SoftToolRequirement,
+		_call: &ToolCall,
+	) -> bool {
+		true
+	}
+
+	fn choice(&self, _requirement: &pi_agent::state::SoftToolRequirement) -> ToolChoice {
+		ToolChoice::Required
+	}
+}
+
+#[tokio::test]
+async fn plan_required_choice_executes_any_tool_then_clears_after_real_write() {
+	let dir = TempDir::new("plan-required");
+	let pending = dir.path.join("pending.txt");
+	let (server_url, mut requests) = spawn_scripted_chat_server(vec![
+		// Text-only turn: the generic gate escalates the next request.
+		json!({ "role": "assistant", "content": "thinking" }),
+		// Any tool satisfies plan progress; this write must actually run.
+		json!({
+			"role": "assistant",
+			"content": "",
+			"tool_calls": [{
+				"id": "plan_write",
+				"type": "function",
+				"function": { "name": "write", "arguments": "{\"path\":\"pending.txt\",\"content\":\"ok\"}" }
+			}]
+		}),
+		json!({ "role": "assistant", "content": "done" }),
+	])
+	.await;
+	let provider = OpenAiCompatibleProvider::new(server_url, "fake-key", "gpt-4o")
+		.expect("provider build");
+	let mut registry = ToolRegistry::new();
+	registry.register(Arc::new(pi_agent::AskTool::new()));
+	registry.register(Arc::new(WriteTool::new()));
+	registry.set_policy(Arc::new(StatPlanPolicy { pending: pending.clone() }));
+
+	let agent = AgentLoop::new(config(&dir.path, 8), Arc::new(provider), registry);
+	let mut state = AgentState::default();
+	agent.run_dialog("go", &mut state, None).await.expect("dialog");
+
+	let first = requests.recv().await.expect("first request");
+	let second = requests.recv().await.expect("escalated request");
+	let third = requests.recv().await.expect("third request");
+	assert!(requests.try_recv().is_err(), "dialog must terminate without a fourth request");
+	assert!(first.get("tool_choice").is_none(), "reminder request stays auto: {first}");
+	assert_eq!(second["tool_choice"], json!("required"), "escalation must require any tool");
+	assert!(third.get("tool_choice").is_none(), "the force must not stick: {third}");
+	assert_eq!(std::fs::read_to_string(&pending).expect("write executed"), "ok");
+	assert!(
+		tool_messages(&state).iter().any(|message| !message.is_error),
+		"the tool must execute successfully while the requirement was pending"
+	);
+}
+
+/// Plan-like gate that never converges: at the generic escalation cap it asks
+/// for a normal end-turn instead of the default abort.
+struct YieldingPlanPolicy;
+
+impl pi_agent::state::ToolPolicy for YieldingPlanPolicy {
+	fn requirement(&self) -> Option<pi_agent::state::SoftToolRequirement> {
+		Some(pi_agent::state::SoftToolRequirement {
+			id:         7,
+			generation: 7,
+			tool_name:  "ask".to_string(),
+			reminder:   Message::user("plan decision pending"),
+		})
+	}
+
+	fn satisfies(
+		&self,
+		_requirement: &pi_agent::state::SoftToolRequirement,
+		_call: &ToolCall,
+	) -> bool {
+		true
+	}
+
+	fn choice(&self, _requirement: &pi_agent::state::SoftToolRequirement) -> ToolChoice {
+		ToolChoice::Required
+	}
+
+	fn exhaustion(
+		&self,
+		_requirement: &pi_agent::state::SoftToolRequirement,
+	) -> pi_agent::state::Exhaustion {
+		pi_agent::state::Exhaustion::EndTurn
+	}
+
+	fn escalation_limit(&self, _requirement: &pi_agent::state::SoftToolRequirement) -> u32 {
+		1
+	}
+}
+
+/// Exact upstream shape: the detached continuation issues one `required`
+/// request; an ignored text reply yields instead of re-forcing.
+#[tokio::test]
+async fn plan_continuation_issues_one_required_request_then_yields() {
+	let dir = TempDir::new("plan-continuation");
+	let (server_url, mut requests) = spawn_scripted_chat_server(vec![
+		json!({ "role": "assistant", "content": "ignored" }),
+	])
+	.await;
+	let provider = OpenAiCompatibleProvider::new(server_url, "fake-key", "gpt-4o")
+		.expect("provider build");
+	let mut registry = ToolRegistry::new();
+	registry.register(Arc::new(pi_agent::AskTool::new()));
+	registry.set_policy(Arc::new(YieldingPlanPolicy));
+
+	let agent = AgentLoop::new(config(&dir.path, 8), Arc::new(provider), registry)
+		.with_continuation(true);
+	let mut state = AgentState::default();
+	let turns = agent
+		.run_dialog_message(Message::developer("plan decision pending"), &mut state, None, None)
+		.await
+		.expect("continuation must end normally");
+
+	let body = requests.recv().await.expect("continuation request");
+	assert_eq!(body["tool_choice"], json!("required"), "first continuation request is required");
+	assert!(requests.try_recv().is_err(), "an ignored required reply must not re-force");
+	assert!(turns.last().is_some_and(|turn| turn.is_completed));
+	assert!(
+		state.messages.iter().all(|message| message.role != pi_agent::Role::User),
+		"continuation must not append a caller/user message"
+	);
+}
+
 #[tokio::test]
 async fn openai_tool_choice_rejects_blank_or_absent_tools_before_sending() {
 	let provider = OpenAiCompatibleProvider::new("http://127.0.0.1:9", "fake-key", "gpt-4o")

@@ -117,9 +117,6 @@ struct RunnerSession {
 	snapshots: Arc<SnapshotStore>,
 	edit:      Arc<EditTool>,
 	pending:   Arc<PendingStore>,
-	/// Session-owned soft requirement policy: a staged preview must keep
-	/// reminding and forcing across prompt turns whose registry is rebuilt.
-	policy:    Arc<dyn pi_agent::state::ToolPolicy>,
 	/// Process-stable eval identity for in-memory sessions; replaced by the
 	/// persisted session id when the host has one.
 	eval_session_id: Mutex<String>,
@@ -163,12 +160,10 @@ impl RunnerSession {
 		let snapshots = Arc::new(SnapshotStore::new());
 		let edit = Arc::new(EditTool::with_options(snapshots.clone(), options));
 		let pending = Arc::new(PendingStore::new());
-		let policy = Arc::new(pi_agent::state::StagedPreviewPolicy::new(Arc::clone(&pending)));
 		Self {
 			snapshots,
 			edit,
 			pending,
-			policy,
 			eval_session_id: Mutex::new(crate::output::session_id()),
 			session_file: Mutex::new(None),
 			eval: Mutex::new(None),
@@ -197,6 +192,7 @@ impl RunnerSession {
 			.unwrap_or_else(|poison| poison.into_inner())
 			.clone()
 	}
+
 
 	/// Root DAP session tree shared by every turn of this runner.
 	fn dap_manager(&self) -> Arc<DapSessionManager> {
@@ -958,6 +954,7 @@ impl AgentRunner for PiAgentRunner {
 			edit_options,
 			Some(&session),
 			resolved_display,
+			&request.plan_mode,
 		)?;
 		let (allow_task, allow_hub) = delegation_selection(request);
 		// Needed for completion tiers and agent spawning; the `task` tool remains
@@ -988,6 +985,7 @@ impl AgentRunner for PiAgentRunner {
 		};
 		let cwd = request.cwd.clone();
 		let prompt = request.prompt.clone();
+		let continuation = request.continuation;
 		let mut messages = match &request.history_messages {
 			Some(override_messages) => override_messages.clone(),
 			None => history_messages(&request.history)?,
@@ -1004,7 +1002,8 @@ impl AgentRunner for PiAgentRunner {
 		}
 		let user_message = user_message_from_parts(&prompt, &request.parts)?;
 
-		if !plan.supports_images
+		if !request.continuation
+			&& !plan.supports_images
 			&& (user_message.has_image() || messages.iter().any(pi_agent::Message::has_image))
 		{
 			return Err(Error::new(format!(
@@ -1227,7 +1226,9 @@ impl AgentRunner for PiAgentRunner {
 				registry.register(Arc::clone(&tool.0));
 			}
 		}
-		let mut agent = AgentLoop::with_approver(config, provider, registry, approvals);
+		let mut agent = AgentLoop::with_approver(config, provider, registry, approvals)
+			.with_plan(request.plan_mode.guard.clone())
+			.with_continuation(request.continuation);
 		if let Some(ack) = &request.turn_ack {
 			agent = agent.with_turn_ack(Arc::clone(ack));
 		}
@@ -1412,9 +1413,13 @@ impl AgentRunner for PiAgentRunner {
 					},
 					// A background child result is already in history; it only
 					// feeds goal accounting once per job id. No host `Event`.
-					AgentEvent::BackgroundResult { id, text: _, usage } => {
+					AgentEvent::BackgroundResult { id, result_key, text: _, usage } => {
 						if let Some(goal) = &goal_runtime {
-							goal.observe_background_result(&id, usage.as_ref());
+							goal.observe_background_result(
+								&id,
+								result_key.as_deref(),
+								usage.as_ref(),
+							);
 						}
 					},
 					AgentEvent::TurnEnd { message, tool_results, status } => {
@@ -1464,7 +1469,10 @@ impl AgentRunner for PiAgentRunner {
 					if let Some(goal) = &goal_runtime {
 						goal.on_agent_end();
 					}
-					let mut new_messages = vec![end_user_message];
+					// A detached continuation appends no caller message; the
+					// persisted developer reminder is already in history.
+					let mut new_messages =
+						if continuation { Vec::new() } else { vec![end_user_message] };
 					for turn in turns {
 						let tool_names: std::collections::HashMap<String, String> = turn
 							.message
@@ -2358,6 +2366,7 @@ pub fn build_registry_with_mcp_and_diagnostics(
 		false,
 		EditToolOptions::default(),
 		None,
+		&crate::agent::PlanModeHooks::default(),
 	)
 }
 
@@ -2372,6 +2381,7 @@ fn build_registry_full(
 	session_persisted: bool,
 	edit_options: EditToolOptions,
 	session: Option<&Arc<RunnerSession>>,
+	plan: &crate::agent::PlanModeHooks,
 ) -> Result<ToolRegistry> {
 	build_registry_with_display(
 		tools,
@@ -2383,6 +2393,7 @@ fn build_registry_full(
 		edit_options,
 		session,
 		default_session_tools(tools.contains(&"edit")),
+		plan,
 	)
 }
 
@@ -2398,6 +2409,7 @@ fn build_registry_with_display(
 	edit_options: EditToolOptions,
 	session: Option<&Arc<RunnerSession>>,
 	resolved: ResolvedSessionTools,
+	plan: &crate::agent::PlanModeHooks,
 ) -> Result<ToolRegistry> {
 	let mut registry = ToolRegistry::new();
 	// Root turns share one snapshot/`EditTool` pair and one pending queue (see
@@ -2441,7 +2453,8 @@ fn build_registry_with_display(
 			)),
 			"write" => {
 				let write = WriteTool::with_pending(Arc::clone(&pending))
-					.with_acp_bridge(acp_bridge.clone());
+					.with_acp_bridge(acp_bridge.clone())
+					.with_propose(plan.propose.clone());
 				Arc::new(match &internal_urls {
 					Some(router) => write.with_internal_urls(Arc::clone(router), Arc::clone(&url_scope)),
 					None => write,
@@ -2489,13 +2502,12 @@ fn build_registry_with_display(
 		registry.register_server_error(server, err);
 	}
 	registry.set_configured_servers(all_server_names);
-	// The soft requirement must follow the same queue: a root turn keeps the
-	// session policy, while a standalone registry (tests, helpers) gets one
-	// bound to the fresh queue it just created.
-	match session {
-		Some(session) => registry.set_policy(Arc::clone(&session.policy)),
-		None => registry.set_policy(Arc::new(pi_agent::state::StagedPreviewPolicy::new(pending))),
-	}
+	// The staged-preview policy keeps first priority; the session's plan policy
+	// applies only when nothing is staged.
+	registry.set_policy(Arc::new(pi_agent::state::CompositeToolPolicy::new(
+		Arc::new(pi_agent::state::StagedPreviewPolicy::new(Arc::clone(&pending))),
+		plan.policy.clone(),
+	)));
 	Ok(registry)
 }
 
@@ -3878,6 +3890,8 @@ mod tests {
 			goal: None,
 			goal_context: None,
 			credential_resolver: None,
+			plan_mode: Default::default(),
+			continuation: false,
 		}
 	}
 
@@ -5272,6 +5286,7 @@ mod tests {
 				false,
 				options,
 				Some(session),
+				&crate::agent::PlanModeHooks::default(),
 			)
 			.expect("registry")
 		};
@@ -5443,6 +5458,7 @@ mod tests {
 				false,
 				options,
 				session,
+				&crate::agent::PlanModeHooks::default(),
 			)
 			.expect("registry")
 		};
@@ -5529,6 +5545,7 @@ mod tests {
 			true,
 			EditToolOptions::default(),
 			None,
+			&crate::agent::PlanModeHooks::default(),
 		)
 		.expect("registry");
 		let todo = registry.get("todo").expect("todo tool");
@@ -5574,6 +5591,7 @@ mod tests {
 			true,
 			EditToolOptions::default(),
 			None,
+			&crate::agent::PlanModeHooks::default(),
 		)
 		.expect("registry");
 		let todo = registry.get("todo").expect("todo tool");
@@ -5707,6 +5725,7 @@ mod tests {
 			false,
 			EditToolOptions::default(),
 			None,
+			&crate::agent::PlanModeHooks::default(),
 		)
 		.expect("registry");
 		let viewed = registry

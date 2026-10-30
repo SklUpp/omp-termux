@@ -26,6 +26,9 @@ pub const RESOLVE_DEVICE: &str = "resolve";
 pub const REJECT_DEVICE: &str = "reject";
 pub const RESOLVE_DEVICE_PATH: &str = "xd://resolve";
 pub const REJECT_DEVICE_PATH: &str = "xd://reject";
+/// Plan-approval device; dispatched by the host's plan-mode proposal handler.
+pub const PROPOSE_DEVICE: &str = "propose";
+pub const PROPOSE_DEVICE_PATH: &str = "xd://propose";
 
 /// Parsed `xd://<device>` target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +74,11 @@ pub fn is_resolution_device_path(path: &str) -> bool {
 	matches!(parse_xd_target(path), Some(XdTarget::Device(device)) if resolution_device_usage(device).is_some())
 }
 
+/// Whether `path` is `xd://propose` (plan approval).
+pub fn is_propose_device_path(path: &str) -> bool {
+	matches!(parse_xd_target(path), Some(XdTarget::Device(device)) if device.eq_ignore_ascii_case(PROPOSE_DEVICE))
+}
+
 /// One staged action: the mutation applied by `xd://resolve` and the optional
 /// cleanup/undo run by `xd://reject`.
 #[async_trait]
@@ -84,6 +92,13 @@ pub trait PendingAction: Send + Sync {
 	/// run must surface `ToolError::Aborted` rather than dropping the future,
 	/// so the same entry can be retried or rejected.
 	async fn apply(&self, ctx: &AgentContext, reason: &str) -> Result<ToolResult, ToolError>;
+
+	/// Files the apply step will mutate. The plan guard classifies these before
+	/// a deferred apply; an action that cannot declare them fails closed while
+	/// plan mode is active.
+	fn targets(&self) -> Vec<String> {
+		Vec::new()
+	}
 
 	/// Discard the staged change. The default has no side effects beyond
 	/// consuming the entry.

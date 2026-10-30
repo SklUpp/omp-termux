@@ -224,6 +224,34 @@ pub struct RunRequest {
 	/// wins, then this store (login, env, static), then the connection block.
 	/// `None` keeps the non-RPC path unchanged.
 	pub credential_resolver: Option<ResolverHandle>,
+	/// Plan-mode runtime wiring: the write guard, the `xd://propose` handler and
+	/// the plan side of the composite tool policy. Empty outside plan mode.
+	pub plan_mode: PlanModeHooks,
+	/// Detached plan-reminder continuation: no caller message is appended and
+	/// the first request uses the policy's one-shot forced choice.
+	pub continuation: bool,
+}
+
+/// Host plan-mode wiring for one run.
+///
+/// The guard stays mounted across turns (it reads the live mode state); the
+/// proposal handler and reminder policy are `None` whenever plan mode is off,
+/// so a plain session keeps the staged-preview policy alone.
+#[derive(Clone, Default)]
+pub struct PlanModeHooks {
+	pub guard:   Option<std::sync::Arc<dyn pi_agent::state::PlanModeGuard>>,
+	pub propose: Option<std::sync::Arc<dyn pi_agent::state::ProposeHandler>>,
+	pub policy:  Option<std::sync::Arc<dyn pi_agent::state::ToolPolicy>>,
+}
+
+impl std::fmt::Debug for PlanModeHooks {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("PlanModeHooks")
+			.field("guard", &self.guard.is_some())
+			.field("propose", &self.propose.is_some())
+			.field("policy", &self.policy.is_some())
+			.finish()
+	}
 }
 
 /// Resolver handle that keeps [`RunRequest`]'s derived `Debug` intact: the

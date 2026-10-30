@@ -11,6 +11,9 @@ pub enum Role {
 	User,
 	Assistant,
 	Tool,
+	/// Host-injected guidance (TS `developer`): plan reminders and similar
+	/// agent-authored context that is not a user turn.
+	Developer,
 }
 
 /// Token usage for exactly one model request, as its provider reported it.
@@ -414,6 +417,20 @@ impl Message {
 		}
 	}
 
+	/// Host-injected developer message (TS `role:"developer"`).
+	pub fn developer(content: impl Into<String>) -> Self {
+		Self {
+			role: Role::Developer,
+			content: content.into(),
+			parts: Vec::new(),
+			name: None,
+			tool_calls: Vec::new(),
+			tool_call_id: None,
+			is_error: false,
+			usage: None,
+		}
+	}
+
 	pub fn user(content: impl Into<String>) -> Self {
 		Self {
 			role: Role::User,
@@ -597,6 +614,26 @@ pub trait ToolPolicy: Send + Sync {
 	/// the precise invocation shape here (e.g. `write` to a resolve device), not
 	/// merely the tool name.
 	fn satisfies(&self, requirement: &SoftToolRequirement, call: &ToolCall) -> bool;
+
+	/// Tool choice for the single escalated request after a non-compliant turn.
+	/// Defaults to forcing the requirement's named tool; a host whose upstream
+	/// gate only requires *some* tool overrides this with
+	/// [`ToolChoice::Required`](crate::provider::ToolChoice::Required).
+	fn choice(&self, requirement: &SoftToolRequirement) -> crate::provider::ToolChoice {
+		crate::provider::ToolChoice::Tool { name: requirement.tool_name.clone() }
+	}
+
+	/// Outcome once the generic escalation budget is spent. Default keeps the
+	/// aborting behavior callers relied on before a policy could opt out.
+	fn exhaustion(&self, _requirement: &SoftToolRequirement) -> Exhaustion {
+		Exhaustion::Error
+	}
+
+	/// Escalation budget for this head. Default keeps the historical generic
+	/// budget; a policy mirroring a one-shot upstream queue overrides it.
+	fn escalation_limit(&self, _requirement: &SoftToolRequirement) -> u32 {
+		3
+	}
 }
 
 /// Session-owned staged-preview policy (upstream `nextToolChoiceDirective`
@@ -645,6 +682,143 @@ impl ToolPolicy for StagedPreviewPolicy {
 				.get("path")
 				.and_then(serde_json::Value::as_str)
 				.is_some_and(crate::tools::pending::is_resolution_device_path)
+	}
+}
+
+/// What the loop does when a soft requirement survives its generic escalation
+/// budget. Staged previews abort (a silently dropped preview would be data
+/// loss); policies that mirror a converging upstream gate ask for a normal
+/// end-turn hand-back instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exhaustion {
+	Error,
+	EndTurn,
+}
+
+/// Operation one plan-mode target describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanWriteOp {
+	Create,
+	Update,
+	Delete,
+	Rename,
+	/// A previously staged mutation about to be applied by `xd://resolve`.
+	DeferredApply,
+}
+
+/// One parsed, effective mutation target.
+///
+/// Tools classify what they will actually touch (parsed sections, patch hunks,
+/// resolved paths), never an unrelated top-level argument.
+#[derive(Debug, Clone, Copy)]
+pub struct PlanWriteTarget<'a> {
+	/// Authored or resolved path; empty only for a staged action that declares
+	/// no targets, which fails closed while plan mode is active.
+	pub path:      &'a str,
+	pub op:        PlanWriteOp,
+	pub rename_to: Option<&'a str>,
+}
+
+impl<'a> PlanWriteTarget<'a> {
+	#[must_use]
+	pub fn new(path: &'a str, op: PlanWriteOp) -> Self {
+		Self { path, op, rename_to: None }
+	}
+
+	#[must_use]
+	pub fn rename(path: &'a str, to: &'a str) -> Self {
+		Self { path, op: PlanWriteOp::Rename, rename_to: Some(to) }
+	}
+}
+
+/// Host-owned plan-mode write guard mounted on the mutating tools.
+///
+/// Plan mode keeps the working tree read-only. The host owns the mode state and
+/// the exact user-facing classification; tools hand it every parsed target
+/// before any resolution. `bash` is never consulted (upstream gap, retained).
+pub trait PlanModeGuard: Send + Sync {
+	/// `Some(message)` blocks the call; `None` allows it.
+	fn write_error(&self, tool_name: &str, targets: &[PlanWriteTarget<'_>]) -> Option<String>;
+
+	/// Sandbox root a local-artifact mutation may use. `Some` only while plan
+	/// mode is active: tools route parsed `local:` targets through this root and
+	/// refuse the mutation when it is `None`.
+	fn artifact_root(&self) -> Option<std::path::PathBuf> {
+		None
+	}
+}
+
+/// `xd://propose` handler mounted on `write` while plan mode is active.
+///
+/// `body` is the raw `write` content — JSON proposal args
+/// (`{"title": …, "content" | "slug": …}`) or a plain plan title. Without a
+/// mounted handler `write xd://propose` fails with the upstream wording.
+#[async_trait]
+pub trait ProposeHandler: Send + Sync {
+	async fn propose(&self, body: &str, ctx: &AgentContext) -> Result<ToolResult, crate::tools::ToolError>;
+}
+
+/// Two-policy stack: the staged-preview requirement wins while a preview is
+/// queued, and the plan-mode reminder applies only when nothing is staged.
+///
+/// Ordering is load-bearing: `xd://resolve|reject` must settle the staged
+/// action before the loop can ask for a plan decision.
+pub struct CompositeToolPolicy {
+	staged: Arc<dyn ToolPolicy>,
+	plan:   Option<Arc<dyn ToolPolicy>>,
+}
+
+impl CompositeToolPolicy {
+	pub fn new(staged: Arc<dyn ToolPolicy>, plan: Option<Arc<dyn ToolPolicy>>) -> Self {
+		Self { staged, plan }
+	}
+
+	/// Policy that produced `requirement`: the head is re-peeked (both policies
+	/// expose a pure requirement), so a stale staged requirement can never
+	/// authorize a plan one or vice versa.
+	fn owner(&self, requirement: &SoftToolRequirement) -> Option<&Arc<dyn ToolPolicy>> {
+		let staged_owns = self.staged.requirement().is_some_and(|head| {
+			head.id == requirement.id
+				&& head.generation == requirement.generation
+				&& head.tool_name == requirement.tool_name
+		});
+		if staged_owns {
+			Some(&self.staged)
+		} else {
+			self.plan.as_ref()
+		}
+	}
+}
+
+impl ToolPolicy for CompositeToolPolicy {
+	fn requirement(&self) -> Option<SoftToolRequirement> {
+		self
+			.staged
+			.requirement()
+			.or_else(|| self.plan.as_ref()?.requirement())
+	}
+
+	fn satisfies(&self, requirement: &SoftToolRequirement, call: &ToolCall) -> bool {
+		self
+			.owner(requirement)
+			.is_some_and(|policy| policy.satisfies(requirement, call))
+	}
+
+	fn choice(&self, requirement: &SoftToolRequirement) -> crate::provider::ToolChoice {
+		self.owner(requirement).map_or(
+			crate::provider::ToolChoice::Auto,
+			|policy| policy.choice(requirement),
+		)
+	}
+
+	fn exhaustion(&self, requirement: &SoftToolRequirement) -> Exhaustion {
+		self
+			.owner(requirement)
+			.map_or(Exhaustion::Error, |policy| policy.exhaustion(requirement))
+	}
+
+	fn escalation_limit(&self, requirement: &SoftToolRequirement) -> u32 {
+		self.owner(requirement).map_or(3, |policy| policy.escalation_limit(requirement))
 	}
 }
 
@@ -775,6 +949,9 @@ pub struct AgentContext {
 	/// `ToolUpdate` on this same channel the loop uses for `ToolStart`/`ToolEnd`,
 	/// so delivery is ordered and backpressured by one bounded queue.
 	pub progress: Option<tokio::sync::mpsc::Sender<crate::AgentEvent>>,
+	/// Session plan-mode guard for this run. Per context, never on a shared
+	/// tool instance: concurrent sessions and child agents each build their own.
+	pub plan: Option<Arc<dyn PlanModeGuard>>,
 }
 
 impl std::fmt::Debug for AgentContext {
@@ -786,6 +963,7 @@ impl std::fmt::Debug for AgentContext {
 			.field("has_approver", &self.approver.is_some())
 			.field("has_ask", &self.ask.is_some())
 			.field("has_progress", &self.progress.is_some())
+			.field("has_plan", &self.plan.is_some())
 			.finish()
 	}
 }
@@ -799,6 +977,7 @@ impl AgentContext {
 			approver: None,
 			ask: None,
 			progress: None,
+			plan: None,
 		}
 	}
 
@@ -810,6 +989,7 @@ impl AgentContext {
 			approver: None,
 			ask: None,
 			progress: None,
+			plan: None,
 		}
 	}
 
@@ -826,7 +1006,15 @@ impl AgentContext {
 			approver,
 			ask,
 			progress: None,
+			plan: None,
 		}
+	}
+
+	/// Attach the session plan-mode guard for this run.
+	#[must_use]
+	pub fn with_plan(mut self, plan: Option<Arc<dyn PlanModeGuard>>) -> Self {
+		self.plan = plan;
+		self
 	}
 
 	/// Attach an interactive `ask` surface (tests and embedders).
@@ -889,4 +1077,127 @@ pub struct TurnResult {
 	pub message: Message,
 	pub tool_results: Vec<ToolResult>,
 	pub is_completed: bool,
+}
+
+#[cfg(test)]
+mod composite_policy_tests {
+	use super::*;
+
+	/// Deterministic policy: the requirement and the satisfaction verdict are
+	/// fixed, so ordering is the only variable under test.
+	struct FixedPolicy {
+		requirement: Option<SoftToolRequirement>,
+		satisfied:   bool,
+	}
+
+	impl ToolPolicy for FixedPolicy {
+		fn requirement(&self) -> Option<SoftToolRequirement> {
+			self.requirement.clone()
+		}
+
+		fn satisfies(&self, _requirement: &SoftToolRequirement, _call: &ToolCall) -> bool {
+			self.satisfied
+		}
+	}
+
+	fn head(tool_name: &str, id: u64) -> SoftToolRequirement {
+		SoftToolRequirement {
+			id,
+			generation: 1,
+			tool_name: tool_name.to_string(),
+			reminder: Message::user("reminder"),
+		}
+	}
+
+	fn call(name: &str, path: &str) -> ToolCall {
+		ToolCall {
+			id: "call-1".to_string(),
+			name: name.to_string(),
+			arguments: serde_json::json!({ "path": path }),
+		}
+	}
+
+	struct NamedChoice;
+
+	impl ToolPolicy for NamedChoice {
+		fn requirement(&self) -> Option<SoftToolRequirement> {
+			Some(head("ask", 9))
+		}
+
+		fn satisfies(&self, _requirement: &SoftToolRequirement, _call: &ToolCall) -> bool {
+			true
+		}
+
+		fn choice(&self, _requirement: &SoftToolRequirement) -> crate::provider::ToolChoice {
+			crate::provider::ToolChoice::Required
+		}
+	}
+
+	#[test]
+	fn staged_preview_policy_keeps_first_priority() {
+		let staged = FixedPolicy { requirement: Some(head("write", 7)), satisfied: true };
+		let plan = Arc::new(NamedChoice);
+		let policy = CompositeToolPolicy::new(Arc::new(staged), Some(plan));
+
+		let requirement = policy.requirement().expect("staged head");
+		assert_eq!(requirement.tool_name, "write");
+		assert!(policy.satisfies(&requirement, &call("write", "xd://resolve")));
+		assert_eq!(
+			policy.choice(&requirement),
+			crate::provider::ToolChoice::Tool { name: "write".to_string() },
+			"staged preview keeps the named-write force"
+		);
+	}
+
+	#[test]
+	fn plan_reminder_applies_only_when_nothing_is_staged() {
+		let staged = Arc::new(FixedPolicy { requirement: None, satisfied: false });
+		let plan = Arc::new(NamedChoice);
+		let policy = CompositeToolPolicy::new(staged, Some(plan));
+
+		let requirement = policy.requirement().expect("plan head");
+		assert_eq!(requirement.tool_name, "ask");
+		assert!(policy.satisfies(&requirement, &call("ask", "ignored")));
+		assert_eq!(policy.choice(&requirement), crate::provider::ToolChoice::Required);
+	}
+
+	#[test]
+	fn exhaustion_belongs_to_the_owning_policy() {
+		struct Yielding;
+
+		impl ToolPolicy for Yielding {
+			fn requirement(&self) -> Option<SoftToolRequirement> {
+				Some(head("ask", 11))
+			}
+
+			fn satisfies(&self, _requirement: &SoftToolRequirement, _call: &ToolCall) -> bool {
+				true
+			}
+
+			fn exhaustion(&self, _requirement: &SoftToolRequirement) -> Exhaustion {
+				Exhaustion::EndTurn
+			}
+		}
+
+		let staged = Arc::new(FixedPolicy { requirement: Some(head("write", 11)), satisfied: true });
+		let policy = CompositeToolPolicy::new(staged, Some(Arc::new(Yielding)));
+		let requirement = policy.requirement().expect("staged head");
+		assert_eq!(policy.exhaustion(&requirement), Exhaustion::Error);
+
+		let policy = CompositeToolPolicy::new(
+			Arc::new(FixedPolicy { requirement: None, satisfied: false }),
+			Some(Arc::new(Yielding)),
+		);
+		let requirement = policy.requirement().expect("plan head");
+		assert_eq!(policy.exhaustion(&requirement), Exhaustion::EndTurn);
+	}
+
+	#[test]
+	fn without_a_plan_policy_the_stack_is_the_staged_policy() {
+		let policy = CompositeToolPolicy::new(
+			Arc::new(FixedPolicy { requirement: None, satisfied: true }),
+			None,
+		);
+		assert!(policy.requirement().is_none());
+	}
 }

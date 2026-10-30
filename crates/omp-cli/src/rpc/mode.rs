@@ -827,17 +827,18 @@ impl RpcMode {
 
 			RpcCommand::Prompt { message, images, streaming_behavior, .. } => {
 				let input = TurnInput {
-					text:   self.expand_skill(&message),
-					images: images.unwrap_or_default(),
+					text:         self.expand_skill(&message),
+					images:       images.unwrap_or_default(),
+					continuation: false,
 				};
 				Some(self.prompt(input, streaming_behavior, id))
 			},
 			RpcCommand::Steer { message, images, .. } => {
-				let input = TurnInput { text: message, images: images.unwrap_or_default() };
+				let input = TurnInput { text: message, images: images.unwrap_or_default(), continuation: false };
 				Some(self.steer(input, id))
 			},
 			RpcCommand::FollowUp { message, images, .. } => {
-				let input = TurnInput { text: message, images: images.unwrap_or_default() };
+				let input = TurnInput { text: message, images: images.unwrap_or_default(), continuation: false };
 				Some(self.follow_up(input, id))
 			},
 			RpcCommand::Abort { .. } => {
@@ -851,7 +852,7 @@ impl RpcMode {
 				Some(ok())
 			},
 			RpcCommand::AbortAndPrompt { message, images, .. } => {
-				let input = TurnInput { text: self.expand_skill(&message), images: images.unwrap_or_default() };
+				let input = TurnInput { text: self.expand_skill(&message), images: images.unwrap_or_default(), continuation: false };
 				// Admission and the replacement are one transition: if the run already
 				// ended, this prompt starts a fresh run instead of being lost.
 				match self.control.replace(input) {
@@ -1913,7 +1914,7 @@ mod run_control_tests {
 	use pi_agent::CancellationToken;
 
 	fn input(text: &str) -> TurnInput {
-		TurnInput { text: text.to_string(), images: Vec::new() }
+		TurnInput { text: text.to_string(), images: Vec::new(), continuation: false }
 	}
 
 	#[test]

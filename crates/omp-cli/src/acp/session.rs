@@ -23,7 +23,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet},
 	path::{Path, PathBuf},
 	sync::{
-		Arc, Condvar, Mutex, MutexGuard, PoisonError,
+		Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
 		atomic::{AtomicU64, Ordering},
 		mpsc::{self, Receiver, RecvTimeoutError, Sender},
 	},
@@ -307,6 +307,9 @@ impl AcpRuntime {
 			caps.clone(),
 		))));
 		session.set_mcp_servers(mcp_servers);
+		// Cached before the record takes the session lock: the approval tool
+		// runs while the turn holds that lock and cannot read it again.
+		let plan_artifacts = session.local_root();
 		let record = Arc::new(AcpSession {
 			id: id.clone(),
 			cwd,
@@ -315,7 +318,8 @@ impl AcpRuntime {
 			session: Mutex::new(session),
 			gate: PromptGate::default(),
 			token: token_slot,
-			plan: Mutex::new(PlanGate::new(self.recipe.plan_enabled)),
+			plan: Arc::new(Mutex::new(PlanGate::new(self.recipe.plan_enabled))),
+			plan_artifacts,
 			closed: Mutex::new(None),
 			next_message_id: AtomicU64::new(1),
 			permission,
@@ -323,6 +327,30 @@ impl AcpRuntime {
 		});
 		// The permission broker and ask channel share this slot.
 		record.permission.bind_session(&id);
+		// Plan-mode runtime wiring: the guard/handler/policy read the live gate,
+		// and the probe backs the `goal` tool's exclusive-slot refusal.
+		{
+			let plan = Arc::clone(&record.plan);
+			let probe_plan = Arc::clone(&plan);
+			let mut session = record.lock();
+			session.set_plan_mode(crate::agent::PlanModeHooks {
+				guard:   Some(Arc::new(plan::PlanWriteGuard::new(
+					Arc::clone(&plan),
+					record.plan_artifacts.clone(),
+				))),
+				propose: Some(Arc::new(AcpPlanProposalHandler {
+					session: Arc::downgrade(&record),
+				})),
+				policy:  Some(Arc::new(plan::PlanReminderPolicy::new(Arc::clone(&plan)))),
+			});
+			session.set_plan_mode_probe(Some(Arc::new(move || {
+				probe_plan
+					.lock()
+					.unwrap_or_else(PoisonError::into_inner)
+					.current_mode_id()
+					== plan::ACP_PLAN_MODE_ID
+			})));
+		}
 		// Restore plan mode from the shared `mode_change` slot. Only `"plan"`
 		// restores (goal/vibe/none leave plan off), and only while the feature
 		// is enabled.
@@ -361,7 +389,10 @@ pub struct AcpSession {
 	/// Turn token, shared with the permission/ask surfaces so a cancel reaches
 	/// their reverse waits. Never held while waiting for a client answer.
 	token: Arc<Mutex<Option<CancellationToken>>>,
-	plan: Mutex<PlanGate>,
+	plan: Arc<Mutex<PlanGate>>,
+	/// Session `local://` root cached at open: the approval tool runs under the
+	/// turn's session lock and must not take it again.
+	plan_artifacts: Option<PathBuf>,
 	closed: Mutex<Option<String>>,
 	next_message_id: AtomicU64,
 	permission: Arc<AcpPermissionBroker>,
@@ -619,6 +650,12 @@ impl AcpSession {
 	/// `session/prompt`.
 	pub fn prompt(self: &Arc<Self>, prompt: &Value) -> Result<Value, RequestError> {
 		self.ensure_open()?;
+		if self.gate.is_autonomous() {
+			return Err(RequestError::session_busy(
+				"Session is busy with an autonomous turn",
+				Some(json!({ "reason": "session_busy", "hint": "steer|followUp|wait" })),
+			));
+		}
 		// Implicit cancel: a new prompt while a turn is still in flight aborts
 		// it exactly like `session/cancel`, then queues behind cleanup.
 		if self.gate.request_cancel() {
@@ -634,8 +671,23 @@ impl AcpSession {
 		let (text, images) = convert_prompt_blocks(prompt)?;
 		let mut text = text;
 		if self.runtime.recipe.tools_enabled {
-			if let Some(reminder) = self.lock_plan().take_reminder() {
-				text = format!("{reminder}\n\n{text}");
+			// Approved-plan pointer: injected once on the first prompt after
+			// approval, and only when the file is actually readable. A failed
+			// resolution keeps the pointer for a later turn.
+			let reference = self.lock_plan().plan_reference_for_injection();
+			if let Some(reference) = reference
+				&& self.plan_reference_readable(&reference)
+			{
+				text = format!("{}\n\n{text}", plan::plan_reference_message(&reference));
+				self.lock_plan().clear_plan_reference();
+			}
+			// A user prompt owns the next decision: counters and any queued
+			// continuation/required choice are dropped, while the reminder
+			// already persisted at settle stays in history (TS :5748-5756).
+			{
+				let mut gate = self.lock_plan();
+				gate.discard_queued_continuation();
+				plan::reset_reminders(&mut gate.settle);
 			}
 			if let Some(prefix) =
 				self
@@ -658,6 +710,16 @@ impl AcpSession {
 					if let Some(error) = done.error {
 						return Err(error);
 					}
+					// Plan approval refreshed the mode: push the new config
+					// options now that the turn released the session lock.
+					let refresh_config = self.lock_plan().take_config_refresh();
+					if refresh_config {
+						let config = self.config_options();
+						self.emit_update(json!({
+							"sessionUpdate": "config_option_update",
+							"configOptions": config,
+						}));
+					}
 					let mut response = json!({ "stopReason": done.stop_reason });
 					if let Some(usage) = done.usage {
 						response["usage"] = usage;
@@ -678,6 +740,61 @@ impl AcpSession {
 					return Err(RequestError::internal_error().with_detail("ACP turn worker stopped"));
 				},
 			}
+		}
+	}
+
+	/// Start the detached plan continuation after the prompt response was
+	/// handed to the transport. Owns the gate (busy surface) and the turn
+	/// token, so a later `session/cancel` reaches it.
+	pub(crate) fn start_pending_continuation(self: &Arc<Self>) {
+		let claimed = self.lock_plan().take_continuation();
+		if !claimed {
+			// Non-plan prompts already ended their gate; never clear a prompt
+			// that began after that point. Autonomous ownership is released only
+			// if this session still holds it (guarded: plain active is a no-op).
+			self.gate.release_autonomous();
+			return;
+		}
+		if self.is_closed() {
+			self.gate.release_autonomous();
+			return;
+		}
+		let session = Arc::clone(self);
+		let spawned = thread::Builder::new()
+			.name(format!("omp-acp-plan-cont-{}", self.id))
+			.spawn(move || {
+				loop {
+					let done = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+						session.execute_continuation()
+					})) {
+						Ok(done) => done,
+						Err(_) => TurnDone {
+							stop_reason: "end_turn".to_string(),
+							usage: None,
+							error: Some(RequestError::internal_error()
+								.with_detail("ACP plan continuation panicked")),
+						},
+					};
+					*session.token.lock().unwrap_or_else(PoisonError::into_inner) = None;
+					if let Some(error) = done.error {
+						session.emit_update(json!({
+							"sessionUpdate": "agent_message_chunk",
+							"content": { "type": "text", "text": error.message.clone() },
+							"messageId": session.message_id(),
+						}));
+						break;
+					}
+					// Tool progress cleared the awaiting gate, so settle may have
+					// scheduled the next reminder cycle (cap-bounded upstream).
+					if !session.lock_plan().take_continuation() {
+						break;
+					}
+				}
+				session.gate.end();
+			});
+		if spawned.is_err() {
+			// Nothing ran: keep the persisted reminder but drop the schedule.
+			self.gate.release_autonomous();
 		}
 	}
 
@@ -703,8 +820,17 @@ impl AcpSession {
 						),
 					},
 				};
-				session.gate.end();
 				*session.token.lock().unwrap_or_else(PoisonError::into_inner) = None;
+				if done.error.is_none() && session.lock_plan().has_continuation() {
+					// The successful response is about to leave; the gate stays
+					// owned and autonomous until the detached continuation ends.
+					session.gate.switch_to_autonomous();
+				} else {
+					// Error responses never reach `after_response`, so nothing may
+					// be left queued: drop the schedule and free the gate here.
+					session.lock_plan().discard_queued_continuation();
+					session.gate.end();
+				}
 				let _ = tx.send(done);
 			})
 			.map(|_| ())
@@ -727,8 +853,16 @@ impl AcpSession {
 	}
 
 	fn execute_turn(&self, text: String, images: Vec<RpcImage>) -> TurnDone {
+		self.execute_turn_input(TurnInput { text, images, continuation: false })
+	}
+
+	fn execute_continuation(&self) -> TurnDone {
+		let reminder = self.lock_plan().take_reminder().unwrap_or_default();
+		self.execute_turn_input(TurnInput { text: reminder, images: Vec::new(), continuation: true })
+	}
+
+	fn execute_turn_input(&self, input: TurnInput) -> TurnDone {
 		let mut session = self.lock();
-		let input = TurnInput { text, images };
 		let (request, mut prepared) = match session.prepare_turn(&input) {
 			Ok(pair) => pair,
 			Err(error) => {
@@ -806,6 +940,14 @@ impl AcpSession {
 		let outcome =
 			TurnOutcome { error: stream_error.clone().filter(|_| !cancelled), aborted: cancelled };
 		session.finish_turn(&mut prepared, &outcome);
+		// An approval tool cannot append while this thread holds the session
+		// lock, so the queued `mode_change` lands here, before the turn reply.
+		let queued_mode = self.lock_plan().take_mode_persist();
+		if let Some((mode, data)) = queued_mode
+			&& let Err(error) = session.append_mode_change(&mode, data)
+		{
+			eprintln!("warning: cannot persist plan-mode exit: {error}");
+		}
 		let current = stats_tokens(&session.stats());
 		let usage = usage_delta(&baseline, &current);
 		let stop_reason = if cancelled {
@@ -822,9 +964,22 @@ impl AcpSession {
 		}
 		let has_ask = self.runtime.recipe.tools_enabled;
 		let has_write = self.runtime.recipe.tools_enabled;
-		let _ = self
+		let settle_reason = if stream_error.is_some() { "error" } else { stop_reason.as_str() };
+		let settle = self
 			.lock_plan()
-			.settle_turn(&stop_reason, &last_calls, has_ask, has_write);
+			.settle_turn(settle_reason, &last_calls, has_ask, has_write);
+		let mut plan_error = None;
+		if let plan::PlanSettle::Reminder(reminder) = &settle
+			&& let Err(error) = session.append_developer_message(reminder)
+		{
+			// Durability first: never schedule or keep a reminder whose write
+			// failed, and surface the loss instead of swallowing it.
+			self.lock_plan().discard_queued_continuation();
+			plan_error = Some(RequestError::new(
+				INTERNAL_ERROR,
+				format!("cannot persist plan reminder: {error}"),
+			));
+		}
 		let title = session.state(None).session_name;
 		if let Some(context) = session.context_usage() {
 			let mut update = json!({
@@ -852,7 +1007,8 @@ impl AcpSession {
 			usage,
 			error: outcome
 				.error
-				.map(|message| RequestError::new(INTERNAL_ERROR, message)),
+				.map(|message| RequestError::new(INTERNAL_ERROR, message))
+				.or(plan_error),
 		}
 	}
 
@@ -881,11 +1037,6 @@ impl AcpSession {
 	#[must_use]
 	pub fn plan_generation(&self) -> u64 {
 		self.lock_plan().generation
-	}
-
-	#[must_use]
-	pub fn plan_reference(&self) -> Option<String> {
-		self.lock_plan().plan_reference().map(str::to_string)
 	}
 
 	#[must_use]
@@ -1161,6 +1312,8 @@ struct PromptGate {
 struct GateState {
 	active: bool,
 	cancel_requested: bool,
+	/// A detached plan continuation owns the session.
+	autonomous: bool,
 }
 
 impl PromptGate {
@@ -1200,14 +1353,44 @@ impl PromptGate {
 		let mut state = self.lock();
 		state.active = false;
 		state.cancel_requested = false;
+		state.autonomous = false;
 		self.wake.notify_all();
+	}
+
+	/// A client prompt during an autonomous turn is a protocol busy error, not
+	/// an implicit cancel (TS `acp-agent.ts:878-887`).
+	fn is_autonomous(&self) -> bool {
+		self.lock().autonomous
+	}
+
+	/// The turn just settled a plan reminder: keep the gate owned and mark the
+	/// session busy before the prompt response leaves, so a racing client
+	/// prompt is rejected as `session_busy` (TS autonomous-turn semantics).
+	fn switch_to_autonomous(&self) {
+		let mut state = self.lock();
+		state.active = true;
+		state.cancel_requested = false;
+		state.autonomous = true;
 	}
 
 	fn abort(&self) {
 		let mut state = self.lock();
 		state.active = false;
 		state.cancel_requested = true;
+		state.autonomous = false;
 		self.wake.notify_all();
+	}
+
+	/// Release only an autonomous ownership this session established; a normal
+	/// prompt gate is left untouched.
+	fn release_autonomous(&self) {
+		let mut state = self.lock();
+		if state.autonomous {
+			state.active = false;
+			state.cancel_requested = false;
+			state.autonomous = false;
+			self.wake.notify_all();
+		}
 	}
 
 	fn wait_idle(&self, timeout: Duration) -> bool {
@@ -2730,4 +2913,257 @@ pub fn absolute_cwd(raw: &str) -> Result<PathBuf, RequestError> {
 		);
 	}
 	Ok(path)
+}
+
+// ------------------------------------------------------------ plan approval --
+
+/// `xd://propose` handler installed on the session's `write` tool.
+///
+/// The proposal never touches the working tree: it validates the plan artifact,
+/// asks the client to confirm (elicitation when advertised, auto-approve
+/// otherwise so plan mode is never stranded), and on approval exits plan mode.
+struct AcpPlanProposalHandler {
+	session: Weak<AcpSession>,
+}
+
+#[async_trait]
+impl pi_agent::state::ProposeHandler for AcpPlanProposalHandler {
+	async fn propose(
+		&self,
+		body: &str,
+		ctx: &pi_agent::AgentContext,
+	) -> Result<pi_agent::ToolResult, pi_agent::ToolError> {
+		let Some(session) = self.session.upgrade() else {
+			return Err(pi_agent::ToolError::ExecutionFailed(
+				"ACP session closed before the plan proposal was dispatched".to_string(),
+			));
+		};
+		session.handle_plan_proposal(body, &ctx.cancellation_token).await
+	}
+}
+
+impl AcpSession {
+	/// Whether an approved-plan pointer resolves to a readable artifact. Only
+	/// the contained reader is trusted; a non-local pointer never counts.
+	fn plan_reference_readable(&self, reference: &str) -> bool {
+		let Some(root) = self.plan_artifacts.as_deref() else {
+			return false;
+		};
+		let Some(relative) = pi_agent::tools::local_artifact_relative(reference) else {
+			return false;
+		};
+		pi_agent::tools::read_local_artifact(root, &relative).is_ok()
+	}
+
+	/// TS `#handleAcpPlanProposal`: resolve the reviewed plan, confirm with the
+	/// client, then exit plan mode (or promote the path for refinement).
+	async fn handle_plan_proposal(
+		&self,
+		body: &str,
+		cancel: &CancellationToken,
+	) -> Result<pi_agent::ToolResult, pi_agent::ToolError> {
+		use pi_agent::ToolError;
+
+		let state_path = {
+			let gate = self.lock_plan();
+			match gate.state.as_ref().filter(|state| state.enabled) {
+				Some(state) => state.plan_file_path.clone(),
+				// The handler is mounted for the session lifetime; while plan mode
+				// is off it must look exactly like no handler at all (TS text).
+				None => {
+					return Err(ToolError::Rejected(
+						"No plan is awaiting approval — xd://propose only accepts a plan title while plan mode is active."
+							.to_string(),
+					));
+				},
+			}
+		};
+		let proposal = plan::parse_plan_proposal(body);
+		let target_url = proposal
+			.slug
+			.as_deref()
+			.map(plan::plan_file_url_for_slug)
+			.unwrap_or(state_path);
+		// Inline plan content is written into the artifact sandbox here: the
+		// `local://` handler is read-only, so `xd://propose` is the one write
+		// path that can create the reviewed file.
+		if let Some(content) = &proposal.content {
+			let root = self.plan_artifacts.as_deref().ok_or_else(|| {
+				pi_agent::ToolError::ExecutionFailed(
+					"Plan artifacts need a persisted session directory".to_string(),
+				)
+			})?;
+			let relative = pi_agent::tools::local_artifact_relative(&target_url).ok_or_else(|| {
+				pi_agent::ToolError::ExecutionFailed(format!(
+					"{target_url} is not a local artifact path"
+				))
+			})?;
+			pi_agent::tools::write_artifact(root, &relative, content.as_bytes(), cancel)
+				.await
+				.map_err(|error| {
+					pi_agent::ToolError::ExecutionFailed(format!(
+						"Failed to write {target_url}: {error}"
+					))
+				})?;
+		}
+		let resolved = self.resolve_reviewed_plan(&proposal, &target_url)?;
+
+		let approved = self
+			.request_plan_approval(&resolved.title, &resolved.plan_content, cancel)
+			.await;
+		let details = json!({
+			"planFilePath": resolved.plan_file_path,
+			"title": resolved.title,
+			"planExists": true,
+		});
+		if !approved {
+			// Rejection keeps plan mode active for another planning turn and
+			// promotes the reviewed path so the next plan message targets it.
+			self.lock_plan().stay_after_refinement(&resolved.plan_file_path);
+			let normalized = plan::normalize_plan_title(&resolved.title)
+				.map(|(title, _)| title)
+				.unwrap_or_else(|_| resolved.title.clone());
+			return Ok(pi_agent::ToolResult {
+				tool_call_id: String::new(),
+				content: format!(
+					"Plan refinement requested. Update the plan file, then write {normalized} to xd://propose again when ready."
+				),
+				is_error: false,
+				terminate: false,
+				details: Some(details),
+			});
+		}
+
+		{
+			let mut gate = self.lock_plan();
+			gate.exit_after_approval(&resolved.plan_file_path);
+			let persisted = gate.persisted_mode_change();
+			gate.queue_mode_persist(persisted.0, persisted.1);
+			gate.queue_config_refresh();
+		}
+		self.emit_update(json!({
+			"sessionUpdate": "current_mode_update",
+			"currentModeId": self.lock_plan().current_mode_id(),
+		}));
+		Ok(pi_agent::ToolResult {
+			tool_call_id: String::new(),
+			content: format!(
+				"Plan approved at {}. Plan mode exited; proceed with the implementation.",
+				resolved.plan_file_path
+			),
+			is_error: false,
+			terminate: false,
+			details: Some(details),
+		})
+	}
+
+	/// TS `resolveApprovedPlan` over the session artifact sandbox.
+	fn resolve_reviewed_plan(
+		&self,
+		proposal: &plan::PlanProposal,
+		target_url: &str,
+	) -> Result<plan::ResolvedPlan, pi_agent::ToolError> {
+		let read_root = self.plan_artifacts.clone();
+		let list_root = self.plan_artifacts.clone();
+		plan::resolve_approved_plan(
+			proposal.title.as_deref(),
+			target_url,
+			// Contained reader: a symlinked artifact can never leak outside
+			// contents into the approval dialog.
+			&|url| {
+				let root = read_root.as_deref()?;
+				let relative = pi_agent::tools::local_artifact_relative(url)?;
+				pi_agent::tools::read_local_artifact(root, &relative).ok()
+			},
+			&|| list_root.as_deref().map(plan::list_local_plan_files).unwrap_or_default(),
+		)
+		.map_err(pi_agent::ToolError::Rejected)
+	}
+
+	/// TS `#requestAcpPlanApprovalChoice`. Approve ONLY on the explicit approve
+	/// selection: dismissal, cancel or timeout fall through to refine semantics
+	/// so closing the dialog can never grant write access. Clients without
+	/// form-mode elicitation auto-approve.
+	async fn request_plan_approval(
+		&self,
+		title: &str,
+		plan_content: &str,
+		cancel: &CancellationToken,
+	) -> bool {
+		if !self.caps.elicitation_form() {
+			return true;
+		}
+		let lines: Vec<&str> = plan_content.lines().take(12).collect();
+		let ellipsis = if plan_content.lines().count() > 12 { "\n…" } else { "" };
+		let message =
+			format!("Approve plan \"{title}\" and start implementation?\n\n{}{ellipsis}", lines.join("\n"));
+		let reverse = self.runtime.reverse.clone();
+		let session_id = self.id.clone();
+		let token = cancel.clone();
+		let answer = tokio::task::spawn_blocking(move || {
+			let cancelled = || token.is_cancelled();
+			reverse.request_cancellable(
+				"elicitation/create",
+				Some(json!({
+					"mode": "form",
+					"sessionId": session_id,
+					"message": message,
+					"requestedSchema": {
+						"type": "object",
+						"properties": {
+							"value": {
+								"type": "string",
+								"enum": [plan::APPROVE_PLAN_OPTION, plan::REFINE_PLAN_OPTION],
+							}
+						},
+						"required": ["value"],
+					},
+				})),
+				None,
+				&cancelled,
+			)
+		})
+		.await;
+		match answer {
+			Ok(Ok(value)) => {
+				value.get("action").and_then(Value::as_str) == Some("accept")
+					&& value
+						.get("content")
+						.and_then(|content| content.get("value"))
+						.and_then(Value::as_str)
+						== Some(plan::APPROVE_PLAN_OPTION)
+			},
+			_ => false,
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::PromptGate;
+
+	#[test]
+	fn plan_gate_release_autonomous_does_not_clear_client_prompt() {
+		// A stale continuation finalizer runs after a newer client prompt took
+		// the gate: releasing must be a guarded no-op, not an `end`.
+		let gate = PromptGate::default();
+		gate.begin();
+		gate.release_autonomous();
+		assert!(gate.is_active());
+		assert!(!gate.is_autonomous());
+		gate.end();
+	}
+
+	#[test]
+	fn plan_gate_release_autonomous_frees_autonomous_owner() {
+		let gate = PromptGate::default();
+		gate.begin();
+		gate.switch_to_autonomous();
+		assert!(gate.is_autonomous());
+		gate.release_autonomous();
+		assert!(!gate.is_active());
+		gate.begin();
+		assert!(gate.is_active());
+		gate.end();
+	}
 }

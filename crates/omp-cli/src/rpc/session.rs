@@ -237,8 +237,10 @@ impl ActiveTurn {
 /// One user message entering a turn.
 #[derive(Debug, Clone)]
 pub struct TurnInput {
-	pub text:    String,
-	pub images:  Vec<RpcImage>,
+	pub text:         String,
+	pub images:       Vec<RpcImage>,
+	/// Detached plan continuation: no caller message, no goal window.
+	pub continuation: bool,
 }
 
 /// Long-lived session state owned by the RPC transport.
@@ -308,6 +310,12 @@ pub struct RpcSession {
 	/// ACP client-supplied MCP servers for this session (validated by the
 	/// adapter); merged with file discovery by the runner's existing gate.
 	pub(crate) mcp_servers: Vec<crate::config::DiscoveredMcpServer>,
+	/// Host plan-mode wiring installed by the ACP transport: the write guard,
+	/// the `xd://propose` handler and the plan reminder policy.
+	pub(crate) plan_mode: crate::agent::PlanModeHooks,
+	/// Live plan-mode probe handed to the hidden `goal` tool, which refuses
+	/// `create`/`resume` while plan mode holds the exclusive mode slot.
+	pub(crate) plan_mode_probe: Option<crate::goal_tool::PlanModeProbe>,
 }
 
 impl RpcSession {
@@ -429,6 +437,8 @@ impl RpcSession {
 			goal: Arc::new(crate::goal::GoalRuntime::new()),
 			acp_bridge: None,
 			mcp_servers: Vec::new(),
+			plan_mode: crate::agent::PlanModeHooks::default(),
+			plan_mode_probe: None,
 		};
 		session.reconcile_goal_mode();
 		Ok(session)
@@ -827,6 +837,17 @@ impl RpcSession {
 	/// Replace the ACP-supplied MCP servers this session merges into each run.
 	pub fn set_mcp_servers(&mut self, servers: Vec<crate::config::DiscoveredMcpServer>) {
 		self.mcp_servers = servers;
+	}
+
+	/// Install the host plan-mode wiring (write guard, `xd://propose` handler,
+	/// reminder policy) copied into every later `RunRequest`.
+	pub fn set_plan_mode(&mut self, hooks: crate::agent::PlanModeHooks) {
+		self.plan_mode = hooks;
+	}
+
+	/// Install the live plan-mode probe the hidden `goal` tool consults.
+	pub fn set_plan_mode_probe(&mut self, probe: Option<crate::goal_tool::PlanModeProbe>) {
+		self.plan_mode_probe = probe;
 	}
 
 	/// Persist the shared exclusive `mode_change` slot (`"plan"`, `"none"`, or
@@ -1284,11 +1305,15 @@ impl RpcSession {
 				crate::goal::GoalPersist::Completed(data) => {
 					self.store.append_goal_completed(data)
 				},
-				crate::goal::GoalPersist::BackgroundUsage { id, usage } => {
+				crate::goal::GoalPersist::BackgroundUsage { id, result_key, usage } => {
 					if self.store.enabled() {
+						let mut data = json!({ "id": id, "usage": usage });
+						if let Some(result_key) = result_key {
+							data["resultKey"] = json!(result_key);
+						}
 						self.store.append_custom(
 							crate::goal::BACKGROUND_USAGE_CUSTOM_TYPE,
-							Some(json!({ "id": id, "usage": usage })),
+							Some(data),
 						)
 					} else {
 						Ok(String::new())
@@ -1368,6 +1393,50 @@ impl RpcSession {
 			));
 		}
 
+		if input.continuation {
+			// Detached plan continuation: no user entry, no goal budget window and
+			// no new persisted message. `input.text` is the reminder text; the
+			// provider history gets it appended exactly once.
+			let mut request = self.request(String::new(), Vec::new(), true)?;
+			let reminder = input.text.as_str();
+			if !reminder.trim().is_empty() {
+				let mut messages = match request.history_messages.take() {
+					Some(messages) => messages,
+					None => crate::runtime::history_messages(&request.history)
+						.map_err(|err| Error::new(err.to_string()))?,
+				};
+				// Identity is the exact persisted bytes (trailing newline and all);
+				// trimming here would both miss the stored reminder and risk
+				// collapsing distinct messages.
+				let already = messages.iter().any(|message| {
+					message.role == pi_agent::Role::Developer && message.content == reminder
+				});
+				if !already {
+					messages.push(pi_agent::Message::developer(reminder.to_string()));
+				}
+				request.history_messages = Some(messages);
+			}
+			let token = CancellationToken::new();
+			request.cancellation_token = Some(token.clone());
+			let turn_ack = TurnAck::new();
+			request.turn_ack = Some(Arc::clone(&turn_ack));
+			let prepared = PreparedTurn {
+				token,
+				turn_ack,
+				builder: TurnBuilder::new(String::new()),
+				parent_id: self.store.leaf_id().map(str::to_string),
+				in_memory_before: self.in_memory_messages.as_ref().map_or(0, Vec::len),
+				started: Instant::now(),
+				model_fallback: self.model.clone(),
+				provider_fallback: self.provider.clone(),
+				tool_names: std::collections::HashMap::new(),
+				tool_images: std::collections::HashMap::new(),
+				wire_user_message: None,
+				aborted: false,
+			};
+			self.is_streaming = true;
+			return Ok((request, prepared));
+		}
 		let parts = self.image_parts(&input.images)?;
 		self.check_host_tool_names()?;
 		let started = SystemTime::now();
@@ -1402,7 +1471,7 @@ impl RpcSession {
 		// `branch_summary` the context is rebuilt from the store, so an entry
 		// written first would come back as history and the runner would append
 		// the same prompt (text and images) a second time.
-		let mut request = self.request(input.text.clone(), turn_parts)?;
+		let mut request = self.request(input.text.clone(), turn_parts, input.continuation)?;
 		if self.store.enabled() {
 			if let Err(err) = entry.validate() {
 				eprintln!("warning: {err}");
@@ -1449,12 +1518,25 @@ impl RpcSession {
 		Ok((request, prepared))
 	}
 
-	pub(crate) fn request(&self, prompt: String, parts: Vec<ContentPart>) -> Result<RunRequest> {
+	pub(crate) fn request(
+		&self,
+		prompt: String,
+		parts: Vec<ContentPart>,
+		continuation: bool,
+	) -> Result<RunRequest> {
 		let history_messages = if !self.store.enabled() {
 			Some(self.in_memory_messages.clone().unwrap_or_default())
 		} else if let Some(messages) = &self.history_messages {
 			Some(messages.clone())
-		} else if self.store.has_branch_context() {
+		} else if self.store.has_branch_context()
+			|| self
+				.store
+				.messages()
+				.iter()
+				.any(|message| message.message.role == "developer")
+		{
+			// Persisted developer reminders (plan) must survive into later turns
+			// even without a branch/custom entry: the message view keeps the role.
 			if let Some(warning) = self.store.branch_chain_warning() {
 				eprintln!("warning: {warning}");
 			}
@@ -1481,8 +1563,10 @@ impl RpcSession {
 		};
 		let mut extra_tools: Vec<crate::agent::ExtraTool> = Vec::new();
 		if self.goal_tool_mounted() {
-			let tool: Arc<dyn pi_agent::tools::Tool> =
-				Arc::new(crate::goal_tool::GoalTool::new(Arc::clone(&self.goal)));
+			let tool: Arc<dyn pi_agent::tools::Tool> = Arc::new(
+				crate::goal_tool::GoalTool::new(Arc::clone(&self.goal))
+					.with_plan_mode(self.plan_mode_probe.clone()),
+			);
 			extra_tools.push(crate::agent::ExtraTool::from(tool));
 		}
 		// The live host tool set, mounted by the runner after every
@@ -1534,7 +1618,40 @@ impl RpcSession {
 			child_session_root: self.child_session_root(),
 			goal: Some(Arc::clone(&self.goal)),
 			goal_context,
+			plan_mode: self.plan_mode.clone(),
+			continuation,
 		})
+	}
+
+	/// Persist one host-injected developer message (TS plan reminder) exactly
+	/// once, before its continuation is scheduled.
+	pub fn append_developer_message(&mut self, text: &str) -> Result<(), Error> {
+		let started = SystemTime::now();
+		let iso = output::iso8601(started);
+		let started_ms =
+			started.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+		let mut message = SessionMessage::user(MessageContent::Text(text.to_string()), started_ms);
+		message.role = "developer".to_string();
+		let id = format!("msg-{}", output::session_id());
+		let parent_id = self.store.leaf_id().map(str::to_string);
+		let entry = MessageEntry::new(id, parent_id, &iso, message);
+		if self.store.enabled() {
+			entry.validate().map_err(Error::new)?;
+			self
+				.store
+				.append_message(&entry)
+				.map_err(|err| Error::new(err.to_string()))?;
+		}
+		if let Ok(value) = serde_json::to_value(&entry.message) {
+			self.messages.push(value);
+		}
+		if !self.store.enabled() {
+			self
+				.in_memory_messages
+				.get_or_insert_with(Vec::new)
+				.push(pi_agent::Message::developer(text));
+		}
+		Ok(())
 	}
 
 	/// Immutable URL scope for this session's turns: the session file plus its
@@ -1554,6 +1671,14 @@ impl RpcSession {
 				.map(|dir| std::collections::BTreeMap::from([("local".to_string(), dir)]))
 				.unwrap_or_default(),
 		})
+	}
+
+	/// Session `local://` root (the artifacts directory), when the log is
+	/// persisted. Read by hosts that need the artifact path before a turn takes
+	/// the session lock.
+	#[must_use]
+	pub fn local_root(&self) -> Option<PathBuf> {
+		self.url_scope().local_roots.get("local").cloned()
 	}
 
 	/// Directory child transcripts live in. Only a persisted session has a
@@ -2080,7 +2205,7 @@ impl RpcSession {
 			text.push_str(&input.text);
 			images.extend(input.images);
 		}
-		TurnAdvance::Run(TurnInput { text, images })
+		TurnAdvance::Run(TurnInput { text, images, continuation: false })
 	}
 
 	/// Whether messages are waiting for the current turn to finish.
@@ -2121,7 +2246,7 @@ impl RpcSession {
 	/// Run one isolated summarizer request (no tools, one turn, not persisted)
 	/// and return the streamed assistant text.
 	fn summarize(&mut self, prompt: String) -> Result<String> {
-		let mut request = self.request(prompt, Vec::new())?;
+		let mut request = self.request(prompt, Vec::new(), false)?;
 		request.tools_enabled = false;
 		request.max_turns = 1;
 		request.session_persisted = false;

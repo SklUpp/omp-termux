@@ -680,6 +680,7 @@ impl TaskTool {
 		let child_cancel_for_loop = child_cancel.clone();
 		let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
 		let events = forward_child_events(self.supervisor.clone(), child_id.clone(), event_rx);
+		let child_plan = ctx.plan.clone();
 		let mut task_handle = tokio::spawn(async move {
 			let child_loop = match child_approver {
 				Some(approver) => AgentLoop::with_approver(
@@ -689,7 +690,8 @@ impl TaskTool {
 					approver,
 				),
 				None => AgentLoop::new(child_config, child_provider, child_registry),
-			};
+			}
+			.with_plan(child_plan);
 			let mut child_state = AgentState::default();
 			child_loop
 				.run_dialog_message_with_cancel(
@@ -1060,6 +1062,7 @@ impl TaskTool {
 		// semaphore, so a parent holding a permit while waiting for descendants
 		// cannot deadlock when every parent permit is occupied.
 		let semaphore = self.semaphore.clone();
+		let plan = ctx.plan.clone();
 		let cwd = ctx.cwd.clone();
 		let task_id = child_id.clone();
 		let cancel = child_cancel.clone();
@@ -1097,6 +1100,7 @@ impl TaskTool {
 				steering_rx,
 				cancel.clone(),
 				child_ctx,
+				plan,
 			)
 			.await;
 			supervisor.unregister_active_child(&task_id);
@@ -1366,6 +1370,7 @@ async fn run_background_child(
 	steering_rx: tokio::sync::mpsc::Receiver<SteeringEvent>,
 	cancel: CancellationToken,
 	child_ctx: ChildContext,
+	plan: Option<Arc<dyn crate::state::PlanModeGuard>>,
 ) -> Result<BackgroundOutcome, AgentError> {
 	let child_model = child_ctx
 		.resolve_model(&item.agent, item.effort.as_deref())
@@ -1435,7 +1440,8 @@ async fn run_background_child(
 			AgentLoop::with_approver(child_config, child_provider, child_registry, approver)
 		},
 		None => AgentLoop::new(child_config, child_provider, child_registry),
-	};
+	}
+	.with_plan(plan);
 	let child_loop = child_loop
 		.with_background_results(supervisor.owner_results_sink(Some(&child_id)))
 		.with_peer_inbox(supervisor.mailbox(), child_id.clone());
@@ -3383,6 +3389,7 @@ mod tests {
 			steering_rx,
 			tokio_util::sync::CancellationToken::new(),
 			tool.child_context(),
+			None,
 		)
 		.await;
 

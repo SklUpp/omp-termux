@@ -577,9 +577,15 @@ pub enum GoalPersist {
 	ModeChange { mode: &'static str, data: Option<Value> },
 	/// Terminal `custom goal-completed` metric.
 	Completed(Value),
-	/// `custom background-usage` entry: the child's summed usage for this job
-	/// id, persisted once so a reopened log can still account it.
-	BackgroundUsage { id: String, usage: pi_agent::TokenUsage },
+	/// `custom background-usage` entry: the child's summed usage for this job,
+	/// persisted once so a reopened log can still account it. `id` stays for
+	/// downgrade compatibility; `result_key` is the durable identity when the
+	/// writer knows it.
+	BackgroundUsage {
+		id: String,
+		result_key: Option<String>,
+		usage: pi_agent::TokenUsage,
+	},
 }
 
 /// TS `GoalRuntimeEvent`, as the RPC/live host forwards it.
@@ -854,22 +860,34 @@ impl GoalRuntime {
 	}
 
 	/// One background child result was injected. `usage` is the child's summed
-	/// report; a job id counts once even if a hub snapshot repeats it.
-	pub fn observe_background_result(&self, id: &str, usage: Option<&pi_agent::TokenUsage>) {
-		if id.is_empty() {
+	/// report; `result_key` is the namespaced accounting key (raw `id` is the
+	/// legacy fallback). A job key counts once even if a hub snapshot repeats
+	/// it, and a key is never recorded without usage: an absent report must not
+	/// suppress a later delivery that carries one.
+	pub fn observe_background_result(
+		&self,
+		id: &str,
+		result_key: Option<&str>,
+		usage: Option<&pi_agent::TokenUsage>,
+	) {
+		let key = result_key.filter(|key| !key.is_empty()).unwrap_or(id);
+		if key.is_empty() {
 			return;
 		}
+		let Some(usage) = usage else {
+			return;
+		};
 		let now = self.now_ms();
 		let steer = {
 			let mut inner = self.lock();
-			if !inner.seen_background_ids.insert(id.to_string()) {
+			if !inner.seen_background_ids.insert(key.to_string()) {
 				return;
 			}
-			let Some(usage) = usage else {
-				return;
-			};
 			inner.pending.push(GoalPersist::BackgroundUsage {
 				id:   id.to_string(),
+				result_key: result_key
+					.filter(|key| !key.is_empty())
+					.map(str::to_string),
 				usage: *usage,
 			});
 			inner.usage = inner.usage.saturating_add(TokenCounters::from_token_usage(usage));
@@ -898,16 +916,15 @@ impl GoalRuntime {
 		{
 			let mut inner = self.lock();
 			for job in jobs {
-				let Some(id) = job.get("id").and_then(Value::as_str) else {
-					continue;
-				};
-				if id.is_empty() {
-					continue;
-				}
 				let Some(usage) = job.get("usage").and_then(usage_counters_from_value) else {
 					continue;
 				};
-				if inner.seen_background_ids.insert(id.to_string()) {
+				// `resultKey` alone when present, else the legacy raw id: a
+				// reopened CLI reuses ids, so consulting both would merge runs.
+				let Some(key) = crate::session::background_usage_key(job) else {
+					continue;
+				};
+				if inner.seen_background_ids.insert(key.to_string()) {
 					inner.usage = inner.usage.saturating_add(usage);
 				}
 			}
@@ -1863,7 +1880,7 @@ mod tests {
 			"totalTokens": 11,
 		}))
 		.expect("token usage");
-		runtime.observe_background_result("bg-1", Some(&usage));
+		runtime.observe_background_result("bg-1", None, Some(&usage));
 		let pending = runtime.take_pending();
 		assert!(
 			pending.iter().any(|intent| matches!(
@@ -1917,6 +1934,86 @@ mod tests {
 				GoalPersist::BackgroundUsage { id, .. } if id == "bg-2"
 			)),
 			"a hub snapshot persists its own tool result, not a duplicate custom entry"
+		);
+	}
+
+	/// The durable key is `resultKey` when present, else the raw id. A hub
+	/// snapshot and an auto-delivery share one key, a report without usage never
+	/// claims one, and two runs that reused `task-1` stay distinct.
+	#[test]
+	fn background_usage_keys_namespaced_runs_once() {
+		let runtime = GoalRuntime::with_clock(Box::new(|| 1_000));
+		runtime.create_goal("ship", None).expect("create goal");
+		runtime.begin_turn(Some("go"), TokenCounters::default());
+		let usage: pi_agent::TokenUsage = serde_json::from_value(json!({
+			"input": 4,
+			"output": 6,
+			"cacheRead": 1,
+			"cacheWrite": 0,
+			"totalTokens": 11,
+		}))
+		.expect("token usage");
+
+		// A snapshot keyed without usage must not suppress the settled report.
+		runtime.observe_tool_end(
+			"hub",
+			Some(&json!({
+				"jobs": [{ "id": "task-1", "resultKey": "ns1:task-1", "status": "running" }],
+			})),
+		);
+		runtime.observe_background_result("task-1", Some("ns1:task-1"), None);
+		assert_eq!(runtime.state().expect("goal state").goal.tokens_used, 0);
+
+		runtime.observe_background_result("task-1", Some("ns1:task-1"), Some(&usage));
+		assert_eq!(runtime.state().expect("goal state").goal.tokens_used, 10);
+
+		// The hub snapshot repeats the same key with usage: still once.
+		runtime.observe_tool_end(
+			"hub",
+			Some(&json!({
+				"jobs": [{
+					"id": "task-1",
+					"resultKey": "ns1:task-1",
+					"usage": {
+						"input": 4,
+						"output": 6,
+						"cacheRead": 1,
+						"cacheWrite": 0,
+						"totalTokens": 11,
+					},
+				}],
+			})),
+		);
+		assert_eq!(
+			runtime.state().expect("goal state").goal.tokens_used,
+			10,
+			"one key is charged once across delivery and snapshot"
+		);
+
+		// A reopened CLI reuses `task-1` under a new namespace.
+		runtime.observe_background_result("task-1", Some("ns2:task-1"), Some(&usage));
+		assert_eq!(
+			runtime.state().expect("goal state").goal.tokens_used,
+			20,
+			"distinct namespaces accrue separately"
+		);
+		let keys: Vec<Option<String>> = runtime
+			.take_pending()
+			.into_iter()
+			.filter_map(|intent| match intent {
+				GoalPersist::BackgroundUsage { id, result_key, .. } if id == "task-1" => {
+					Some(result_key)
+				},
+				_ => None,
+			})
+			.collect();
+		assert_eq!(
+			keys,
+			vec![
+				Some("ns1:task-1".to_string()),
+				Some("ns2:task-1".to_string())
+			],
+			"each persisted entry keeps its namespaced key beside the legacy id"
 		);
 	}
 

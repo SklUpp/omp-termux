@@ -417,6 +417,11 @@ fn format_ts_message(
 				"timestamp": timestamp,
 			})
 		},
+		pi_agent::Role::Developer => serde_json::json!({
+			"role": "developer",
+			"content": [{ "type": "text", "text": message.content }],
+			"timestamp": timestamp,
+		}),
 		pi_agent::Role::Assistant => format_ts_assistant_message(message, api, provider, model, None, timestamp),
 		pi_agent::Role::Tool => format_ts_tool_result(
 			message.tool_call_id.as_deref().unwrap_or_default(),

@@ -15,6 +15,11 @@
 //! [`PlanGate::reminder_pending`], [`PlanGate::generation`] and
 //! [`is_propose_tool_call`].
 
+use std::{
+	path::{Path, PathBuf},
+	sync::{Arc, Mutex},
+};
+
 use serde_json::Value;
 
 /// Plan mode id advertised by ACP.
@@ -26,6 +31,10 @@ pub const DEFAULT_PLAN_FILE_URL: &str = "local://PLAN.md";
 /// TS `PLAN_MODE_REMINDER_MAX`: after this many unanswered reminders the agent
 /// yields to the user instead of looping.
 pub const PLAN_MODE_REMINDER_MAX: u32 = 3;
+/// TS `APPROVE_OPTION`: the only elicitation answer that grants write access.
+pub const APPROVE_PLAN_OPTION: &str = "Approve and execute";
+/// TS `REFINE_OPTION`: keeps plan mode active for another planning turn.
+pub const REFINE_PLAN_OPTION: &str = "Refine plan";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlanWorkflow {
@@ -191,6 +200,15 @@ pub struct PlanGate {
 	/// (`setPlanReferencePath`); the plan-proposal slice reads this.
 	plan_reference: Option<String>,
 	pending_reminder: Option<String>,
+	/// Mode-slot change the runner persists once the tool stream releases the
+	/// session lock: the ACP turn holds that lock while tools execute, so an
+	/// approval tool cannot append the entry itself.
+	pending_mode_persist: Option<(String, Option<Value>)>,
+	/// Set when the mode changed inside a tool call: the turn owner pushes a
+	/// `config_option_update` once the session lock is released.
+	config_refresh: bool,
+	/// A persisted developer reminder is waiting for its detached continuation.
+	continuation_pending: bool,
 }
 
 impl PlanGate {
@@ -203,7 +221,50 @@ impl PlanGate {
 			enabled,
 			plan_reference: None,
 			pending_reminder: None,
+			pending_mode_persist: None,
+			config_refresh: false,
+			continuation_pending: false,
 		}
+	}
+
+	/// Queue a `mode_change` entry for the runner to append once the turn's
+	/// tool stream finishes (the ACP turn owns the session lock while tools run).
+	pub fn queue_mode_persist(&mut self, mode: &str, data: Option<Value>) {
+		self.pending_mode_persist = Some((mode.to_string(), data));
+	}
+
+	/// Take the queued `mode_change` entry, if any.
+	pub fn take_mode_persist(&mut self) -> Option<(String, Option<Value>)> {
+		self.pending_mode_persist.take()
+	}
+
+	/// Whether a persisted reminder still awaits its detached continuation.
+	#[must_use]
+	pub fn has_continuation(&self) -> bool {
+		self.continuation_pending
+	}
+
+	/// Claim the pending continuation for the detached worker.
+	pub fn take_continuation(&mut self) -> bool {
+		std::mem::take(&mut self.continuation_pending)
+	}
+
+	/// A user prompt owns the next decision: reset counters and drop the
+	/// queued continuation, but keep the already-persisted developer reminder
+	/// and the awaiting head (TS :5748-5756).
+	pub fn discard_queued_continuation(&mut self) {
+		self.pending_reminder = None;
+		self.continuation_pending = false;
+	}
+
+	/// Request a `config_option_update` after the current turn.
+	pub fn queue_config_refresh(&mut self) {
+		self.config_refresh = true;
+	}
+
+	/// Consume the refresh request, if any.
+	pub fn take_config_refresh(&mut self) -> bool {
+		std::mem::take(&mut self.config_refresh)
 	}
 
 	#[must_use]
@@ -248,6 +309,7 @@ impl PlanGate {
 			self.state = None;
 			reset_reminders(&mut self.settle);
 			self.pending_reminder = None;
+			self.continuation_pending = false;
 			self.generation = self.generation.wrapping_add(1);
 			return Ok(());
 		}
@@ -257,6 +319,7 @@ impl PlanGate {
 		self.state = Some(AcpPlanState::enter(self.state.as_ref()));
 		reset_reminders(&mut self.settle);
 		self.pending_reminder = None;
+		self.continuation_pending = false;
 		self.generation = self.generation.wrapping_add(1);
 		Ok(())
 	}
@@ -319,6 +382,7 @@ impl PlanGate {
 		);
 		if let PlanSettle::Reminder(message) = &outcome {
 			self.pending_reminder = Some(message.clone());
+			self.continuation_pending = true;
 		}
 		outcome
 	}
@@ -329,14 +393,24 @@ impl PlanGate {
 		self.state = None;
 		reset_reminders(&mut self.settle);
 		self.pending_reminder = None;
+		self.continuation_pending = false;
 		self.plan_reference = Some(plan_file_path.to_string());
 		self.generation = self.generation.wrapping_add(1);
 	}
 
-	/// Approved plan path the next turn composer injects as context.
+	/// Pointer to inject on the next prompt while plan mode is off. The caller
+	/// clears it only after the message was actually delivered.
 	#[must_use]
-	pub fn plan_reference(&self) -> Option<&str> {
-		self.plan_reference.as_deref()
+	pub fn plan_reference_for_injection(&self) -> Option<String> {
+		if self.state.as_ref().is_some_and(|state| state.enabled) {
+			return None;
+		}
+		self.plan_reference.clone()
+	}
+
+	/// Mark the pointer delivered (TS `#planReferenceSent`).
+	pub fn clear_plan_reference(&mut self) {
+		self.plan_reference = None;
 	}
 
 	/// Mode-change payload for the shared session slot.
@@ -481,6 +555,14 @@ pub fn plan_tool_decision_reminder(ask_tool_name: &str) -> String {
 	format!(
 		"<system-reminder>\nPlan mode turn ended without a required tool call.\n\nYou MUST choose exactly one next action now:\n1. Call `{ask_tool_name}` to gather required clarification, OR\n2. Write the plan slug/title (`<slug>`, matching `local://<slug>-plan.md`) as plain text to `xd://propose` with `write` to finish planning and request approval\n\nYou NEVER output plain text in this turn.\n</system-reminder>\n"
 	)
+}
+
+/// `prompts/system/plan-mode-reference.md`, rendered with the pointer only
+/// (the plan body is read from the file, never inlined).
+#[must_use]
+pub fn plan_reference_message(plan_file_path: &str) -> String {
+	include_str!("../../../../packages/coding-agent/src/prompts/system/plan-mode-reference.md")
+		.replace("{{planFilePath}}", plan_file_path)
 }
 
 /// TS `isPlanDecisionTool`: `ask`, or a plan proposal write.
@@ -680,59 +762,213 @@ pub fn resolve_approved_plan(
 	))
 }
 
-/// Write-guard classification. `None` means the write is allowed; otherwise the
-/// exact TS message. Guarded tools are write/edit/delete/move and the archive
-/// writers; `bash` is deliberately not guarded (TS gap, retained).
-#[must_use]
-pub fn plan_write_error(tool_name: &str, args: &Value) -> Option<&'static str> {
-	match tool_name {
-		"delete" => Some("Plan mode: deleting files is not allowed."),
-		"move" => Some("Plan mode: renaming files is not allowed."),
-		"write" => {
-			let raw = args
-				.get("path")
-				.or_else(|| args.get("file_path"))?
-				.as_str()?;
-			if is_local_artifact(raw) || is_propose_path(raw) {
-				None
-			} else {
-				Some(
-					"Plan mode: the working tree is read-only. Write your plan to a local://<slug>-plan.md file instead.",
-				)
-			}
-		},
-		"edit" | "apply_patch" | "ast_edit" => {
-			if let Some(edits) = args.get("edits").and_then(Value::as_array) {
-				for edit in edits {
-					match edit.get("op").and_then(Value::as_str) {
-						Some("delete") => return Some("Plan mode: deleting files is not allowed."),
-						Some(op) if op != "create" && edit.get("rename").is_some() => {
-							return Some("Plan mode: renaming files is not allowed.");
-						},
-						_ => {},
-					}
-				}
-			}
-			let raw = args.get("path").and_then(Value::as_str).unwrap_or("");
-			if is_local_artifact(raw) {
-				None
-			} else {
-				Some(
-					"Plan mode: the working tree is read-only. Write your plan to a local://<slug>-plan.md file instead.",
-				)
-			}
-		},
-		_ => None,
+fn is_propose_path(path: &str) -> bool {
+	xd_device_name(path) == Some("propose")
+}
+
+// ------------------------------------------------------------- enforcement --
+
+/// Plan-mode guard messages (TS `enforcePlanModeWrite`).
+pub const PLAN_WRITE_READ_ONLY: &str =
+	"Plan mode: the working tree is read-only. Write your plan to a local://<slug>-plan.md file instead.";
+pub const PLAN_WRITE_DELETE: &str = "Plan mode: deleting files is not allowed.";
+pub const PLAN_WRITE_RENAME: &str = "Plan mode: renaming files is not allowed.";
+
+/// Host [`pi_agent::state::PlanModeGuard`]: classifies every parsed target the
+/// mutating tools will actually touch, before any resolution.
+pub struct PlanWriteGuard {
+	plan:      Arc<Mutex<PlanGate>>,
+	/// Session `local://` root; `None` disables artifact writes (fail closed).
+	artifacts: Option<PathBuf>,
+}
+
+impl PlanWriteGuard {
+	pub fn new(plan: Arc<Mutex<PlanGate>>, artifacts: Option<PathBuf>) -> Self {
+		Self { plan, artifacts }
+	}
+
+	fn active(&self) -> bool {
+		let gate = self.plan.lock().unwrap_or_else(|poison| poison.into_inner());
+		gate.state.as_ref().is_some_and(|state| state.enabled)
+	}
+
+	/// Only a validated `local:` artifact URL is writable. Authored absolute or
+	/// working-tree paths are rejected: the tool maps accepted URLs to the
+	/// sandbox itself, so the guard never has to trust a filesystem spelling.
+	/// `vault://` is not an artifact alias.
+	fn allowed_path(&self, path: &str) -> bool {
+		pi_agent::tools::local_artifact_relative(path).is_some()
 	}
 }
 
-fn is_local_artifact(path: &str) -> bool {
-	let normalized = normalize_local_scheme(path);
-	normalized.starts_with("local://") || path.starts_with("vault://")
+impl pi_agent::state::PlanModeGuard for PlanWriteGuard {
+	fn write_error(
+		&self,
+		_tool_name: &str,
+		targets: &[pi_agent::state::PlanWriteTarget<'_>],
+	) -> Option<String> {
+		if !self.active() {
+			return None;
+		}
+		// Unknown targets fail closed rather than authorizing nothing.
+		if targets.is_empty() {
+			return Some(PLAN_WRITE_READ_ONLY.to_string());
+		}
+		use pi_agent::state::PlanWriteOp;
+		for target in targets {
+			match target.op {
+				PlanWriteOp::Delete => return Some(PLAN_WRITE_DELETE.to_string()),
+				PlanWriteOp::Rename => return Some(PLAN_WRITE_RENAME.to_string()),
+				PlanWriteOp::DeferredApply => return Some(PLAN_WRITE_READ_ONLY.to_string()),
+				PlanWriteOp::Create | PlanWriteOp::Update => {
+					if !self.allowed_path(target.path) {
+						return Some(PLAN_WRITE_READ_ONLY.to_string());
+					}
+					if let Some(rename_to) = target.rename_to
+						&& !self.allowed_path(rename_to)
+					{
+						return Some(PLAN_WRITE_READ_ONLY.to_string());
+					}
+				},
+			}
+		}
+		None
+	}
+
+	fn artifact_root(&self) -> Option<PathBuf> {
+		if self.active() { self.artifacts.clone() } else { None }
+	}
 }
 
-fn is_propose_path(path: &str) -> bool {
-	xd_device_name(path) == Some("propose")
+/// Host [`pi_agent::state::ToolPolicy`] for the plan-mode decision reminder:
+/// one head per plan generation while a reminder is outstanding.
+pub struct PlanReminderPolicy {
+	plan: Arc<Mutex<PlanGate>>,
+}
+
+impl PlanReminderPolicy {
+	pub fn new(plan: Arc<Mutex<PlanGate>>) -> Self {
+		Self { plan }
+	}
+}
+
+impl pi_agent::state::ToolPolicy for PlanReminderPolicy {
+	fn requirement(&self) -> Option<pi_agent::state::SoftToolRequirement> {
+		let gate = self.plan.lock().unwrap_or_else(|poison| poison.into_inner());
+		gate.state.as_ref().filter(|state| state.enabled)?;
+		// The deferred reminder may already be drained into the running prompt;
+		// `awaiting_progress` keeps the head alive until a decision tool ends.
+		if !gate.reminder_pending() && !gate.settle.awaiting_progress {
+			return None;
+		}
+		// TS `PLAN_MODE_REMINDER_MAX`: stop forcing once the cap is reached.
+		if gate.settle.reminder_count >= PLAN_MODE_REMINDER_MAX {
+			return None;
+		}
+		Some(pi_agent::state::SoftToolRequirement {
+			id:         gate.generation,
+			generation: gate.generation,
+			tool_name:  "ask".to_string(),
+			reminder:   pi_agent::Message::user(plan_tool_decision_reminder("ask")),
+		})
+	}
+
+	fn satisfies(&self, _requirement: &pi_agent::state::SoftToolRequirement, _call: &pi_agent::ToolCall) -> bool {
+		// TS clears the awaiting flag on every `tool_execution_end`: any executed
+		// tool is progress. Decision resets (count) stay in `observe_tool_end`.
+		true
+	}
+
+	fn choice(&self, _requirement: &pi_agent::state::SoftToolRequirement) -> pi_agent::ToolChoice {
+		// TS queues a one-shot `tool_choice: required`, never a named tool.
+		pi_agent::ToolChoice::Required
+	}
+
+	fn escalation_limit(&self, _requirement: &pi_agent::state::SoftToolRequirement) -> u32 {
+		// TS schedules exactly one forced continuation; an ignored reply yields.
+		1
+	}
+
+	fn exhaustion(&self, _requirement: &pi_agent::state::SoftToolRequirement) -> pi_agent::state::Exhaustion {
+		// TS logs "yielding to user" at the reminder cap; it never aborts the
+		// dialog. The loop hands the turn back normally instead.
+		pi_agent::state::Exhaustion::EndTurn
+	}
+}
+
+/// Resolve a `local://` artifact URL inside `root`; traversal is rejected.
+#[must_use]
+pub fn local_artifact_path(root: &Path, url: &str) -> Option<PathBuf> {
+	let normalized = normalize_local_scheme(url);
+	let relative = normalized.strip_prefix("local://")?;
+	let mut path = root.to_path_buf();
+	for part in relative.split('/') {
+		if part.is_empty() || part == "." || part == ".." {
+			return None;
+		}
+		path.push(part);
+	}
+	Some(path)
+}
+
+/// Newest-first `local://` URLs of `<root>/*plan.md` (TS
+/// `#listAcpLocalPlanFiles`).
+#[must_use]
+pub fn list_local_plan_files(root: &Path) -> Vec<String> {
+	let Ok(entries) = std::fs::read_dir(root) else {
+		return Vec::new();
+	};
+	let mut plans: Vec<(std::time::SystemTime, String)> = entries
+		.filter_map(Result::ok)
+		.filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+		.filter(|entry| {
+			entry.file_name().to_string_lossy().to_ascii_lowercase().ends_with("plan.md")
+		})
+		.map(|entry| {
+			let modified = entry
+				.metadata()
+				.and_then(|meta| meta.modified())
+				.unwrap_or(std::time::UNIX_EPOCH);
+			(modified, format!("local://{}", entry.file_name().to_string_lossy()))
+		})
+		.collect();
+	plans.sort_by(|a, b| b.0.cmp(&a.0));
+	plans.into_iter().map(|(_, url)| url).collect()
+}
+
+/// One `xd://propose` body: JSON args (`title` + `content`/`slug`) or the
+/// plain plan title upstream models send.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanProposal {
+	pub title:   Option<String>,
+	pub slug:    Option<String>,
+	pub content: Option<String>,
+}
+
+#[must_use]
+pub fn parse_plan_proposal(body: &str) -> PlanProposal {
+	let trimmed = body.trim();
+	let object = serde_json::from_str::<Value>(trimmed).ok().filter(Value::is_object);
+	match object {
+		Some(value) => PlanProposal {
+			title:   string_field(&value, "title"),
+			slug:    string_field(&value, "slug"),
+			content: value.get("content").and_then(Value::as_str).map(str::to_string),
+		},
+		None => PlanProposal {
+			title: Some(trimmed.to_string()).filter(|title| !title.is_empty()),
+			..PlanProposal::default()
+		},
+	}
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+	value
+		.get(key)
+		.and_then(Value::as_str)
+		.map(str::trim)
+		.filter(|text| !text.is_empty())
+		.map(str::to_string)
 }
 
 #[cfg(test)]
@@ -821,22 +1057,167 @@ mod tests {
 	}
 
 	#[test]
-	fn write_guard_matches_ts_scope() {
+	fn plan_write_guard_classifies_parsed_targets() {
+		use pi_agent::state::{PlanModeGuard, PlanWriteOp, PlanWriteTarget};
+
+		let root = std::env::temp_dir().join("omp-plan-guard-artifacts");
+		let gate = Arc::new(Mutex::new(PlanGate::new(true)));
+		let guard = PlanWriteGuard::new(Arc::clone(&gate), Some(root.clone()));
+		fn target(path: &str, op: PlanWriteOp) -> PlanWriteTarget<'_> {
+			PlanWriteTarget { path, op, rename_to: None }
+		}
+
+		// Outside plan mode nothing is blocked and no sandbox root is offered.
+		assert!(guard.write_error("write", &[target("src/main.rs", PlanWriteOp::Update)]).is_none());
+		assert!(guard.artifact_root().is_none());
+
+		gate
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.set_mode(ACP_PLAN_MODE_ID)
+			.expect("enter plan mode");
+		assert_eq!(guard.artifact_root(), Some(root.clone()));
 		assert_eq!(
-			plan_write_error("write", &serde_json::json!({ "path": "src/main.rs" })),
-			Some(
-				"Plan mode: the working tree is read-only. Write your plan to a local://<slug>-plan.md file instead."
-			)
+			guard.write_error("write", &[target("src/main.rs", PlanWriteOp::Update)]),
+			Some(PLAN_WRITE_READ_ONLY.to_string())
+		);
+		assert!(guard
+			.write_error("write", &[target("local://demo-plan.md", PlanWriteOp::Update)])
+			.is_none());
+		assert_eq!(
+			guard.write_error("write", &[target("local:/demo-plan.md", PlanWriteOp::Update)]),
+			Some(PLAN_WRITE_READ_ONLY.to_string()),
+			"non-canonical spelling is not an artifact URL"
 		);
 		assert_eq!(
-			plan_write_error("write", &serde_json::json!({ "path": "local://x-plan.md" })),
-			None
+			guard.write_error("write", &[target("vault://notes/x.md", PlanWriteOp::Update)]),
+			Some(PLAN_WRITE_READ_ONLY.to_string())
 		);
-		assert_eq!(plan_write_error("write", &serde_json::json!({ "path": "xd://propose" })), None);
 		assert_eq!(
-			plan_write_error("move", &serde_json::json!({ "path": "a", "newPath": "b" })),
-			Some("Plan mode: renaming files is not allowed.")
+			guard.write_error("edit", &[target("src/main.rs", PlanWriteOp::Delete)]),
+			Some(PLAN_WRITE_DELETE.to_string())
 		);
-		assert_eq!(plan_write_error("bash", &serde_json::json!({ "command": "rm -rf x" })), None);
+		assert_eq!(
+			guard.write_error("edit", &[target("local://demo-plan.md", PlanWriteOp::Rename)]),
+			Some(PLAN_WRITE_RENAME.to_string())
+		);
+		assert_eq!(
+			guard.write_error("ast_edit", &[target("src/main.rs", PlanWriteOp::DeferredApply)]),
+			Some(PLAN_WRITE_READ_ONLY.to_string())
+		);
+		assert_eq!(
+			guard.write_error("edit", &[]),
+			Some(PLAN_WRITE_READ_ONLY.to_string()),
+			"unknown targets fail closed"
+		);
+		// Authored absolute paths (even under the root, or via `..`) are never
+		// trusted: the tools map accepted URLs to the sandbox themselves.
+		let inside = root.join("demo-plan.md").display().to_string();
+		assert_eq!(
+			guard.write_error("write", &[target(&inside, PlanWriteOp::Update)]),
+			Some(PLAN_WRITE_READ_ONLY.to_string())
+		);
+		let escape = root.join("../outside.md").display().to_string();
+		assert_eq!(
+			guard.write_error("write", &[target(&escape, PlanWriteOp::Update)]),
+			Some(PLAN_WRITE_READ_ONLY.to_string())
+		);
+	}
+
+	#[test]
+	fn plan_reminder_policy_treats_any_tool_as_progress() {
+		use pi_agent::state::{SoftToolRequirement, ToolPolicy};
+		use pi_agent::ToolCall;
+
+		let gate = Arc::new(Mutex::new(PlanGate::new(true)));
+		let policy = PlanReminderPolicy::new(Arc::clone(&gate));
+		assert!(policy.requirement().is_none(), "no reminder while plan mode is off");
+
+		{
+			let mut plan = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+			plan.set_mode(ACP_PLAN_MODE_ID).expect("enter plan mode");
+			plan.settle_turn("stop", &[], true, true);
+		}
+		let requirement: SoftToolRequirement = policy.requirement().expect("reminder head");
+		assert_eq!(requirement.tool_name, "ask");
+		assert_eq!(policy.choice(&requirement), pi_agent::ToolChoice::Required);
+
+		let call = |name: &str, path: &str| ToolCall {
+			id: "call-1".to_string(),
+			name: name.to_string(),
+			arguments: serde_json::json!({ "path": path }),
+		};
+		// Any executed tool is progress (TS `tool_execution_end`), including a
+		// legitimate local artifact write and a plain read.
+		assert!(policy.satisfies(&requirement, &call("read", "src/main.rs")));
+		assert!(policy.satisfies(&requirement, &call("write", "local://demo-plan.md")));
+		assert!(policy.satisfies(&requirement, &call("ask", "")));
+
+		// Cap: no head once TS `PLAN_MODE_REMINDER_MAX` reminders were issued.
+		gate
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.settle
+			.reminder_count = PLAN_MODE_REMINDER_MAX;
+		assert!(policy.requirement().is_none(), "reminder cap yields to the user");
+
+		assert_eq!(policy.exhaustion(&requirement), pi_agent::state::Exhaustion::EndTurn);
+		assert_eq!(policy.escalation_limit(&requirement), 1);
+		assert!(policy.choice(&requirement) == pi_agent::ToolChoice::Required);
+
+		// A user prompt drops the queued continuation and counters, but the
+		// reminder was persisted at settle and the head is not re-armed.
+		{
+			let mut plan = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+			assert!(plan.has_continuation(), "settle scheduled the continuation");
+			plan.discard_queued_continuation();
+			reset_reminders(&mut plan.settle);
+			assert!(!plan.has_continuation());
+			assert!(!plan.settle.awaiting_progress);
+			assert_eq!(plan.settle.reminder_count, 0);
+		}
+
+		// The approval tool queues its `mode_change` entry for the runner.
+		{
+			let mut plan = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+			plan.queue_mode_persist("none", None);
+			assert_eq!(plan.take_mode_persist().map(|(mode, _)| mode).as_deref(), Some("none"));
+			assert!(plan.take_mode_persist().is_none());
+			// Approved-plan pointer: injected once, cleared only after delivery.
+			plan.exit_after_approval("local://demo-plan.md");
+			assert_eq!(plan.plan_reference_for_injection().as_deref(), Some("local://demo-plan.md"));
+			plan.clear_plan_reference();
+			assert!(plan.plan_reference_for_injection().is_none());
+		}
+		assert!(plan_reference_message("local://demo-plan.md").contains("local://demo-plan.md"));
+	}
+
+	#[test]
+	fn propose_body_accepts_ts_title_and_json_args() {
+		assert_eq!(
+			parse_plan_proposal("  auth-token-refresh  "),
+			PlanProposal {
+				title: Some("auth-token-refresh".to_string()),
+				..PlanProposal::default()
+			}
+		);
+		let parsed = parse_plan_proposal(
+			&serde_json::json!({ "title": "auth", "slug": "auth", "content": "# Plan\n" }).to_string(),
+		);
+		assert_eq!(parsed.title.as_deref(), Some("auth"));
+		assert_eq!(parsed.slug.as_deref(), Some("auth"));
+		assert_eq!(parsed.content.as_deref(), Some("# Plan\n"));
+		assert_eq!(parse_plan_proposal("   "), PlanProposal::default());
+	}
+
+	#[test]
+	fn local_artifact_paths_stay_inside_the_root() {
+		let root = Path::new("/artifacts/session");
+		assert_eq!(
+			local_artifact_path(root, "local://auth-plan.md"),
+			Some(PathBuf::from("/artifacts/session/auth-plan.md"))
+		);
+		assert!(local_artifact_path(root, "local://../escape.md").is_none());
+		assert!(local_artifact_path(root, "src/main.rs").is_none());
 	}
 }
