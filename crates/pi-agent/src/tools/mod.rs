@@ -3094,7 +3094,7 @@ mod plan_mode_tool_tests {
 		let edit = EditTool::new(Arc::clone(&store));
 		let result = edit
 			.execute(
-				&json!({ "input": format!("[local://demo-plan.md#{tag}]\nPUT 2: step two") }),
+				&json!({ "input": format!("[local://demo-plan.md#{tag}]\nPUT 2.=2:\n+step two") }),
 				&ctx,
 			)
 			.await
