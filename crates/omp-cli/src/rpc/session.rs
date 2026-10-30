@@ -2454,6 +2454,11 @@ impl RpcSession {
 
 	/// `export_html`: write a standalone HTML transcript.
 	pub fn export_html(&self, output_path: Option<&str>) -> Result<String> {
+		if !self.store.enabled() {
+			if let Some(reason) = self.store.corrupt_reason() {
+				return Err(Error::new(format!("cannot export corrupt session: {reason}")));
+			}
+		}
 		let path = match output_path {
 			Some(path) => PathBuf::from(path),
 			None => match self.store.file() {

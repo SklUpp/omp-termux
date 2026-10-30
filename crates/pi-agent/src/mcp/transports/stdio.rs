@@ -59,6 +59,7 @@ pub struct StdioTransport {
     next_id: AtomicU64,
     request_id_format: RequestIdFormat,
     read_handle: Mutex<Option<JoinHandle<()>>>,
+    write_handle: Mutex<Option<JoinHandle<()>>>,
     closed: Arc<AtomicBool>,
 }
 
@@ -96,7 +97,7 @@ impl StdioTransport {
         let closed = Arc::new(AtomicBool::new(false));
 
         let stdin_tx_reply = stdin_tx.clone();
-        tokio::spawn(async move {
+        let write_handle = tokio::spawn(async move {
             while let Some(line) = stdin_rx.recv().await {
                 if stdin.write_all(line.as_bytes()).await.is_err() {
                     break;
@@ -250,6 +251,7 @@ impl StdioTransport {
             next_id: AtomicU64::new(1),
             request_id_format: config.request_id_format.unwrap_or(RequestIdFormat::Number),
             read_handle: Mutex::new(Some(read_handle)),
+            write_handle: Mutex::new(Some(write_handle)),
             closed,
         })
     }
@@ -362,6 +364,9 @@ impl McpTransport for StdioTransport {
         if let Some(handle) = self.read_handle.lock().unwrap().take() {
             handle.abort();
         }
+        if let Some(handle) = self.write_handle.lock().unwrap().take() {
+            handle.abort();
+        }
 
         let child_opt = {
             let mut child_guard = self.child.lock().unwrap();
@@ -389,12 +394,19 @@ impl Drop for StdioTransport {
         if let Some(handle) = self.read_handle.lock().unwrap().take() {
             handle.abort();
         }
+        if let Some(handle) = self.write_handle.lock().unwrap().take() {
+            handle.abort();
+        }
         let mut child_guard = self.child.lock().unwrap();
         if let Some(mut child) = child_guard.take() {
             let _ = child.start_kill();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     let _ = child.wait().await;
+                });
+            } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                std::thread::spawn(move || {
+                    let _ = rt.block_on(child.wait());
                 });
             }
         }

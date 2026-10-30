@@ -496,6 +496,7 @@ impl McpConnection {
     }
 
     pub async fn close(&self) -> Result<(), McpError> {
+        unregister_active_session(&self.name);
         let guard = self.transport.read().await;
         guard.close().await
     }

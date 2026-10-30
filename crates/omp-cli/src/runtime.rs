@@ -27,7 +27,7 @@ use pi_agent::{
 	mcp::{
 		MCPContent, MCPServerConfig, MCPStdioServerConfig, McpConnection, McpError,
 		McpToolOriginSource, connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key,
-		mcp_tool_match_score, sanitize_mcp_tool_name_part,
+		mcp_tool_match_score, register_active_session, sanitize_mcp_tool_name_part,
 	},
 	tools::hashline::{NativeSnapshotSink, SnapshotStore, edit::EditToolOptions},
 	tools::{
@@ -3697,7 +3697,11 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 		let conn = tokio::select! {
 			_ = cancel_token.cancelled() => break,
 			res = connect_fut => match res {
-				Ok(connection) => Arc::new(connection),
+				Ok(connection) => {
+					let conn = Arc::new(connection);
+					register_active_session(Arc::clone(&conn));
+					conn
+				},
 				Err(err) => {
 					let safe_err = format_mcp_infrastructure_error(&server.name, "connect", &err);
 					eprintln!("{safe_err}");

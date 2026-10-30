@@ -2807,6 +2807,26 @@ fn run_commit_command(
 			cwd.display()
 		)));
 	}
+	let unmerged = std::process::Command::new("git")
+		.args(["ls-files", "-u"])
+		.current_dir(cwd)
+		.output()
+		.map_err(|err| CliError::fail(format!("git ls-files failed: {err}")))?;
+	if !unmerged.stdout.is_empty() {
+		return Err(CliError::fail(
+			"cannot commit: unresolved merge conflicts exist. Resolve conflicts before committing."
+				.to_string(),
+		));
+	}
+	let diff = std::process::Command::new("git")
+		.args(["status", "--porcelain"])
+		.current_dir(cwd)
+		.output()
+		.map_err(|err| CliError::fail(format!("git status failed: {err}")))?;
+	if diff.stdout.is_empty() {
+		println!("Nothing to commit, working tree clean.");
+		return Ok(());
+	}
 	let add = std::process::Command::new("git")
 		.args(["add", "-A"])
 		.current_dir(cwd)
