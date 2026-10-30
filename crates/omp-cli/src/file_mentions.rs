@@ -938,6 +938,21 @@ pub fn generate_file_mention_messages_vec(
 
 /// Formats a [`FileMentionMessage`] into standard `<file path="...">` blocks for prompt context.
 #[must_use]
+pub fn escape_xml_attr(input: &str) -> String {
+	let mut out = String::with_capacity(input.len());
+	for character in input.chars() {
+		match character {
+			'&' => out.push_str("&amp;"),
+			'<' => out.push_str("&lt;"),
+			'>' => out.push_str("&gt;"),
+			'"' => out.push_str("&quot;"),
+			other => out.push(other),
+		}
+	}
+	out
+}
+
+#[must_use]
 pub fn format_prompt_block(message: &FileMentionMessage) -> String {
 	let mut out = String::new();
 	for file in &message.files {
@@ -949,7 +964,7 @@ pub fn format_prompt_block(message: &FileMentionMessage) -> String {
 		} else {
 			format!("\n{}\n", file.content)
 		};
-		out.push_str(&format!("<file path=\"{}\">{}</file>", file.path, inner));
+		out.push_str(&format!("<file path=\"{}\">{}</file>", escape_xml_attr(&file.path), inner));
 	}
 	out
 }

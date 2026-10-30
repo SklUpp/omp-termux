@@ -367,7 +367,7 @@ impl Drop for MailboxWaiter {
 			}
 		}
 		if let Some(message) = recovered {
-			buffer_locked(&mut state, message);
+			prepend_locked(&mut state, message);
 		}
 	}
 }
@@ -381,6 +381,17 @@ fn buffer_locked(state: &mut MailboxState, message: IrcMessage) {
 	mailbox.push_back(message);
 	while mailbox.len() > cap {
 		mailbox.pop_front();
+	}
+}
+
+/// Prepend unpolled recovered mail at the head of the queue to preserve FIFO ordering.
+fn prepend_locked(state: &mut MailboxState, message: IrcMessage) {
+	let inflight = state.inflight.get(&message.to).copied().unwrap_or(0);
+	let cap = MAILBOX_CAP.saturating_sub(inflight);
+	let mailbox = state.mailboxes.entry(message.to.clone()).or_default();
+	mailbox.push_front(message);
+	while mailbox.len() > cap {
+		mailbox.pop_back();
 	}
 }
 

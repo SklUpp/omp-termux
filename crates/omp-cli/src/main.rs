@@ -2162,7 +2162,7 @@ fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Resul
 			})?;
 			text.push_str(&format!(
 				"<file name=\"{}\">\n{}\n</file>\n",
-				abs_path.display(),
+				file_mentions::escape_xml_attr(&abs_path.display().to_string()),
 				listing.output
 			));
 			continue;
@@ -2301,7 +2301,7 @@ fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Resul
 			let content = String::from_utf8_lossy(&bytes);
 			text.push_str(&format!(
 				"<file name=\"{}\">\n{content}\n</file>\n",
-				abs_path.display()
+				file_mentions::escape_xml_attr(&abs_path.display().to_string())
 			));
 		}
 	}

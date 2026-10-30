@@ -118,7 +118,12 @@ pub fn server_key(params: &MuxConnectParams) -> String {
 		.collect::<BTreeMap<_, _>>()
 		.into_iter()
 		.collect();
-	let identity = serde_json::json!([params.command, params.args, params.cwd, env]);
+	let normalized_cwd = std::path::Path::new(&params.cwd)
+		.canonicalize()
+		.unwrap_or_else(|_| std::path::PathBuf::from(&params.cwd))
+		.to_string_lossy()
+		.into_owned();
+	let identity = serde_json::json!([params.command, params.args, normalized_cwd, env]);
 	let encoded = identity.to_string();
 	let high = xxhash_rust::xxh64::xxh64(encoded.as_bytes(), 0x9e37_79b9_7f4a_7c15);
 	let low = xxhash_rust::xxh64::xxh64(encoded.as_bytes(), 0xc2b2_ae3d_27d4_eb4f);

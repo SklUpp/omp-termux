@@ -100,7 +100,13 @@ fn parse_skill(path: &Path, content: &str) -> Option<Skill> {
 	let meta = if frontmatter.trim().is_empty() {
 		Value::Null
 	} else {
-		yaml::parse(frontmatter).ok()?
+		match yaml::parse(frontmatter) {
+			Ok(val) => val,
+			Err(err) => {
+				eprintln!("warning: failed to parse YAML frontmatter in {}: {err}", path.display());
+				return None;
+			}
+		}
 	};
 	if meta.get("enabled").and_then(Value::as_bool) == Some(false) {
 		return None;

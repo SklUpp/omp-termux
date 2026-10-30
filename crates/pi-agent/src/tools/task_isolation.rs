@@ -958,7 +958,11 @@ fn write_synthetic_tree(repo: &Path, baseline: &RepoBaseline) -> Result<String, 
 			false,
 		);
 		let _ = fs::remove_file(&path);
-		result?;
+		if let Err(err) = result {
+			let _ = fs::remove_file(&index);
+			let _ = fs::remove_file(index.with_extension("lock"));
+			return Err(err);
+		}
 	}
 	let tree = run_git(repo, &["write-tree"], &envs, false).and_then(|output| {
 		String::from_utf8(output.stdout)

@@ -154,8 +154,12 @@ pub async fn run(
 								)
 								.for_provider(provider)
 							})?;
-						if let Some(state) = state.as_deref().filter(|state| !state.is_empty()) {
-							if !constant_time_eq(state, expected_state) && !expected_state.is_empty() {
+						if !expected_state.is_empty() {
+							let matches = state
+								.as_deref()
+								.map(|s| constant_time_eq(s, expected_state))
+								.unwrap_or(false);
+							if !matches {
 								return Err(
 									AuthError::new(AuthErrorKind::Validation, "OAuth state mismatch")
 										.for_provider(provider),

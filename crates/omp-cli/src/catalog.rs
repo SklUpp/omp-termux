@@ -149,6 +149,11 @@ impl Catalog {
 		if let Some(path) = json_paths.iter().find(|path| path.is_file()) {
 			let mut catalog = Self::from_json(path)?;
 			catalog.connections = connections;
+			if let Some((providers, _)) = yml_providers {
+				for (provider_id, models) in providers {
+					catalog.providers.entry(provider_id).or_insert(models);
+				}
+			}
 			return Ok(catalog);
 		}
 		if let Some((providers, path)) = yml_providers

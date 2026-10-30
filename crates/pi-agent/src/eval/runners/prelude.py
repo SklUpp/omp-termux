@@ -113,6 +113,11 @@ if "__omp_prelude_loaded__" not in globals():
         resolved = os.path.abspath(os.path.join(root_path, relative))
         if resolved != root_path and not resolved.startswith(root_path + os.sep):
             raise ValueError(f"{scheme}:// path escapes its root: {path}")
+        if os.path.exists(resolved):
+            real_resolved = os.path.realpath(resolved)
+            real_root = os.path.realpath(root_path)
+            if real_resolved != real_root and not real_resolved.startswith(real_root + os.sep):
+                raise ValueError(f"{scheme}:// symlink target escapes its root: {path}")
         return Path(resolved)
 
     def read(path: str | Path, offset: int = 1, limit: int | None = None) -> str:
