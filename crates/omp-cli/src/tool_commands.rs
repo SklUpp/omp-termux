@@ -15,6 +15,7 @@
 use std::{
 	io::{self, Write},
 	path::{Path, PathBuf},
+	sync::Arc,
 };
 
 use grep_searcher::{
@@ -206,8 +207,11 @@ pub fn run_read(
 		.build()
 		.map_err(|err| format!("Failed to start runtime: {err}"))?;
 	let ctx = pi_agent::AgentContext::new(cwd.to_path_buf());
+	let router = Arc::new(pi_agent::tools::InternalUrlRouter::default());
+	let scope = Arc::new(pi_agent::tools::UrlScope::default());
+	let tool = pi_agent::ReadTool::new().with_internal_urls(router, scope);
 	let result = runtime
-		.block_on(pi_agent::ReadTool::new().execute(&json!({ "path": path }), &ctx))
+		.block_on(tool.execute(&json!({ "path": path }), &ctx))
 		.map_err(|err| format!("Error: {err}"))?;
 	if result.is_error {
 		return Err(format!("Error: {}", result.content));
