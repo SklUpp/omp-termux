@@ -486,10 +486,13 @@ impl EvalRuntime {
 				() = cancellation.cancelled() => {
 					return Err(EvalError::Aborted("Julia kernel readiness was cancelled".to_string()));
 				},
-				started = tokio::time::timeout(
-					deadline.saturating_duration_since(now),
-					Kernel::start(spawn, cancellation.clone()),
-				) => started,
+				started = {
+					let remaining = deadline.saturating_duration_since(now);
+					tokio::time::timeout(
+						remaining,
+						Kernel::start_with_timeout(spawn, cancellation.clone(), remaining),
+					)
+				} => started,
 			};
 			let kernel = match started {
 				Ok(Ok(kernel)) => kernel,

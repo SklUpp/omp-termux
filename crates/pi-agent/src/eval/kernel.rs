@@ -99,6 +99,19 @@ impl Kernel {
 
 	/// Spawn the interpreter, run the language init cell, then its prelude.
 	pub async fn start(spawn: KernelSpawn, cancellation: CancellationToken) -> Result<Self, EvalError> {
+		let timeout = languages::startup_timeout(spawn.language);
+		Self::start_with_timeout(spawn, cancellation, timeout).await
+	}
+
+	/// Startup with an explicit per-stage deadline. Callers that already own a
+	/// total budget (a bounded cell) pass its remainder here so cold boot is
+	/// not cut short by the default stage cap; the caller's outer timeout stays
+	/// authoritative.
+	pub async fn start_with_timeout(
+		spawn: KernelSpawn,
+		cancellation: CancellationToken,
+		timeout: Duration,
+	) -> Result<Self, EvalError> {
 		let script = languages::stage_runner(spawn.language)?;
 		let argv = languages::argv(spawn.language, &spawn.runtime.program, &script);
 		let mut env = spawn.runtime.env.clone();
@@ -115,7 +128,6 @@ impl Kernel {
 		}
 		let kernel = Self::spawn_process(spawn.language, &argv, &spawn.cwd, env)?;
 
-		let timeout = languages::startup_timeout(spawn.language);
 		let init = languages::init_script(spawn.language, &spawn.cwd);
 		kernel.run_startup("init", &init, timeout, &cancellation).await?;
 		let assets = languages::assets(spawn.language);
