@@ -2083,3 +2083,229 @@ async fn test_sse_connect_many_short_data_lines_exceeding_bound() {
         err
     );
 }
+
+/// Deterministic stdio MCP server exposing resources. `mode` selects:
+/// `full` (resources + templates), `no-templates` (resources capability but
+/// `resources/templates/list` answers -32601), `no-resources-cap`.
+fn write_resource_fixture(script_path: &std::path::Path) {
+    std::fs::write(
+        script_path,
+        r#"
+import sys, json
+
+mode = sys.argv[1] if len(sys.argv) > 1 else "full"
+capabilities = {"tools": {}} if mode == "no-resources-cap" else {"resources": {"subscribe": False}}
+
+PAGE1_URI = "test://opaque/a:b?x=1&y=%2F"
+PAGE2_URI = "mem://notes/second"
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params") or {}
+
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": capabilities,
+            "serverInfo": {"name": "mock-resources", "version": "1.0.0"}
+        }})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "resources/list":
+        if mode == "no-resources-cap":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found"}})
+        elif params.get("cursor") == "res-page-2":
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "resources": [{"uri": PAGE2_URI, "name": "second"}],
+                "nextCursor": None
+            }})
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "resources": [{
+                    "uri": PAGE1_URI,
+                    "name": "opaque",
+                    "title": "Opaque resource",
+                    "description": "colon and query preserved",
+                    "mimeType": "text/plain",
+                    "size": 42,
+                    "annotations": {
+                        "audience": ["user"],
+                        "priority": 0.5,
+                        "lastModified": "2026-01-02T03:04:05Z"
+                    }
+                }],
+                "nextCursor": "res-page-2"
+            }})
+    elif method == "resources/templates/list":
+        if mode == "no-templates":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found"}})
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "resourceTemplates": [{
+                    "uriTemplate": "test://opaque/{id}{?x}",
+                    "name": "tmpl",
+                    "title": "Template",
+                    "description": "parameterized",
+                    "mimeType": "text/plain",
+                    "annotations": {"audience": ["assistant"], "priority": 0.25}
+                }],
+                "nextCursor": None
+            }})
+    elif method == "resources/read":
+        uri = params.get("uri")
+        if uri is None:
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "missing uri"}})
+        elif uri.startswith("missing:"):
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32002, "message": "Resource not found: " + uri}})
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "contents": [
+                    {"uri": uri, "mimeType": "text/plain", "text": "echo:" + uri},
+                    {"uri": uri, "mimeType": "image/png", "blob": "AAECAwQ="}
+                ]
+            }})
+    else:
+        send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found: " + str(method)}})
+"#,
+    )
+    .unwrap();
+}
+
+async fn resource_fixture_conn(mode: &str) -> (McpConnection, std::path::PathBuf) {
+    let script_path = std::env::temp_dir().join(format!(
+        "mock_mcp_resources_{}_{}.py",
+        mode,
+        std::process::id()
+    ));
+    write_resource_fixture(&script_path);
+
+    let config = MCPServerConfig::Stdio(MCPStdioServerConfig {
+        command: "python3".to_string(),
+        args: vec![script_path.to_str().unwrap().to_string(), mode.to_string()],
+        env: HashMap::new(),
+        cwd: None,
+        timeout: Some(10000),
+        request_id_format: Some(RequestIdFormat::Number),
+    });
+
+    let conn = connect_to_server("test_resources", config)
+        .await
+        .expect("Failed to connect resources fixture");
+    (conn, script_path)
+}
+
+#[tokio::test]
+async fn test_stdio_resources_list_templates_read() {
+    let (conn, script_path) = resource_fixture_conn("full").await;
+
+    let resources = conn.list_resources().await.expect("list_resources");
+    assert_eq!(resources.len(), 2, "both pages must be fetched");
+
+    assert_eq!(resources[0].uri, "test://opaque/a:b?x=1&y=%2F");
+    assert_eq!(resources[0].name, "opaque");
+    assert_eq!(resources[0].title.as_deref(), Some("Opaque resource"));
+    assert_eq!(resources[0].description.as_deref(), Some("colon and query preserved"));
+    assert_eq!(resources[0].mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(resources[0].size, Some(42));
+    let annotations = resources[0].annotations.as_ref().expect("annotations");
+    assert_eq!(
+        annotations.audience.as_deref(),
+        Some(&[MCPAnnotationAudience::User][..])
+    );
+    assert_eq!(annotations.priority, Some(0.5));
+    assert_eq!(annotations.last_modified.as_deref(), Some("2026-01-02T03:04:05Z"));
+
+    assert_eq!(resources[1].uri, "mem://notes/second");
+    assert_eq!(resources[1].name, "second");
+    assert!(resources[1].size.is_none());
+    assert!(resources[1].annotations.is_none());
+
+    let templates = conn.list_resource_templates().await.expect("list templates");
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].uri_template, "test://opaque/{id}{?x}");
+    assert_eq!(templates[0].name, "tmpl");
+    assert_eq!(templates[0].title.as_deref(), Some("Template"));
+    assert_eq!(templates[0].description.as_deref(), Some("parameterized"));
+    assert_eq!(templates[0].mime_type.as_deref(), Some("text/plain"));
+    let t_annotations = templates[0].annotations.as_ref().expect("template annotations");
+    assert_eq!(
+        t_annotations.audience.as_deref(),
+        Some(&[MCPAnnotationAudience::Assistant][..])
+    );
+    assert_eq!(t_annotations.priority, Some(0.25));
+
+    // URI is opaque: the fixture echoes the request URI byte-for-byte.
+    let opaque = "test://opaque/a:b?x=1&y=%2F";
+    let read = conn.read_resource(opaque).await.expect("read_resource");
+    assert_eq!(read.contents.len(), 2);
+    assert_eq!(read.contents[0].uri, opaque);
+    assert_eq!(read.contents[0].mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(read.contents[0].text.as_deref(), Some(&*format!("echo:{}", opaque)));
+    assert!(read.contents[0].blob.is_none());
+    assert_eq!(read.contents[1].uri, opaque);
+    assert_eq!(read.contents[1].mime_type.as_deref(), Some("image/png"));
+    assert_eq!(read.contents[1].blob.as_deref(), Some("AAECAwQ="));
+    assert!(read.contents[1].text.is_none());
+
+    // Read failures surface as JSON-RPC errors; no synthetic fallback.
+    let err = conn
+        .read_resource("missing:server-side")
+        .await
+        .expect_err("missing resource must fail");
+    match err {
+        McpError::JsonRpc { code, message, .. } => {
+            assert_eq!(code, -32002);
+            assert_eq!(message, "Resource not found: missing:server-side");
+        }
+        other => panic!("expected JsonRpc error, got {other:?}"),
+    }
+
+    conn.close().await.expect("close");
+    let _ = std::fs::remove_file(script_path);
+}
+
+#[tokio::test]
+async fn test_stdio_resources_missing_templates_method_returns_empty() {
+    let (conn, script_path) = resource_fixture_conn("no-templates").await;
+
+    // -32601 on resources/templates/list must not discard concrete resources.
+    let resources = conn.list_resources().await.expect("list_resources");
+    assert_eq!(resources.len(), 2);
+    assert_eq!(resources[0].uri, "test://opaque/a:b?x=1&y=%2F");
+
+    let templates = conn
+        .list_resource_templates()
+        .await
+        .expect("missing method is treated as no templates");
+    assert!(templates.is_empty());
+
+    conn.close().await.expect("close");
+    let _ = std::fs::remove_file(script_path);
+}
+
+#[tokio::test]
+async fn test_stdio_resources_requires_capability() {
+    let (conn, script_path) = resource_fixture_conn("no-resources-cap").await;
+
+    // The fixture answers resources/list with -32601; Ok(vec![]) proves no
+    // request was sent because the capability is absent.
+    assert!(conn.capabilities.resources.is_none());
+    assert!(conn.list_resources().await.expect("gated list").is_empty());
+    assert!(conn
+        .list_resource_templates()
+        .await
+        .expect("gated templates")
+        .is_empty());
+
+    conn.close().await.expect("close");
+    let _ = std::fs::remove_file(script_path);
+}

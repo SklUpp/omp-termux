@@ -315,6 +315,92 @@ pub struct MCPToolCallResult {
 	pub _meta: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MCPAnnotationAudience {
+	User,
+	Assistant,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MCPAnnotations {
+	#[serde(default)]
+	pub audience: Option<Vec<MCPAnnotationAudience>>,
+	#[serde(default)]
+	pub priority: Option<f64>,
+	#[serde(rename = "lastModified", default)]
+	pub last_modified: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MCPResource {
+	pub uri: String,
+	pub name: String,
+	#[serde(default)]
+	pub title: Option<String>,
+	#[serde(default)]
+	pub description: Option<String>,
+	#[serde(rename = "mimeType", default)]
+	pub mime_type: Option<String>,
+	#[serde(default)]
+	pub size: Option<u64>,
+	#[serde(default)]
+	pub annotations: Option<MCPAnnotations>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MCPResourceTemplate {
+	#[serde(rename = "uriTemplate")]
+	pub uri_template: String,
+	pub name: String,
+	#[serde(default)]
+	pub title: Option<String>,
+	#[serde(default)]
+	pub description: Option<String>,
+	#[serde(rename = "mimeType", default)]
+	pub mime_type: Option<String>,
+	#[serde(default)]
+	pub annotations: Option<MCPAnnotations>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MCPResourcesListResult {
+	#[serde(default)]
+	pub resources: Vec<MCPResource>,
+	#[serde(rename = "nextCursor", default)]
+	pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MCPResourceTemplatesListResult {
+	#[serde(rename = "resourceTemplates", default)]
+	pub resource_templates: Vec<MCPResourceTemplate>,
+	#[serde(rename = "nextCursor", default)]
+	pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MCPResourceContentItem {
+	pub uri: String,
+	#[serde(rename = "mimeType", default)]
+	pub mime_type: Option<String>,
+	#[serde(default)]
+	pub text: Option<String>,
+	#[serde(default)]
+	pub blob: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MCPResourceReadResult {
+	#[serde(default)]
+	pub contents: Vec<MCPResourceContentItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MCPResourceReadParams {
+	pub uri: String,
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

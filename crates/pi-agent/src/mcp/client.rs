@@ -11,8 +11,10 @@ use crate::mcp::transports::sse::LegacySseTransport;
 use crate::mcp::transports::stdio::StdioTransport;
 use crate::mcp::transports::McpTransport;
 use crate::mcp::types::{
-    MCPContent, MCPInitializeParams, MCPInitializeResult, MCPServerCapabilities, MCPServerConfig,
-    MCPServerInfo, MCPToolCallResult, MCPToolDefinition, MCPToolsListResult, MCP_PROTOCOL_VERSION,
+    MCPContent, MCPInitializeParams, MCPInitializeResult, MCPResource, MCPResourceReadParams,
+    MCPResourceReadResult, MCPResourceTemplate, MCPResourceTemplatesListResult,
+    MCPResourcesListResult, MCPServerCapabilities, MCPServerConfig, MCPServerInfo,
+    MCPToolCallResult, MCPToolDefinition, MCPToolsListResult, MCP_PROTOCOL_VERSION,
 };
 
 pub fn is_retriable_connection_error(error: &McpError) -> bool {
@@ -151,7 +153,29 @@ pub async fn connect_to_server(
     })
 }
 
+/// JSON-RPC `-32601` ("Method not found"). Servers may advertise the
+/// `resources` capability without implementing the optional
+/// `resources/templates/list` method.
+fn is_method_not_found_error(error: &McpError) -> bool {
+    if let McpError::JsonRpc { code, .. } = error {
+        if *code == -32601 {
+            return true;
+        }
+    }
+    let message = error.to_string().to_lowercase();
+    message.contains("-32601") || message.contains("method not found")
+}
+
 impl McpConnection {
+    fn request_timeout(&self) -> Option<Duration> {
+        let timeout_ms = resolve_mcp_timeout_ms(self.config.timeout());
+        if timeout_ms > 0 {
+            Some(Duration::from_millis(timeout_ms))
+        } else {
+            None
+        }
+    }
+
     pub async fn reconnect(&self) -> Result<(), McpError> {
         let (new_transport, _) = create_and_init_transport(&self.config).await?;
         let mut t = self.transport.write().await;
@@ -161,12 +185,7 @@ impl McpConnection {
     }
 
     pub async fn list_tools(&self) -> Result<Vec<MCPToolDefinition>, McpError> {
-        let timeout_ms = resolve_mcp_timeout_ms(self.config.timeout());
-        let timeout_dur = if timeout_ms > 0 {
-            Some(Duration::from_millis(timeout_ms))
-        } else {
-            None
-        };
+        let timeout_dur = self.request_timeout();
 
         let mut all_tools = Vec::new();
         let mut cursor: Option<String> = None;
@@ -220,17 +239,125 @@ impl McpConnection {
         Ok(all_tools)
     }
 
+    /// List resources, following `nextCursor` until exhausted.
+    ///
+    /// Returns `[]` when the server did not advertise the `resources`
+    /// capability (no request is sent), matching the TS client. Reads are
+    /// idempotent, but nothing is cached or replayed here: the TS side caches
+    /// per connection, and a stale cache is worse than one request.
+    pub async fn list_resources(&self) -> Result<Vec<MCPResource>, McpError> {
+        if self.capabilities.resources.is_none() {
+            return Ok(Vec::new());
+        }
+        let timeout_dur = self.request_timeout();
+        let mut all_resources = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let mut params = json!({});
+            if let Some(c) = &cursor {
+                params["cursor"] = json!(c);
+            }
+
+            let res_val = {
+                let guard = self.transport.read().await;
+                guard
+                    .clone()
+                    .request("resources/list", Some(params), timeout_dur)
+                    .await?
+            };
+            let page: MCPResourcesListResult = serde_json::from_value(res_val).map_err(|e| {
+                McpError::Protocol(format!("Invalid resources/list response: {}", e))
+            })?;
+
+            all_resources.extend(page.resources);
+
+            match page.next_cursor {
+                Some(next) if !next.is_empty() => cursor = Some(next),
+                _ => break,
+            }
+        }
+
+        Ok(all_resources)
+    }
+
+    /// List resource templates, following `nextCursor` until exhausted.
+    ///
+    /// A server MAY advertise `resources` without implementing the optional
+    /// `resources/templates/list` method and answer JSON-RPC `-32601`. That is
+    /// treated as "no templates" so it cannot discard the server's concrete
+    /// resources; every other error propagates.
+    pub async fn list_resource_templates(&self) -> Result<Vec<MCPResourceTemplate>, McpError> {
+        if self.capabilities.resources.is_none() {
+            return Ok(Vec::new());
+        }
+        let timeout_dur = self.request_timeout();
+        let mut all_templates = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let mut params = json!({});
+            if let Some(c) = &cursor {
+                params["cursor"] = json!(c);
+            }
+
+            let res_val = {
+                let guard = self.transport.read().await;
+                guard
+                    .clone()
+                    .request("resources/templates/list", Some(params), timeout_dur)
+                    .await
+            };
+            let res_val = match res_val {
+                Ok(v) => v,
+                Err(e) if is_method_not_found_error(&e) => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            };
+            let page: MCPResourceTemplatesListResult =
+                serde_json::from_value(res_val).map_err(|e| {
+                    McpError::Protocol(format!(
+                        "Invalid resources/templates/list response: {}",
+                        e
+                    ))
+                })?;
+
+            all_templates.extend(page.resource_templates);
+
+            match page.next_cursor {
+                Some(next) if !next.is_empty() => cursor = Some(next),
+                _ => break,
+            }
+        }
+
+        Ok(all_templates)
+    }
+
+    /// Read a resource by URI. The URI is sent byte-for-byte: MCP resource URIs
+    /// are opaque and must not be normalized (colons, query strings, and
+    /// fragments are all significant). Failures, including JSON-RPC errors,
+    /// are surfaced unchanged — no synthetic content is ever produced.
+    pub async fn read_resource(&self, uri: &str) -> Result<MCPResourceReadResult, McpError> {
+        let timeout_dur = self.request_timeout();
+        let params = serde_json::to_value(MCPResourceReadParams { uri: uri.to_string() })?;
+
+        let res_val = {
+            let guard = self.transport.read().await;
+            guard
+                .clone()
+                .request("resources/read", Some(params), timeout_dur)
+                .await?
+        };
+
+        serde_json::from_value(res_val)
+            .map_err(|e| McpError::Protocol(format!("Invalid resources/read response: {}", e)))
+    }
+
     pub async fn call_tool(
         &self,
         name: &str,
         arguments: Value,
     ) -> Result<MCPToolCallResult, McpError> {
-        let timeout_ms = resolve_mcp_timeout_ms(self.config.timeout());
-        let timeout_dur = if timeout_ms > 0 {
-            Some(Duration::from_millis(timeout_ms))
-        } else {
-            None
-        };
+        let timeout_dur = self.request_timeout();
 
         let params = json!({
             "name": name,
