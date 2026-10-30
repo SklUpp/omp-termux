@@ -2123,6 +2123,11 @@ for line in sys.stdin:
     elif method == "resources/list":
         if mode == "no-resources-cap":
             send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found"}})
+        elif mode == "repeat-resources":
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "resources": [{"uri": "repeat://resource", "name": "loop"}],
+                "nextCursor": "same-cursor"
+            }})
         elif params.get("cursor") == "res-page-2":
             send({"jsonrpc": "2.0", "id": mid, "result": {
                 "resources": [{"uri": PAGE2_URI, "name": "second"}],
@@ -2148,6 +2153,11 @@ for line in sys.stdin:
     elif method == "resources/templates/list":
         if mode == "no-templates":
             send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found"}})
+        elif mode == "repeat-templates":
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "resourceTemplates": [{"uriTemplate": "repeat://{id}", "name": "loop"}],
+                "nextCursor": "same-cursor"
+            }})
         else:
             send({"jsonrpc": "2.0", "id": mid, "result": {
                 "resourceTemplates": [{
@@ -2287,6 +2297,40 @@ async fn test_stdio_resources_missing_templates_method_returns_empty() {
         .await
         .expect("missing method is treated as no templates");
     assert!(templates.is_empty());
+
+    conn.close().await.expect("close");
+    let _ = std::fs::remove_file(script_path);
+}
+
+#[tokio::test]
+async fn test_stdio_resources_repeated_cursor_is_bounded() {
+    let (conn, script_path) = resource_fixture_conn("repeat-resources").await;
+
+    let error = conn
+        .list_resources()
+        .await
+        .expect_err("a repeated cursor must not loop forever");
+    assert!(
+        format!("{error:?}").contains("repeated cursor"),
+        "unexpected error: {error:?}"
+    );
+
+    conn.close().await.expect("close");
+    let _ = std::fs::remove_file(script_path);
+}
+
+#[tokio::test]
+async fn test_stdio_resource_templates_repeated_cursor_is_bounded() {
+    let (conn, script_path) = resource_fixture_conn("repeat-templates").await;
+
+    let error = conn
+        .list_resource_templates()
+        .await
+        .expect_err("a repeated cursor must not loop forever");
+    assert!(
+        format!("{error:?}").contains("repeated cursor"),
+        "unexpected error: {error:?}"
+    );
 
     conn.close().await.expect("close");
     let _ = std::fs::remove_file(script_path);

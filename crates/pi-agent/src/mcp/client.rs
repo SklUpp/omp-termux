@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::mcp::config::validate_server_config;
@@ -16,6 +17,12 @@ use crate::mcp::types::{
     MCPResourcesListResult, MCPServerCapabilities, MCPServerConfig, MCPServerInfo,
     MCPToolCallResult, MCPToolDefinition, MCPToolsListResult, MCP_PROTOCOL_VERSION,
 };
+
+// Conservative pagination bounds for untrusted servers; shared by resources
+// and resource templates. 64 pages x 10k entries keeps a broken cursor from
+// becoming unbounded memory/time while never limiting a real server.
+const MAX_RESOURCE_PAGES: usize = 64;
+const MAX_RESOURCE_ENTRIES: usize = 10_000;
 
 pub fn is_retriable_connection_error(error: &McpError) -> bool {
     match error {
@@ -250,30 +257,62 @@ impl McpConnection {
             return Ok(Vec::new());
         }
         let timeout_dur = self.request_timeout();
+        let deadline = timeout_dur.map(|timeout| Instant::now() + timeout);
         let mut all_resources = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut pages = 0usize;
 
         loop {
+            pages += 1;
+            if pages > MAX_RESOURCE_PAGES {
+                return Err(McpError::Protocol(
+                    "resources/list exceeded pagination bounds".to_string(),
+                ));
+            }
             let mut params = json!({});
             if let Some(c) = &cursor {
                 params["cursor"] = json!(c);
             }
-
-            let res_val = {
-                let guard = self.transport.read().await;
-                guard
-                    .clone()
-                    .request("resources/list", Some(params), timeout_dur)
-                    .await?
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(McpError::Timeout(
+                            "resources/list pagination deadline exceeded".to_string(),
+                        ));
+                    }
+                    Some(remaining)
+                }
+                None => None,
             };
+            let transport = {
+                let guard = self.transport.read().await;
+                guard.clone()
+            };
+            let res_val = transport
+                .request("resources/list", Some(params), remaining)
+                .await?;
             let page: MCPResourcesListResult = serde_json::from_value(res_val).map_err(|e| {
                 McpError::Protocol(format!("Invalid resources/list response: {}", e))
             })?;
 
+            if page.resources.len() > MAX_RESOURCE_ENTRIES.saturating_sub(all_resources.len()) {
+                return Err(McpError::Protocol(
+                    "resources/list exceeded pagination bounds".to_string(),
+                ));
+            }
             all_resources.extend(page.resources);
 
             match page.next_cursor {
-                Some(next) if !next.is_empty() => cursor = Some(next),
+                Some(next) if !next.is_empty() => {
+                    if !seen.insert(next.clone()) {
+                        return Err(McpError::Protocol(
+                            "resources/list returned a repeated cursor".to_string(),
+                        ));
+                    }
+                    cursor = Some(next);
+                }
                 _ => break,
             }
         }
@@ -292,22 +331,42 @@ impl McpConnection {
             return Ok(Vec::new());
         }
         let timeout_dur = self.request_timeout();
+        let deadline = timeout_dur.map(|timeout| Instant::now() + timeout);
         let mut all_templates = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut pages = 0usize;
 
         loop {
+            pages += 1;
+            if pages > MAX_RESOURCE_PAGES {
+                return Err(McpError::Protocol(
+                    "resources/templates/list exceeded pagination bounds".to_string(),
+                ));
+            }
             let mut params = json!({});
             if let Some(c) = &cursor {
                 params["cursor"] = json!(c);
             }
-
-            let res_val = {
-                let guard = self.transport.read().await;
-                guard
-                    .clone()
-                    .request("resources/templates/list", Some(params), timeout_dur)
-                    .await
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(McpError::Timeout(
+                            "resources/templates/list pagination deadline exceeded".to_string(),
+                        ));
+                    }
+                    Some(remaining)
+                }
+                None => None,
             };
+            let transport = {
+                let guard = self.transport.read().await;
+                guard.clone()
+            };
+            let res_val = transport
+                .request("resources/templates/list", Some(params), remaining)
+                .await;
             let res_val = match res_val {
                 Ok(v) => v,
                 Err(e) if is_method_not_found_error(&e) => return Ok(Vec::new()),
@@ -321,10 +380,24 @@ impl McpConnection {
                     ))
                 })?;
 
+            if page.resource_templates.len()
+                > MAX_RESOURCE_ENTRIES.saturating_sub(all_templates.len())
+            {
+                return Err(McpError::Protocol(
+                    "resources/templates/list exceeded pagination bounds".to_string(),
+                ));
+            }
             all_templates.extend(page.resource_templates);
 
             match page.next_cursor {
-                Some(next) if !next.is_empty() => cursor = Some(next),
+                Some(next) if !next.is_empty() => {
+                    if !seen.insert(next.clone()) {
+                        return Err(McpError::Protocol(
+                            "resources/templates/list returned a repeated cursor".to_string(),
+                        ));
+                    }
+                    cursor = Some(next);
+                }
                 _ => break,
             }
         }
@@ -340,13 +413,13 @@ impl McpConnection {
         let timeout_dur = self.request_timeout();
         let params = serde_json::to_value(MCPResourceReadParams { uri: uri.to_string() })?;
 
-        let res_val = {
+        let transport = {
             let guard = self.transport.read().await;
-            guard
-                .clone()
-                .request("resources/read", Some(params), timeout_dur)
-                .await?
+            guard.clone()
         };
+        let res_val = transport
+            .request("resources/read", Some(params), timeout_dur)
+            .await?;
 
         serde_json::from_value(res_val)
             .map_err(|e| McpError::Protocol(format!("Invalid resources/read response: {}", e)))

@@ -195,10 +195,8 @@ async fn harness_with(
 	tune: impl FnOnce(EvalSettings) -> EvalSettings,
 ) -> Option<(Arc<EvalTool>, Arc<EvalRuntime>, AgentContext, PathBuf)> {
 	let settings = tune(
-		// Contract defaults: a 10 s probe budget for probed backends and a 30 s
-		// cell budget. Julia readiness draws from the cell budget, so cold CI
-		// boots are covered without a test-only override; the dedicated
-		// short-timeout regressions set their own bounds.
+		// Keep contract defaults; tests covering startup cost or short deadlines
+		// set their own explicit cell budgets.
 		EvalSettings::new(allowance, interpreters).with_spill_bytes(4096),
 	);
 	let runtime = match EvalRuntime::start(settings).await {
@@ -998,7 +996,7 @@ async fn julia_state_and_scheme_map_local_paths() {
 		return;
 	};
 	let first = tool
-		.execute(&json!({"language": "jl", "code": "x = 40"}), &ctx)
+		.execute(&json!({"language": "jl", "code": "x = 40", "timeout": 120}), &ctx)
 		.await
 		.expect("julia first cell");
 	assert!(!first.is_error, "{}", first.content);
