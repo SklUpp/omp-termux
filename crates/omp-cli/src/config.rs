@@ -911,6 +911,24 @@ impl Config {
 		if let Some(input) = &cli.append_system_prompt {
 			self.append_system_prompt = Some(input.clone());
 		}
+		// Empty CLI values block environment fallback without replacing configured roles.
+		for (role, flag, env_var) in [
+			("smol", cli.smol.as_deref(), "PI_SMOL_MODEL"),
+			("slow", cli.slow.as_deref(), "PI_SLOW_MODEL"),
+		] {
+			let pattern = match flag {
+				Some(value) if value.is_empty() => continue,
+				Some(value) => value.to_owned(),
+				None => match env::var(env_var) {
+					Ok(value) if !value.is_empty() => value,
+					_ => continue,
+				},
+			};
+			self.model_roles.insert(role.to_string(), pattern);
+		}
+		if cli.no_lsp {
+			self.lsp.enabled = Some(false);
+		}
 	}
 }
 

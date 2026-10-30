@@ -50,6 +50,14 @@ struct LaunchArgs {
 	#[arg(long)]
 	model: Option<String>,
 
+	/// Smol/fast model for lightweight tasks (or `PI_SMOL_MODEL`).
+	#[arg(long, value_name = "MODEL")]
+	smol: Option<String>,
+
+	/// Slow/reasoning model for thorough analysis (or `PI_SLOW_MODEL`).
+	#[arg(long, value_name = "MODEL")]
+	slow: Option<String>,
+
 	/// Provider id.
 	#[arg(long)]
 	provider: Option<String>,
@@ -73,6 +81,10 @@ struct LaunchArgs {
 	/// Disable every tool.
 	#[arg(long = "no-tools")]
 	no_tools: bool,
+
+	/// Disable LSP tools, formatting, and diagnostics.
+	#[arg(long = "no-lsp")]
+	no_lsp: bool,
 
 	/// Only enable these tools (comma-separated or repeatable).
 	#[arg(long, value_delimiter = ',', value_name = "TOOLS")]
@@ -214,6 +226,12 @@ pub struct Cli {
 	/// Model id (`provider/model` or bare id).
 	pub model: Option<String>,
 
+	/// Smol/fast model for lightweight tasks (or `PI_SMOL_MODEL`).
+	pub smol: Option<String>,
+
+	/// Slow/reasoning model for thorough analysis (or `PI_SLOW_MODEL`).
+	pub slow: Option<String>,
+
 	/// Provider id.
 	pub provider: Option<String>,
 
@@ -231,6 +249,9 @@ pub struct Cli {
 
 	/// Disable every tool.
 	pub no_tools: bool,
+
+	/// Disable LSP tools, formatting, and diagnostics.
+	pub no_lsp: bool,
 
 	/// Only enable these tools (comma-separated or repeatable).
 	pub tools: Option<Vec<String>>,
@@ -387,12 +408,15 @@ impl Cli {
 			profile: raw.profile,
 			alias: raw.alias,
 			model: raw.model,
+			smol: raw.smol,
+			slow: raw.slow,
 			provider: raw.provider,
 			api_key: raw.api_key,
 			system_prompt: raw.system_prompt,
 			append_system_prompt: raw.append_system_prompt,
 			max_time: raw.max_time,
 			no_tools: raw.no_tools,
+			no_lsp: raw.no_lsp,
 			tools: raw.tools,
 			approval_mode: raw.approval_mode,
 			yolo: raw.yolo,
