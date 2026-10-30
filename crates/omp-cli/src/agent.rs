@@ -316,6 +316,41 @@ impl RunRequest {
 
 pub trait AgentRunner: Send + Sync {
 	fn run(&self, request: &RunRequest) -> Result<EventStream>;
+
+	/// Release one root session's long-lived runtime resources. Hosts call this
+	/// after a session closes or switches away; the selector is the same
+	/// `session_id`/`session_file` pair the session's runs carried. The default
+	/// is a no-op for runners that do not retain per-session state.
+	fn close_session(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) -> Option<u64> {
+		let _ = (session_id, session_file);
+		None
+	}
+
+	/// Release a closed tombstone only with the exact ticket returned by the
+	/// close that created it. Default no-op; fast, no threads/joins.
+	fn release_session_scope(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+		ticket: u64,
+	) {
+		let _ = (session_id, session_file, ticket);
+	}
+
+	/// Clear a closed-identity tombstone when a host explicitly opens the same
+	/// persisted session again (RPC switch/new target, ACP load/new/resume/fork).
+	/// The default is a no-op for runners without per-session state.
+	fn reopen_session(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) {
+		let _ = (session_id, session_file);
+	}
 }
 
 static RUNNER: OnceLock<Box<dyn AgentRunner>> = OnceLock::new();

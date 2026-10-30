@@ -219,6 +219,13 @@ fn role_flags_override_configured_roles_for_model_alias() {
 		&["--slow", "mock/other, mock/cli-slow", "--model", "@slow"],
 	);
 	assert_eq!(server.body(1)["model"], "other", "comma pattern list keeps its order");
+
+	run_omp_ok(&agent_dir, &cwd, &[], &["--model", "slow"]);
+	assert_eq!(
+		server.body(2)["model"],
+		"configured-slow",
+		"a bare configured role resolves like `@slow`"
+	);
 	server.stop();
 }
 

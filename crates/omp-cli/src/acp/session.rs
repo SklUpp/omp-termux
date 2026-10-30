@@ -310,10 +310,23 @@ impl AcpRuntime {
 		// Cached before the record takes the session lock: the approval tool
 		// runs while the turn holds that lock and cannot read it again.
 		let plan_artifacts = session.local_root();
+		// Same selector a `RunRequest` carries (persisted store id, else log
+		// path), captured before the session moves behind its mutex.
+		let (scope_id, scope_file) = session.session_scope_identity();
+		// A closed identity may be loaded/newed again by the host: clear its
+		// tombstone before any run can acquire resources.
+		self
+			.recipe
+			.runner
+			.reopen_session(scope_id.as_deref(), scope_file.as_deref());
 		let record = Arc::new(AcpSession {
 			id: id.clone(),
 			cwd,
 			runtime: self.clone(),
+			runner: Arc::clone(&self.recipe.runner),
+			scope_id,
+			scope_file,
+			close_ticket: Arc::new(Mutex::new(None)),
 			caps: caps.clone(),
 			session: Mutex::new(session),
 			gate: PromptGate::default(),
@@ -383,6 +396,15 @@ pub struct AcpSession {
 	id: String,
 	cwd: PathBuf,
 	runtime: AcpRuntime,
+	/// Process runner that owns this session's scoped runtime resources.
+	runner: Arc<dyn AgentRunner>,
+	/// Same selector the session's runs carry (persisted store id/file).
+	scope_id: Option<String>,
+	scope_file: Option<PathBuf>,
+	/// Ownership ticket of the close that tombstoned this scope, shared by the
+	/// close hook and the Drop release so an old session can never release a
+	/// newer generation.
+	close_ticket: Arc<Mutex<Option<u64>>>,
 	caps: ClientCapabilities,
 	session: Mutex<RpcSession>,
 	gate: PromptGate,
@@ -412,6 +434,24 @@ impl AcpSession {
 	#[must_use]
 	pub fn id(&self) -> &str {
 		&self.id
+	}
+
+	/// Release this session's scoped runtime resources through the same
+	/// selector its runs used. Idempotent; other ACP sessions are untouched.
+	/// An unpersisted (anonymous) session shares the process fallback bucket
+	/// and is left to global shutdown.
+	pub(crate) fn close_runner_scope(&self) -> Option<u64> {
+		if self.scope_id.is_none() && self.scope_file.is_none() {
+			return None;
+		}
+		let ticket = self
+			.runner
+			.close_session(self.scope_id.as_deref(), self.scope_file.as_deref());
+		*self
+			.close_ticket
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = ticket;
+		ticket
 	}
 
 	#[must_use]
@@ -2814,10 +2854,108 @@ fn replay_user_content(message: &Value, message_id: &str) -> Vec<Value> {
 
 // --------------------------------------------------------------- manager --
 
+impl Drop for AcpSession {
+	fn drop(&mut self) {
+		// The last Arc (including a forced-close turn's continuation) is the
+		// "no further acquisition" barrier. Release only the exact close ticket
+		// this generation observed; an old Drop never removes a newer tombstone.
+		let ticket = self
+			.close_ticket
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.take();
+		if let Some(ticket) = ticket {
+			self.runner.release_session_scope(
+				self.scope_id.as_deref(),
+				self.scope_file.as_deref(),
+				ticket,
+			);
+		}
+	}
+}
+
+/// One reservation in flight. `cancelled` keeps the id occupied after a close
+/// until the original reservation drops, so no second store writer can start.
+struct ReservedEntry {
+	ticket:    u64,
+	cancelled: bool,
+}
+
+struct SessionManagerState {
+	sessions:        BTreeMap<String, Arc<AcpSession>>,
+	reserved:        BTreeMap<String, ReservedEntry>,
+	next_reservation: u64,
+	shutting_down:   bool,
+}
+
+impl SessionManagerState {
+	/// Checked issuance: at `u64::MAX` the ticket is returned once, then the
+	/// counter parks at `0`; `0` is never issued, so tickets never repeat.
+	fn issue_reservation(&mut self) -> Option<u64> {
+		match self.next_reservation {
+			0 => None,
+			u64::MAX => {
+				self.next_reservation = 0;
+				Some(u64::MAX)
+			},
+			ticket => {
+				self.next_reservation = ticket + 1;
+				Some(ticket)
+			},
+		}
+	}
+}
+
 /// Session map for one ACP connection.
-#[derive(Default)]
 pub struct SessionManager {
-	sessions: Mutex<BTreeMap<String, Arc<AcpSession>>>,
+	state: Mutex<SessionManagerState>,
+}
+
+impl Default for SessionManager {
+	fn default() -> Self {
+		Self {
+			state: Mutex::new(SessionManagerState {
+				sessions:        BTreeMap::new(),
+				reserved:        BTreeMap::new(),
+				next_reservation: 1,
+				shutting_down:   false,
+			}),
+		}
+	}
+}
+
+/// Result of atomically reserving an identity before opening its store.
+pub enum ReserveOpen {
+	Live(Arc<AcpSession>),
+	Reserved(SessionReservation),
+}
+
+/// RAII reservation. Only drops the exact ticket it owns; an old reservation
+/// can never clear a newer one.
+pub struct SessionReservation {
+	manager:    Weak<SessionManager>,
+	id:         String,
+	ticket:     u64,
+	committed:  bool,
+}
+
+impl Drop for SessionReservation {
+	fn drop(&mut self) {
+		if self.committed {
+			return;
+		}
+		let Some(manager) = self.manager.upgrade() else {
+			return;
+		};
+		let mut state = manager.lock();
+		if state
+			.reserved
+			.get(&self.id)
+			.is_some_and(|entry| entry.ticket == self.ticket)
+		{
+			state.reserved.remove(&self.id);
+		}
+	}
 }
 
 impl SessionManager {
@@ -2826,47 +2964,158 @@ impl SessionManager {
 		Self::default()
 	}
 
-	pub fn insert(self: &Arc<Self>, session: Arc<AcpSession>) {
+	/// Atomically reserve an identity before `load_session` opens its store.
+	/// Live reuse is reported as `Live`; any in-flight reservation (including a
+	/// cancelled one awaiting Drop) reports session-busy.
+	pub fn reserve(self: &Arc<Self>, id: &str) -> Result<ReserveOpen, RequestError> {
+		let mut state = self.lock();
+		if state.shutting_down {
+			return Err(RequestError::session_busy(
+				format!("ACP session {id} is shutting down"),
+				Some(json!({ "reason": "session_busy" })),
+			));
+		}
+		if let Some(session) = state.sessions.get(id) {
+			return Ok(ReserveOpen::Live(Arc::clone(session)));
+		}
+		if state.reserved.contains_key(id) {
+			return Err(RequestError::session_busy(
+				format!("ACP session {id} is already loading"),
+				Some(json!({ "reason": "session_busy" })),
+			));
+		}
+		let Some(ticket) = state.issue_reservation() else {
+			return Err(RequestError::new(
+				INTERNAL_ERROR,
+				"ACP session reservation space exhausted",
+			));
+		};
+		state.reserved.insert(id.to_string(), ReservedEntry {
+			ticket,
+			cancelled: false,
+		});
+		Ok(ReserveOpen::Reserved(SessionReservation {
+			manager: Arc::downgrade(self),
+			id: id.to_string(),
+			ticket,
+			committed: false,
+		}))
+	}
+
+	/// Commit a reserved open. On failure the session is returned so the caller
+	/// can close/drop every Arc before the reservation Drop releases occupancy.
+	pub fn commit(
+		self: &Arc<Self>,
+		mut reservation: SessionReservation,
+		session: Arc<AcpSession>,
+	) -> Result<Arc<AcpSession>, (Arc<AcpSession>, SessionReservation)> {
+		let mut state = self.lock();
+		let own = state
+			.reserved
+			.get(&reservation.id)
+			.is_some_and(|entry| entry.ticket == reservation.ticket && !entry.cancelled);
+		if reservation.committed || state.shutting_down || !own {
+			return Err((session, reservation));
+		}
+		if state.sessions.contains_key(session.id()) {
+			return Err((session, reservation));
+		}
+		state.reserved.remove(&reservation.id);
+		self.attach(&session);
+		state.sessions.insert(session.id().to_string(), Arc::clone(&session));
+		reservation.committed = true;
+		Ok(session)
+	}
+
+	/// Install the close hook used by every managed session.
+	fn attach(self: &Arc<Self>, session: &Arc<AcpSession>) {
 		let id = session.id().to_string();
 		let manager = Arc::downgrade(self);
+		let runner = Arc::clone(&session.runner);
+		let scope_id = session.scope_id.clone();
+		let scope_file = session.scope_file.clone();
+		let close_ticket = Arc::clone(&session.close_ticket);
 		session.set_close_hook(Arc::new(move |_reason| {
 			if let Some(manager) = manager.upgrade() {
 				manager.remove(&id);
 			}
+			if scope_id.is_some() || scope_file.is_some() {
+				let ticket =
+					runner.close_session(scope_id.as_deref(), scope_file.as_deref());
+				*close_ticket
+					.lock()
+					.unwrap_or_else(|poison| poison.into_inner()) = ticket;
+			}
 		}));
-		self.lock().insert(session.id().to_string(), session);
+	}
+
+	/// Insert a freshly created session (new/fork). Never overwrites a live or
+	/// reserved identity; the caller closes the returned session on failure.
+	pub fn insert(
+		self: &Arc<Self>,
+		session: Arc<AcpSession>,
+	) -> Result<(), Arc<AcpSession>> {
+		let id = session.id().to_string();
+		{
+			let mut state = self.lock();
+			if state.shutting_down
+				|| state.sessions.contains_key(&id)
+				|| state.reserved.contains_key(&id)
+			{
+				return Err(session);
+			}
+			self.attach(&session);
+			state.sessions.insert(id, Arc::clone(&session));
+		}
+		Ok(())
 	}
 
 	#[must_use]
 	pub fn get(&self, id: &str) -> Option<Arc<AcpSession>> {
-		self.lock().get(id).cloned()
+		self.lock().sessions.get(id).cloned()
 	}
 
 	pub fn remove(&self, id: &str) -> Option<Arc<AcpSession>> {
-		self.lock().remove(id)
+		let mut state = self.lock();
+		let live = state.sessions.remove(id);
+		if let Some(entry) = state.reserved.get_mut(id) {
+			// Keep occupancy until the original reservation drops; a later load
+			// must not open a second store writer while the first unwinds.
+			entry.cancelled = true;
+		}
+		live
 	}
 
 	#[must_use]
 	pub fn first(&self) -> Option<Arc<AcpSession>> {
-		self.lock().values().next().cloned()
+		self.lock().sessions.values().next().cloned()
 	}
 
 	/// Signal every live session; used by transport close.
 	pub fn shutdown_all(&self, reason: &str) {
-		let sessions: Vec<Arc<AcpSession>> = self.lock().values().cloned().collect();
+		let sessions: Vec<Arc<AcpSession>> = {
+			let mut state = self.lock();
+			state.shutting_down = true;
+			state.reserved.clear();
+			state.sessions.values().cloned().collect()
+		};
 		for session in sessions {
 			session.shutdown(reason);
+			// `shutdown` deliberately skips the close hook (transport is already
+			// closed, no frame may leave), so close this scope explicitly and keep
+			// the ticket for the session Drop release.
+			let _ = session.close_runner_scope();
 		}
 	}
 
 	/// Count of managed sessions (usage extension picks the first record).
 	#[must_use]
 	pub fn len(&self) -> usize {
-		self.lock().len()
+		self.lock().sessions.len()
 	}
 
-	fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Arc<AcpSession>>> {
-		self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+	fn lock(&self) -> MutexGuard<'_, SessionManagerState> {
+		self.state.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 }
 
@@ -3140,7 +3389,41 @@ impl AcpSession {
 
 #[cfg(test)]
 mod tests {
-	use super::PromptGate;
+	use std::sync::Arc;
+
+	use super::{PromptGate, ReserveOpen, SessionManager};
+
+	#[test]
+	fn reservation_blocks_duplicate_open_until_dropped() {
+		let manager = Arc::new(SessionManager::new());
+		let first = manager.reserve("session-1").unwrap();
+		assert!(matches!(&first, ReserveOpen::Reserved(_)));
+		assert!(manager.reserve("session-1").is_err());
+		drop(first);
+		assert!(matches!(
+			manager.reserve("session-1").unwrap(),
+			ReserveOpen::Reserved(_)
+		));
+	}
+
+	#[test]
+	fn close_during_open_cancels_reservation() {
+		let manager = Arc::new(SessionManager::new());
+		let ReserveOpen::Reserved(reservation) = manager.reserve("session-1").unwrap() else {
+			panic!("expected a fresh reservation");
+		};
+		assert!(manager.remove("session-1").is_none());
+		assert!(manager.lock().reserved.get("session-1").unwrap().cancelled);
+		drop(reservation);
+		assert!(!manager.lock().reserved.contains_key("session-1"));
+	}
+
+	#[test]
+	fn shutdown_rejects_new_reservations() {
+		let manager = Arc::new(SessionManager::new());
+		manager.shutdown_all("test");
+		assert!(manager.reserve("session-1").is_err());
+	}
 
 	#[test]
 	fn plan_gate_release_autonomous_does_not_clear_client_prompt() {

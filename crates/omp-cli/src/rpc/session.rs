@@ -676,6 +676,20 @@ impl RpcSession {
 		self.store.file().map(|path| path.display().to_string())
 	}
 
+	/// The same `(session_id, session_file)` pair a `RunRequest` carries for this
+	/// store: persisted, non-v1 logs only. Used to close exactly the scope the
+	/// runs used, never the ACP client id.
+	pub(crate) fn session_scope_identity(&self) -> (Option<String>, Option<PathBuf>) {
+		let persisted = self.store.enabled() && !self.store.is_v1();
+		if !persisted {
+			return (None, None);
+		}
+		(
+			Some(self.store.id().to_string()),
+			self.store.file().map(Path::to_path_buf),
+		)
+	}
+
 	/// `get_session_stats` payload. Token totals come from the store's
 	/// cumulative usage index (one contribution per persisted assistant entry);
 	/// reasoning/cost/premium figures are read from the same persisted usage
@@ -970,6 +984,7 @@ impl RpcSession {
 
 	/// Start a fresh session log, keeping the prompt inputs and route.
 	pub fn new_session(&mut self, parent_session: Option<&str>) -> Result<()> {
+		let old_scope = self.session_scope_identity();
 		let mut options = self.store_options.clone();
 		options.id = None;
 		options.continue_latest = false;
@@ -999,11 +1014,28 @@ impl RpcSession {
 		self.tokens_per_second = None;
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);
+		let target = self.session_scope_identity();
+		self.runner
+			.reopen_session(target.0.as_deref(), target.1.as_deref());
+		let old_identified = old_scope.0.is_some() || old_scope.1.is_some();
+		if old_identified && target != old_scope {
+			if let Some(ticket) = self
+				.runner
+				.close_session(old_scope.0.as_deref(), old_scope.1.as_deref())
+			{
+				self.runner.release_session_scope(
+					old_scope.0.as_deref(),
+					old_scope.1.as_deref(),
+					ticket,
+				);
+			}
+		}
 		Ok(())
 	}
 
 	/// Switch to an existing session log.
 	pub fn switch_session(&mut self, path: &Path) -> Result<()> {
+		let old_scope = self.session_scope_identity();
 		if !path.is_file() {
 			return Err(Error::new(format!("Session not found: {}", path.display())));
 		}
@@ -1051,6 +1083,22 @@ impl RpcSession {
 		self.store = store;
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);
+		let target = self.session_scope_identity();
+		self.runner
+			.reopen_session(target.0.as_deref(), target.1.as_deref());
+		let old_identified = old_scope.0.is_some() || old_scope.1.is_some();
+		if old_identified && target != old_scope {
+			if let Some(ticket) = self
+				.runner
+				.close_session(old_scope.0.as_deref(), old_scope.1.as_deref())
+			{
+				self.runner.release_session_scope(
+					old_scope.0.as_deref(),
+					old_scope.1.as_deref(),
+					ticket,
+				);
+			}
+		}
 		Ok(())
 	}
 

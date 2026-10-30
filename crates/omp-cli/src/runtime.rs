@@ -85,16 +85,93 @@ pub const BUILTIN_TOOLS: [(&str, bool); 13] = [
 /// excluded with `--tools`/`config.tools`.
 pub const DELEGATION_TOOLS: [&str; 2] = ["task", "hub"];
 
+/// Stable key for one root session's long-lived runtime resources.
+///
+/// `session_id` is the persisted store id every host already puts on
+/// `RunRequest`; `session_file` is the same session's log when an id was not
+/// supplied. Both absent keeps today's single anonymous scope for in-memory
+/// non-ACP runs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SessionScope {
+	Session(String),
+	File(PathBuf),
+	Anonymous,
+}
+
+fn session_scope(id: Option<&str>, file: Option<&std::path::Path>) -> SessionScope {
+	if let Some(id) = id.filter(|id| !id.is_empty()) {
+		return SessionScope::Session(id.to_string());
+	}
+	match file {
+		Some(file) => SessionScope::File(file.to_path_buf()),
+		None => SessionScope::Anonymous,
+	}
+}
+
+/// Supervisor slot guarded with its closed marker: `close_scope` sets
+/// `closed` and takes the supervisor under the same lock a run uses to create
+/// it, so a stale run holding this resource cannot resurrect a supervisor.
+struct SupervisorSlot {
+	closed: bool,
+	value:  Option<Arc<Supervisor>>,
+}
+
+/// One session's root resources. The supervisor is created on the first
+/// delegation-enabled turn and rebound per turn; both handles persist across
+/// turns until the session closes or the process shuts down.
+struct SessionResources {
+	tools:      Arc<RunnerSession>,
+	supervisor: Mutex<SupervisorSlot>,
+}
+
+/// Closed scopes stay as tombstones so a late or stale run cannot recreate
+/// their resources; `reopen_session_scope` clears one explicitly. The ticket is
+/// issued from one runner-global monotonic counter, so an old holder can only
+/// release the exact close it observed, never a newer generation of the same
+/// identity.
+enum SessionSlot {
+	Open(Arc<SessionResources>),
+	Closed { ticket: u64 },
+}
+
+/// One mutex owns scope state and close-handle publication. `shutdown` sets
+/// `shutting_down` and takes both fields under the same lock, so a close either
+/// publishes its teardown before that snapshot or owns no resources at all.
+struct Lifecycle {
+	slots:         HashMap<SessionScope, SessionSlot>,
+	closing:       Vec<std::thread::JoinHandle<()>>,
+	shutting_down: bool,
+	/// Next release ticket. `0` means exhausted; `0` is never issued and never
+	/// matched by a release, so tickets are never reused.
+	next_ticket:   u64,
+}
+
+impl Lifecycle {
+	/// Checked issuance: at `u64::MAX` the ticket is still returned once, then
+	/// the counter parks at `0` (exhausted) instead of wrapping or reusing.
+	fn issue_ticket(&mut self) -> Option<u64> {
+		match self.next_ticket {
+			0 => None,
+			u64::MAX => {
+				self.next_ticket = 0;
+				Some(u64::MAX)
+			},
+			ticket => {
+				self.next_ticket = ticket + 1;
+				Some(ticket)
+			},
+		}
+	}
+}
+
 /// Synchronous `AgentRunner` that drives `pi-agent` on its own tokio runtime.
 pub struct PiAgentRunner {
 	runtime:    tokio::runtime::Runtime,
 	dispatcher: Arc<SignalDispatcher>,
-	/// In-memory supervisor reused across turns of this process. Child records
-	/// survive REPL turns so `hub jobs` can inspect earlier delegations; they
-	/// are never written to the session log.
-	supervisor: Mutex<Option<Arc<Supervisor>>>,
-	/// Root `read`/`edit` provenance shared by every turn this runner serves.
-	session:    Mutex<Option<Arc<RunnerSession>>>,
+	/// Root session scopes and their pending teardown handles. Entries are
+	/// never evicted per turn; only explicit close or process shutdown changes
+	/// them.
+	lifecycle:  Mutex<Lifecycle>,
 	/// One broker-backed process supervisor per project scope, reused across
 	/// turns. A scope that cannot reach its broker falls back to the
 	/// supervisor's local manager (no entry cached).
@@ -385,8 +462,12 @@ impl PiAgentRunner {
 		Ok(Self {
 			runtime,
 			dispatcher,
-			supervisor: Mutex::new(None),
-			session: Mutex::new(None),
+			lifecycle: Mutex::new(Lifecycle {
+				slots:         HashMap::new(),
+				closing:       Vec::new(),
+				shutting_down: false,
+				next_ticket:   1,
+			}),
 			processes: Mutex::new(HashMap::new()),
 			process_scope_ns: crate::output::session_id(),
 			shutdown_latch: Arc::new(ShutdownLatch::new()),
@@ -426,22 +507,173 @@ impl PiAgentRunner {
 	}
 
 
-	/// Reuse this runner's root store/`EditTool`, refreshing only the knobs.
-	fn session_tools(&self, options: EditToolOptions, mode: EditMode) -> Arc<RunnerSession> {
-		let mut slot = self.session.lock().unwrap_or_else(|poison| poison.into_inner());
-		let session = Arc::clone(slot.get_or_insert_with(|| Arc::new(RunnerSession::new(options))));
-		session.edit.set_options(options);
+	/// Get or create this session scope's root store/`EditTool`, refreshing the
+	/// per-turn knobs. `None` means the scope was closed (or shutdown began):
+	/// callers must not recreate resources for a closed identity.
+	fn session_tools(
+		&self,
+		scope: &SessionScope,
+		options: EditToolOptions,
+		mode: EditMode,
+	) -> Option<Arc<SessionResources>> {
+		let resources = {
+			let mut lifecycle = self
+				.lifecycle
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner());
+			if lifecycle.shutting_down {
+				return None;
+			}
+			match lifecycle.slots.get(scope) {
+				Some(SessionSlot::Open(resources)) => Arc::clone(resources),
+				Some(SessionSlot::Closed { .. }) => return None,
+				None => {
+					let resources = Arc::new(SessionResources {
+						tools:      Arc::new(RunnerSession::new(options)),
+						supervisor: Mutex::new(SupervisorSlot {
+							closed: false,
+							value:  None,
+						}),
+					});
+					lifecycle.slots.insert(
+						scope.clone(),
+						SessionSlot::Open(Arc::clone(&resources)),
+					);
+					resources
+				},
+			}
+		};
+		resources.tools.edit.set_options(options);
 		// Cross-turn registers/guard survive; only the wire contract follows the
 		// active model/env, as upstream's lazy `get mode()`.
-		session.edit.set_mode(mode);
-		session
+		resources.tools.edit.set_mode(mode);
+		Some(resources)
+	}
+
+	/// Release exactly this session's resources. The supervisor's own
+	/// `shutdown` cancels this session's reservations/children only; other
+	/// scopes and the process-wide project backends stay alive.
+	fn close_scope(&self, scope: &SessionScope) -> Option<u64> {
+		// The tombstone, supervisor take, and teardown-handle publication all
+		// happen under the same lifecycle lock `shutdown` snapshots. Every path
+		// leaves a Closed entry, including absent/already-closed scopes, so a run
+		// that reaches acquisition later cannot recreate this identity.
+		let mut lifecycle = self
+			.lifecycle
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		let removed = lifecycle.slots.remove(scope);
+		let (resources, ticket) = match removed {
+			Some(SessionSlot::Open(resources)) => (Some(resources), lifecycle.issue_ticket()),
+			Some(SessionSlot::Closed { ticket }) => {
+				(None, (ticket != 0).then_some(ticket))
+			},
+			None => (None, lifecycle.issue_ticket()),
+		};
+		lifecycle.slots.insert(
+			scope.clone(),
+			SessionSlot::Closed {
+				ticket: ticket.unwrap_or(0),
+			},
+		);
+		if let Some(resources) = resources {
+			// Mutually exclusive with supervisor creation under the same slot lock.
+			let supervisor = {
+				let mut slot = resources
+					.supervisor
+					.lock()
+					.unwrap_or_else(|poison| poison.into_inner());
+				slot.closed = true;
+				slot.value.take()
+			};
+			let session = Arc::clone(&resources.tools);
+			let handle = self.runtime.handle().clone();
+			// Supervisor cancellation and session release are both owned by this
+			// published handle; the global latch joins it, so it cannot finish while
+			// either is still running.
+			let teardown = std::thread::spawn(move || {
+				if let Some(supervisor) = supervisor {
+					supervisor.shutdown();
+				}
+				handle.block_on(shutdown_session(session));
+			});
+			lifecycle.closing.retain(|handle| !handle.is_finished());
+			lifecycle.closing.push(teardown);
+		}
+		ticket
+	}
+
+	/// Close one session scope from a host hook. The selector is the same
+	/// `session_id`/`session_file` pair the run used, so an ACP store id and an
+	/// RPC store id resolve identically. No other scope is touched. The returned
+	/// ticket is the ownership proof for a later `release_scope_ticket`; `None`
+	/// means the global ticket space is exhausted (permanent tombstone).
+	pub fn close_session_scope(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) -> Option<u64> {
+		self.close_scope(&session_scope(session_id, session_file))
+	}
+
+	/// Release a tombstone only when the caller still owns the exact close it
+	/// observed. Never removes `Open`, never matches another generation, and is
+	/// a no-op during shutdown. Fast and allocation-free: host Drops may call it
+	/// on a Tokio worker.
+	pub fn release_scope_ticket(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+		ticket: u64,
+	) {
+		if ticket == 0 {
+			return;
+		}
+		let scope = session_scope(session_id, session_file);
+		let mut lifecycle = self
+			.lifecycle
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		if lifecycle.shutting_down {
+			return;
+		}
+		let owned = matches!(
+			lifecycle.slots.get(&scope),
+			Some(SessionSlot::Closed { ticket: stored }) if *stored == ticket
+		);
+		if owned {
+			lifecycle.slots.remove(&scope);
+		}
+	}
+
+	/// Clear a closed tombstone for a host-authorized fresh open (RPC
+	/// switch/new target, ACP new/load/resume/fork). Refused after shutdown.
+	pub fn reopen_session_scope(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) {
+		let scope = session_scope(session_id, session_file);
+		let mut lifecycle = self
+			.lifecycle
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		if lifecycle.shutting_down {
+			return;
+		}
+		if matches!(
+			lifecycle.slots.get(&scope),
+			Some(SessionSlot::Closed { .. }) | None
+		) {
+			lifecycle.slots.remove(&scope);
+		}
 	}
 }
 
 impl PiAgentRunner {
-	/// Release everything this runner keeps alive across turns: the in-memory
-	/// supervisor, eval kernels and loopback bridge, the LSP ownership scope and
-	/// the root debug tree.
+	/// Release everything this runner keeps alive across turns: every session
+	/// scope's supervisor, eval kernels and loopback bridge, the LSP ownership
+	/// scope and the root debug tree.
 	///
 	/// Idempotent and coalesced: the first caller owns teardown, later callers
 	/// wait for its real completion (`ShutdownLatch`) instead of returning on
@@ -473,51 +705,67 @@ impl PiAgentRunner {
 			}
 			return;
 		}
-		// Background jobs hold `Arc<Supervisor>`, so the supervisor's own Drop
-		// cannot fire while they run. Shut it down here, before the `runtime`
-		// field is dropped, so queued reservations are cancelled and live child
-		// tasks get their cancellation token plus abort handle. The slot lock is
-		// released before any callback runs.
-		if let Some(supervisor) = self.take_supervisor() {
+		// One lifecycle lock owns scope state and teardown-handle publication.
+		// A close either publishes under this lock before the snapshot or finds
+		// `shutting_down`/an empty map and owns no resources, so the latch cannot
+		// finish ahead of a late close registration.
+		let (closing, sessions, supervisors) = {
+			let mut lifecycle = self
+				.lifecycle
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner());
+			lifecycle.shutting_down = true;
+			let closing = std::mem::take(&mut lifecycle.closing);
+			let slots = std::mem::take(&mut lifecycle.slots);
+			let mut sessions = Vec::new();
+			let mut supervisors = Vec::new();
+			for (_, slot) in slots {
+				let SessionSlot::Open(resources) = slot else {
+					continue;
+				};
+				let supervisor = {
+					let mut slot = resources
+						.supervisor
+						.lock()
+						.unwrap_or_else(|poison| poison.into_inner());
+					slot.closed = true;
+					slot.value.take()
+				};
+				if let Some(supervisor) = supervisor {
+					supervisors.push(supervisor);
+				}
+				sessions.push(Arc::clone(&resources.tools));
+			}
+			(closing, sessions, supervisors)
+		};
+		for supervisor in supervisors {
 			supervisor.shutdown();
 		}
-		// Kernels, the loopback bridge, LSP connections and the root debug tree
-		// live as long as the runner session. Shut them down explicitly while the
-		// Tokio runtime is still alive: LSP release is ownership-scoped, so a
-		// server another session still uses stays up, and DAP terminate sends
-		// `disconnect` before the adapter is killed.
-		let Some(session) = self.take_session() else {
+		// The plain teardown thread owns every published close handle and all
+		// remaining session releases, even when `sessions` is empty; `LatchFinish`
+		// runs only after both sets are done. Runtime callers never join a worker.
+		if closing.is_empty() && sessions.is_empty() {
 			self.shutdown_latch.finish();
 			return;
-		};
-		// Teardown always runs on a plain thread: `Runtime::block_on` panics in
-		// a runtime context, and `LatchFinish` closes the latch even if an
-		// adapter panics, so a waiting caller sees completion either way.
+		}
 		let handle = self.runtime.handle().clone();
 		let latch = Arc::clone(&self.shutdown_latch);
 		let teardown = std::thread::spawn(move || {
 			let _finish = LatchFinish(latch);
-			handle.block_on(shutdown_session(session));
+			for scoped in closing {
+				let _ = scoped.join();
+			}
+			if !sessions.is_empty() {
+				handle.block_on(async move {
+					for session in sessions {
+						shutdown_session(session).await;
+					}
+				});
+			}
 		});
 		if tokio::runtime::Handle::try_current().is_err() {
 			let _ = teardown.join();
 		}
-	}
-
-	fn take_supervisor(&self) -> Option<Arc<Supervisor>> {
-		self
-			.supervisor
-			.lock()
-			.unwrap_or_else(|poison| poison.into_inner())
-			.take()
-	}
-
-	fn take_session(&self) -> Option<Arc<RunnerSession>> {
-		self
-			.session
-			.lock()
-			.unwrap_or_else(|poison| poison.into_inner())
-			.take()
 	}
 }
 
@@ -670,6 +918,31 @@ pub fn reserved_tool_names() -> Vec<String> {
 impl AgentRunner for Arc<PiAgentRunner> {
 	fn run(&self, request: &RunRequest) -> Result<EventStream> {
 		<PiAgentRunner as AgentRunner>::run(self, request)
+	}
+
+	fn close_session(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) -> Option<u64> {
+		self.close_session_scope(session_id, session_file)
+	}
+
+	fn release_session_scope(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+		ticket: u64,
+	) {
+		self.release_scope_ticket(session_id, session_file, ticket);
+	}
+
+	fn reopen_session(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) {
+		self.reopen_session_scope(session_id, session_file);
 	}
 }
 
@@ -836,6 +1109,31 @@ impl TimerGuard {
 }
 
 impl AgentRunner for PiAgentRunner {
+	fn close_session(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) -> Option<u64> {
+		self.close_session_scope(session_id, session_file)
+	}
+
+	fn release_session_scope(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+		ticket: u64,
+	) {
+		self.release_scope_ticket(session_id, session_file, ticket);
+	}
+
+	fn reopen_session(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) {
+		self.reopen_session_scope(session_id, session_file);
+	}
+
 	fn run(&self, request: &RunRequest) -> Result<EventStream> {
 		let cancellation_token = request.cancellation_token.clone().unwrap_or_default();
 		let timed_out = Arc::new(AtomicBool::new(false));
@@ -920,7 +1218,11 @@ impl AgentRunner for PiAgentRunner {
 		let active_model = format!("{}/{}", plan.provider, plan.model);
 		let resolved_display =
 			display_resolver.resolve(Some(&active_model), plan.tools.contains(&"edit"));
-		let session = self.session_tools(edit_options, resolved_display.edit_tool);
+		let scope = session_scope(request.session_id.as_deref(), request.session_file.as_deref());
+		let resources = self
+			.session_tools(&scope, edit_options, resolved_display.edit_tool)
+			.ok_or_else(|| Error::new("session scope is closed"))?;
+		let session = Arc::clone(&resources.tools);
 		session.set_session_identity(
 			request.session_id.as_deref(),
 			request.session_file.as_deref(),
@@ -1043,10 +1345,13 @@ impl AgentRunner for PiAgentRunner {
 			|| plan.tools.iter().any(|tool| *tool == "bash"))
 			.then(|| self.process_backend(&request.cwd));
 		let mut registry = if allow_task || allow_hub {
-			let mut slot = self.supervisor.lock().map_err(|_| {
+			let mut slot = resources.supervisor.lock().map_err(|_| {
 				Error::new("delegation supervisor lock poisoned")
 			})?;
-			let supervisor = match slot.as_ref() {
+			if slot.closed {
+				return Err(Error::new("session scope is closed"));
+			}
+			let supervisor = match slot.value.as_ref() {
 				Some(supervisor) => {
 					supervisor.rebind(
 						base_registry,
@@ -1067,7 +1372,7 @@ impl AgentRunner for PiAgentRunner {
 						allow_task,
 						allow_hub,
 					);
-					*slot = Some(Arc::clone(&supervisor));
+					slot.value = Some(Arc::clone(&supervisor));
 					supervisor
 				},
 			};
@@ -1611,6 +1916,62 @@ impl Iterator for BoundedEventStream {
 		}
 	}
 }
+/// One root candidate: provider/model/effort plus the provider connection and
+/// its required base URL. Pure selector logic shared by every candidate.
+fn root_candidate(
+	request: &RunRequest,
+	pattern: &str,
+) -> std::result::Result<
+	(
+		String,
+		String,
+		Option<String>,
+		Option<crate::config::ProviderConfig>,
+		String,
+	),
+	String,
+> {
+	let (provider, model, effort) = match request.provider.as_deref() {
+		Some(provider) => {
+			let prefix = format!("{provider}/");
+			let raw = pattern.strip_prefix(prefix.as_str()).unwrap_or(pattern);
+			let (id, parsed) = split_effort(raw);
+			(provider.to_string(), id.to_string(), parsed.map(str::to_string))
+		},
+		None => match pattern.split_once('/') {
+			Some((provider, id)) if !provider.is_empty() && !id.is_empty() => {
+				let (id, parsed) = split_effort(id);
+				(provider.to_string(), id.to_string(), parsed.map(str::to_string))
+			},
+			_ => {
+				let (id, parsed) = split_effort(pattern);
+				let provider = request.catalog.provider_of(id).map(str::to_string).ok_or_else(
+					|| {
+						format!(
+							"no provider for model `{id}`: pass --provider or use `provider/{id}`"
+						)
+					},
+				)?;
+				(provider, id.to_string(), parsed.map(str::to_string))
+			},
+		},
+	};
+	// Connection block: config.yml first, then models.yml providers.<id>.
+	let connection = request
+		.config
+		.providers
+		.get(&provider)
+		.cloned()
+		.or_else(|| request.catalog.connections.get(&provider).cloned());
+	let base_url = connection
+		.as_ref()
+		.and_then(|connection| connection.base_url.clone())
+		.ok_or_else(|| {
+			format!("provider `{provider}` has no baseUrl in config.yml or models.yml")
+		})?;
+	Ok((provider, model, effort, connection, base_url))
+}
+
 
 /// Provider/model/budget resolution from a [`RunRequest`].
 struct RunPlan {
@@ -1642,54 +2003,28 @@ impl RunPlan {
 			.model
 			.clone()
 			.ok_or_else(|| Error::new("no model: pass --model or set defaultModel in config"))?;
-		// `provider/id` (first segment is the provider, as in TS model roles),
-		// `provider/id:effort`, or a bare id resolved through the catalog.
-		let effort: Option<&str>;
-		let (provider, model) = match request.provider.as_deref() {
-			Some(provider) => {
-				let prefix = format!("{provider}/");
-				let raw = requested
-					.strip_prefix(prefix.as_str())
-					.unwrap_or(&requested);
-				let (id, parsed) = split_effort(raw);
-				effort = parsed;
-				(provider.to_string(), id.to_string())
-			},
-			None => match requested.split_once('/') {
-				Some((provider, id)) if !provider.is_empty() && !id.is_empty() => {
-					let (id, parsed) = split_effort(id);
-					effort = parsed;
-					(provider.to_string(), id.to_string())
-				},
-				_ => {
-					let (id, parsed) = split_effort(&requested);
-					effort = parsed;
-					let provider = request
-						.catalog
-						.provider_of(id)
-						.map(str::to_string)
-						.ok_or_else(|| {
-							Error::new(format!(
-								"no provider for model `{id}`: pass --provider or use `provider/{id}`"
-							))
-						})?;
-					(provider, id.to_string())
-				},
-			},
+		// Alias expansion is root-only and only when the CLI did not pin a
+		// provider (TS `model-resolver.ts:1902-1955`); a pinned provider keeps the
+		// plain `provider/id` path. Candidates are tried in order, like the child
+		// factory, so `@role` chains pick the first usable provider.
+		let candidates = match request.provider.as_deref() {
+			Some(_) => vec![requested.clone()],
+			None => model_patterns(&request.config, &requested, None).map_err(Error::new)?,
 		};
-		// Connection block: config.yml first, then models.yml providers.<id>.
-		let connection = request
-			.config
-			.providers
-			.get(&provider)
-			.cloned()
-			.or_else(|| request.catalog.connections.get(&provider).cloned());
-		let base_url = connection
-			.as_ref()
-			.and_then(|connection| connection.base_url.clone())
-			.ok_or_else(|| {
-				Error::new(format!("provider `{provider}` has no baseUrl in config.yml or models.yml"))
-			})?;
+		let mut last_error = None;
+		let mut selected = None;
+		for pattern in &candidates {
+			match root_candidate(request, pattern) {
+				Ok(candidate) => {
+					selected = Some(candidate);
+					break;
+				},
+				Err(error) => last_error = Some(error),
+			}
+		}
+		let (provider, model, effort, connection, base_url) = selected.ok_or_else(|| {
+			Error::new(last_error.unwrap_or_else(|| format!("no model candidate for `{requested}`")))
+		})?;
 		// A keyless provider (local gateway, `auth: none`) is legal: the OpenAI
 		// client sends an empty bearer token.
 		//
@@ -1757,7 +2092,7 @@ impl RunPlan {
 			api,
 			provider,
 			model,
-			effort: effort.map(str::to_string),
+			effort,
 			max_turns: request.max_turns.max(1),
 			context_limit,
 			system_prompt: compose_system_prompt(request),
@@ -1800,171 +2135,7 @@ impl CliChildModelFactory {
 	/// comma lists, thinking suffixes, configured values, default inheritance for
 	/// smol/slow/designer, and the bundled `priority.json` chains.
 	fn patterns_for(&self, raw: &str) -> std::result::Result<Vec<String>, String> {
-		let raw = raw.trim();
-		if raw.is_empty() {
-			return Err("empty model pattern".to_string());
-		}
-		let Some((role, suffix)) = role_alias(raw, &self.config.model_roles) else {
-			return Ok(vec![raw.to_string()]);
-		};
-		let mut visited = HashSet::new();
-		let mut patterns = self.role_patterns(&role, &mut visited)?;
-		if patterns.is_empty() {
-			patterns = self.default_patterns();
-		} else if let Some(level) = suffix {
-			patterns = patterns
-				.into_iter()
-				.map(|pattern| format!("{pattern}:{level}"))
-				.collect();
-		}
-		if patterns.is_empty() {
-			return Err(format!(
-				"model role '@{role}' has no resolvable model and no default model is set"
-			));
-		}
-		Ok(patterns)
-	}
-
-	fn default_patterns(&self) -> Vec<String> {
-		for candidate in [
-			self.default_model.as_deref(),
-			self.config.default_model.as_deref(),
-		] {
-			let Some(candidate) = candidate.map(str::trim).filter(|value| !value.is_empty()) else {
-				continue;
-			};
-			if let Some((role, suffix)) = role_alias(candidate, &self.config.model_roles) {
-				let mut visited = HashSet::new();
-				if let Ok(mut patterns) = self.role_patterns(&role, &mut visited) {
-					if let Some(level) = suffix {
-						patterns = patterns
-							.into_iter()
-							.map(|pattern| format!("{pattern}:{level}"))
-							.collect();
-					}
-					if !patterns.is_empty() {
-						return patterns;
-					}
-				}
-				// An alias that expands to nothing must not be returned as a
-				// literal model id; try the next fallback candidate.
-				continue;
-			}
-			let patterns = split_pattern_list(candidate);
-			if !patterns.is_empty() {
-				return patterns;
-			}
-		}
-		Vec::new()
-	}
-
-	fn role_patterns(
-		&self,
-		role: &str,
-		visited: &mut HashSet<String>,
-	) -> std::result::Result<Vec<String>, String> {
-		if !visited.insert(role.to_string()) {
-			return Err(format!("model role cycle while resolving '@{role}'"));
-		}
-		let configured = self
-			.config
-			.model_roles
-			.get(role)
-			.map(|value| value.trim())
-			.filter(|value| !value.is_empty())
-			.map(str::to_string);
-		let mut patterns = if let Some(configured) = configured {
-			split_pattern_list(&configured)
-		} else if should_inherit_default(role) {
-			match self
-				.config
-				.model_roles
-				.get("default")
-				.map(|value| value.trim())
-				.filter(|value| !value.is_empty())
-			{
-				Some(default) => self.inherited_default(role, default, visited)?,
-				None => self.priority(role),
-			}
-		} else {
-			self.priority(role)
-		};
-		if patterns.is_empty() {
-			patterns = self.priority(role);
-		}
-
-		let mut resolved = Vec::new();
-		for pattern in patterns {
-			if let Some((alias, suffix)) = role_alias(&pattern, &self.config.model_roles) {
-				let mut branch = visited.clone();
-				if let Ok(mut nested) = self.role_patterns(&alias, &mut branch) {
-					if !nested.is_empty() {
-						if let Some(level) = suffix {
-							nested = nested
-								.into_iter()
-								.map(|pattern| format!("{pattern}:{level}"))
-								.collect();
-						}
-						resolved.extend(nested);
-						continue;
-					}
-				}
-			}
-			resolved.push(pattern);
-		}
-		Ok(resolved)
-	}
-
-	fn inherited_default(
-		&self,
-		role: &str,
-		default_value: &str,
-		visited: &HashSet<String>,
-	) -> std::result::Result<Vec<String>, String> {
-		let mut resolved = Vec::new();
-		for pattern in split_pattern_list(default_value) {
-			let (base, level) = split_thinking(&pattern, 0);
-			if let Some((alias, _)) = role_alias(base, &self.config.model_roles) {
-				if alias == role {
-					// `modelRoles.default = "@smol"` must not loop back.
-					let defaults = self.priority(role);
-					resolved.extend(defaults.into_iter().map(|default| match level {
-						Some(level) => format!("{default}:{level}"),
-						None => default,
-					}));
-					continue;
-				}
-				if !visited.contains(&alias) {
-					let mut branch = visited.clone();
-					if let Ok(nested) = self.role_patterns(&alias, &mut branch) {
-						if !nested.is_empty() {
-							resolved.extend(nested);
-							continue;
-						}
-					}
-				}
-			}
-			resolved.push(pattern);
-		}
-		Ok(resolved)
-	}
-
-	fn priority(&self, role: &str) -> Vec<String> {
-		let key = match role {
-			"advisor" => "slow",
-			"tiny" => "smol",
-			other => other,
-		};
-		priority_json()
-			.get(key)
-			.and_then(serde_json::Value::as_array)
-			.map(|patterns| {
-				patterns
-					.iter()
-					.filter_map(|pattern| pattern.as_str().map(str::to_string))
-					.collect()
-			})
-			.unwrap_or_default()
+		model_patterns(&self.config, raw, self.default_model.as_deref())
 	}
 
 	fn locate(
@@ -2116,6 +2287,178 @@ impl ChildModelFactory for CliChildModelFactory {
 	}
 }
 
+/// Resolve a CLI/agent model pattern to an ordered candidate list using the
+/// same role rules as `model-resolver.ts`: `@role`, `pi/role`, `*` aliases,
+/// comma lists, thinking suffixes, configured values, default inheritance for
+/// smol/slow/designer, and the bundled `priority.json` chains. Pure: no
+/// catalog, credential or session state.
+fn model_patterns(
+	config: &crate::config::Config,
+	raw: &str,
+	default_model: Option<&str>,
+) -> std::result::Result<Vec<String>, String> {
+	let raw = raw.trim();
+	if raw.is_empty() {
+		return Err("empty model pattern".to_string());
+	}
+	let Some((role, suffix)) = role_alias(raw, &config.model_roles) else {
+		return Ok(vec![raw.to_string()]);
+	};
+	let mut visited = HashSet::new();
+	let mut patterns = role_patterns(config, &role, &mut visited)?;
+	if patterns.is_empty() {
+		patterns = default_patterns(config, default_model);
+	} else if let Some(level) = suffix {
+		patterns = patterns
+			.into_iter()
+			.map(|pattern| format!("{pattern}:{level}"))
+			.collect();
+	}
+	if patterns.is_empty() {
+		return Err(format!(
+			"model role '@{role}' has no resolvable model and no default model is set"
+		));
+	}
+	Ok(patterns)
+}
+
+fn default_patterns(config: &crate::config::Config, default_model: Option<&str>) -> Vec<String> {
+	for candidate in [default_model, config.default_model.as_deref()] {
+		let Some(candidate) = candidate.map(str::trim).filter(|value| !value.is_empty()) else {
+			continue;
+		};
+		if let Some((role, suffix)) = role_alias(candidate, &config.model_roles) {
+			let mut visited = HashSet::new();
+			if let Ok(mut patterns) = role_patterns(config, &role, &mut visited) {
+				if let Some(level) = suffix {
+					patterns = patterns
+						.into_iter()
+						.map(|pattern| format!("{pattern}:{level}"))
+						.collect();
+				}
+				if !patterns.is_empty() {
+					return patterns;
+				}
+			}
+			// An alias that expands to nothing must not be returned as a
+			// literal model id; try the next fallback candidate.
+			continue;
+		}
+		let patterns = split_pattern_list(candidate);
+		if !patterns.is_empty() {
+			return patterns;
+		}
+	}
+	Vec::new()
+}
+
+fn role_patterns(
+	config: &crate::config::Config,
+	role: &str,
+	visited: &mut HashSet<String>,
+) -> std::result::Result<Vec<String>, String> {
+	if !visited.insert(role.to_string()) {
+		return Err(format!("model role cycle while resolving '@{role}'"));
+	}
+	let configured = config
+		.model_roles
+		.get(role)
+		.map(|value| value.trim())
+		.filter(|value| !value.is_empty())
+		.map(str::to_string);
+	let mut patterns = if let Some(configured) = configured {
+		split_pattern_list(&configured)
+	} else if should_inherit_default(role) {
+		match config
+			.model_roles
+			.get("default")
+			.map(|value| value.trim())
+			.filter(|value| !value.is_empty())
+		{
+			Some(default) => inherited_default(config, role, default, visited)?,
+			None => priority(role),
+		}
+	} else {
+		priority(role)
+	};
+	if patterns.is_empty() {
+		patterns = priority(role);
+	}
+
+	let mut resolved = Vec::new();
+	for pattern in patterns {
+		if let Some((alias, suffix)) = role_alias(&pattern, &config.model_roles) {
+			let mut branch = visited.clone();
+			if let Ok(mut nested) = role_patterns(config, &alias, &mut branch) {
+				if !nested.is_empty() {
+					if let Some(level) = suffix {
+						nested = nested
+							.into_iter()
+							.map(|pattern| format!("{pattern}:{level}"))
+							.collect();
+					}
+					resolved.extend(nested);
+					continue;
+				}
+			}
+		}
+		resolved.push(pattern);
+	}
+	Ok(resolved)
+}
+
+fn inherited_default(
+	config: &crate::config::Config,
+	role: &str,
+	default_value: &str,
+	visited: &HashSet<String>,
+) -> std::result::Result<Vec<String>, String> {
+	let mut resolved = Vec::new();
+	for pattern in split_pattern_list(default_value) {
+		let (base, level) = split_thinking(&pattern, 0);
+		if let Some((alias, _)) = role_alias(base, &config.model_roles) {
+			if alias == role {
+				// `modelRoles.default = "@smol"` must not loop back.
+				let defaults = priority(role);
+				resolved.extend(defaults.into_iter().map(|default| match level {
+					Some(level) => format!("{default}:{level}"),
+					None => default,
+				}));
+				continue;
+			}
+			if !visited.contains(&alias) {
+				let mut branch = visited.clone();
+				if let Ok(nested) = role_patterns(config, &alias, &mut branch) {
+					if !nested.is_empty() {
+						resolved.extend(nested);
+						continue;
+					}
+				}
+			}
+		}
+		resolved.push(pattern);
+	}
+	Ok(resolved)
+}
+
+fn priority(role: &str) -> Vec<String> {
+	let key = match role {
+		"advisor" => "slow",
+		"tiny" => "smol",
+		other => other,
+	};
+	priority_json()
+		.get(key)
+		.and_then(serde_json::Value::as_array)
+		.map(|patterns| {
+			patterns
+				.iter()
+				.filter_map(|pattern| pattern.as_str().map(str::to_string))
+				.collect()
+		})
+		.unwrap_or_default()
+}
+
 /// Role ids from `model-roles.ts`; configured custom roles are also accepted.
 const MODEL_ROLE_IDS: [&str; 10] = [
 	"default", "smol", "slow", "vision", "plan", "designer", "commit", "tiny", "task", "advisor",
@@ -2168,7 +2511,17 @@ fn role_alias(
 	} else if value.starts_with("pi/") {
 		3
 	} else {
-		return None;
+		// Bare configured role (`--model slow`), matching TS's
+		// `getModelRole(bareRoleName) !== undefined` branch: only an explicitly
+		// configured, non-empty role key is an alias; everything else stays a
+		// literal model id. Thinking suffixes are split first.
+		let (base, suffix) = split_thinking(value, -1);
+		let configured_role =
+			configured.get(base).is_some_and(|role| !role.trim().is_empty());
+		if !configured_role {
+			return None;
+		}
+		return Some((base.to_string(), suffix));
 	};
 	let (base, suffix) = split_thinking(value, prefix_len as isize);
 	let candidate = if base == "*" {
@@ -5305,7 +5658,12 @@ mod tests {
 		runner.runtime.block_on(async {
 		// Turn 1: read mints the tag, `CUT` parks line 2 in a named register.
 		std::fs::write(dir.join("note.txt"), "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n").expect("write");
-		let session = runner.session_tools(plain, EditMode::Hashline);
+		let session = Arc::clone(
+			&runner
+				.session_tools(&SessionScope::Anonymous, plain, EditMode::Hashline)
+				.expect("open scope")
+				.tools,
+		);
 		let turn1 = build(&session, plain);
 		let read = execute(&turn1, "read", serde_json::json!({ "path": "note.txt" }), &ctx).await;
 		assert!(!read.is_error, "{}", read.content);
@@ -5354,7 +5712,12 @@ mod tests {
 		std::fs::write(dir.join("other.txt"), "o1\no2\no3\no4\no5\no6\no7\no8\no9\no10\n")
 			.expect("write");
 		let guarded = EditToolOptions { enforce_seen_lines: true };
-		let session = runner.session_tools(guarded, EditMode::Hashline);
+		let session = Arc::clone(
+			&runner
+				.session_tools(&SessionScope::Anonymous, guarded, EditMode::Hashline)
+				.expect("open scope")
+				.tools,
+		);
 		let turn4 = build(&session, guarded);
 		let read = execute(&turn4, "read", serde_json::json!({ "path": "other.txt:1-4" }), &ctx).await;
 		let header = read.content.lines().next().expect("header").to_string();
@@ -5467,7 +5830,12 @@ mod tests {
 		runner.runtime.block_on(async {
 			// Prompt 1 stages the action under the session store; prompt 2 runs
 			// against a rebuilt registry and must still see it.
-			let session = runner.session_tools(options, EditMode::Hashline);
+			let session = Arc::clone(
+				&runner
+					.session_tools(&SessionScope::Anonymous, options, EditMode::Hashline)
+					.expect("open scope")
+					.tools,
+			);
 			let _turn1 = build(Some(&session));
 			session.pending.register(Arc::new(Stage { path: target.clone(), calls: calls.clone() }));
 			let turn2 = build(Some(&session));
@@ -6144,6 +6512,135 @@ mod process_scope_tests {
 		// Closed latch: later callers return at once and elect nobody.
 		latch.wait();
 		assert!(!latch.begin());
+	}
+
+	/// Scopes key on the run's session identity and closing one leaves the
+	/// other's tools/supervisor slot untouched; the anonymous fallback is a
+	/// single bucket.
+	#[test]
+	fn session_scopes_are_isolated_and_close_only_its_own_resources() {
+		let path = PathBuf::from("/tmp/session-a.jsonl");
+		assert_eq!(
+			session_scope(Some("sid-a"), Some(&path)),
+			SessionScope::Session("sid-a".to_string())
+		);
+		assert_eq!(session_scope(None, Some(&path)), SessionScope::File(path));
+		assert_eq!(session_scope(None, None), SessionScope::Anonymous);
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let options = EditToolOptions::default();
+		let a = runner
+			.session_tools(
+				&SessionScope::Session("sid-a".to_string()),
+				options,
+				EditMode::Hashline,
+			)
+			.expect("open A");
+		let b = runner
+			.session_tools(
+				&SessionScope::Session("sid-b".to_string()),
+				options,
+				EditMode::Hashline,
+			)
+			.expect("open B");
+		assert!(
+			!Arc::ptr_eq(&a.tools, &b.tools),
+			"distinct scopes must not share a RunnerSession"
+		);
+
+		let t1 = runner
+			.close_session_scope(Some("sid-a"), None)
+			.expect("first close ticket");
+		let b_again = runner
+			.session_tools(
+				&SessionScope::Session("sid-b".to_string()),
+				options,
+				EditMode::Hashline,
+			)
+			.expect("B stays open");
+		assert!(
+			Arc::ptr_eq(&b.tools, &b_again.tools),
+			"closing one scope must preserve another session's tools"
+		);
+		assert!(
+			runner
+				.session_tools(
+					&SessionScope::Session("sid-a".to_string()),
+					options,
+					EditMode::Hashline,
+				)
+				.is_none(),
+			"a closed identity must stay tombstoned"
+		);
+
+		runner.reopen_session_scope(Some("sid-a"), None);
+		let a_again = runner
+			.session_tools(
+				&SessionScope::Session("sid-a".to_string()),
+				options,
+				EditMode::Hashline,
+			)
+			.expect("explicit reopen");
+		assert!(
+			!Arc::ptr_eq(&a.tools, &a_again.tools),
+			"an explicitly reopened scope gets fresh resources"
+		);
+
+		let t2 = runner
+			.close_session_scope(Some("sid-a"), None)
+			.expect("second close ticket");
+		assert_ne!(t1, t2, "each close owns a distinct generation ticket");
+		runner.release_scope_ticket(Some("sid-a"), None, t1);
+		assert!(
+			runner
+				.session_tools(
+					&SessionScope::Session("sid-a".to_string()),
+					options,
+					EditMode::Hashline,
+				)
+				.is_none(),
+			"an old ticket must not release a newer closed generation"
+		);
+		runner.release_scope_ticket(Some("sid-a"), None, t2);
+		assert!(
+			runner
+				.session_tools(
+					&SessionScope::Session("sid-a".to_string()),
+					options,
+					EditMode::Hashline,
+				)
+				.is_some(),
+			"the owning ticket releases the tombstone"
+		);
+	}
+
+	#[test]
+	fn shutdown_latch_waits_for_published_scoped_teardown() {
+		let runner = PiAgentRunner::new().expect("runner");
+		let finished = Arc::new(AtomicBool::new(false));
+		let flag = Arc::clone(&finished);
+		// One touched scope: the close-published handle owns its teardown.
+		let scoped = std::thread::spawn(move || {
+			std::thread::sleep(std::time::Duration::from_millis(150));
+			flag.store(true, Ordering::SeqCst);
+		});
+		runner
+			.lifecycle
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.closing
+			.push(scoped);
+
+		// Runtime-initiated shutdown: the caller must not join a worker, yet the
+		// latch may only close after the published scoped teardown is joined.
+		runner.runtime.block_on(async {
+			runner.shutdown();
+			runner.shutdown_latch.wait();
+			assert!(
+				finished.load(Ordering::SeqCst),
+				"latch finished before the published scoped teardown was joined"
+			);
+		});
 	}
 
 }

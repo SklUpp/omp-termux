@@ -19,8 +19,8 @@ use super::{
 	capabilities,
 	protocol::{self, ClientCapabilities, INTERNAL_ERROR, RequestError},
 	session::{
-		AcpRecipe, AcpRuntime, AcpSession, SessionManager, absolute_cwd, extensions_payload,
-		list_payload, usage_payload,
+		AcpRecipe, AcpRuntime, AcpSession, ReserveOpen, SessionManager, absolute_cwd,
+		extensions_payload, list_payload, usage_payload,
 	},
 	session_list,
 	transport::{Dispatcher, Transport},
@@ -111,8 +111,16 @@ impl AcpAgent {
 				let cwd = absolute_cwd(cwd)?;
 				let mcp = mcp_servers(params)?;
 				let session = self.runtime().new_session(cwd, &self.caps(), mcp)?;
+				let id = session.id().to_string();
 				let response = session.protocol_response();
-				self.manager.insert(Arc::clone(&session));
+				if let Err(session) = self.manager.insert(Arc::clone(&session)) {
+					let _ = session.close("session/new collision");
+					session.close_runner_scope();
+					return Err(RequestError::new(
+						INTERNAL_ERROR,
+						format!("ACP session already exists: {id}"),
+					));
+				}
 				session.schedule_bootstrap();
 				Ok(response)
 			},
@@ -120,8 +128,8 @@ impl AcpAgent {
 				let id = session_id(params)?;
 				let cwd = absolute_cwd(cwd_param(params)?)?;
 				let mcp = mcp_servers(params)?;
-				let session = match self.manager.get(&id) {
-					Some(session) => {
+				let session = match self.manager.reserve(&id)? {
+					ReserveOpen::Live(session) => {
 						if session.cwd() != cwd.as_path() {
 							return Err(RequestError::new(
 								INTERNAL_ERROR,
@@ -135,10 +143,30 @@ impl AcpAgent {
 						session.set_mcp_servers(mcp);
 						session
 					},
-					None => {
-						let session = self.runtime().load_session(&id, cwd, &self.caps(), mcp)?;
-						self.manager.insert(Arc::clone(&session));
-						session
+					ReserveOpen::Reserved(reservation) => {
+						let session = match self
+							.runtime()
+							.load_session(&id, cwd, &self.caps(), mcp)
+						{
+							Ok(session) => session,
+							Err(error) => {
+								drop(reservation);
+								return Err(error);
+							},
+						};
+						match self.manager.commit(reservation, session) {
+							Ok(session) => session,
+							Err((session, reservation)) => {
+								let _ = session.close("session/load cancelled");
+								session.close_runner_scope();
+								drop(session);
+								drop(reservation);
+								return Err(RequestError::session_busy(
+									format!("ACP session {id} was closed while loading"),
+									Some(json!({ "reason": "session_busy" })),
+								));
+							},
+						}
 					},
 				};
 				session.replay_history();
@@ -165,8 +193,8 @@ impl AcpAgent {
 				let id = session_id(params)?;
 				let cwd = absolute_cwd(cwd_param(params)?)?;
 				let mcp = mcp_servers(params)?;
-				let session = match self.manager.get(&id) {
-					Some(session) => {
+				let session = match self.manager.reserve(&id)? {
+					ReserveOpen::Live(session) => {
 						if session.cwd() != cwd.as_path() {
 							return Err(RequestError::new(
 								INTERNAL_ERROR,
@@ -180,10 +208,30 @@ impl AcpAgent {
 						session.set_mcp_servers(mcp);
 						session
 					},
-					None => {
-						let session = self.runtime().load_session(&id, cwd, &self.caps(), mcp)?;
-						self.manager.insert(Arc::clone(&session));
-						session
+					ReserveOpen::Reserved(reservation) => {
+						let session = match self
+							.runtime()
+							.load_session(&id, cwd, &self.caps(), mcp)
+						{
+							Ok(session) => session,
+							Err(error) => {
+								drop(reservation);
+								return Err(error);
+							},
+						};
+						match self.manager.commit(reservation, session) {
+							Ok(session) => session,
+							Err((session, reservation)) => {
+								let _ = session.close("session/load cancelled");
+								session.close_runner_scope();
+								drop(session);
+								drop(reservation);
+								return Err(RequestError::session_busy(
+									format!("ACP session {id} was closed while loading"),
+									Some(json!({ "reason": "session_busy" })),
+								));
+							},
+						}
 					},
 				};
 				let response = json!({
@@ -197,27 +245,65 @@ impl AcpAgent {
 				let id = session_id(params)?;
 				let cwd = absolute_cwd(cwd_param(params)?)?;
 				let mcp = mcp_servers(params)?;
-				let source = match self.manager.get(&id) {
-					Some(session) => session,
-					None => {
-						let session =
-							self.runtime().load_session(&id, cwd.clone(), &self.caps(), mcp.clone())?;
-						session
+				let (source, reservation) = match self.manager.reserve(&id)? {
+					ReserveOpen::Live(session) => (session, None),
+					ReserveOpen::Reserved(reservation) => {
+						let session = match self
+							.runtime()
+							.load_session(&id, cwd.clone(), &self.caps(), mcp.clone())
+						{
+							Ok(session) => session,
+							Err(error) => {
+								drop(reservation);
+								return Err(error);
+							},
+						};
+						(session, Some(reservation))
 					},
 				};
 				if source.is_prompt_in_flight() {
+					if reservation.is_some() {
+						source.close_runner_scope();
+					}
+					drop(source);
+					drop(reservation);
 					return Err(RequestError::new(
 						INTERNAL_ERROR,
 						format!("ACP session fork is unavailable while a prompt is in progress: {id}"),
 					));
 				}
-				let forked = self.runtime().fork_session(&source, cwd, &self.caps(), mcp)?;
+				let forked = match self.runtime().fork_session(&source, cwd, &self.caps(), mcp) {
+					Ok(forked) => forked,
+					Err(error) => {
+						if reservation.is_some() {
+							source.close_runner_scope();
+						}
+						drop(source);
+						drop(reservation);
+						return Err(error);
+					},
+				};
+				// Release the temporary source open (and its reservation) before
+				// returning the forked session.
+				if reservation.is_some() {
+					source.close_runner_scope();
+				}
+				drop(source);
+				drop(reservation);
+				let forked_id = forked.id().to_string();
 				let response = json!({
 					"sessionId": forked.id(),
 					"configOptions": forked.config_options(),
 					"modes": forked.mode_state(),
 				});
-				self.manager.insert(Arc::clone(&forked));
+				if let Err(forked) = self.manager.insert(Arc::clone(&forked)) {
+					let _ = forked.close("session/fork collision");
+					forked.close_runner_scope();
+					return Err(RequestError::new(
+						INTERNAL_ERROR,
+						format!("ACP session already exists: {forked_id}"),
+					));
+				}
 				forked.schedule_bootstrap();
 				Ok(response)
 			},
