@@ -142,8 +142,8 @@ export interface IsolationContext {
  * the error as a task-tool failure. Each spawn captures its own baseline from
  * its isolation copy (see {@link captureIsolationBaseline}).
  */
-export async function prepareIsolationContext(cwd: string): Promise<IsolationContext> {
-	return { repoRoot: await getRepoRoot(cwd) };
+export async function prepareIsolationContext(cwd: string, explicitRepoRoot?: string): Promise<IsolationContext> {
+	return { repoRoot: await getRepoRoot(cwd, explicitRepoRoot) };
 }
 
 /** Fingerprint of a captured delta, used to skip re-committing an unchanged workspace on release. */
