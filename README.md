@@ -16,13 +16,11 @@ sh "$PREFIX/tmp/omp-install.sh"
 omp --version
 ```
 
-Минимальная установка без Chromium: `OMP_INSTALL_BROWSER=0 sh "$PREFIX/tmp/omp-install.sh"`. По умолчанию доустанавливаются `x11-repo` и `chromium` для инструмента `browser`.
-
 Установка: `$PREFIX/lib/omp-termux`, launcher: `$PREFIX/bin/omp`. Обновление и выбор версии — повторный запуск: `OMP_VERSION='<release-tag>' sh "$PREFIX/tmp/omp-install.sh"` (по умолчанию `latest`).
 
 ## Браузер (опционально)
 
-Chromium не входит в bundle: `pkg install -y x11-repo && pkg install -y chromium`. Проверки — [verification.md](android/docs/verification.md).
+Chromium не входит в bundle и по умолчанию не устанавливается. Включить инструмент `browser` вместе с `x11-repo` и `chromium`: `OMP_INSTALL_BROWSER=1 sh "$PREFIX/tmp/omp-install.sh"`. Проверки — [verification.md](android/docs/verification.md).
 
 ## Документация
 

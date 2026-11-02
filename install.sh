@@ -27,7 +27,7 @@ fi
 
 # Chromium stays outside OMP bundle. Install Termux:X11 package in separate
 # transactions so repository setup completes before Chromium resolution.
-if [ "${OMP_INSTALL_BROWSER:-1}" != "0" ]; then
+if [ "${OMP_INSTALL_BROWSER:-0}" = "1" ]; then
     pkg install -y x11-repo
     pkg install -y chromium
 fi
