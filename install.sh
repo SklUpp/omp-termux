@@ -10,7 +10,7 @@ unset LD_PRELOAD || true
 PREFIX_DIR="${PREFIX:-/data/data/com.termux/files/usr}"
 BIN_DIR="${OMP_BIN_DIR:-$PREFIX_DIR/bin}"
 LIB_DIR="${OMP_LIB_DIR:-$PREFIX_DIR/lib/omp-termux}"
-REPO="${OMP_REPO:-sasazemzulin058-debug/omp-termux}"
+REPO="${OMP_REPO:-SklUpp/omp-termux}"
 TAG="${OMP_VERSION:-latest}"
 BASE="https://github.com/$REPO/releases"
 [ "$TAG" = latest ] && BASE="$BASE/latest/download" || BASE="$BASE/download/$TAG"
@@ -159,7 +159,7 @@ rm -f "$BIN_DIR/omp"
 cat > "$BIN_DIR/omp" <<EOF
 #!/bin/sh
 PREFIX_DIR="\${PREFIX:-$PREFIX_DIR}"
-LIB_DIR="\$PREFIX_DIR/lib/omp-termux"
+LIB_DIR="\${OMP_LIB_DIR:-$LIB_DIR}"
 COMPAT_SO="\$LIB_DIR/libomp-compat.so"
 FALLBACK_SO="\$PREFIX_DIR/lib/libfix_close_range.so"
 
@@ -191,12 +191,12 @@ printf '%s\n' 'Installed omp. Run: omp'
 #   bash android/scripts/verify-browser.sh
 #   bash android/scripts/smoke-browser.sh --no-network
 # If you installed via curl | sh and have no clone, fetch verifiers from the release (published as separate assets, never bundled):
-#   curl -fsSL "https://github.com/$REPO/releases/latest/download/verify-browser.sh" -o /tmp/verify-browser.sh
-#   bash /tmp/verify-browser.sh
-#   curl -fsSL "https://github.com/$REPO/releases/latest/download/smoke-browser.sh" -o /tmp/smoke-browser.sh
-#   bash /tmp/smoke-browser.sh --no-network
+#   curl -fsSL "https://github.com/$REPO/releases/latest/download/verify-browser.sh" -o "$PREFIX/tmp/verify-browser.sh"
+#   bash "$PREFIX/tmp/verify-browser.sh"
+#   curl -fsSL "https://github.com/$REPO/releases/latest/download/smoke-browser.sh" -o "$PREFIX/tmp/smoke-browser.sh"
+#   bash "$PREFIX/tmp/smoke-browser.sh" --no-network
 printf '%s\n' 'Browser: for OMP browser tool, install external Chromium separately:'
 printf '%s\n' '  pkg install -y x11-repo'
 printf '%s\n' '  pkg install -y chromium'
 printf '%s\n' '  bash android/scripts/verify-browser.sh  # from clone, or fetch from release:'
-printf '%s\n' "  curl -fsSL https://github.com/$REPO/releases/latest/download/verify-browser.sh -o /tmp/verify-browser.sh && bash /tmp/verify-browser.sh"
+printf '%s\n' "  curl -fsSL https://github.com/$REPO/releases/latest/download/verify-browser.sh -o \"\${TMPDIR:-$PREFIX_DIR/tmp}/verify-browser.sh\" && bash \"\${TMPDIR:-$PREFIX_DIR/tmp}/verify-browser.sh\""

@@ -68,7 +68,7 @@ and `verify-browser.sh --check-bundle ./omp-termux.tar.gz`.
 ## Release install: guarded installer (current)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/sasazemzulin058-debug/omp-termux/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/SklUpp/omp-termux/main/install.sh | sh
 omp --version
 ```
 

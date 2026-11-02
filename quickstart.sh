@@ -5,7 +5,7 @@ set -eu
 PREFIX_DIR="${PREFIX:-/data/data/com.termux/files/usr}"
 LIB_DIR="$PREFIX_DIR/lib/omp-termux"
 BIN_DIR="$PREFIX_DIR/bin"
-REPO="${OMP_REPO:-sasazemzulin058-debug/omp-termux}"
+REPO="${OMP_REPO:-SklUpp/omp-termux}"
 TAG="${OMP_VERSION:-latest}"
 BASE="https://github.com/$REPO/releases"
 [ "$TAG" = latest ] && BASE="$BASE/latest/download" || BASE="$BASE/download/$TAG"

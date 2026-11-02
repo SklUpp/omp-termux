@@ -16,7 +16,7 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 cd "$REPO_ROOT"
 
-REPO="${OMP_REPO:-sasazemzulin058-debug/omp-termux}"
+REPO="${OMP_REPO:-SklUpp/omp-termux}"
 FILENAME="pi_natives.android-arm64.node"
 
 # Resolve tag: OMP_TAG > RELEASE_TAG > OMP_VERSION (if not 'latest') > v<package-version>-termux
