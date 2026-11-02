@@ -50,6 +50,10 @@ The queue is regenerated from clean upstream-derived source when upstream change
 The sync workflow applies it in CI; release workflows apply it idempotently after
 checking out immutable release tag.
 
+Current port target: upstream oh-my-pi **18.16.0** (`544cacab86b0`). Upstream
+requires Bun **>= 1.4.4**; `android/versions.env` pins official Bionic Bun
+1.4.4 (`bun-linux-aarch64-android.zip`, SHA-256 verified at release).
+
 ## Transformation catalog (current)
 
 The eight overlay transforms, one concern each:
