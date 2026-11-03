@@ -23,8 +23,12 @@ import { adaptDesktopSession } from "./desktop-adapter.js";
 const nativeBindings = loadNative();
 // --- generated native exports (do not edit) ---
 // classes
-export const AudioCapture = nativeBindings.AudioCapture;
-export const AudioPlayback = nativeBindings.AudioPlayback;
+export const AudioCapture = process.platform === "android"
+	? (() => { const v = nativeBindings.AudioCapture; if (v !== undefined) return v; const err = function err() { throw new Error("Native AudioCapture is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
+	: (nativeBindings.AudioCapture);
+export const AudioPlayback = process.platform === "android"
+	? (() => { const v = nativeBindings.AudioPlayback; if (v !== undefined) return v; const err = function err() { throw new Error("Native AudioPlayback is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
+	: (nativeBindings.AudioPlayback);
 export const DesktopSession = adaptDesktopSession(nativeBindings.DesktopSession);
 export const DiffStream = nativeBindings.DiffStream;
 export const EditSession = nativeBindings.EditSession;
@@ -34,7 +38,9 @@ export const HighlightStream = nativeBindings.HighlightStream;
 export const IpcConnection = nativeBindings.IpcConnection;
 export const IpcServer = nativeBindings.IpcServer;
 export const LineMatcher = nativeBindings.LineMatcher;
-export const LiveWebRtcPeer = nativeBindings.LiveWebRtcPeer;
+export const LiveWebRtcPeer = process.platform === "android"
+	? (() => { const v = nativeBindings.LiveWebRtcPeer; if (v !== undefined) return v; const err = function err() { throw new Error("Native LiveWebRtcPeer is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
+	: (nativeBindings.LiveWebRtcPeer);
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const MacOSFrontApp = nativeBindings.MacOSFrontApp;
 export const NativeOAuthCallback = nativeBindings.NativeOAuthCallback;
@@ -62,7 +68,9 @@ export const astGrep = nativeBindings.astGrep ?? missingNativeExport("astGrep");
 export const astMatch = nativeBindings.astMatch ?? missingNativeExport("astMatch");
 export const blockRangeAt = nativeBindings.blockRangeAt ?? missingNativeExport("blockRangeAt");
 export const closeDesktopEventTaps = nativeBindings.closeDesktopEventTaps ?? missingNativeExport("closeDesktopEventTaps");
-export const copyToClipboard = nativeBindings.copyToClipboard ?? missingNativeExport("copyToClipboard");
+export const copyToClipboard = process.platform === "android"
+	? (() => { const v = nativeBindings.copyToClipboard; if (v !== undefined) return v; const err = function err() { throw new Error("Native copyToClipboard is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
+	: (nativeBindings.copyToClipboard ?? missingNativeExport("copyToClipboard"));
 export const cosineSimilarityPairs = nativeBindings.cosineSimilarityPairs ?? missingNativeExport("cosineSimilarityPairs");
 export const countTokens = nativeBindings.countTokens ?? missingNativeExport("countTokens");
 export const decodeSixelToPng = nativeBindings.decodeSixelToPng ?? missingNativeExport("decodeSixelToPng");
@@ -131,7 +139,9 @@ export const parseKey = nativeBindings.parseKey ?? missingNativeExport("parseKey
 export const parseKittySequence = nativeBindings.parseKittySequence ?? missingNativeExport("parseKittySequence");
 export const pdfToMarkdown = nativeBindings.pdfToMarkdown ?? missingNativeExport("pdfToMarkdown");
 export const rasterizeSvg = nativeBindings.rasterizeSvg ?? missingNativeExport("rasterizeSvg");
-export const readImageFromClipboard = nativeBindings.readImageFromClipboard ?? missingNativeExport("readImageFromClipboard");
+export const readImageFromClipboard = process.platform === "android"
+	? (() => { const v = nativeBindings.readImageFromClipboard; if (v !== undefined) return v; const err = function err() { throw new Error("Native readImageFromClipboard is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
+	: (nativeBindings.readImageFromClipboard ?? missingNativeExport("readImageFromClipboard"));
 export const readTextFromClipboard = nativeBindings.readTextFromClipboard ?? missingNativeExport("readTextFromClipboard");
 export const renderMermaidAscii = nativeBindings.renderMermaidAscii ?? missingNativeExport("renderMermaidAscii");
 export const renderSnapcompactPng = nativeBindings.renderSnapcompactPng ?? missingNativeExport("renderSnapcompactPng");
