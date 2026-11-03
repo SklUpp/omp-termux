@@ -2068,10 +2068,10 @@ index 0000000..2da7523
 +}
 diff --git a/packages/coding-agent/test/task/isolation-retained.test.ts b/packages/coding-agent/test/task/isolation-retained.test.ts
 new file mode 100644
-index 0000000..34862ac
+index 0000000..a48b374
 --- /dev/null
 +++ b/packages/coding-agent/test/task/isolation-retained.test.ts
-@@ -0,0 +1,823 @@
+@@ -0,0 +1,827 @@
 +import { afterEach, describe, expect, it, vi } from "bun:test";
 +import { type } from "@oh-my-pi/omptype";
 +import * as fs from "node:fs/promises";
@@ -2222,7 +2222,8 @@ index 0000000..34862ac
 +		release: async () => {
 +			// End the pipe, not just write: the worker resumed stdin, so an open
 +			// pipe is a live handle and `exited` would never resolve.
-+			child.stdin.end("x\n");
++			child.stdin.write("x\n");
++			child.stdin.end();
 +			await child.exited;
 +		},
 +	};
@@ -2593,7 +2594,10 @@ index 0000000..34862ac
 +			const outputs = await Promise.all(children.map(childVerdict));
 +			expect(outputs.filter(line => line.includes("won"))).toHaveLength(1);
 +			expect(outputs.join("")).toMatch(/lost:(.*lease.*|.*owned by live omp process.*)/);
-+			for (const child of children) child.stdin.end("x\n");
++			for (const child of children) {
++				child.stdin.write("x\n");
++				child.stdin.end();
++			}
 +			await Promise.all(children.map(child => child.exited));
 +		} finally {
 +			for (const child of children) child.kill();
