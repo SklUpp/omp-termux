@@ -73,7 +73,7 @@ jobs:
       # Reuses the addon build's cargo profile ("local"); these are the pure
       # naming/private-dir unit tests that the addon build alone never runs.
       - name: Run IPC endpoint and relocation-directory unit tests
-        run: cargo test --profile local -p pi-natives --lib ipc::
+        run: cargo test --profile local -p pi-natives --lib 'ipc::'
       - name: Run native IPC integration tests
         run: bun test ./packages/natives/test/ipc.test.ts
       - name: Type check applied patch queue
@@ -120,7 +120,7 @@ jobs:
       # procfs/cgroup reads — MemAvailable when available, physical RAM only
       # when /proc/meminfo itself is unreadable, cgroup limits when readable.
       - name: Run Android sort memory-hint tests
-        run: cargo test --profile local -p pi-builtins --lib sort::
+        run: cargo test --profile local -p pi-builtins --lib 'sort::'
       # Required, not optional coverage: these exercise the retained-workspace
       # lifecycle, dynamic-schema repoRoot, resume-hint, and explicit cold
       # release contracts added by patch 02, so a missing/renamed file must fail the job instead of

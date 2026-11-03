@@ -81,6 +81,29 @@ jobs:
           test -f crates/pi-natives/Cargo.toml
           test -f packages/natives/native/loader-state.js
           git status --short
+      # A tag whose workflow files do not parse cannot be dispatched, and tags
+      # are immutable, so reject malformed YAML before anything is published.
+      - name: Validate workflow YAML
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import sys
+          import yaml
+
+          failed = []
+          paths = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/actions/*/action.yml"))
+          for path in paths:
+              try:
+                  with open(path, encoding="utf-8") as handle:
+                      yaml.safe_load(handle)
+              except Exception as exc:  # noqa: BLE001 - report every parse failure
+                  failed.append(f"{path}: {exc}")
+          if failed:
+              sys.exit("invalid workflow YAML:\n" + "\n".join(failed))
+          print(f"validated {len(paths)} workflow files")
+          PY
       - name: Validate release inputs
         run: python3 android/scripts/check-release-inputs.py
       - name: Setup Bun and verify lockfile consistency
