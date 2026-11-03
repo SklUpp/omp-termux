@@ -1,8 +1,8 @@
 diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-agent/src/cli/worktree-cli.ts
-index f9f8253..11d0b94 100644
+index f9f8253..39456ee 100644
 --- a/packages/coding-agent/src/cli/worktree-cli.ts
 +++ b/packages/coding-agent/src/cli/worktree-cli.ts
-@@ -9,9 +9,11 @@
+@@ -9,9 +9,12 @@
   *   - **Task-isolation dirs** (`task/worktree.ts`): a wrapper dir with a
   *     compact `m` subdir mounted/cloned by `natives.isoStart`. Legacy `merged`
   *     subdirs are still recognized. `ensureIsolation` writes an ownership
@@ -12,12 +12,13 @@ index f9f8253..11d0b94 100644
 + *     marker naming the live omp process plus an isolation-state descriptor;
 + *     a sandbox whose owner is still running is reported `live` and never
 + *     removed, while a descriptor-bearing sandbox whose owner is gone is
-+ *     `retained` — kept by default because a later process can still revive
-+ *     and release it, and reclaimed only by `--all`.
++ *     `retained` — always kept because it may hold uncaptured work, and only
++ *     the explicit release path can capture it before teardown. `--all` GCs
++ *     marker-only leftovers, never retained sandboxes.
   *
   * Legacy entries from before the encoding change keep working because git still
   * tracks them by branch name. This command exists to GC them on demand.
-@@ -23,8 +25,21 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
+@@ -23,8 +26,21 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
  import { getWorktreesDir, isEnoent } from "@oh-my-pi/pi-utils";
  import chalk from "@oh-my-pi/pi-utils/chalk";
  import { Settings } from "../config/settings";
@@ -41,7 +42,7 @@ index f9f8253..11d0b94 100644
  
  import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
  
-@@ -43,6 +58,14 @@ export interface WorktreeEntry {
+@@ -43,6 +59,14 @@ export interface WorktreeEntry {
  	branch?: string;
  	/** When set, the entry is unhealthy and `omp worktree clear` will remove it. */
  	orphanReason?: string;
@@ -56,7 +57,19 @@ index f9f8253..11d0b94 100644
  }
  
  export interface AddWorktreeOptions {
-@@ -79,16 +102,29 @@ export interface ClearWorktreesOptions {
+@@ -60,7 +84,10 @@ export interface ListWorktreesOptions {
+ }
+ 
+ export interface ClearWorktreesOptions {
+-	/** Remove every entry, including live PR-checkout worktrees. */
++	/**
++	 * Widen the GC to every entry, including live PR-checkout worktrees.
++	 * Descriptor-bearing task-isolation workspaces are still preserved.
++	 */
+ 	all: boolean;
+ 	/** Print what would be removed without touching the filesystem. */
+ 	dryRun: boolean;
+@@ -79,16 +106,29 @@ export interface ClearWorktreesOptions {
   * with the error, data intact.
   */
  export async function stopRetainedMount(dir: string): Promise<boolean> {
@@ -92,24 +105,28 @@ index f9f8253..11d0b94 100644
  			await natives.isoStop(backend, candidate);
  			return true;
  		}
-@@ -192,13 +228,29 @@ export async function listWorktrees(options: ListWorktreesOptions): Promise<void
+@@ -192,25 +232,48 @@ export async function listWorktrees(options: ListWorktreesOptions): Promise<void
  
  export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{ removed: number; failed: number }> {
  	const entries = await scanWorktrees();
 -	const targets = options.all ? entries : entries.filter(entry => entry.orphanReason !== undefined);
 +	// A live owner is never removed, under any flag: explicit release (or an
 +	// agent revive + release) is what ends a task-isolation workspace, and
-+	// `--all` is a GC for leftovers, not a force-kill. Retained sandboxes (with
-+	// a descriptor) hold work a later process can still capture, so default
-+	// `clear` skips them; `--all` reclaims them once their owner is gone.
++	// `--all` is a GC for leftovers, not a force-kill. A descriptor means the
++	// sandbox still holds uncaptured work (or an in-workspace commit only its
++	// release can land), so `clear` — including `--all` — always preserves it;
++	// only the explicit release path may capture and then tear it down.
++	// Descriptor-bearing sandboxes are classified as kept up front so dry-run and
++	// real runs agree; removal still re-checks the descriptor under the lease in
++	// case state appears after classification.
 +	const targets = options.all
-+		? entries.filter(entry => !(entry.kind === "task-isolation" && entry.ownerAlive))
++		? entries.filter(entry => !(entry.kind === "task-isolation" && (entry.ownerAlive || entry.retained)))
 +		: entries.filter(entry => entry.orphanReason !== undefined && entry.retained !== true);
 +	// Ownership is decided under the lease during removal, never from a probe:
 +	// `isFileLockHeld` reports unsupported on some platforms, so a probe-based
 +	// filter would either hide every sandbox or trust a guess.
 +	let keptLive = entries.filter(entry =>
-+		options.all ? entry.kind === "task-isolation" && entry.ownerAlive : entry.retained === true,
++		options.all ? entry.kind === "task-isolation" && (entry.ownerAlive || entry.retained) : entry.retained === true,
 +	);
  
  	if (targets.length === 0) {
@@ -124,7 +141,23 @@ index f9f8253..11d0b94 100644
  		}
  		return { removed: 0, failed: 0 };
  	}
-@@ -228,8 +280,33 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
+ 
+ 	if (options.dryRun) {
+ 		if (options.json) {
+-			console.log(JSON.stringify({ wouldRemove: targets.map(t => t.path) }, null, 2));
++			console.log(
++				JSON.stringify({ wouldRemove: targets.map(t => t.path), keptLive: keptLive.map(e => e.path) }, null, 2),
++			);
+ 		} else {
+ 			for (const target of targets) {
+ 				console.log(`${chalk.yellow("would remove")}  ${target.path}`);
+ 			}
+ 			console.log(chalk.dim(`\n${targets.length} dir${targets.length === 1 ? "" : "s"} would be removed.`));
++			for (const entry of keptLive) console.log(`${chalk.dim("kept  ")}  ${entry.path}`);
+ 		}
+ 		return { removed: 0, failed: 0 };
+ 	}
+@@ -228,8 +291,39 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
  					await fs.rm(target.path, { recursive: true, force: true });
  					parentsToPrune.add(target.parentRepo);
  				}
@@ -137,7 +170,13 @@ index f9f8253..11d0b94 100644
 +				// re-checked under the lease.
 +				const slot = isolationSlotFromDirName(path.basename(target.path));
 +				const teardown = async (): Promise<boolean> => {
++					// Owner, descriptor, and removal all under the slot lease so a
++					// concurrent spawn/revive cannot publish state between the checks
++					// and the rm.
 +					if (await hasLiveIsolationOwner(target.path)) return false;
++					// Descriptor-bearing sandboxes are never garbage: release is the
++					// only path that captures their delta and branch commits first.
++					if (await isolationStateExists(target.path)) return false;
 +					await stopRetainedMount(target.path);
 +					await fs.rm(target.path, { recursive: true, force: true });
 +					return true;
@@ -159,7 +198,7 @@ index f9f8253..11d0b94 100644
  				await fs.rm(target.path, { recursive: true, force: true });
  				if (target.parentRepo) parentsToPrune.add(target.parentRepo);
  			}
-@@ -252,7 +329,9 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
+@@ -252,7 +346,9 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
  	const failed = results.length - succeeded;
  
  	if (options.json) {
@@ -170,7 +209,7 @@ index f9f8253..11d0b94 100644
  		return { removed: succeeded, failed };
  	}
  
-@@ -264,6 +343,13 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
+@@ -264,6 +360,13 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
  			if (result.error) console.log(`          ${chalk.dim(result.error)}`);
  		}
  	}
@@ -178,13 +217,13 @@ index f9f8253..11d0b94 100644
 +		console.log(`${chalk.dim("kept  ")}  ${entry.path}`);
 +		if (entry.ownerAlive) console.log(`          ${chalk.dim("live owner; release the agent to remove it")}`);
 +		else if (entry.retained)
-+			console.log(`          ${chalk.dim("retained; revive and release the agent, or pass --all")}`);
++			console.log(`          ${chalk.dim("retained; revive and release the agent to capture and remove it")}`);
 +		else console.log(`          ${chalk.dim("another process is claiming it; retry when that claim finishes")}`);
 +	}
  	console.log(chalk.dim(`\n${succeeded} removed${failed > 0 ? ` · ${chalk.red(`${failed} failed`)}` : ""}`));
  	return { removed: succeeded, failed };
  }
-@@ -346,9 +432,18 @@ async function classifyDir(dir: string): Promise<WorktreeEntry | null> {
+@@ -346,9 +449,18 @@ async function classifyDir(dir: string): Promise<WorktreeEntry | null> {
  	}
  	if (!isIsolation) return null;
  	const live = await hasLiveIsolationOwner(dir);
@@ -203,7 +242,7 @@ index f9f8253..11d0b94 100644
  		// Only after confirming no live owner is the "no live task" claim true.
  		// A running subagent's sandbox stays live so `clear` won't delete it.
  		orphanReason: live ? undefined : "task-isolation leftover (no live task owns it)",
-@@ -415,7 +510,7 @@ function formatEntryDetail(entry: WorktreeEntry): string {
+@@ -415,7 +527,7 @@ function formatEntryDetail(entry: WorktreeEntry): string {
  		const branch = entry.branch ?? "unknown branch";
  		parts.push(`${repo} · ${branch}`);
  	} else if (entry.kind === "task-isolation") {
@@ -212,8 +251,22 @@ index f9f8253..11d0b94 100644
  	} else if (entry.kind === "empty") {
  		parts.push("legacy project shell");
  	} else {
+diff --git a/packages/coding-agent/src/commands/worktree.ts b/packages/coding-agent/src/commands/worktree.ts
+index 1796529..4a90d84 100644
+--- a/packages/coding-agent/src/commands/worktree.ts
++++ b/packages/coding-agent/src/commands/worktree.ts
+@@ -56,7 +56,8 @@ export default class Worktree extends Command {
+ 			default: false,
+ 		}),
+ 		all: Flags.boolean({
+-			description: "Clear every entry, including live PR-checkout worktrees (clear)",
++			description:
++				"Clear every entry, including live PR-checkout worktrees; retained task-isolation workspaces are always preserved (clear)",
+ 			default: false,
+ 		}),
+ 		"dry-run": Flags.boolean({
 diff --git a/packages/coding-agent/src/prompts/tools/isolation-summary.md b/packages/coding-agent/src/prompts/tools/isolation-summary.md
-index 69378db..719fd12 100644
+index 69378db..2c7a6b2 100644
 --- a/packages/coding-agent/src/prompts/tools/isolation-summary.md
 +++ b/packages/coding-agent/src/prompts/tools/isolation-summary.md
 @@ -79,3 +79,6 @@ Nested repository patches (not applied):
@@ -221,7 +274,7 @@ index 69378db..719fd12 100644
  {{/if}}
  {{/when}}
 +{{#if retainedDir}}
-+Isolation workspace retained at `{{retainedDir}}`; revive and release the agent to capture its changes, or `omp worktree clear --all` once its owner has exited.
++Isolation workspace retained at `{{retainedDir}}`; revive and release the agent to capture its changes. `omp worktree clear` never deletes it.
 +{{/if}}
 diff --git a/packages/coding-agent/src/prompts/tools/task-follow-up.md b/packages/coding-agent/src/prompts/tools/task-follow-up.md
 index 574e9be..8fc5486 100644
@@ -597,7 +650,7 @@ index 98f8661..91df2a1 100644
  			})}`;
  		};
 diff --git a/packages/coding-agent/src/task/isolation-ownership.ts b/packages/coding-agent/src/task/isolation-ownership.ts
-index dc4655c..2a8c434 100644
+index dc4655c..bf196c1 100644
 --- a/packages/coding-agent/src/task/isolation-ownership.ts
 +++ b/packages/coding-agent/src/task/isolation-ownership.ts
 @@ -6,8 +6,10 @@
@@ -745,8 +798,8 @@ index dc4655c..2a8c434 100644
 + * Claim the retained sandbox for this process, atomically across processes.
 + *
 + * The owner marker is what `omp worktree clear` consults, so a cold/warm revive
-+ * must refresh it: otherwise the revived run looks owner-less and `clear --all`
-+ * could delete a workspace a live session is writing. Read-check-write happens
++ * must refresh it: otherwise the revived run looks owner-less, and only the
++ * explicit release path may tear down a workspace a live session is writing. Read-check-write happens
 + * under the slot lease, so two simultaneous revives cannot both believe they
 + * own the sandbox; the loser refuses, and a marker naming another live process
 + * is never stolen. A dead owner (crash, previous boot) is reclaimed.
@@ -1432,7 +1485,7 @@ index 0ceddc2..b146118 100644
  		...effortField,
  		...schemaFields,
 diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/src/task/worktree.ts
-index 34fa981..4355498 100644
+index 34fa981..fb64e10 100644
 --- a/packages/coding-agent/src/task/worktree.ts
 +++ b/packages/coding-agent/src/task/worktree.ts
 @@ -6,11 +6,18 @@ import * as path from "node:path";
@@ -1771,7 +1824,7 @@ index 34fa981..4355498 100644
 +export async function assertIsolationWorkspaceReleased(baseDir: string, id: string): Promise<void> {
 +	if (!(await isolationStateExists(baseDir))) return;
 +	throw new Error(
-+		`Isolation workspace for "${id}" is retained at ${baseDir}. Release it first: revive the agent and release it, or run \`omp worktree clear --all\` once its owner has exited.`,
++		`Isolation workspace for "${id}" is retained at ${baseDir}. Release it first: revive the agent and release it; \`omp worktree clear\` never deletes retained work.`,
 +	);
 +}
 +
@@ -2068,10 +2121,10 @@ index 0000000..2da7523
 +}
 diff --git a/packages/coding-agent/test/task/isolation-retained.test.ts b/packages/coding-agent/test/task/isolation-retained.test.ts
 new file mode 100644
-index 0000000..a48b374
+index 0000000..eef3142
 --- /dev/null
 +++ b/packages/coding-agent/test/task/isolation-retained.test.ts
-@@ -0,0 +1,827 @@
+@@ -0,0 +1,842 @@
 +import { afterEach, describe, expect, it, vi } from "bun:test";
 +import { type } from "@oh-my-pi/omptype";
 +import * as fs from "node:fs/promises";
@@ -2821,7 +2874,7 @@ index 0000000..a48b374
 +		expect(await fs.stat(preserved)).toBeDefined();
 +	});
 +
-+	it("keeps retained sandboxes by default, keeps live owners, and reclaims dead retained ones with --all", async () => {
++	it("preserves descriptor-bearing retained sandboxes on every clear, removing only marker-only leftovers", async () => {
 +		const worktrees = await tempDir("omp-iso-clear-");
 +		setWorktreesDir(worktrees);
 +		const repo = await tempDir("omp-iso-clear-repo-");
@@ -2830,6 +2883,7 @@ index 0000000..a48b374
 +
 +		const retainedDead = path.join(worktrees, "retained-dead");
 +		const liveOwned = path.join(worktrees, "live-owned");
++		const markerOnly = path.join(worktrees, "marker-only");
 +		for (const dir of [retainedDead, liveOwned]) {
 +			await fs.mkdir(path.join(dir, "m"), { recursive: true });
 +			await writeIsolationState(dir, {
@@ -2843,21 +2897,45 @@ index 0000000..a48b374
 +				sessionFile: transcript,
 +			});
 +		}
++		await fs.mkdir(path.join(markerOnly, "m"), { recursive: true });
 +		await Bun.write(
 +			path.join(retainedDead, ISOLATION_OWNER_FILE),
 +			JSON.stringify({ pid: await deadPid(), id: "retained-dead" }),
 +		);
++		await Bun.write(
++			path.join(markerOnly, ISOLATION_OWNER_FILE),
++			JSON.stringify({ pid: await deadPid(), id: "marker-only" }),
++		);
 +		await writeIsolationOwner(liveOwned, "live-owned");
 +
++		// Dry-run must classify descriptor-bearing sandboxes as kept, matching the
++		// real run, instead of presenting retained work as removable.
++		const logs: string[] = [];
++		const log = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
++			logs.push(args.map(String).join(" "));
++		});
++		try {
++			await clearWorktrees({ all: true, dryRun: true, json: true });
++		} finally {
++			log.mockRestore();
++		}
++		const plan = JSON.parse(logs.join("\n")) as { wouldRemove: string[]; keptLive: string[] };
++		expect(plan.wouldRemove).toEqual([markerOnly]);
++		expect(plan.keptLive).toEqual(expect.arrayContaining([retainedDead, liveOwned]));
++
 +		await clearWorktrees({ all: false, dryRun: false, json: true });
++		for (const dir of [retainedDead, liveOwned, markerOnly]) {
++			expect(await fs.stat(dir).catch(() => null)).not.toBeNull();
++		}
++
++		// `--all` is still a GC, not a release: a descriptor means the sandbox
++		// holds uncaptured work (or in-workspace commits), so only the explicit
++		// release path may remove it. A marker-only crashed leftover is reclaimed.
++		await clearWorktrees({ all: true, dryRun: false, json: true });
 +		expect(await fs.stat(retainedDead).catch(() => null)).not.toBeNull();
 +		expect(await fs.stat(liveOwned).catch(() => null)).not.toBeNull();
-+
-+		// `--all` attempts the real lease instead of trusting any lock probe: a
-+		// dead retained sandbox is reclaimed while a live owner stays untouched.
-+		await clearWorktrees({ all: true, dryRun: false, json: true });
-+		expect(await fs.stat(retainedDead).catch(() => null)).toBeNull();
-+		expect(await fs.stat(liveOwned).catch(() => null)).not.toBeNull();
++		expect(await fs.stat(markerOnly).catch(() => null)).toBeNull();
++		expect(await isolationStateExists(retainedDead)).toBe(true);
 +	});
 +
 +	it("keys the lease to the immutable slot across a retention rename", async () => {
@@ -2868,19 +2946,9 @@ index 0000000..a48b374
 +		const slot = getTaskIsolationSlot(repo, id);
 +		const base = path.join(worktrees, slot);
 +		await fs.mkdir(path.join(base, "m"), { recursive: true });
-+		const transcript = path.join(worktrees, `${id}.jsonl`);
-+		await Bun.write(transcript, "");
-+		await writeIsolationState(base, {
-+			version: 1,
-+			id,
-+			repoRoot: repo,
-+			backend: natives.IsoBackendKind.Rcopy,
-+			slot,
-+			mergedDir: "m",
-+			baseline: baselineFor(repo),
-+			sessionFile: transcript,
-+		});
 +		await Bun.write(path.join(base, ISOLATION_OWNER_FILE), JSON.stringify({ pid: await deadPid(), id }));
++		// Marker-only so the sandbox stays reclaimable after the lease drops; the
++		// point is the lease key, not descriptor retention (covered above).
 +		// Acquire the lease on the ORIGINAL sandbox, then let retention rename it.
 +		// The lease lives outside the sandbox and is keyed by the immutable slot,
 +		// so it must still exclude `clear` of the renamed sibling.

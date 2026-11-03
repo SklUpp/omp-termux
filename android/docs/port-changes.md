@@ -135,11 +135,14 @@ queue (`02-isolated-revive.patch`) so releases from this fork keep it.
 Task-isolation workspaces now outlive a run: spawn writes
 `.omp-isolation-state.json` beside the owner marker recording the id, parent
 repo root, mount dir, backend and capture baseline. The workspace is destroyed
-only by an explicit release (`AgentLifecycleManager.release`, or
-`omp worktree clear --all` for a sandbox whose owner has exited) — run end,
-park, shutdown and kill retain it, including `keepAlive:false` one-shot runs.
-Retention moves the sandbox to a `.retained-*` sibling and the transcript
-pointer (`<id>.isolation.json`) follows the move.
+only by an explicit release (`AgentLifecycleManager.release`, e.g. cancelling
+the agent) — run end, park, shutdown and kill retain it, including
+`keepAlive:false` one-shot runs. `omp worktree clear`, with or without `--all`,
+never destroys a sandbox that still has this descriptor: it only reclaims
+marker-only leftovers from a crashed setup, because a descriptor means the
+workspace may hold changes (or in-workspace commits) that only release can
+capture. Retention moves the sandbox to a `.retained-*` sibling and the
+transcript pointer (`<id>.isolation.json`) follows the move.
 
 Cold revival resolves the descriptor (header cwd, then pointer), replays the
 same transcript in the retained workspace cwd, and owns a release that
