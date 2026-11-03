@@ -239,6 +239,10 @@ rm -f "$BIN_DIR/omp"
 cat > "$BIN_DIR/omp" <<EOF
 #!/bin/sh
 PREFIX_DIR="\${PREFIX:-$PREFIX_DIR}"
+# Install identity for native IPC endpoint naming: baked here, never derived
+# from the caller's environment, so every process of this install names one
+# socket even when PREFIX differs or is unset in the invoking shell.
+OMP_ANDROID_PREFIX="$PREFIX_DIR"
 LIB_DIR="\${OMP_LIB_DIR:-$LIB_DIR}"
 COMPAT_SO="\$LIB_DIR/libomp-compat.so"
 FALLBACK_SO="\$PREFIX_DIR/lib/libfix_close_range.so"
@@ -248,7 +252,7 @@ if [ -f "\$COMPAT_SO" ]; then
 elif [ -f "\$FALLBACK_SO" ]; then
     export LD_PRELOAD="\$FALLBACK_SO\${LD_PRELOAD:+:\$LD_PRELOAD}"
 fi
-exec env OMP_PLATFORM=android "\$LIB_DIR/bun" "\$LIB_DIR/cli.js" "\$@"
+exec env OMP_PLATFORM=android OMP_ANDROID_PREFIX="\$OMP_ANDROID_PREFIX" "\$LIB_DIR/bun" "\$LIB_DIR/cli.js" "\$@"
 EOF
 chmod 755 "$BIN_DIR/omp"
 

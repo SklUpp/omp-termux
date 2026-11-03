@@ -70,6 +70,12 @@ jobs:
         run: bash android/scripts/test-patch-profiles.sh
       - name: Build host native addon for applied tests
         run: bun --cwd=packages/natives run build
+      # Reuses the addon build's cargo profile ("local"); these are the pure
+      # naming/private-dir unit tests that the addon build alone never runs.
+      - name: Run IPC endpoint and relocation-directory unit tests
+        run: cargo test --profile local -p pi-natives --lib ipc::
+      - name: Run native IPC integration tests
+        run: bun test ./packages/natives/test/ipc.test.ts
       - name: Type check applied patch queue
         run: bun run ci:check:full
       - name: Build applied collab web
@@ -98,6 +104,23 @@ jobs:
             [[ -f "$t" ]] && tests+=("$t")
           done
           bun test "${tests[@]}"
+      # Required, not optional coverage: first-party Android browser discovery
+      # (real probe fixture, forced android platform) and the update refusal,
+      # so a missing/renamed file fails instead of silently greening.
+      - name: Run Android browser, update, notification, and clipboard tests
+        run: |
+          bun test \
+            ./packages/coding-agent/test/tools/browser-android-chromium.test.ts \
+            ./packages/coding-agent/test/cli/update-cli.test.ts \
+            ./packages/coding-agent/test/termux-notifications.test.ts \
+            ./packages/coding-agent/test/utils/clipboard.test.ts \
+            ./packages/coding-agent/test/utils/clipboard-osc52.test.ts \
+            ./packages/coding-agent/test/slash-commands/copy.test.ts
+      # Required: the Android memory-hint widening must keep its fallible
+      # procfs/cgroup reads — MemAvailable when available, physical RAM only
+      # when /proc/meminfo itself is unreadable, cgroup limits when readable.
+      - name: Run Android sort memory-hint tests
+        run: cargo test --profile local -p pi-builtins --lib sort::
       # Required, not optional coverage: these exercise the retained-workspace
       # lifecycle, dynamic-schema repoRoot, resume-hint, and explicit cold
       # release contracts added by patch 02, so a missing/renamed file must fail the job instead of

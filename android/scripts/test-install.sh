@@ -80,7 +80,7 @@ exit 0' ;;
 # Logs one call per execution with each argv element separately.
 # It never executes loader-state.js imports; mode only controls exit status.
 {
-	printf 'BEGIN|%s|%s|%s\n' "$0" "${OMP_PLATFORM-}" "${LD_PRELOAD-}"
+	printf 'BEGIN|%s|%s|%s|%s\n' "$0" "${OMP_PLATFORM-}" "${LD_PRELOAD-}" "${OMP_ANDROID_PREFIX-}"
 	for a in "$@"; do printf 'ARG=%s\n' "$a"; done
 } >> "${BUN_LOG:?}"
 SH
@@ -159,7 +159,7 @@ expect_absent "$LIB_T.old"; expect_absent "$LIB_T.new"
 : > "$CASE/bun.log"
 out=$(run_launcher --version 'two words') || die 'launcher run failed'
 [ "$out" = '' ] || die "launcher stdout: $out"
-expected=$(printf 'BEGIN|%s|android|\nARG=%s\nARG=--version\nARG=two words' "$LIB_T/bun" "$LIB_T/cli.js")
+expected=$(printf 'BEGIN|%s|android||%s\nARG=%s\nARG=--version\nARG=two words' "$LIB_T/bun" "$PREFIX_T" "$LIB_T/cli.js")
 [ "$(cat "$CASE/bun.log")" = "$expected" ] || die "launcher argv/platform:
 $(cat "$CASE/bun.log")"
 override="$CASE/override lib"
@@ -167,10 +167,17 @@ cp -a "$LIB_T" "$override"
 : > "$CASE/bun.log"
 env -u PREFIX -u LD_PRELOAD BUN_LOG="$CASE/bun.log" OMP_LIB_DIR="$override" \
 	"$BIN_T/omp" --version 'two words' >/dev/null || die 'launcher runtime OMP_LIB_DIR override failed'
-expected=$(printf 'BEGIN|%s|android|\nARG=%s\nARG=--version\nARG=two words' "$override/bun" "$override/cli.js")
+expected=$(printf 'BEGIN|%s|android||%s\nARG=%s\nARG=--version\nARG=two words' "$override/bun" "$PREFIX_T" "$override/cli.js")
 [ "$(cat "$CASE/bun.log")" = "$expected" ] || die "launcher override argv:
 $(cat "$CASE/bun.log")"
-pass 'latest install, checksum URL, no browser packages, launcher path/args/platform/override'
+: > "$CASE/bun.log"
+env -u LD_PRELOAD PREFIX="$CASE/elsewhere" BUN_LOG="$CASE/bun.log" \
+	"$BIN_T/omp" --version >/dev/null \
+	|| die 'launcher caller PREFIX override run failed'
+expected=$(printf 'BEGIN|%s|android||%s\nARG=%s\nARG=--version' "$LIB_T/bun" "$PREFIX_T" "$LIB_T/cli.js")
+[ "$(cat "$CASE/bun.log")" = "$expected" ] || die "launcher installed root followed caller PREFIX:
+$(cat "$CASE/bun.log")"
+pass 'latest install, checksum URL, no browser packages, launcher path/args/platform/installed-root'
 
 # 2. pinned version URL
 new_case version
@@ -258,8 +265,8 @@ if [ -n "$preload" ]; then
 	run_install "$assets/preload" || { cat "$CASE/run.log"; die 'preload install failed'; }
 	: > "$CASE/bun.log"
 	run_launcher --version 'two words' >/dev/null || die 'preload launcher run failed'
-	expected=$(printf 'BEGIN|%s|android|%s\nARG=%s\nARG=--version\nARG=two words' \
-		"$LIB_T/bun" "$LIB_T/libomp-compat.so" "$LIB_T/cli.js")
+	expected=$(printf 'BEGIN|%s|android|%s|%s\nARG=%s\nARG=--version\nARG=two words' \
+		"$LIB_T/bun" "$LIB_T/libomp-compat.so" "$PREFIX_T" "$LIB_T/cli.js")
 	[ "$(cat "$CASE/bun.log")" = "$expected" ] || die "launcher preload:
 $(cat "$CASE/bun.log")"
 	pass 'launcher preload'

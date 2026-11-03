@@ -90,8 +90,35 @@ The Linux arm is tightened to
 `#[cfg(all(target_os = "linux", not(target_os = "android")))]`; macOS/Windows
 arms to `#[cfg(all(not(target_os = "linux"), not(target_os = "android")))]`.
 Android `set_clipboard_text` stub returns an error directing JS to
-`termux-clipboard-set`; `read_image_from_clipboard` returns `Ok(None)`.
+`termux-clipboard-set`; `read_image_from_clipboard` returns `Err(...)` (the JS
+shim short-circuits to `null` on Termux before reaching the addon).
 `#[napi]` export names stay identical across platforms.
+
+On the JS side, `copyToClipboard` no longer swallows a total failure: it
+resolves only when a channel actually emitted or accepted the text, and
+rejects otherwise. `writeTerminalSequence` now reports whether it emitted the
+OSC 52 — a Bun worker cannot reach the main thread's terminal, and a closed
+stdout is swallowed, so neither counts. Emission is still best-effort: the
+external terminal may ignore OSC 52, so "resolved" means "handed to a channel",
+not "paste will definitely work". The interactive copy paths and `/copy` report
+the rejection instead of printing "Copied ..."; `/copy` also clears the draft
+in `finally`. This makes a missing `termux-api` (spawn `ENOENT`, native stub
+`Err`, no TTY or no emission for OSC 52) visible instead of a silent no-op. The
+Termux read path uses `termux-clipboard-get` and still degrades to an empty
+string with a warning, because the paste UI treats an unreadable clipboard as
+empty rather than as an error.
+
+The Android-only unsupported proxies in `packages/natives/native/index.js`
+(`copyToClipboard`, `readImageFromClipboard`, the audio classes and
+`LiveWebRtcPeer`) are gated on `process.platform === "android"`. On other
+platforms they fall back to the upstream expressions — including
+`missingNativeExport` — so a stale desktop addon keeps its rebuild diagnostic
+instead of a misleading "unsupported on Android/Termux" error. The same gate is
+emitted by `packages/natives/scripts/gen-enums.ts`, because `bun run build`
+regenerates `index.js` from it; a generator drift would silently undo the fix on
+the next bindings build. The stub target is a normal `function` (not an arrow),
+so `new AudioCapture()` reaches the trap and throws the Android message instead
+of a generic "not a constructor" error.
 
 ### 5. process.rs (pi-shell) — enable platform module on Android
 
@@ -105,6 +132,48 @@ Same widening: `proc_snapshot` module and its enclosing cfg block gain
 `target_os = "android"`; `ps_total_memory_bytes()` gate widened to
 `any(target_os = "linux", target_os = "android")`. Keeps process snapshotting
 and memory reporting native.
+
+Process **waiting** is not widened: `proc_match::wait_for_watchable_exits`
+still compiles the pidfd arm only for `target_os = "linux"`, so `pidwait` /
+`pgrep --wait` poll every 50 ms on Android. `pidfd_open` has an API 34
+capability floor and seccomp can SIGSYS-kill it on API 31–33; enabling the arm
+without a runtime API-level guard would kill the process on those devices.
+The polling fallback is correct, just less efficient.
+
+### 6.1 pi-builtins — sort memory hint (Android uses the same procfs)
+
+`available_memory_hint` / `system_available_memory` / `meminfo_available_bytes`
+/ `linux_cgroup_memory_headroom` / `cgroup_memory_headroom` gates are widened to
+`any(target_os = "linux", target_os = "android")`, together with the
+`MemoryFiles` / `CGROUP_V1` / `CGROUP_V2` / `headroom_along` helpers the cgroup
+path needs. These are the same Linux procfs/cgroup interfaces, but Android does
+**not** guarantee them: on stock Termux `/proc/meminfo` and
+`/proc/self/cgroup` are readable, while `/sys/fs/cgroup` and `/dev/memcg` are
+`EACCES`/`ENOENT` for the app UID, so both cgroup branches return `None`.
+Every read is fallible (`read_to_string(..).ok()?`); the size hint therefore
+uses `MemAvailable` from `/proc/meminfo` when readable, and falls back to
+`physical_memory_bytes()` (total RAM) only when `/proc/meminfo` itself cannot
+be read. No cgroup or availability assumption is made: a source wins only when
+it was actually read. Previously Android skipped procfs entirely and always
+used total RAM, so an 8 GB phone could size `sort` chunks from the whole
+machine and be OOM/LMK killed under pressure; the cgroup part remains
+best-effort/dormant on platforms that deny `/sys/fs/cgroup`.
+
+### 6.2 Held-file / SQLite locks stay POSIX on Android (known risk)
+
+`held_files` and the SQLite OFD-lock shim remain `target_os = "linux"`-only and
+`installSqliteLockShim()` effectively returns `false` on Android. It is **not**
+widened here: bionic's `F_OFD_*` behaviour, the `/proc/locks` `OFDLCK`
+visibility and the static-Bun SQLite table scan needed to patch `close()` are
+unproven on Android. Enabling them blind could silently corrupt a database.
+Until a device proof and an Android test exist, the port keeps POSIX locks,
+which means the historical lock-release-on-close hazard (upstream issue
+#15586) still applies on Android: closing any descriptor for the same inode —
+for example `cat agent.db-shm` or a grep walk over `~/.omp` — can release the
+live connection's locks and let a peer checkpoint/unlink the WAL underneath
+it. Do not enable OFD on Android without a bionic `F_OFD_SETLK` probe, an
+`OFDLCK` check in `/proc/locks`, and a test that a peer's WAL inode stays
+stable.
 
 ### 7. loader-state.js — register android-arm64
 

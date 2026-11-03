@@ -41,6 +41,42 @@ bash android/scripts/smoke-browser.sh --help
 
    On device, full validation also probes the installed Chromium (see Device browser gate).
 
+7. Android behavior tests on the applied patch queue:
+
+```sh
+# browser discovery runs the real probe fixture with a forced android platform;
+# update refusal asserts no upstream fetch and non-zero exit.
+bun test ./packages/coding-agent/test/tools/browser-android-chromium.test.ts
+bun test ./packages/coding-agent/test/cli/update-cli.test.ts
+bun test ./packages/coding-agent/test/termux-notifications.test.ts
+# Termux copy/read argv + stdin, OSC 52 preserved, and loud failure when every
+# clipboard channel is missing (no silent "Copied" success).
+bun test ./packages/coding-agent/test/utils/clipboard.test.ts
+# OSC 52 routing: worker thread and failed stdout write must not count as
+# delivery; /copy reports a rejection and clears the draft.
+bun test ./packages/coding-agent/test/utils/clipboard-osc52.test.ts
+bun test ./packages/coding-agent/test/slash-commands/copy.test.ts
+# gen-enums emits platform-gated native proxies: Android fails loud, desktop
+# keeps the missing-export diagnostic (includes a real generator round-trip).
+bun test ./packages/coding-agent/test/generator-android.test.ts
+# Android memory hint uses MemAvailable when /proc/meminfo is readable and
+# treats unreadable /sys/fs/cgroup files as no limit (physical RAM is only the
+# last fallback when /proc/meminfo itself fails).
+cargo test --profile local -p pi-builtins --lib sort::
+# endpoint naming is pure/stable; relocation-directory validation covers
+# creation, owner-mode repair, file/symlink leaves, and an untrusted base.
+cargo test --profile local -p pi-natives --lib ipc::
+# real bind/connect over a relocated socket, including a second process with a
+# different TMPDIR that must compute and dial the same endpoint.
+bun test ./packages/natives/test/ipc.test.ts
+# pure Android naming policies (installed-root precedence, exact/overlong
+# sun_path limits, multibyte roots) live in the ipc::endpoint unit tests above.
+```
+
+   `cargo test`/`bun test` run on the Linux CI host: they compile and execute
+   the relocation logic, but the `target_os = "android"` branch itself only
+   runs on the device build.
+
 ## Local verification
 
 ```sh
@@ -54,6 +90,17 @@ bash -n android/scripts/smoke-browser.sh && echo "syntax OK"
 bash android/scripts/verify-browser.sh
 bash android/scripts/verify-browser.sh --check-bundle ./omp-termux.tar.gz
 bash android/scripts/smoke-browser.sh --no-network --skip-daemon  # quick probe
+# applied-tree behavior tests (requires workspace deps + cargo):
+bun test ./packages/coding-agent/test/tools/browser-android-chromium.test.ts
+bun test ./packages/coding-agent/test/cli/update-cli.test.ts
+bun test ./packages/coding-agent/test/termux-notifications.test.ts
+bun test ./packages/coding-agent/test/utils/clipboard.test.ts
+bun test ./packages/coding-agent/test/utils/clipboard-osc52.test.ts
+bun test ./packages/coding-agent/test/slash-commands/copy.test.ts
+bun test ./packages/coding-agent/test/generator-android.test.ts
+cargo test --profile local -p pi-builtins --lib sort::
+cargo test --profile local -p pi-natives --lib ipc::
+bun test ./packages/natives/test/ipc.test.ts
 ```
 
 `verify-browser.sh` is **fail-closed**: missing `chromium` package, missing

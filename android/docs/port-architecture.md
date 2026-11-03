@@ -120,10 +120,12 @@ Every candidate is validated through one async validator:
 
 Invalid configured paths produce an explicit `ToolError` and never silently
 fall through to another binary. When no valid Android binary exists, the tool
-throws an actionable install/configuration error. Puppeteer **never** downloads
-a managed Linux Chromium on Android (`android` platform short-circuits the
-download path — `verify-browser.sh` and the `no-linux-download` unit test
-prove it).
+throws an actionable install/configuration error naming the two-step
+`pkg install -y x11-repo` / `pkg install -y chromium` sequence. Puppeteer
+**never** downloads a managed Linux Chromium on Android (`android` platform
+short-circuits the download path — `verify-browser.sh` and
+`test/tools/browser-android-chromium.test.ts`, which runs the real probe
+fixture with a forced `android` platform, prove it).
 
 The validated executable is threaded from `BrowserTool` → `acquireBrowser`
 → `launchHeadlessBrowser` / `resolveSharedBrowserLaunchSpec`; daemon identity
@@ -192,6 +194,77 @@ Relevant files:
 - `packages/coding-agent/src/tools/browser/shared-daemon.ts`
 - `packages/coding-agent/src/tools/browser/attach.ts`
 - `android/scripts/verify-browser.sh` / `smoke-browser.sh`
+
+### IPC endpoints and `sun_path` relocation
+
+Unix IPC paths are `<dir>/<stem>.sock`. Linux and Android allow 108 bytes in
+`sockaddr_un::sun_path`, including the NUL; longer paths are relocated to a
+per-user private directory with a hashed basename (see
+`crates/pi-natives/src/ipc/endpoint.rs`).
+
+Android has no `/tmp` in Termux, so the relocation directory is
+`<install root>/tmp/omp-<euid>`. The install root is the value the installer
+bakes into the launcher and exports as `OMP_ANDROID_PREFIX`; `PREFIX` is only a
+fallback and `/data/data/com.termux/files/usr` (the default Termux root) is
+used when neither is an absolute path. Naming is a pure function of that root
+and the effective uid: `TMPDIR` is ignored and no filesystem probe takes part,
+so one install names one socket even when shells or clients carry different
+`PREFIX`/`TMPDIR` values. Non-Android Unix keeps `/tmp/omp-<euid>`.
+
+If the installed root is long enough that
+`<root>/tmp/omp-<euid>/<hash16>.sock` cannot fit `sun_path`, `ipcEndpoint`
+throws `socket path does not fit sockaddr_un …` instead of returning a path
+that cannot bind.
+
+The directory is validated when the socket is bound, not while naming it:
+
+- the base (`<root>/tmp`) is checked lexically, component by component, without
+  following symlinks. A symlinked install root is rejected rather than
+  resolved, so validation and use share one path and no second path can be
+  swapped in;
+- every component must be owned by the app uid, root, or Android's system uid.
+  A foreign owner is rejected even at `0755` (an owner can chmod and rename its
+  own entries). Ownership alone is not enough: a non-sticky directory must not
+  be group- or world-writable, while a write-open directory is accepted only
+  with the sticky bit, where renames are limited to the entry owner (the `/tmp`
+  rule). Group write is accepted only for the app's own group and the Android
+  system group (`/data/data` is `0771 system:system`). The base must grant
+  owner write and search; a root/system base counts only as sticky,
+  world-writable and searchable — root-owned `0755` is not writable by the app;
+- `omp-<euid>` must be a real directory owned by us. Any mode other than `0700`
+  is repaired, and a file, a symlink, or a foreign-owned directory fails with
+  `EACCES` and the message `no usable IPC relocation directory …`.
+
+There is no silent fallback: a broken directory or an over-long root is an
+explicit failure, so the name a client dials is always the directory the server
+validates.
+
+Relevant files:
+
+- `crates/pi-natives/src/ipc/endpoint.rs`
+- `crates/pi-natives/src/ipc/unix.rs`
+- `crates/pi-natives/src/ipc/mod.rs`
+- `install.sh` (launcher exports `OMP_ANDROID_PREFIX`)
+- `packages/natives/test/ipc.test.ts`
+
+### Android notifications (best-effort)
+
+`EventController.sendCompletionNotification` / `sendErrorNotification` and
+`AskTool.#sendAskNotification` keep their existing terminal notification and
+additionally mirror the card into the Android shade, after every existing gate
+(config `*.notify`, Warp OSC protocol, stop reason, `session.hasUI`). The
+helper in `utils/android-helpers.ts` re-checks the global `PI_NOTIFICATIONS`
+suppression, truncates the fixed text, and no-ops when `termux-notification`
+is absent — failures never block a turn.
+
+Completion/error cards use `omp-status-<pid>`: Termux:API treats `--id` as a
+global `NotificationManager` tag, so a literal id would let a second omp
+process overwrite the first session's card. The ask card uses its own
+`omp-ask-<pid>-<n>` id, and `execute` clears it in a `finally` that covers the
+rich and plain dialog paths, answers, cancels, timeouts, aborts and throws; the
+`termux-notification-remove` call is serialized behind the earlier post (and
+skipped when the post was suppressed or failed). Cards carry fixed text only —
+never assistant output or the conversation-derived session name.
 
 ### Screenshots and model delivery (webpage only)
 
@@ -281,8 +354,8 @@ works natively.
 | Surface | Android status |
 |---------|----------------|
 | Shell, PTY, process management (pidfd), grep, glob, file discovery, syntax highlighting, tokenization, AST edit/grep, diff, iso diff, sixel, fs-scan cache | **native**, unchanged |
-| Clipboard | text only — JS falls back to `termux-clipboard-set` (`termux-api`) |
-| Clipboard image paste | unsupported; current implementation returns empty |
+| Clipboard | text only — copy uses `termux-clipboard-set`, paste uses `termux-clipboard-get` (`termux-api`); copy rejects when no channel (OSC 52 / Termux / native) accepted the text |
+| Clipboard image paste | unsupported; JS returns `null` on Termux and the native stub errors |
 | Audio capture / playback | unsupported; current Android implementation returns an error |
 | Codex live WebRTC peer | unsupported; current Android implementation returns an error |
 | Desktop surfaces | unsupported / not applicable |
