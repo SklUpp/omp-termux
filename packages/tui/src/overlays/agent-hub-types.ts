@@ -60,6 +60,8 @@ export interface AgentRecordLike {
 		patchPath?: string;
 		branchName?: string;
 		nestedPatchPaths?: string[];
+		/** Retained isolated workspace; a revived agent runs there until released. */
+		isolationDir?: string;
 	};
 	lifecycle?: { responseAt?: number; acceptedAt?: number; terminalAt?: number };
 }

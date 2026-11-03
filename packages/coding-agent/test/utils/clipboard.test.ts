@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import {
+	copyToClipboard,
 	isClipboardTerminalLocal,
 	readImageFromClipboard,
 	readMacFileUrlsFromClipboard,
@@ -59,6 +60,17 @@ function restorePlatform(): void {
 	if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
 }
 
+const stdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+
+function setStdoutIsTTY(value: boolean): void {
+	Object.defineProperty(process.stdout, "isTTY", { value, configurable: true });
+}
+
+function restoreStdoutIsTTY(): void {
+	if (stdoutIsTTY) Object.defineProperty(process.stdout, "isTTY", stdoutIsTTY);
+	else delete (process.stdout as { isTTY?: boolean }).isTTY;
+}
+
 const ENV_KEYS = ["WSL_DISTRO_NAME", "WSL_INTEROP", "DISPLAY", "WAYLAND_DISPLAY", "TERMUX_VERSION"] as const;
 let savedEnv: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
 
@@ -77,6 +89,7 @@ afterEach(() => {
 		else process.env[key] = prior;
 	}
 	restorePlatform();
+	restoreStdoutIsTTY();
 	vi.restoreAllMocks();
 });
 
@@ -240,6 +253,97 @@ describe("readImageFromClipboard dispatch", () => {
 		expect(await readImageFromClipboard()).toBeNull();
 		expect(spawnSpy).not.toHaveBeenCalled();
 		expect(nativeSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe("Termux clipboard", () => {
+	it("copies through termux-clipboard-set with the text on stdin and skips the native bridge", async () => {
+		setPlatform("android");
+		process.env.TERMUX_VERSION = "0.118";
+		setStdoutIsTTY(false);
+
+		const calls: SpawnCall[] = [];
+		spySpawn(calls, "");
+		const nativeSpy = vi.spyOn(native, "copyToClipboard").mockImplementation(async () => {});
+
+		await copyToClipboard("hello");
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.cmd).toEqual(["termux-clipboard-set"]);
+		expect(calls[0]?.options.stdin).toEqual(Buffer.from("hello"));
+		expect(nativeSpy).not.toHaveBeenCalled();
+	});
+
+	it("rejects when termux-api is missing and no TTY received OSC 52", async () => {
+		setPlatform("android");
+		process.env.TERMUX_VERSION = "0.118";
+		setStdoutIsTTY(false);
+
+		vi.spyOn(Bun, "spawn").mockImplementation(() => {
+			throw new Error("ENOENT: termux-clipboard-set not found");
+		});
+		const nativeSpy = vi
+			.spyOn(native, "copyToClipboard")
+			.mockRejectedValue(new Error("Native arboard clipboard is unsupported on Android/Termux"));
+
+		await expect(copyToClipboard("hello")).rejects.toThrow(/unsupported on Android\/Termux/);
+		expect(nativeSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("rejects when the OSC 52 write is swallowed and no other channel works", async () => {
+		setPlatform("android");
+		process.env.TERMUX_VERSION = "0.118";
+		setStdoutIsTTY(true);
+
+		vi.spyOn(Bun, "spawn").mockImplementation(() => {
+			throw new Error("ENOENT: termux-clipboard-set not found");
+		});
+		vi.spyOn(native, "copyToClipboard").mockRejectedValue(new Error("arboard unavailable"));
+		vi.spyOn(process.stdout, "write").mockImplementation(() => {
+			throw new Error("EPIPE");
+		});
+
+		await expect(copyToClipboard("hello")).rejects.toThrow(/arboard unavailable/);
+	});
+
+	it("resolves after emitting OSC 52 even when the Termux and native backends fail", async () => {
+		setPlatform("android");
+		process.env.TERMUX_VERSION = "0.118";
+		setStdoutIsTTY(true);
+
+		vi.spyOn(Bun, "spawn").mockImplementation(() => {
+			throw new Error("ENOENT: termux-clipboard-set not found");
+		});
+		vi.spyOn(native, "copyToClipboard").mockRejectedValue(new Error("arboard unavailable"));
+		const writeSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+
+		await copyToClipboard("hello");
+
+		const osc52 = `\x1b]52;c;${Buffer.from("hello").toString("base64")}\x07`;
+		expect(writeSpy.mock.calls.some(([chunk]) => String(chunk) === osc52)).toBe(true);
+	});
+
+	it("reads text through termux-clipboard-get", async () => {
+		setPlatform("android");
+		process.env.TERMUX_VERSION = "0.118";
+
+		const calls: SpawnCall[] = [];
+		spySpawn(calls, "hello\n");
+
+		expect(await readTextFromClipboard()).toBe("hello\n");
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.cmd).toEqual(["termux-clipboard-get"]);
+	});
+
+	it("returns an empty string and warns when the Termux read fails", async () => {
+		setPlatform("android");
+		process.env.TERMUX_VERSION = "0.118";
+
+		const calls: SpawnCall[] = [];
+		spySpawn(calls, "", 1);
+
+		expect(await readTextFromClipboard()).toBe("");
+		expect(calls[0]?.cmd).toEqual(["termux-clipboard-get"]);
 	});
 });
 

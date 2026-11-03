@@ -61,6 +61,12 @@ export interface AgentHistorySummary {
 	branchName?: string;
 	/** Captured nested-repo patches (`<id>.nested-<n>-<path>.patch`), one per nested repository the agent changed. */
 	nestedPatchPaths?: string[];
+	/**
+	 * Isolated workspace whose changes are not released yet, while it still
+	 * exists on disk. Reviving an isolated agent runs it there and releasing it
+	 * captures the remaining delta.
+	 */
+	isolationDir?: string;
 }
 
 export interface AgentRef {
