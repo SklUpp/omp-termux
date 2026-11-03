@@ -2029,17 +2029,17 @@ index 34fa981..4355498 100644
  // ═══════════════════════════════════════════════════════════════════════════
 diff --git a/packages/coding-agent/test/task/isolation-retained.test.ts b/packages/coding-agent/test/task/isolation-retained.test.ts
 new file mode 100644
-index 0000000..b9108bf
+index 0000000..7c88af1
 --- /dev/null
 +++ b/packages/coding-agent/test/task/isolation-retained.test.ts
-@@ -0,0 +1,828 @@
+@@ -0,0 +1,865 @@
 +import { afterEach, describe, expect, it, vi } from "bun:test";
 +import { type } from "@oh-my-pi/omptype";
 +import * as fs from "node:fs/promises";
 +import * as os from "node:os";
 +import * as path from "node:path";
 +import * as natives from "@oh-my-pi/pi-natives";
-+import { setWorktreesDir } from "@oh-my-pi/pi-utils";
++import { getWorktreesDir, setWorktreesDir } from "@oh-my-pi/pi-utils";
 +import { clearWorktrees, stopRetainedMount } from "@oh-my-pi/pi-coding-agent/cli/worktree-cli";
 +import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 +import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -2141,6 +2141,25 @@ index 0000000..b9108bf
 +}
 +
 +/**
++ *  Child scripts are written under a temp dir outside the workspace, so package
++ *  specifiers cannot resolve there; import the module by absolute file URL.
++ */
++function ownershipModuleUrl(): string {
++	return new URL("../../src/task/isolation-ownership.ts", import.meta.url).href;
++}
++
++/** Read what a failed child wrote to stderr so a crash is not reported as silence. */
++async function childError(child: {
++	kill(): unknown;
++	exited: Promise<number>;
++	stderr: ReadableStream<Uint8Array>;
++}): Promise<string> {
++	child.kill();
++	await child.exited.catch(() => undefined);
++	return (await new Response(child.stderr).text()).trim();
++}
++
++/**
 + * Hold the sandbox slot lease in a real child process until `release()` is
 + * called. The child stays alive on stdin, so no wall-clock wait is involved.
 + */
@@ -2148,7 +2167,7 @@ index 0000000..b9108bf
 +	const script = path.join(scriptDir, `hold-${Bun.hash(slot).toString(16)}.ts`);
 +	await Bun.write(
 +		script,
-+		`import { withIsolationLease } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
++		`import { withIsolationLease } from ${JSON.stringify(ownershipModuleUrl())};
 +const [slot] = process.argv.slice(2);
 +await withIsolationLease(slot, async () => {
 +	console.log("held");
@@ -2162,9 +2181,15 @@ index 0000000..b9108bf
 +		stdin: "pipe",
 +		stdout: "pipe",
 +		stderr: "pipe",
++		// `setWorktreesDir` is process-local; pin the same root for the child via
++		// the documented env override, or it locks the default ~/.omp/wt lease.
++		env: { ...process.env, OMP_WORKTREE_DIR: getWorktreesDir() },
 +	});
 +	const line = await readLine(child.stdout);
-+	if (!line.includes("held")) throw new Error(`child did not hold the claim: ${line}`);
++	if (!line.includes("held")) {
++		const stderr = await childError(child);
++		throw new Error(`child did not hold the claim: ${line || stderr}`);
++	}
 +	return {
 +		release: async () => {
 +			child.stdin.write("x\n");
@@ -2530,10 +2555,14 @@ index 0000000..b9108bf
 +
 +	it("serialises two-process claims on the same slot", async () => {
 +		const fixture = await isolationFixture();
++		// The fixture's marker names this (live) process, so either child would
++		// refuse before ever racing the lease. Clear it so the winner can claim
++		// and the loser observes the lease/owner contention instead.
++		await fs.rm(path.join(fixture.base, ISOLATION_OWNER_FILE));
 +		const script = path.join(fixture.artifactsDir, "claim-child.ts");
 +		await Bun.write(
 +			script,
-+			`import { claimIsolationOwner } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
++			`import { claimIsolationOwner } from ${JSON.stringify(ownershipModuleUrl())};
 +const [dir, id, slot] = process.argv.slice(2);
 +try {
 +	await claimIsolationOwner(dir, id, slot);
@@ -2552,10 +2581,18 @@ index 0000000..b9108bf
 +				stdin: "pipe",
 +				stdout: "pipe",
 +				stderr: "pipe",
++				// `setWorktreesDir` is process-local; pin the same root for the child
++				// via the documented env override, or it locks ~/.omp/wt instead.
++				env: { ...process.env, OMP_WORKTREE_DIR: getWorktreesDir() },
 +			}),
 +		);
 +		try {
-+			const outputs = await Promise.all(children.map(child => readLine(child.stdout)));
++			const outputs = await Promise.all(
++				children.map(async child => {
++					const line = await readLine(child.stdout);
++					return line.trim().length > 0 ? line : await childError(child);
++				}),
++			);
 +			expect(outputs.filter(line => line.includes("won"))).toHaveLength(1);
 +			expect(outputs.join("")).toMatch(/lost:(.*lease.*|.*owned by live omp process.*)/);
 +			for (const child of children) child.stdin.write("x\n");
