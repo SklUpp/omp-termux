@@ -109,6 +109,15 @@ and memory reporting native.
 `SUPPORTED_PLATFORMS` gains `"android-arm64"` so the loader accepts the
 addon at startup and maps the tag to `pi_natives.android-arm64.node`.
 
+### 8. pi-vfs — bionic `faccessat` flags
+
+Bionic rejects any nonzero `faccessat` flag with `EINVAL`, and the Rust `libc`
+Android module omits `AT_EACCESS`. `may_access` therefore passes `flags = 0`
+(real IDs) only when `uid == euid` and `gid == egid`; on mismatch it returns
+`false` conservatively, so FIFO cancellation skips its best-effort release
+wake and can leave the helper blocked until the other end connects. Non-Android
+still uses `AT_EACCESS` unchanged.
+
 ## Fork feature: task isolation workspace lifecycle (patch `02`)
 
 Not Android-gated — this is a port-carried feature that rides in the same

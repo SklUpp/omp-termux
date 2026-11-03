@@ -740,6 +740,33 @@ index fc1c1c8..c01d501 100644
  mod platform {
  	use std::{
  		collections::HashSet,
+diff --git a/crates/pi-vfs/src/fs.rs b/crates/pi-vfs/src/fs.rs
+index a378045..f11e5e6 100644
+--- a/crates/pi-vfs/src/fs.rs
++++ b/crates/pi-vfs/src/fs.rs
+@@ -510,8 +510,21 @@ fn may_access(path: &Path, mode: libc::c_int) -> bool {
+ 	let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+ 		return false;
+ 	};
++	// bionic rejects every nonzero faccessat flag with EINVAL, so its flags=0
++	// path checks real IDs. That matches the effective-ID contract only when
++	// real and effective IDs agree (the normal Termux case); fail closed
++	// otherwise — release is best-effort and stays blocked instead.
++	// SAFETY: the get*id calls take no arguments and never fail.
++	#[cfg(target_os = "android")]
++	if unsafe { libc::getuid() != libc::geteuid() || libc::getgid() != libc::getegid() } {
++		return false;
++	}
++	#[cfg(target_os = "android")]
++	const ACCESS_FLAGS: libc::c_int = 0;
++	#[cfg(not(target_os = "android"))]
++	const ACCESS_FLAGS: libc::c_int = libc::AT_EACCESS;
+ 	// SAFETY: `path` is a NUL-terminated string alive for the call.
+-	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, libc::AT_EACCESS) == 0 }
++	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, ACCESS_FLAGS) == 0 }
+ }
+ 
+ /// Reads a whole host file. Under a cancellable scope the read goes through
 diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src/task/index.ts
 index 88cd09b..98f8661 100644
 --- a/packages/coding-agent/src/task/index.ts
