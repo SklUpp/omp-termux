@@ -2965,7 +2965,7 @@ index 02c7e0a..3254658 100644
  	}
 diff --git a/packages/coding-agent/test/android-helpers.test.ts b/packages/coding-agent/test/android-helpers.test.ts
 new file mode 100644
-index 0000000..1987b3e
+index 0000000..143a092
 --- /dev/null
 +++ b/packages/coding-agent/test/android-helpers.test.ts
 @@ -0,0 +1,147 @@
@@ -3016,7 +3016,7 @@ index 0000000..1987b3e
 +			kill: () => {},
 +			exited: Promise.resolve(result.code ?? 0),
 +		} as never;
-+	}) as typeof Bun.spawn);
++	}) as unknown as typeof Bun.spawn);
 +	return calls;
 +}
 +
@@ -3236,19 +3236,19 @@ index 497d309..f215916 100644
  	spyOn(os, "platform").mockReturnValue(platform);
  } else if (platform) {
 diff --git a/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts b/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
-index 98ca39a..543b1f6 100644
+index 98ca39a..a2dc6d1 100644
 --- a/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
 +++ b/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
-@@ -3,23 +3,37 @@
- // reached this worker's stdout and the native backend. The worker has its own
- // `process`, so the fakes below do not touch the test runner.
- import { spyOn } from "bun:test";
-+import { workerData } from "node:worker_threads";
- import { copyToClipboard } from "@oh-my-pi/pi-coding-agent/utils/clipboard";
+@@ -7,19 +7,37 @@ import { copyToClipboard } from "@oh-my-pi/pi-coding-agent/utils/clipboard";
  import * as natives from "@oh-my-pi/pi-natives/clipboard";
  
  declare const self: Worker;
-+const failNativeCopy = workerData === "native-fails";
++// `workerData` is not typed in every Bun WorkerOptions build, so the test sends
++// the mode as the first message; it is queued until this listener registers.
++const mode = await new Promise<string>(resolve => {
++	self.addEventListener("message", event => resolve(String(event.data)), { once: true });
++});
++const failNativeCopy = mode === "native-fails";
  
  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
  // Linux keeps macOS runs off the real pbcopy; the native write is stubbed.
@@ -3514,10 +3514,10 @@ index 0946a6e..2976d99 100644
  		const harness = createRuntimeHarness([assistantText("answer")]);
 diff --git a/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
 new file mode 100644
-index 0000000..c9ccbce
+index 0000000..79bda86
 --- /dev/null
 +++ b/packages/coding-agent/test/termux-notifications.test.ts
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,495 @@
 +/**
 + * Termux notification wiring: the existing `completion.notify` / `error.notify` /
 + * `ask.notify` gates and the global `PI_NOTIFICATIONS` suppression decide whether
@@ -3596,7 +3596,7 @@ index 0000000..c9ccbce
 +			kill: () => {},
 +			exited: Promise.resolve(0),
 +		} as never;
-+	}) as typeof Bun.spawn);
++	}) as unknown as typeof Bun.spawn);
 +	return calls;
 +}
 +
@@ -3821,7 +3821,8 @@ index 0000000..c9ccbce
 +
 +		const post = calls.find(args => args[0] === "termux-notification");
 +		expect(post?.[2]?.startsWith(`omp-ask-${process.pid}-`)).toBe(true);
-+		expect(calls.at(-1)).toEqual(["termux-notification-remove", post?.[2]]);
++		expect(post).toBeDefined();
++		expect(calls.at(-1)).toEqual(["termux-notification-remove", post![2]]);
 +	});
 +
 +	it("clears the card when the dialog throws", async () => {
@@ -3842,7 +3843,8 @@ index 0000000..c9ccbce
 +		).rejects.toBeDefined();
 +
 +		const post = calls.find(args => args[0] === "termux-notification");
-+		expect(calls.at(-1)).toEqual(["termux-notification-remove", post?.[2]]);
++		expect(post).toBeDefined();
++		expect(calls.at(-1)).toEqual(["termux-notification-remove", post![2]]);
 +	});
 +
 +	it("clears the card when the ask is aborted before the dialog settles", async () => {
@@ -3863,7 +3865,8 @@ index 0000000..c9ccbce
 +		).rejects.toBeDefined();
 +
 +		const post = calls.find(args => args[0] === "termux-notification");
-+		expect(calls.at(-1)).toEqual(["termux-notification-remove", post?.[2]]);
++		expect(post).toBeDefined();
++		expect(calls.at(-1)).toEqual(["termux-notification-remove", post![2]]);
 +	});
 +
 +	it("posts and removes nothing when notifications are globally suppressed", async () => {
@@ -3974,7 +3977,7 @@ index 0000000..c9ccbce
 +				kill: () => {},
 +				exited: Promise.resolve(1),
 +			} as never;
-+		}) as typeof Bun.spawn);
++		}) as unknown as typeof Bun.spawn);
 +
 +		const outcome = await sendAndroidNotification("Safe Title", "Contains secret: ghp_1234567890abcdef");
 +
@@ -4168,10 +4171,18 @@ index 0000000..7720ed1
 +	});
 +});
 diff --git a/packages/coding-agent/test/utils/clipboard-osc52.test.ts b/packages/coding-agent/test/utils/clipboard-osc52.test.ts
-index 32b5f21..d1fff31 100644
+index 32b5f21..b4fdc3a 100644
 --- a/packages/coding-agent/test/utils/clipboard-osc52.test.ts
 +++ b/packages/coding-agent/test/utils/clipboard-osc52.test.ts
-@@ -67,4 +67,24 @@ describe("copyToClipboard OSC 52 routing", () => {
+@@ -56,6 +56,7 @@ describe("copyToClipboard OSC 52 routing", () => {
+ 		const worker = new Worker(new URL("../fixtures/clipboard-worker-copy.ts", import.meta.url).href, {
+ 			type: "module",
+ 		});
++		worker.postMessage("ok");
+ 		const report = Promise.withResolvers<{ stdout: string[]; nativeCopies: string[] }>();
+ 		worker.addEventListener("message", event => report.resolve(event.data));
+ 		worker.addEventListener("error", event => report.reject(event.error ?? new Error(event.message)));
+@@ -67,4 +68,24 @@ describe("copyToClipboard OSC 52 routing", () => {
  			worker.terminate();
  		}
  	});
@@ -4181,8 +4192,8 @@ index 32b5f21..d1fff31 100644
 +	it("rejects in a worker when the native copy fails because OSC 52 cannot be emitted there", async () => {
 +		const worker = new Worker(new URL("../fixtures/clipboard-worker-copy.ts", import.meta.url).href, {
 +			type: "module",
-+			workerData: "native-fails",
 +		});
++		worker.postMessage("native-fails");
 +		const report = Promise.withResolvers<{ stdout: string[]; nativeCopies: string[]; error?: string }>();
 +		worker.addEventListener("message", event => report.resolve(event.data));
 +		worker.addEventListener("error", event => report.reject(event.error ?? new Error(event.message)));
@@ -4197,7 +4208,7 @@ index 32b5f21..d1fff31 100644
 +	});
  });
 diff --git a/packages/coding-agent/test/utils/clipboard.test.ts b/packages/coding-agent/test/utils/clipboard.test.ts
-index 00a84ff..a9fe857 100644
+index 00a84ff..4a171f8 100644
 --- a/packages/coding-agent/test/utils/clipboard.test.ts
 +++ b/packages/coding-agent/test/utils/clipboard.test.ts
 @@ -1,5 +1,6 @@
@@ -4233,7 +4244,7 @@ index 00a84ff..a9fe857 100644
  	vi.restoreAllMocks();
  });
  
-@@ -243,6 +256,97 @@ describe("readImageFromClipboard dispatch", () => {
+@@ -243,6 +256,101 @@ describe("readImageFromClipboard dispatch", () => {
  	});
  });
  
@@ -4263,9 +4274,9 @@ index 00a84ff..a9fe857 100644
 +		vi.spyOn(Bun, "spawn").mockImplementation(() => {
 +			throw new Error("ENOENT: termux-clipboard-set not found");
 +		});
-+		const nativeSpy = vi
-+			.spyOn(native, "copyToClipboard")
-+			.mockRejectedValue(new Error("Native arboard clipboard is unsupported on Android/Termux"));
++		const nativeSpy = vi.spyOn(native, "copyToClipboard").mockImplementation(() => {
++			throw new Error("Native arboard clipboard is unsupported on Android/Termux");
++		});
 +
 +		await expect(copyToClipboard("hello")).rejects.toThrow(/unsupported on Android\/Termux/);
 +		expect(nativeSpy).toHaveBeenCalledTimes(1);
@@ -4279,7 +4290,9 @@ index 00a84ff..a9fe857 100644
 +		vi.spyOn(Bun, "spawn").mockImplementation(() => {
 +			throw new Error("ENOENT: termux-clipboard-set not found");
 +		});
-+		vi.spyOn(native, "copyToClipboard").mockRejectedValue(new Error("arboard unavailable"));
++		vi.spyOn(native, "copyToClipboard").mockImplementation(() => {
++			throw new Error("arboard unavailable");
++		});
 +		vi.spyOn(process.stdout, "write").mockImplementation(() => {
 +			throw new Error("EPIPE");
 +		});
@@ -4295,7 +4308,9 @@ index 00a84ff..a9fe857 100644
 +		vi.spyOn(Bun, "spawn").mockImplementation(() => {
 +			throw new Error("ENOENT: termux-clipboard-set not found");
 +		});
-+		vi.spyOn(native, "copyToClipboard").mockRejectedValue(new Error("arboard unavailable"));
++		vi.spyOn(native, "copyToClipboard").mockImplementation(() => {
++			throw new Error("arboard unavailable");
++		});
 +		const writeSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
 +
 +		await copyToClipboard("hello");
@@ -4483,7 +4498,7 @@ index 75dcd5d..ccb5d0f 100644
  	const existing = await Bun.file(jsPath).text();
  	const generatedBlock = buildGeneratedBlock(dts);
 diff --git a/packages/natives/test/ipc.test.ts b/packages/natives/test/ipc.test.ts
-index c569d44..6cbaee0 100644
+index c569d44..ded5c37 100644
 --- a/packages/natives/test/ipc.test.ts
 +++ b/packages/natives/test/ipc.test.ts
 @@ -223,7 +223,15 @@ describe("native IPC", () => {
@@ -4503,7 +4518,7 @@ index c569d44..6cbaee0 100644
  		expect(ipcEndpoint(dir, name)).toBe(endpoint);
  		expect(Buffer.byteLength(endpoint)).toBeLessThan(104);
  		await listen(endpoint, { framing: "lines" }, connection => {
-@@ -239,6 +247,48 @@ describe("native IPC", () => {
+@@ -239,6 +247,51 @@ describe("native IPC", () => {
  		expect(seen.events).toEqual(["RELOCATED"]);
  	});
  
@@ -4537,7 +4552,10 @@ index c569d44..6cbaee0 100644
 +		cleanups.push(() => child.kill());
 +
 +		const peer = record(await accepted);
-+		await peer.until(1);
++		// The child sends, drains, then destroys its connection; the peer sees
++		// the message followed by the natural close. Waiting for both removes
++		// the race where close arrived just before the assertion.
++		await peer.until(2);
 +		const [stdout, stderr, exitCode] = await Promise.all([
 +			new Response(child.stdout).text(),
 +			new Response(child.stderr).text(),
@@ -4546,7 +4564,7 @@ index c569d44..6cbaee0 100644
 +		expect(stderr).toBe("");
 +		expect(exitCode).toBe(0);
 +		expect(stdout.trim()).toBe(endpoint);
-+		expect(peer.events).toEqual(["from-child"]);
++		expect(peer.events).toEqual(["from-child", "<close>"]);
 +	});
 +
  	test("small and large frames arrive in send order, within and across tasks", async () => {
