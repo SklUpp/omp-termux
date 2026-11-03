@@ -2027,12 +2027,51 @@ index 34fa981..4355498 100644
  // ═══════════════════════════════════════════════════════════════════════════
  // Branch-mode isolation
  // ═══════════════════════════════════════════════════════════════════════════
+diff --git a/packages/coding-agent/test/fixtures/isolation-lease-child.ts b/packages/coding-agent/test/fixtures/isolation-lease-child.ts
+new file mode 100644
+index 0000000..2da7523
+--- /dev/null
++++ b/packages/coding-agent/test/fixtures/isolation-lease-child.ts
+@@ -0,0 +1,33 @@
++import { claimIsolationOwner, withIsolationLease } from "../../src/task/isolation-ownership";
++
++const [mode, ...args] = process.argv.slice(2);
++if (!mode) throw new Error("Expected a mode");
++
++async function waitForRelease(): Promise<void> {
++	process.stdin.resume();
++	await new Promise(resolve => process.stdin.once("data", resolve));
++	// Drop the stdin handle: the parent closes it after one byte, and a resumed
++	// pipe would otherwise keep this process alive past the release.
++	process.stdin.pause();
++}
++
++if (mode === "hold") {
++	const [slot] = args;
++	if (!slot) throw new Error("Expected a slot");
++	await withIsolationLease(slot, async () => {
++		process.stdout.write("held\n");
++		await waitForRelease();
++	});
++} else if (mode === "claim") {
++	const [base, id, slot] = args;
++	if (!base || !id || !slot) throw new Error("Expected base, id, and slot");
++	try {
++		await claimIsolationOwner(base, id, slot);
++		process.stdout.write("won\n");
++	} catch (error) {
++		process.stdout.write(`lost:${error instanceof Error ? error.message : String(error)}\n`);
++	}
++	await waitForRelease();
++} else {
++	throw new Error(`Unknown mode ${mode}`);
++}
 diff --git a/packages/coding-agent/test/task/isolation-retained.test.ts b/packages/coding-agent/test/task/isolation-retained.test.ts
 new file mode 100644
-index 0000000..7c88af1
+index 0000000..978562e
 --- /dev/null
 +++ b/packages/coding-agent/test/task/isolation-retained.test.ts
-@@ -0,0 +1,865 @@
+@@ -0,0 +1,825 @@
 +import { afterEach, describe, expect, it, vi } from "bun:test";
 +import { type } from "@oh-my-pi/omptype";
 +import * as fs from "node:fs/promises";
@@ -2140,59 +2179,52 @@ index 0000000..7c88af1
 +	return text;
 +}
 +
++/** Child worker kept in-repo so its relative imports resolve in CI. */
++const leaseChildScript = path.join(import.meta.dir, "..", "fixtures", "isolation-lease-child.ts");
++
 +/**
-+ *  Child scripts are written under a temp dir outside the workspace, so package
-+ *  specifiers cannot resolve there; import the module by absolute file URL.
++ * First line a child prints, or its exit code and stderr when it dies first:
++ * a crashed child must never look like a silent hang.
 + */
-+function ownershipModuleUrl(): string {
-+	return new URL("../../src/task/isolation-ownership.ts", import.meta.url).href;
++async function childVerdict(child: {
++	stdout: ReadableStream<Uint8Array>;
++	stderr: ReadableStream<Uint8Array>;
++	exited: Promise<number>;
++}): Promise<string> {
++	return await Promise.race([
++		readLine(child.stdout),
++		child.exited.then(
++			async code => `child exited (${code}): ${(await new Response(child.stderr).text()).trim()}`,
++		),
++	]);
 +}
 +
-+/** Read what a failed child wrote to stderr so a crash is not reported as silence. */
-+async function childError(child: {
-+	kill(): unknown;
-+	exited: Promise<number>;
-+	stderr: ReadableStream<Uint8Array>;
-+}): Promise<string> {
-+	child.kill();
-+	await child.exited.catch(() => undefined);
-+	return (await new Response(child.stderr).text()).trim();
++/** Lease worktrees root is per-process; the env override pins the parent's root. */
++function spawnLeaseChild(args: string[]) {
++	return Bun.spawn([process.execPath, leaseChildScript, ...args], {
++		stdin: "pipe",
++		stdout: "pipe",
++		stderr: "pipe",
++		env: { ...process.env, OMP_WORKTREE_DIR: getWorktreesDir() },
++	});
 +}
 +
 +/**
 + * Hold the sandbox slot lease in a real child process until `release()` is
 + * called. The child stays alive on stdin, so no wall-clock wait is involved.
 + */
-+async function holdClaimInChild(slot: string, scriptDir: string): Promise<{ release: () => Promise<void> }> {
-+	const script = path.join(scriptDir, `hold-${Bun.hash(slot).toString(16)}.ts`);
-+	await Bun.write(
-+		script,
-+		`import { withIsolationLease } from ${JSON.stringify(ownershipModuleUrl())};
-+const [slot] = process.argv.slice(2);
-+await withIsolationLease(slot, async () => {
-+	console.log("held");
-+	process.stdin.resume();
-+	await new Promise(resolve => process.stdin.once("data", resolve));
-+});
-+console.log("released");
-+`,
-+	);
-+	const child = Bun.spawn([process.execPath, script, slot], {
-+		stdin: "pipe",
-+		stdout: "pipe",
-+		stderr: "pipe",
-+		// `setWorktreesDir` is process-local; pin the same root for the child via
-+		// the documented env override, or it locks the default ~/.omp/wt lease.
-+		env: { ...process.env, OMP_WORKTREE_DIR: getWorktreesDir() },
-+	});
-+	const line = await readLine(child.stdout);
-+	if (!line.includes("held")) {
-+		const stderr = await childError(child);
-+		throw new Error(`child did not hold the claim: ${line || stderr}`);
++async function holdClaimInChild(slot: string): Promise<{ release: () => Promise<void> }> {
++	const child = spawnLeaseChild(["hold", slot]);
++	const verdict = await childVerdict(child);
++	if (!verdict.includes("held")) {
++		child.kill();
++		throw new Error(`child did not hold the claim: ${verdict}`);
 +	}
 +	return {
 +		release: async () => {
-+			child.stdin.write("x\n");
++			// End the pipe, not just write: the worker resumed stdin, so an open
++			// pipe is a live handle and `exited` would never resolve.
++			child.stdin.end("x\n");
 +			await child.exited;
 +		},
 +	};
@@ -2521,8 +2553,7 @@ index 0000000..7c88af1
 +
 +	it("refuses while another process holds the slot lease, then succeeds after it exits", async () => {
 +		const fixture = await isolationFixture();
-+		const scripts = await tempDir("omp-iso-claim-script-");
-+		const holder = await holdClaimInChild(fixture.slot, scripts);
++		const holder = await holdClaimInChild(fixture.slot);
 +		try {
 +			await expect(claimIsolationOwner(fixture.base, fixture.id, fixture.slot)).rejects.toThrow(
 +				/holds the isolation lease/,
@@ -2559,43 +2590,12 @@ index 0000000..7c88af1
 +		// refuse before ever racing the lease. Clear it so the winner can claim
 +		// and the loser observes the lease/owner contention instead.
 +		await fs.rm(path.join(fixture.base, ISOLATION_OWNER_FILE));
-+		const script = path.join(fixture.artifactsDir, "claim-child.ts");
-+		await Bun.write(
-+			script,
-+			`import { claimIsolationOwner } from ${JSON.stringify(ownershipModuleUrl())};
-+const [dir, id, slot] = process.argv.slice(2);
-+try {
-+	await claimIsolationOwner(dir, id, slot);
-+	console.log("won");
-+} catch (error) {
-+	console.log("lost:" + (error instanceof Error ? error.message : String(error)));
-+}
-+// Stay alive until the parent has read both verdicts: the loser must observe a
-+// LIVE winning owner, so no wall-clock delay is involved on either side.
-+process.stdin.resume();
-+await new Promise(resolve => process.stdin.once("data", resolve));
-+`,
-+		);
-+		const children = [0, 1].map(() =>
-+			Bun.spawn([process.execPath, script, fixture.base, fixture.id, fixture.slot], {
-+				stdin: "pipe",
-+				stdout: "pipe",
-+				stderr: "pipe",
-+				// `setWorktreesDir` is process-local; pin the same root for the child
-+				// via the documented env override, or it locks ~/.omp/wt instead.
-+				env: { ...process.env, OMP_WORKTREE_DIR: getWorktreesDir() },
-+			}),
-+		);
++		const children = [0, 1].map(() => spawnLeaseChild(["claim", fixture.base, fixture.id, fixture.slot]));
 +		try {
-+			const outputs = await Promise.all(
-+				children.map(async child => {
-+					const line = await readLine(child.stdout);
-+					return line.trim().length > 0 ? line : await childError(child);
-+				}),
-+			);
++			const outputs = await Promise.all(children.map(childVerdict));
 +			expect(outputs.filter(line => line.includes("won"))).toHaveLength(1);
 +			expect(outputs.join("")).toMatch(/lost:(.*lease.*|.*owned by live omp process.*)/);
-+			for (const child of children) child.stdin.write("x\n");
++			for (const child of children) child.stdin.end("x\n");
 +			await Promise.all(children.map(child => child.exited));
 +		} finally {
 +			for (const child of children) child.kill();
@@ -2879,11 +2879,10 @@ index 0000000..7c88af1
 +			sessionFile: transcript,
 +		});
 +		await Bun.write(path.join(base, ISOLATION_OWNER_FILE), JSON.stringify({ pid: await deadPid(), id }));
-+		const scripts = await tempDir("omp-iso-rename-script-");
 +		// Acquire the lease on the ORIGINAL sandbox, then let retention rename it.
 +		// The lease lives outside the sandbox and is keyed by the immutable slot,
 +		// so it must still exclude `clear` of the renamed sibling.
-+		const holder = await holdClaimInChild(slot, scripts);
++		const holder = await holdClaimInChild(slot);
 +		const retained = `${base}.retained-1-abc`;
 +		try {
 +			await fs.rename(base, retained);
