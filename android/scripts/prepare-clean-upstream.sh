@@ -21,7 +21,11 @@ fi
 
 metadata_dir="$(dirname "$METADATA_ARCHIVE")"
 mkdir -p "$metadata_dir"
-tar -C "$ROOT_DIR" -czf "$METADATA_ARCHIVE" android .github
+metadata_entries=(android .github)
+for extra in install.sh quickstart.sh README.md; do
+	[[ -e "$ROOT_DIR/$extra" ]] && metadata_entries+=("$extra")
+done
+tar -C "$ROOT_DIR" -czf "$METADATA_ARCHIVE" "${metadata_entries[@]}"
 cleanup() {
 	rm -f "$METADATA_ARCHIVE"
 }
