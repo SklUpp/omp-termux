@@ -48,6 +48,14 @@ jobs:
       - name: Validate release inputs
         run: python3 android/scripts/check-release-inputs.py
       - uses: ./.github/actions/bun-install
+      # Lightweight synthetic installer regression: stubbed curl/pkg/uname with
+      # real tar/sha256sum, no network and no native build. Runs before the
+      # heavy addon build so installer breakage fails fast.
+      - name: Verify installer end to end (synthetic)
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: bash android/scripts/test-install.sh
       - name: Build host native addon for applied tests
         run: bun --cwd=packages/natives run build
       - name: Type check applied patch queue
@@ -78,3 +86,16 @@ jobs:
             [[ -f "$t" ]] && tests+=("$t")
           done
           bun test "${tests[@]}"
+      # Required, not optional coverage: these exercise the retained-workspace
+      # lifecycle, dynamic-schema repoRoot, and resume-hint contracts added by
+      # patch 02, so a missing/renamed file must fail the job instead of
+      # silently greening the overlay check.
+      - name: Run isolation lifecycle tests
+        shell: bash
+        run: |
+          bun test \
+            ./packages/coding-agent/test/task/isolation-retained.test.ts \
+            ./packages/coding-agent/test/task/persisted-revive.test.ts \
+            ./packages/coding-agent/test/task/task-spawn.test.ts \
+            ./packages/coding-agent/test/task/task-schema.test.ts \
+            ./packages/coding-agent/test/task/result-summary.test.ts

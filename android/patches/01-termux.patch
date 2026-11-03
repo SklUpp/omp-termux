@@ -1453,3 +1453,34 @@ diff --git a/crates/pi-natives/src/desktop/control.rs b/crates/pi-natives/src/de
  			_kernel: kernel,
  			running: AtomicBool::new(false),
  		})
+diff --git a/packages/coding-agent/test/interactive-click-focus.test.ts b/packages/coding-agent/test/interactive-click-focus.test.ts
+index 5a55fc7d4e..3ad6cc9627 100644
+--- a/packages/coding-agent/test/interactive-click-focus.test.ts
++++ b/packages/coding-agent/test/interactive-click-focus.test.ts
+@@ -862,7 +862,11 @@ describe("inline click-to-focus geometry", () => {
+ 		await term.waitForRender(() => screen().some(row => row.includes("Extension links")));
+ 		// A link handler's `ctx.ui.custom(…, { overlay: true })` draws over the browser and takes the keys.
+ 		const keys: string[] = [];
+-		const panel = { render: () => ["Handler panel"], invalidate() {}, handleInput: (data: string) => keys.push(data) };
++		const panel = {
++			render: () => ["Handler panel"],
++			invalidate() {},
++			handleInput: (data: string) => keys.push(data),
++		};
+ 		const handle = mode.ui.showOverlay(panel, { anchor: "center", width: 30 });
+ 		expect(mode.ui.getFocused()).toBe(panel);
+ 
+diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
+index 612a355510..71989dbebd 100644
+--- a/packages/tui/src/tui.ts
++++ b/packages/tui/src/tui.ts
+@@ -1328,7 +1328,8 @@ export class TUI extends Container {
+ 					this.overlayStack.splice(index, 1);
+ 					// Overlays opened over this one return focus to where it would have.
+ 					for (const other of this.overlayStack) {
+-						if (other.preFocus && isOverlayFocusTarget(component, other.preFocus)) other.preFocus = entry.preFocus;
++						if (other.preFocus && isOverlayFocusTarget(component, other.preFocus))
++							other.preFocus = entry.preFocus;
+ 					}
+ 					// Restore focus if this overlay or one of its owned targets had focus
+ 					if (isOverlayFocusTarget(component, this.#focusedComponent)) {
