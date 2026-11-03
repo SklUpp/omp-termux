@@ -91,6 +91,71 @@ index d36b3f6..99b661e 100644
  fn ps_total_memory_bytes() -> Option<u64> {
  	let value = fs::read_to_string("/proc/meminfo")
  		.ok()?
+diff --git a/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs b/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
+index d28e8c0..c6f521f 100644
+--- a/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
++++ b/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
+@@ -133,13 +133,18 @@ pub(super) fn resolve(
+ /// The numeric form of an address (`getnameinfo(NI_NUMERICHOST)`).
+ pub(super) fn numeric_host(addr: &Addr) -> String {
+ 	let mut buf = [0 as libc::c_char; 1025];
++	// bionic declares `getnameinfo` hostlen/servlen as `size_t`, not `socklen_t`.
++	#[cfg(target_os = "android")]
++	let host_len = buf.len();
++	#[cfg(not(target_os = "android"))]
++	let host_len = buf.len() as libc::socklen_t;
+ 	// SAFETY: `addr` holds `len` valid bytes; `buf` is writable for its length.
+ 	let rc = unsafe {
+ 		libc::getnameinfo(
+ 			addr.as_ptr(),
+ 			addr.len,
+ 			buf.as_mut_ptr(),
+-			buf.len() as libc::socklen_t,
++			host_len,
+ 			std::ptr::null_mut(),
+ 			0,
+ 			libc::NI_NUMERICHOST,
+diff --git a/crates/pi-builtins/src/rsync/tree/sys.rs b/crates/pi-builtins/src/rsync/tree/sys.rs
+index 08b8c00..6732262 100644
+--- a/crates/pi-builtins/src/rsync/tree/sys.rs
++++ b/crates/pi-builtins/src/rsync/tree/sys.rs
+@@ -267,7 +267,20 @@ pub(crate) fn mknodat(
+ 	}))
+ }
+ 
++/// bionic exports `mkfifoat` since API 23, but the Rust `libc` Android module
++/// omits the binding; the workspace targets API 24+.
++#[cfg(target_os = "android")]
++unsafe extern "C" {
++	#[link_name = "mkfifoat"]
++	fn bionic_mkfifoat(
++		dirfd: libc::c_int,
++		path: *const libc::c_char,
++		mode: libc::mode_t,
++	) -> libc::c_int;
++}
++
+ /// `mkfifoat(dir, name, mode)`.
++#[cfg(not(target_os = "android"))]
+ pub(crate) fn mkfifoat(dir: Option<BorrowedFd<'_>>, name: &CStr, mode: u32) -> io::Result<()> {
+ 	check(retry(|| {
+ 		// SAFETY: valid C string and dirfd.
+@@ -275,6 +288,15 @@ pub(crate) fn mkfifoat(dir: Option<BorrowedFd<'_>>, name: &CStr, mode: u32) -> i
+ 	}))
+ }
+ 
++/// `mkfifoat(dir, name, mode)` via bionic's symbol.
++#[cfg(target_os = "android")]
++pub(crate) fn mkfifoat(dir: Option<BorrowedFd<'_>>, name: &CStr, mode: u32) -> io::Result<()> {
++	check(retry(|| {
++		// SAFETY: valid C string and dirfd; bionic provides the symbol on API 23+.
++		unsafe { bionic_mkfifoat(dirfd(dir), name.as_ptr(), mode as libc::mode_t) }
++	}))
++}
++
+ /// Names in the directory `fd` (opened for reading), without `.` and `..`.
+ pub(crate) fn read_dir(fd: OwnedFd) -> io::Result<Vec<OsString>> {
+ 	let mut dir = rustix::fs::Dir::new(fd)?;
 diff --git a/crates/pi-natives/Cargo.toml b/crates/pi-natives/Cargo.toml
 index efed215..2e02031 100644
 --- a/crates/pi-natives/Cargo.toml

@@ -118,6 +118,15 @@ Android module omits `AT_EACCESS`. `may_access` therefore passes `flags = 0`
 wake and can leave the helper blocked until the other end connects. Non-Android
 still uses `AT_EACCESS` unchanged.
 
+### 9. pi-builtins — bionic sync calls
+
+Bionic exports `mkfifoat` since API 23, but the Rust `libc` Android module omits
+the binding; the patch declares the bionic symbol locally (API 24+ target),
+keeping the dirfd-relative call, `EINTR` retry and errno unchanged. Bionic also
+declares `getnameinfo` host length as `size_t`, so Android passes `buf.len()` as
+`usize`; other Unix targets keep `socklen_t`. Address, length and behavior are
+unchanged.
+
 ## Fork feature: task isolation workspace lifecycle (patch `02`)
 
 Not Android-gated — this is a port-carried feature that rides in the same
