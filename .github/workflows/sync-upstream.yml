@@ -1,0 +1,80 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 3 */2 * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+  issues: write
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+# Tracks the official upstream tip only. Never touches the generated tree,
+# the patch queue, mod, or tags. Porting happens in port-patches.yml, so a
+# red patch queue can never turn this workflow red.
+jobs:
+  upstream-sync:
+    name: Sync upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Record upstream tip
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/can1357/oh-my-pi.git 2>/dev/null || git remote set-url upstream https://github.com/can1357/oh-my-pi.git
+          git fetch --no-tags upstream main
+          upstream_tip=$(git rev-parse upstream/main)
+          if [[ ! "$upstream_tip" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: fetched upstream tip is not a 40-character SHA: $upstream_tip" >&2
+            exit 1
+          fi
+          if git show-ref --verify --quiet refs/heads/upstream; then
+            old_upstream=$(git rev-parse refs/heads/upstream)
+            git merge-base --is-ancestor "$old_upstream" "$upstream_tip" || {
+              echo "error: upstream branch would move backwards ($old_upstream is not an ancestor of $upstream_tip)" >&2
+              exit 1
+            }
+            git update-ref refs/heads/upstream "$upstream_tip" "$old_upstream"
+          else
+            git update-ref refs/heads/upstream "$upstream_tip"
+          fi
+          git push origin refs/heads/upstream:refs/heads/upstream || echo "warning: could not push upstream branch (permissions)"
+          # Verify patch queue applies before advancing UPSTREAM_TRACKED on main
+          probe_dir=$(mktemp -d)
+          git archive "$upstream_tip" | tar -x -C "$probe_dir"
+          git -C "$probe_dir" init -q
+          if ! git -C "$probe_dir" apply --check --whitespace=nowarn "$GITHUB_WORKSPACE/android/patches/01-termux.patch" 2>/dev/null; then
+            rm -rf "$probe_dir"
+            echo "::warning::Patches do not apply cleanly onto upstream tip $upstream_tip; skipping automatic update"
+            exit 0
+          fi
+          rm -rf "$probe_dir"
+
+          git config user.name github-actions[bot]
+          printf '%s\n' "$upstream_tip" > android/UPSTREAM_TRACKED
+          printf '%s\n' "$upstream_tip" > android/UPSTREAM_COMMIT
+          git add android/UPSTREAM_TRACKED android/UPSTREAM_COMMIT
+          git commit -m "chore: track upstream ${upstream_tip:0:12}" || echo "already tracked: $upstream_tip"
+          git push origin HEAD:refs/heads/main
+        env:
+          PUBLISH_UPSTREAM_BRANCH: ${{ vars.PUBLISH_UPSTREAM_BRANCH }}
+      - name: Notify track failure
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          msg="Upstream track failed on run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
+          issue_num=$(gh issue list --repo "${{ github.repository }}" --state open --search "Upstream track failure" --json number --jq '.[0].number // empty' || echo "")
+          if [ -n "$issue_num" ]; then
+            gh issue comment "$issue_num" --repo "${{ github.repository }}" --body "$msg" || true
+          else
+            gh issue create --repo "${{ github.repository }}" --title "Upstream track failure" --body "$msg" || true
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
