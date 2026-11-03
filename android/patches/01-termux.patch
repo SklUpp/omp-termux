@@ -853,10 +853,18 @@ index 2f9b06c..81a8446 100644
  
  	#[test]
 diff --git a/crates/pi-natives/src/ipc/mod.rs b/crates/pi-natives/src/ipc/mod.rs
-index afe6bc9..c6b9118 100644
+index afe6bc9..fc0f929 100644
 --- a/crates/pi-natives/src/ipc/mod.rs
 +++ b/crates/pi-natives/src/ipc/mod.rs
-@@ -142,20 +142,25 @@ pub struct IpcConnectOptions {
+@@ -46,6 +46,7 @@ const DEFAULT_MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
+ const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 3000;
+ 
+ /// Transport failure carrying an errno-style code.
++#[derive(Debug)]
+ pub struct IpcError {
+ 	code:    &'static str,
+ 	message: String,
+@@ -142,20 +143,25 @@ pub struct IpcConnectOptions {
  /// Platform endpoint for `name` scoped to directory `dir`.
  ///
  /// Unix: `<dir>/<stem>.sock`; when that path does not fit `sun_path` (104 bytes
@@ -2885,10 +2893,10 @@ index 0000000..db76062
 +	return { ok: false, error: "OOM adjust not available or denied" };
 +}
 diff --git a/packages/coding-agent/src/utils/clipboard.ts b/packages/coding-agent/src/utils/clipboard.ts
-index 02c7e0a..636cabb 100644
+index 02c7e0a..3254658 100644
 --- a/packages/coding-agent/src/utils/clipboard.ts
 +++ b/packages/coding-agent/src/utils/clipboard.ts
-@@ -124,10 +124,25 @@ let macClipboardWrite = Promise.resolve();
+@@ -124,10 +124,24 @@ let macClipboardWrite = Promise.resolve();
   * The OSC 52 goes through `writeTerminalSequence`, so it cannot tear a TUI
   * frame; from a worker thread it is skipped and only the native copy runs.
   *
@@ -2909,13 +2917,12 @@ index 02c7e0a..636cabb 100644
 +	// a Bun worker cannot reach the main thread's terminal, and a closed stdout
 +	// is swallowed, so neither may count as delivery.
 +	const osc52Emitted =
-+		process.stdout.isTTY &&
-+		writeTerminalSequence(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
++		process.stdout.isTTY && writeTerminalSequence(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
 +	let delivered = osc52Emitted;
  
  	// Keep pbcopy, document-header writes, and native fallbacks in invocation order.
  	let releaseWrite: (() => void) | undefined;
-@@ -144,9 +159,13 @@ export async function copyToClipboard(text: string): Promise<void> {
+@@ -144,9 +158,13 @@ export async function copyToClipboard(text: string): Promise<void> {
  		if (process.env.TERMUX_VERSION) {
  			try {
  				await spawnCapture(["termux-clipboard-set"], { input: text, timeoutMs: 5000 });
@@ -2931,7 +2938,7 @@ index 02c7e0a..636cabb 100644
  			}
  		}
  		// macOS: prefer `pbcopy` over the in-process AppKit write, mirroring the
-@@ -172,15 +191,21 @@ export async function copyToClipboard(text: string): Promise<void> {
+@@ -172,15 +190,21 @@ export async function copyToClipboard(text: string): Promise<void> {
  					timeoutMs: 5000,
  					env: { ...process.env, LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" },
  				});
@@ -3275,10 +3282,10 @@ index 98ca39a..543b1f6 100644
 +}
 diff --git a/packages/coding-agent/test/generator-android.test.ts b/packages/coding-agent/test/generator-android.test.ts
 new file mode 100644
-index 0000000..d939312
+index 0000000..390c4b5
 --- /dev/null
 +++ b/packages/coding-agent/test/generator-android.test.ts
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,145 @@
 +import { describe, expect, it } from "bun:test";
 +import * as fs from "node:fs/promises";
 +import * as os from "node:os";
@@ -3308,7 +3315,11 @@ index 0000000..d939312
 +/** Evaluate the generated exports against a fake addon and platform. */
 +function instantiate(
 +	block: string,
-+	options: { platform: NodeJS.Platform; bindings: Record<string, unknown>; missingNativeExport: (name: string) => unknown },
++	options: {
++		platform: NodeJS.Platform;
++		bindings: Record<string, unknown>;
++		missingNativeExport: (name: string) => unknown;
++	},
 +): Record<string, any> {
 +	const names = [...block.matchAll(/^export const (\w+) =/gm)].map(match => match[1]!);
 +	const body = block.replace(/^export const /gm, "const ");
@@ -3503,10 +3514,10 @@ index 0946a6e..2976d99 100644
  		const harness = createRuntimeHarness([assistantText("answer")]);
 diff --git a/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
 new file mode 100644
-index 0000000..d6e8098
+index 0000000..c9ccbce
 --- /dev/null
 +++ b/packages/coding-agent/test/termux-notifications.test.ts
-@@ -0,0 +1,494 @@
+@@ -0,0 +1,492 @@
 +/**
 + * Termux notification wiring: the existing `completion.notify` / `error.notify` /
 + * `ask.notify` gates and the global `PI_NOTIFICATIONS` suppression decide whether
@@ -3665,9 +3676,7 @@ index 0000000..d6e8098
 +			makeAgentEndEvent([makeAssistantMessage("stop")]),
 +		);
 +
-+		expect(calls).toEqual([
-+			["termux-notification", "--id", statusId, "--title", "omp", "--content", "Complete"],
-+		]);
++		expect(calls).toEqual([["termux-notification", "--id", statusId, "--title", "omp", "--content", "Complete"]]);
 +	});
 +
 +	it("uses the fixed app title, never the conversation-derived session name", () => {
@@ -3954,7 +3963,7 @@ index 0000000..d6e8098
 +
 +	it("returns the command error without leaking arguments or secrets", async () => {
 +		process.env.TERMUX_VERSION = "0.118";
-+		vi.spyOn(Bun, "spawn").mockImplementation(((() => {
++		vi.spyOn(Bun, "spawn").mockImplementation((() => {
 +			return {
 +				stderr: new ReadableStream({
 +					start(controller) {
@@ -3965,7 +3974,7 @@ index 0000000..d6e8098
 +				kill: () => {},
 +				exited: Promise.resolve(1),
 +			} as never;
-+		}) as typeof Bun.spawn));
++		}) as typeof Bun.spawn);
 +
 +		const outcome = await sendAndroidNotification("Safe Title", "Contains secret: ghp_1234567890abcdef");
 +
@@ -4474,18 +4483,17 @@ index 75dcd5d..ccb5d0f 100644
  	const existing = await Bun.file(jsPath).text();
  	const generatedBlock = buildGeneratedBlock(dts);
 diff --git a/packages/natives/test/ipc.test.ts b/packages/natives/test/ipc.test.ts
-index c569d44..d03c815 100644
+index c569d44..6cbaee0 100644
 --- a/packages/natives/test/ipc.test.ts
 +++ b/packages/natives/test/ipc.test.ts
-@@ -223,7 +223,16 @@ describe("native IPC", () => {
+@@ -223,7 +223,15 @@ describe("native IPC", () => {
  		const dir = path.join(await tempDir(), "d".repeat(120));
  		const name = `long-${process.pid}`;
  		const endpoint = ipcEndpoint(dir, name);
 -		expect(endpoint).toMatch(new RegExp(`^/tmp/omp-${process.getuid!()}/[0-9a-f]{16}\\.sock$`));
 +		// Android has no /tmp: the relocation directory is <installed root>/tmp/omp-<uid>,
 +		// where the launcher exports the installed root as OMP_ANDROID_PREFIX.
-+		const prefix =
-+			process.env.OMP_ANDROID_PREFIX ?? process.env.PREFIX ?? "/data/data/com.termux/files/usr";
++		const prefix = process.env.OMP_ANDROID_PREFIX ?? process.env.PREFIX ?? "/data/data/com.termux/files/usr";
 +		const relocationRoot =
 +			process.platform === "android"
 +				? path.join(prefix, "tmp", `omp-${process.getuid!()}`)
@@ -4495,7 +4503,7 @@ index c569d44..d03c815 100644
  		expect(ipcEndpoint(dir, name)).toBe(endpoint);
  		expect(Buffer.byteLength(endpoint)).toBeLessThan(104);
  		await listen(endpoint, { framing: "lines" }, connection => {
-@@ -239,6 +248,48 @@ describe("native IPC", () => {
+@@ -239,6 +247,48 @@ describe("native IPC", () => {
  		expect(seen.events).toEqual(["RELOCATED"]);
  	});
  
