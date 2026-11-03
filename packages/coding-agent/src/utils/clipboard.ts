@@ -124,10 +124,25 @@ let macClipboardWrite = Promise.resolve();
  * The OSC 52 goes through `writeTerminalSequence`, so it cannot tear a TUI
  * frame; from a worker thread it is skipped and only the native copy runs.
  *
+ * Resolves once at least one channel actually emitted or accepted the text:
+ * OSC 52 written to a TTY on the main thread, `termux-clipboard-set`, `pbcopy`,
+ * or the native bridge. A worker thread cannot emit OSC 52, and a swallowed
+ * stdout write does not count. Rejects when every channel failed, so a caller
+ * cannot claim the copy succeeded when nothing received the text (for example
+ * Termux without `termux-api` and no TTY for OSC 52). OSC 52 is still
+ * best-effort even when emitted: the external terminal may ignore it.
+ *
  * @param text - UTF-8 text to place on the clipboard.
+ * @throws Error when no channel accepted the text.
  */
 export async function copyToClipboard(text: string): Promise<void> {
-	if (process.stdout.isTTY) writeTerminalSequence(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
+	// `writeTerminalSequence` reports whether it actually emitted the sequence:
+	// a Bun worker cannot reach the main thread's terminal, and a closed stdout
+	// is swallowed, so neither may count as delivery.
+	const osc52Emitted =
+		process.stdout.isTTY &&
+		writeTerminalSequence(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
+	let delivered = osc52Emitted;
 
 	// Keep pbcopy, document-header writes, and native fallbacks in invocation order.
 	let releaseWrite: (() => void) | undefined;
@@ -144,9 +159,13 @@ export async function copyToClipboard(text: string): Promise<void> {
 		if (process.env.TERMUX_VERSION) {
 			try {
 				await spawnCapture(["termux-clipboard-set"], { input: text, timeoutMs: 5000 });
+				delivered = true;
 				return;
-			} catch {
-				// Fall through to native
+			} catch (error) {
+				logger.warn("clipboard: termux-clipboard-set failed; trying native bridge", {
+					error: String(error),
+				});
+				// Fall through to native.
 			}
 		}
 		// macOS: prefer `pbcopy` over the in-process AppKit write, mirroring the
@@ -172,15 +191,21 @@ export async function copyToClipboard(text: string): Promise<void> {
 					timeoutMs: 5000,
 					env: { ...process.env, LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" },
 				});
+				delivered = true;
 				return;
-			} catch {
+			} catch (error) {
+				logger.warn("clipboard: pbcopy failed; trying native bridge", { error: String(error) });
 				// Fall through to native.
 			}
 		}
 
 		await nativeCopyToClipboard(text);
-	} catch {
-		// Ignore — clipboard copy is best-effort
+		delivered = true;
+	} catch (error) {
+		if (!delivered) {
+			throw error instanceof Error ? error : new Error(`clipboard copy failed: ${String(error)}`);
+		}
+		logger.warn("clipboard: copy failed after OSC 52 was emitted", { error: String(error) });
 	} finally {
 		releaseWrite?.();
 	}

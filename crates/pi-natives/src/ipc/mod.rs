@@ -142,20 +142,25 @@ pub struct IpcConnectOptions {
 /// Platform endpoint for `name` scoped to directory `dir`.
 ///
 /// Unix: `<dir>/<stem>.sock`; when that path does not fit `sun_path` (104 bytes
-/// on macOS/BSD, 108 on Linux, including NUL), `/tmp/omp-<euid>/<hash16>.sock`.
+/// on macOS/BSD, 108 on Linux, including NUL), the per-user relocation directory
+/// (`/tmp/omp-<euid>`; on Android `<install root>/tmp/omp-<euid>`) plus
+/// `<hash16>.sock`. Throws when even that cannot fit — an install root long
+/// enough to exhaust `sun_path`.
 /// Windows: `\\.\pipe\omp-<stem>-<hash16(lowercase(resolve(dir)))>`.
 /// `stem` is `name` with every char outside `[A-Za-z0-9._-]` replaced by "_".
-/// Pure and deterministic: every process computes the same endpoint.
+/// Pure and deterministic: every process of one install computes the same
+/// endpoint.
 #[napi(js_name = "ipcEndpoint")]
-pub fn ipc_endpoint(dir: String, name: String) -> String {
+pub fn ipc_endpoint(dir: String, name: String) -> Result<String> {
 	let resolved = endpoint::resolve_dir(&dir);
 	#[cfg(unix)]
 	{
 		endpoint::unix_endpoint(&resolved, &name, platform::euid(), endpoint::SUN_PATH_MAX)
+			.map_err(Error::from_reason)
 	}
 	#[cfg(windows)]
 	{
-		endpoint::windows_pipe_name(&resolved, &name)
+		Ok(endpoint::windows_pipe_name(&resolved, &name))
 	}
 }
 
