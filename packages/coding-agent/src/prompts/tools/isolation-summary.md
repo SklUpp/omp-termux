@@ -79,3 +79,6 @@ Nested repository patches (not applied):
 {{#list nestedPatchPaths prefix="- "}}{{this}}{{/list}}
 {{/if}}
 {{/when}}
+{{#if retainedDir}}
+Isolation workspace retained at `{{retainedDir}}`; revive and release the agent to capture its changes. `omp worktree clear` never deletes it.
+{{/if}}
