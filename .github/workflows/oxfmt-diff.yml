@@ -22,6 +22,9 @@ jobs:
       - name: Format flagged files
         shell: bash
         run: |
+          git -c user.name=ci -c user.email=ci@ci commit -am "pre-fmt" || true
+          git add -A
+          git -c user.name=ci -c user.email=ci@ci commit -m "add untracked" || true
           ./node_modules/.bin/oxfmt \
             packages/coding-agent/src/cli/worktree-cli.ts \
             packages/coding-agent/src/task/isolation-ownership.ts \
