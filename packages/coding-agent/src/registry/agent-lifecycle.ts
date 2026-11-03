@@ -63,25 +63,40 @@ async function removeAgentTombstone(id: string, sessionFile: string): Promise<vo
  * Builds a reviver for a `parked` ref restored from disk (Agent Hub scan,
  * collab mirror, resumed process) that carries a sessionFile but no in-memory
  * adoption. Returns undefined when the ref cannot be faithfully rebuilt (no
- * persisted session contract, or its workspace is gone). Injected from the
- * top-level session so this manager stays free of sdk/SessionManager imports.
+ * persisted session contract) and throws with the precise cause when it looks
+ * revivable but is not (missing/corrupt isolation state, moved workspace).
+ * Injected from the top-level session so this manager stays free of
+ * sdk/SessionManager imports.
  */
-export type PersistedSubagentReviverFactory = (ref: AgentRef) => Promise<AgentReviver | undefined>;
+export type PersistedSubagentReviverFactory = (ref: AgentRef) => Promise<PersistedSubagentReviver | undefined>;
+
+/**
+ * A cold reviver with the release it owns. The release rides on the reviver
+ * function itself so existing reviver call sites stay plain functions.
+ */
+export type PersistedSubagentReviver = AgentReviver & {
+	/** Terminal release of resources the revived run owns (e.g. its isolation workspace). */
+	onRelease?: (opts?: { retain?: boolean }) => Promise<void>;
+};
 
 export interface AdoptOptions {
 	/** TTL before an idle agent is parked. <= 0 disables parking. */
 	idleTtlMs: number;
 	/** Recreates a live AgentSession from the ref's sessionFile after parking. */
 	revive?: AgentReviver;
-	/** Releases resources that must survive parking but end with the agent lifecycle. */
-	onRelease?: () => Promise<void>;
+	/**
+	 * Releases resources that must survive parking but end with the agent
+	 * lifecycle. `retain` keeps them (kill tombstone, shutdown) for an explicit
+	 * release later instead of destroying them now.
+	 */
+	onRelease?: (opts?: { retain?: boolean }) => Promise<void>;
 }
 
 interface AdoptedAgent {
 	ref: AgentRef;
 	idleTtlMs: number;
 	revive?: AgentReviver;
-	onRelease?: () => Promise<void>;
+	onRelease?: (opts?: { retain?: boolean }) => Promise<void>;
 	timer?: NodeJS.Timeout;
 }
 
@@ -460,7 +475,7 @@ export class AgentLifecycleManager {
 		}
 		if (!reviver) {
 			throw new Error(
-				`Agent "${id}" was killed and its transcript cannot be resumed (no session contract, isolated run, or its workspace is gone). Read history://${id} for what it did.`,
+				`Agent "${id}" was killed and its transcript cannot be resumed (no session contract or its workspace is gone). Read history://${id} for what it did.`,
 			);
 		}
 		const reopened = this.#registry.reopen(id, killed);
@@ -481,7 +496,7 @@ export class AgentLifecycleManager {
 		let revive = adoption?.ref === ref ? adoption.revive : undefined;
 		let coldAdopted = false;
 		if (!revive && ref.status === "parked" && ref.sessionFile && this.#persistedReviverFactory) {
-			revive = await this.#persistedReviverFactory(ref);
+			const built = await this.#persistedReviverFactory(ref);
 			// Teardown can complete during the factory await. A late cold revive must
 			// not cold-adopt (and later attach a live session + TTL) into a disposed
 			// manager — reject deterministically before creating any session.
@@ -490,8 +505,9 @@ export class AgentLifecycleManager {
 					`Agent "${id}" revival aborted: its lifecycle was disposed while its persisted session was being prepared.`,
 				);
 			}
-			if (revive) {
-				adoption = { ref, idleTtlMs: this.#persistedReviveTtlMs(), revive };
+			if (built) {
+				revive = built;
+				adoption = { ref, idleTtlMs: this.#persistedReviveTtlMs(), revive, onRelease: built.onRelease };
 				this.#adopted.set(id, adoption);
 				coldAdopted = true;
 			}
@@ -529,8 +545,16 @@ export class AgentLifecycleManager {
 	 * `finalizeSubagentLifecycle`'s explicit-kill path. The kill stops the agent,
 	 * it does not destroy it: {@link ensureLive} (a message, Hub revive/focus)
 	 * reopens the transcript.
+	 *
+	 * `retainWorkspace` keeps whatever the adoption owns (an isolation
+	 * workspace) without capturing it, for teardown paths that must leave the
+	 * work recoverable; a plain release destroys it after capturing.
 	 */
-	async release(id: string, expected?: AgentRefExpectation, options?: { tombstone?: boolean }): Promise<boolean> {
+	async release(
+		id: string,
+		expected?: AgentRefExpectation,
+		options?: { tombstone?: boolean; retainWorkspace?: boolean },
+	): Promise<boolean> {
 		const adopted = this.#adopted.get(id);
 		const current = this.#registry.get(id);
 		const currentMatches =
@@ -583,7 +607,7 @@ export class AgentLifecycleManager {
 				}
 			}
 			try {
-				await onRelease?.();
+				await onRelease?.({ retain: Boolean(options?.tombstone) || Boolean(options?.retainWorkspace) });
 			} catch (error) {
 				logger.warn("AgentLifecycleManager.release: owned resource cleanup failed", {
 					id,
@@ -603,7 +627,7 @@ export class AgentLifecycleManager {
 		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])];
 		await Promise.all(
 			ids.map(async id => {
-				const release = this.release(id).then(() => {});
+				const release = this.release(id, undefined, { retainWorkspace: true }).then(() => {});
 				try {
 					await untilAborted(AbortSignal.timeout(Math.max(0, deadlineAt - Date.now())), () => release);
 				} catch (error) {

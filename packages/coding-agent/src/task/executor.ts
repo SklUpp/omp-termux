@@ -15,6 +15,8 @@ import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager, type
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { ModelRegistry } from "../config/model-registry";
+import { claimIsolationOwner } from "./isolation-ownership";
+import { resolveIsolationWorkspace } from "./worktree";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import {
 	previewLine,
@@ -601,8 +603,8 @@ export interface ExecutorOptions {
 	keepAlive?: boolean;
 	/** Internal ownership handoff for cleanup that outlives the visible Task result. */
 	onCleanupDeferred?: (completion: Promise<void>) => void;
-	/** Releases resources retained for a kept-alive agent when its lifecycle ends. */
-	onRelease?: () => Promise<void>;
+	/** Releases resources retained for a kept-alive agent when its lifecycle ends. `retain` keeps them for a later explicit release. */
+	onRelease?: (opts?: { retain?: boolean }) => Promise<void>;
 	/**
 	 * Takes over releasing the run's IRC wake hold (see `AgentSession.holdIrcWakes`),
 	 * for a caller that must finish with the agent's workspace before a held
@@ -3564,7 +3566,8 @@ export async function finalizeSubagentLifecycle(args: {
 	reviveSession: AgentReviver | null;
 	cleanupDeadlineAt?: number;
 	onCleanupDeferred?: (completion: Promise<void>) => void;
-	onRelease?: () => Promise<void>;
+	/** `retain` keeps lifecycle-owned resources (an isolation workspace) for a later explicit release. */
+	onRelease?: (opts?: { retain?: boolean }) => Promise<void>;
 }): Promise<void> {
 	const registry = AgentRegistry.global();
 	const ref = registry.get(args.id);
@@ -3597,7 +3600,10 @@ export async function finalizeSubagentLifecycle(args: {
 	};
 	const releaseOwnedResources = async (): Promise<void> => {
 		try {
-			await args.onRelease?.();
+			// An isolated run keeps its workspace (and descriptor) past run end:
+			// one-shot agents become revivable from their transcript, so the
+			// explicit release is what finally captures and tears it down.
+			await args.onRelease?.({ retain: args.isolated });
 		} catch (error) {
 			logger.warn("Subagent lifecycle resource cleanup failed", { id: args.id, error: String(error) });
 		}
@@ -3615,7 +3621,7 @@ export async function finalizeSubagentLifecycle(args: {
 		if (ref && ownsRef) {
 			if (args.abortKind === "shutdown") {
 				try {
-					await AgentLifecycleManager.global().release(args.id, ref);
+					await AgentLifecycleManager.global().release(args.id, ref, { retainWorkspace: true });
 				} catch (error) {
 					logger.warn("runSubagent: failed to release session during manager shutdown", {
 						id: args.id,
@@ -4146,6 +4152,28 @@ export async function replayRevivedAgentStart(session: AgentSession): Promise<vo
 function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 	return async expectedAgentRef => {
 		const { id } = capture.spec.prompt;
+		// An isolated workspace may have been retained (renamed) after this
+		// closure was built, so resolve the descriptor/pointer fresh instead of
+		// trusting the spawn-time cwd, then claim it for this process before the
+		// session can write there. Refusal (gone/foreign owner/forged state) is
+		// precise and leaves the workspace untouched.
+		const isolation = capture.spec.prompt.worktree
+			? await resolveIsolationWorkspace(
+					capture.sessionFile,
+					id,
+					capture.spec.options.cwd ?? capture.spec.prompt.worktree,
+				)
+			: undefined;
+		if (isolation && "refusal" in isolation) {
+			throw new Error(
+				`Cannot revive subagent "${id}": ${isolation.refusal}. Its transcript remains readable at history://${id}.`,
+			);
+		}
+		if (isolation) await claimIsolationOwner(isolation.state.dir, id, isolation.state.slot);
+		// Retention renamed the workspace after spawn, so the captured prompt
+		// input still names the old path. Render the CURRENT bound workspace;
+		// the committed transcript keeps describing where the run really is.
+		if (isolation) capture.spec.prompt.worktree = isolation.workspaceDir;
 		const reopened = await SessionManager.open(capture.sessionFile, undefined, undefined, {
 			suppressBreadcrumb: true,
 			throwIfMissing: true,
@@ -4191,6 +4219,9 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 					reopened,
 					expectedAgentRef,
 				);
+				// Warm revive must run in the CURRENT bound workspace, not the
+				// pre-retention path recorded at spawn.
+				if (isolation) options.cwd = isolation.workspaceDir;
 				({ session: revived } = await createAgentSession({
 					...options,
 					...(sessionLocalModel
@@ -5029,9 +5060,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
 				restrictToolNames: restrictToolNames || undefined,
-				// Isolated runs are never revivable (worktree merged + cleaned):
-				// stamp the contract so cold revival leaves them transcript-only
-				// even when the workspace was retained for recovery.
+				// Stamp the contract so a later revive resolves the retained
+				// workspace (and its descriptor) instead of resuming in the parent.
 				isolated: worktree !== undefined || undefined,
 			});
 
