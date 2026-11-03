@@ -56,7 +56,8 @@ export default class Worktree extends Command {
 			default: false,
 		}),
 		all: Flags.boolean({
-			description: "Clear every entry, including live PR-checkout worktrees (clear)",
+			description:
+				"Clear every entry, including live PR-checkout worktrees; retained task-isolation workspaces are always preserved (clear)",
 			default: false,
 		}),
 		"dry-run": Flags.boolean({
