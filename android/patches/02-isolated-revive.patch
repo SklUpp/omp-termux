@@ -763,7 +763,7 @@ index dc4655c..2a8c434 100644
 +	});
 +}
 diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/coding-agent/src/task/isolation-runner.ts
-index 45486bf..a578091 100644
+index 45486bf..2562b8c 100644
 --- a/packages/coding-agent/src/task/isolation-runner.ts
 +++ b/packages/coding-agent/src/task/isolation-runner.ts
 @@ -22,7 +22,7 @@ import * as fs from "node:fs/promises";
@@ -976,18 +976,20 @@ index 45486bf..a578091 100644
  /**
   * Run a subagent inside an isolation worktree and capture its changes.
   *
-@@ -385,6 +551,10 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -385,6 +551,12 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  	/** Fingerprint of the delta already handed to the caller at run end; release only re-captures on change. */
  	let handedOff: bigint | number | undefined;
  	let handle: IsolationHandle | undefined;
 +	/** Sandbox dir currently holding this run's descriptor (follows retention renames). */
 +	let stateDir: string | undefined;
++	/** Immutable slot basename: retention renames the base dir, the slot never changes. */
++	let isolationSlot: string | undefined;
 +	/** True once the descriptor exists: such a workspace is retained until an explicit release. */
 +	let stateWritten = false;
  	let deferredCleanup: Promise<void> | undefined;
  	let retainWorkspace = false;
  	let baseReleasePromise: Promise<void> | undefined;
-@@ -403,60 +573,79 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -403,60 +575,79 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  		})();
  		return cleanupPromise;
  	};
@@ -1057,7 +1059,7 @@ index 45486bf..a578091 100644
 +					id: opts.agentId,
 +					repoRoot: opts.context.repoRoot,
 +					backend: handle.backend,
-+					slot: isolationSlot,
++					slot: isolationSlot ?? path.basename(path.dirname(handle.mergedDir)),
 +					mergedDir: path.basename(handle.mergedDir),
 +					baseline: taskBaseline,
 +					// Follow a retention rename performed at run end: the original
@@ -1080,7 +1082,7 @@ index 45486bf..a578091 100644
  		handle = await ensureIsolation(opts.context.repoRoot, opts.agentId, opts.preferredBackend);
  		const isolationDir = handle.mergedDir;
 +		const isolationBaseDir = path.dirname(isolationDir);
-+		const isolationSlot = path.basename(isolationBaseDir);
++		isolationSlot = path.basename(isolationBaseDir);
  		const isolationBackend = handle.backend;
  		const baseline = await captureIsolationBaseline(isolationDir, opts.context.repoRoot);
  		taskBaseline = baseline;
@@ -1107,7 +1109,7 @@ index 45486bf..a578091 100644
  		const result = await runSubprocess({
  			...opts.baseOptions,
  			worktree: isolationDir,
-@@ -467,17 +656,15 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -467,17 +658,15 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  				deferredCleanup = completion;
  				opts.baseOptions.onCleanupDeferred?.(completion);
  			},
@@ -1129,7 +1131,7 @@ index 45486bf..a578091 100644
  		// A successful result cannot be captured while deferred owner jobs or
  		// shutdown hooks may still write the worktree. Failed runs skip capture,
  		// so their cleanup remains asynchronous.
-@@ -519,6 +706,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -519,6 +708,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  				} catch (patchErr) {
  					retainWorkspace = true;
  					const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
@@ -1138,7 +1140,7 @@ index 45486bf..a578091 100644
  					return rememberAgentArtifacts({
  						...result,
  						error: renderIsolationError({
-@@ -551,6 +740,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -551,6 +742,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  			} catch (persistErr) {
  				retainWorkspace = true;
  				const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
@@ -1147,7 +1149,7 @@ index 45486bf..a578091 100644
  				return rememberAgentArtifacts({
  					...result,
  					branchName: commitResult?.branchName,
-@@ -573,6 +764,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -573,6 +766,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  			} catch (patchErr) {
  				retainWorkspace = true;
  				const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
@@ -1156,7 +1158,7 @@ index 45486bf..a578091 100644
  				return rememberAgentArtifacts({
  					...result,
  					error: renderIsolationError({
-@@ -588,8 +781,28 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -588,8 +783,28 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  	} catch (err) {
  		return rememberAgentArtifacts(opts.buildFailureResult(err));
  	} finally {
@@ -1185,7 +1187,7 @@ index 45486bf..a578091 100644
  			!retainWorkspace &&
  			!releasePromise &&
  			!(opts.baseOptions.keepAlive !== false && AgentLifecycleManager.global().has(opts.agentId))
-@@ -642,6 +855,9 @@ export interface IsolationMergeOutcome {
+@@ -642,6 +857,9 @@ export interface IsolationMergeOutcome {
  export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise<IsolationMergeOutcome> {
  	const { result, repoRoot, mergeMode } = opts;
  	const repo = vcs.requireGit(repoRoot);
@@ -1195,7 +1197,7 @@ index 45486bf..a578091 100644
  	try {
  		if (mergeMode === "branch") {
  			if (!result.branchName && result.exitCode === 0 && !result.aborted && result.error) {
-@@ -651,6 +867,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
+@@ -651,6 +869,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
  						error: result.error,
  						rootPatchPath: result.patchPath,
  						nestedPatchPaths: result.nestedPatchPaths,
@@ -1203,7 +1205,7 @@ index 45486bf..a578091 100644
  					}),
  					changesApplied: false,
  					hadAnyChanges: false,
-@@ -759,6 +976,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
+@@ -759,6 +978,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
  				kind: "not-applied",
  				rootPatchPath: result.patchPath,
  				nestedPatchPaths: result.nestedPatchPaths,
@@ -1212,7 +1214,7 @@ index 45486bf..a578091 100644
  		}
  		return { summary, changesApplied, hadAnyChanges, mergedBranchForNestedPatches: false };
 diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/coding-agent/src/task/persisted-revive.ts
-index 16f34c6..dbd1155 100644
+index 16f34c6..a840a60 100644
 --- a/packages/coding-agent/src/task/persisted-revive.ts
 +++ b/packages/coding-agent/src/task/persisted-revive.ts
 @@ -1,6 +1,6 @@
@@ -1290,11 +1292,11 @@ index 16f34c6..dbd1155 100644
 +		const systemPrompt =
 +			isolatedState && isolationState
 +				? rebindWorkspacePrompt(
-+						init.systemPrompt,
++						peek.init.systemPrompt,
 +						path.join(getWorktreesDir(), isolatedState.slot, isolatedState.mergedDir),
 +						isolationState.workspaceDir,
 +					)
-+				: init.systemPrompt;
++				: peek.init.systemPrompt;
 +		if (!isolatedState) {
 +			try {
 +				await fs.stat(restoredSeance?.cwd ?? peek.cwd);
