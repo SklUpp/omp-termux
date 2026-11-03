@@ -223,7 +223,15 @@ describe("native IPC", () => {
 		const dir = path.join(await tempDir(), "d".repeat(120));
 		const name = `long-${process.pid}`;
 		const endpoint = ipcEndpoint(dir, name);
-		expect(endpoint).toMatch(new RegExp(`^/tmp/omp-${process.getuid!()}/[0-9a-f]{16}\\.sock$`));
+		// Android has no /tmp: the relocation directory is <installed root>/tmp/omp-<uid>,
+		// where the launcher exports the installed root as OMP_ANDROID_PREFIX.
+		const prefix = process.env.OMP_ANDROID_PREFIX ?? process.env.PREFIX ?? "/data/data/com.termux/files/usr";
+		const relocationRoot =
+			process.platform === "android"
+				? path.join(prefix, "tmp", `omp-${process.getuid!()}`)
+				: `/tmp/omp-${process.getuid!()}`;
+		expect(endpoint.startsWith(`${relocationRoot}/`)).toBe(true);
+		expect(endpoint).toMatch(/[0-9a-f]{16}\.sock$/);
 		expect(ipcEndpoint(dir, name)).toBe(endpoint);
 		expect(Buffer.byteLength(endpoint)).toBeLessThan(104);
 		await listen(endpoint, { framing: "lines" }, connection => {
@@ -237,6 +245,48 @@ describe("native IPC", () => {
 		client.send("relocated");
 		await seen.until(1);
 		expect(seen.events).toEqual(["RELOCATED"]);
+	});
+
+	test.skipIf(isWindows)("relocated endpoint is stable across processes with different TMPDIR", async () => {
+		const dir = path.join(await tempDir(), "d".repeat(120));
+		const name = `cross-${process.pid}`;
+		const endpoint = ipcEndpoint(dir, name);
+		const { accepted } = await acceptingServer(endpoint, { framing: "lines" });
+
+		// The child inherits the install (PREFIX) but a different per-shell TMPDIR.
+		// Naming must ignore it, otherwise the child dials another socket than the
+		// live broker listens on.
+		const nativeEntry = path.resolve(import.meta.dir, "../native/index.js");
+		const scriptPath = path.join(await tempDir(), "child.ts");
+		await Bun.write(
+			scriptPath,
+			`import { IpcConnection, ipcEndpoint } from ${JSON.stringify(nativeEntry)};
+const endpoint = ipcEndpoint(${JSON.stringify(dir)}, ${JSON.stringify(name)});
+process.stdout.write(\`\${endpoint}\n\`);
+const connection = await IpcConnection.connect(endpoint, { framing: "lines" });
+connection.send("from-child");
+await connection.drained();
+connection.destroy();
+`,
+		);
+		const child = Bun.spawn([process.execPath, scriptPath], {
+			env: { ...process.env, TMPDIR: await tempDir() },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		cleanups.push(() => child.kill());
+
+		const peer = record(await accepted);
+		await peer.until(1);
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect(stderr).toBe("");
+		expect(exitCode).toBe(0);
+		expect(stdout.trim()).toBe(endpoint);
+		expect(peer.events).toEqual(["from-child"]);
 	});
 
 	test("small and large frames arrive in send order, within and across tasks", async () => {

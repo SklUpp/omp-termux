@@ -1,0 +1,4692 @@
+diff --git a/crates/pi-builtins/src/lib.rs b/crates/pi-builtins/src/lib.rs
+index ee13736..f29ce76 100644
+--- a/crates/pi-builtins/src/lib.rs
++++ b/crates/pi-builtins/src/lib.rs
+@@ -343,7 +343,7 @@ pub use proc_snapshot::{ProcInfo, ProcessStatus};
+ /// implementation.
+ #[cfg(all(
+ 	feature = "util.procs",
+-	any(target_os = "linux", target_os = "macos", target_os = "windows")
++	any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")
+ ))]
+ pub use proc_snapshot::sys as proc_sys;
+ 
+diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/proc_snapshot.rs
+index 5ab3109..48f7cd2 100644
+--- a/crates/pi-builtins/src/proc_snapshot.rs
++++ b/crates/pi-builtins/src/proc_snapshot.rs
+@@ -100,7 +100,7 @@ fn parse_procargs2(buffer: &[u8]) -> Vec<String> {
+ }
+ 
+ /// Linux process primitives: procfs and pidfds.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub mod sys {
+ 	use std::{
+ 		fs,
+@@ -181,7 +181,7 @@ pub mod sys {
+ 	}
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod proc_snapshot {
+ 	use std::{collections::HashMap, fs, os::fd::AsFd, time::Duration};
+ 
+@@ -1796,7 +1796,7 @@ mod proc_snapshot {
+ 	}
+ }
+ 
+-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
+ pub use proc_snapshot::{ProcInfo, threads_by_pid};
+ 
+ /// The processes a signal must never reach: this one and its ancestors.
+@@ -1820,7 +1820,7 @@ pub use proc_snapshot::{ProcInfo, threads_by_pid};
+ ///
+ /// Listing is unaffected: `pgrep` still reports ancestors and `ps` still shows
+ /// them. Only signalling consults this.
+-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
+ pub(crate) struct HostProcesses {
+ 	/// This process and its ancestors, nearest first.
+ 	pub pids:  smallvec::SmallVec<[i32; 16]>,
+@@ -1833,7 +1833,7 @@ pub(crate) struct HostProcesses {
+ /// Keeping the walk over this rather than over [`ProcInfo`] lets the recycling
+ /// cases — which are otherwise only reachable by winning a race against the OS —
+ /// be tested with a synthetic tree.
+-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
+ #[derive(Clone, Copy)]
+ struct ChainNode {
+ 	ppid:  Option<i32>,
+@@ -1843,7 +1843,7 @@ struct ChainNode {
+ 	start: u64,
+ }
+ 
+-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
++#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
+ impl HostProcesses {
+ 	/// Walks the parent chain from the current process, taking one process-table
+ 	/// snapshot.
+@@ -1914,7 +1914,7 @@ impl HostProcesses {
+ 	}
+ }
+ 
+-#[cfg(all(test, any(target_os = "linux", target_os = "macos", target_os = "windows")))]
++#[cfg(all(test, any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+ mod tests {
+ 	use super::{HostProcesses, ProcInfo};
+ 
+diff --git a/crates/pi-builtins/src/ps.rs b/crates/pi-builtins/src/ps.rs
+index 956c7f7..5a74f2b 100644
+--- a/crates/pi-builtins/src/ps.rs
++++ b/crates/pi-builtins/src/ps.rs
+@@ -1266,7 +1266,7 @@ fn format_ps_elapsed(duration: Duration) -> String {
+ 	}
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn ps_total_memory_bytes() -> Option<u64> {
+ 	let value = fs::read_to_string("/proc/meminfo")
+ 		.ok()?
+diff --git a/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs b/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
+index d28e8c0..c6f521f 100644
+--- a/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
++++ b/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
+@@ -133,13 +133,18 @@ pub(super) fn resolve(
+ /// The numeric form of an address (`getnameinfo(NI_NUMERICHOST)`).
+ pub(super) fn numeric_host(addr: &Addr) -> String {
+ 	let mut buf = [0 as libc::c_char; 1025];
++	// bionic declares `getnameinfo` hostlen/servlen as `size_t`, not `socklen_t`.
++	#[cfg(target_os = "android")]
++	let host_len = buf.len();
++	#[cfg(not(target_os = "android"))]
++	let host_len = buf.len() as libc::socklen_t;
+ 	// SAFETY: `addr` holds `len` valid bytes; `buf` is writable for its length.
+ 	let rc = unsafe {
+ 		libc::getnameinfo(
+ 			addr.as_ptr(),
+ 			addr.len,
+ 			buf.as_mut_ptr(),
+-			buf.len() as libc::socklen_t,
++			host_len,
+ 			std::ptr::null_mut(),
+ 			0,
+ 			libc::NI_NUMERICHOST,
+diff --git a/crates/pi-builtins/src/rsync/tree/sys.rs b/crates/pi-builtins/src/rsync/tree/sys.rs
+index 08b8c00..6732262 100644
+--- a/crates/pi-builtins/src/rsync/tree/sys.rs
++++ b/crates/pi-builtins/src/rsync/tree/sys.rs
+@@ -267,7 +267,20 @@ pub(crate) fn mknodat(
+ 	}))
+ }
+ 
++/// bionic exports `mkfifoat` since API 23, but the Rust `libc` Android module
++/// omits the binding; the workspace targets API 24+.
++#[cfg(target_os = "android")]
++unsafe extern "C" {
++	#[link_name = "mkfifoat"]
++	fn bionic_mkfifoat(
++		dirfd: libc::c_int,
++		path: *const libc::c_char,
++		mode: libc::mode_t,
++	) -> libc::c_int;
++}
++
+ /// `mkfifoat(dir, name, mode)`.
++#[cfg(not(target_os = "android"))]
+ pub(crate) fn mkfifoat(dir: Option<BorrowedFd<'_>>, name: &CStr, mode: u32) -> io::Result<()> {
+ 	check(retry(|| {
+ 		// SAFETY: valid C string and dirfd.
+@@ -275,6 +288,15 @@ pub(crate) fn mkfifoat(dir: Option<BorrowedFd<'_>>, name: &CStr, mode: u32) -> i
+ 	}))
+ }
+ 
++/// `mkfifoat(dir, name, mode)` via bionic's symbol.
++#[cfg(target_os = "android")]
++pub(crate) fn mkfifoat(dir: Option<BorrowedFd<'_>>, name: &CStr, mode: u32) -> io::Result<()> {
++	check(retry(|| {
++		// SAFETY: valid C string and dirfd; bionic provides the symbol on API 23+.
++		unsafe { bionic_mkfifoat(dirfd(dir), name.as_ptr(), mode as libc::mode_t) }
++	}))
++}
++
+ /// Names in the directory `fd` (opened for reading), without `.` and `..`.
+ pub(crate) fn read_dir(fd: OwnedFd) -> io::Result<Vec<OsString>> {
+ 	let mut dir = rustix::fs::Dir::new(fd)?;
+diff --git a/crates/pi-builtins/src/sort.rs b/crates/pi-builtins/src/sort.rs
+index 5a45f57..cc18a77 100644
+--- a/crates/pi-builtins/src/sort.rs
++++ b/crates/pi-builtins/src/sort.rs
+@@ -126,7 +126,7 @@ fn file_size_hint(fs: &BlockingFs, files: &[OsString]) -> Option<usize> {
+ 
+ fn available_memory_hint() -> Option<usize> {
+ 	let system = system_available_memory();
+-	#[cfg(target_os = "linux")]
++	#[cfg(any(target_os = "linux", target_os = "android"))]
+ 	let system = match (system, linux_cgroup_memory_headroom()) {
+ 		(Some(system), Some(cgroup)) => Some(system.min(cgroup)),
+ 		(system, cgroup) => system.or(cgroup),
+@@ -146,7 +146,10 @@ fn memory_hint(available: u128) -> usize {
+ }
+ 
+ fn system_available_memory() -> Option<u128> {
+-	#[cfg(target_os = "linux")]
++	// Android exposes the same Linux procfs and cgroup files; every read is
++	// fallible, so a kernel/SELinux policy that hides them still falls back to
++	// physical memory instead of sizing the buffer from an assumption.
++	#[cfg(any(target_os = "linux", target_os = "android"))]
+ 	if let Some(bytes) =
+ 		std::fs::read_to_string("/proc/meminfo").ok().as_deref().and_then(meminfo_available_bytes)
+ 	{
+@@ -162,7 +165,7 @@ fn system_available_memory() -> Option<u128> {
+ /// the procfs crate's values, already in bytes, by 1024 again, so available
+ /// memory always gave the 1 GiB maximum; only a cgroup limit made the hint
+ /// smaller.)
+-#[cfg(any(target_os = "linux", test))]
++#[cfg(any(target_os = "linux", target_os = "android", test))]
+ fn meminfo_available_bytes(meminfo: &str) -> Option<u128> {
+ 	let field = |name: &str| -> Option<u128> {
+ 		meminfo
+@@ -183,7 +186,7 @@ fn meminfo_available_bytes(meminfo: &str) -> Option<u128> {
+ /// Memory the process's cgroups still let it use. `/proc/meminfo` reports the
+ /// whole machine, so in a container or a systemd scope with a lower limit a
+ /// buffer sized from it gets the process killed.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn linux_cgroup_memory_headroom() -> Option<u128> {
+ 	let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+ 	cgroup_memory_headroom(&membership, Path::new("/sys/fs/cgroup"))
+@@ -194,7 +197,7 @@ fn linux_cgroup_memory_headroom() -> Option<u128> {
+ /// limit is the lower of `memory.max` and `memory.high` (cgroup v2), or
+ /// `memory.limit_in_bytes` (cgroup v1, mounted at `root/memory`). `None`
+ /// when no cgroup on the path sets a limit.
+-#[cfg(any(target_os = "linux", test))]
++#[cfg(any(target_os = "linux", target_os = "android", test))]
+ fn cgroup_memory_headroom(membership: &str, root: &Path) -> Option<u128> {
+ 	for line in membership.lines() {
+ 		let mut fields = line.splitn(3, ':');
+@@ -220,7 +223,7 @@ fn cgroup_memory_headroom(membership: &str, root: &Path) -> Option<u128> {
+ }
+ 
+ /// Where a cgroup version reports a memory limit and its use.
+-#[cfg(any(target_os = "linux", test))]
++#[cfg(any(target_os = "linux", target_os = "android", test))]
+ struct MemoryFiles {
+ 	limits:      &'static [&'static str],
+ 	usage:       &'static str,
+@@ -229,14 +232,14 @@ struct MemoryFiles {
+ 	reclaimable: &'static str,
+ }
+ 
+-#[cfg(any(target_os = "linux", test))]
++#[cfg(any(target_os = "linux", target_os = "android", test))]
+ const CGROUP_V2: MemoryFiles = MemoryFiles {
+ 	limits:      &["memory.max", "memory.high"],
+ 	usage:       "memory.current",
+ 	reclaimable: "inactive_file",
+ };
+ 
+-#[cfg(any(target_os = "linux", test))]
++#[cfg(any(target_os = "linux", target_os = "android", test))]
+ const CGROUP_V1: MemoryFiles = MemoryFiles {
+ 	limits:      &["memory.limit_in_bytes"],
+ 	usage:       "memory.usage_in_bytes",
+@@ -245,7 +248,7 @@ const CGROUP_V1: MemoryFiles = MemoryFiles {
+ 
+ /// Walks from `dir` up to `top`, returning the smallest headroom that any
+ /// level with a numeric limit allows.
+-#[cfg(any(target_os = "linux", test))]
++#[cfg(any(target_os = "linux", target_os = "android", test))]
+ fn headroom_along(dir: &Path, top: &Path, files: &MemoryFiles) -> Option<u128> {
+ 	let read = |dir: &Path, name: &str| -> Option<u128> {
+ 		std::fs::read_to_string(dir.join(name)).ok()?.trim().parse().ok()
+@@ -408,6 +411,20 @@ mod tests {
+ 		assert_eq!(memory_hint(8 * 1024 * KIB), 2 * 1024 * 1024);
+ 	}
+ 
++	// Failure mode: a kernel or SELinux policy that hides `/proc/meminfo`
++	// or the cgroup files must fall back to the physical-memory hint rather
++	// than panicking or assuming the files are readable.
++	#[test]
++	fn unavailable_memory_files_fall_back_instead_of_assuming_procfs() {
++		assert_eq!(meminfo_available_bytes(""), None);
++		assert_eq!(meminfo_available_bytes("MemFree: nope\nBuffers: nope\nCached: nope\n"), None);
++		assert_eq!(
++			cgroup_memory_headroom("0::/user.slice/app.scope\n", Path::new("/nonexistent-omp-cgroup")),
++			None
++		);
++		assert_eq!(cgroup_memory_headroom("not-a-cgroup-line\n", Path::new("/nonexistent-omp-cgroup")), None);
++	}
++
+ 	fn write_files(dir: &Path, files: &[(&str, &str)]) {
+ 		std::fs::create_dir_all(dir).unwrap();
+ 		for (name, contents) in files {
+diff --git a/crates/pi-natives/Cargo.toml b/crates/pi-natives/Cargo.toml
+index efed215..2e02031 100644
+--- a/crates/pi-natives/Cargo.toml
++++ b/crates/pi-natives/Cargo.toml
+@@ -25,7 +25,6 @@ wayland-pipewire = ["dep:pipewire"]
+ [dependencies]
+ anyhow.workspace = true
+ async-trait.workspace = true
+-arboard.workspace = true
+ base64.workspace = true
+ clap.workspace = true
+ heapless.workspace = true
+@@ -63,7 +62,6 @@ pi-iso.workspace = true
+ pi-predict.workspace = true
+ pi-shell.workspace = true
+ pi-vfs.workspace = true
+-pi-voice.workspace = true
+ portable-pty.workspace = true
+ png.workspace = true
+ rayon.workspace = true
+@@ -79,6 +77,10 @@ xutf.workspace = true
+ zstd.workspace = true
+ xxhash-rust.workspace = true
+ 
++[target.'cfg(not(target_os = "android"))'.dependencies]
++arboard.workspace = true
++pi-voice.workspace = true
++
+ [target.'cfg(target_os = "linux")'.dependencies]
+ ashpd = { version = "=0.11.1", default-features = false, features = ["tokio"] }
+ atspi = { version = "=0.30.0", features = ["tokio", "zbus"] }
+diff --git a/crates/pi-natives/src/audio.rs b/crates/pi-natives/src/audio.rs
+index 8377dcf..305c4ef 100644
+--- a/crates/pi-natives/src/audio.rs
++++ b/crates/pi-natives/src/audio.rs
+@@ -4,6 +4,7 @@
+ //! lives in `pi_voice::audio`; these classes adapt its mono `f32` contract to
+ //! TypeScript callbacks and `Float32Array` buffers.
+ 
++#[cfg(not(target_os = "android"))]
+ use std::sync::Arc;
+ 
+ use napi::{
+@@ -11,18 +12,28 @@ use napi::{
+ 	threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue},
+ };
+ use napi_derive::napi;
++#[cfg(not(target_os = "android"))]
+ use parking_lot::Mutex;
++#[cfg(not(target_os = "android"))]
+ use pi_voice::audio::{CaptureStream, PlaybackState, PlaybackStream};
+ 
+ type CaptureCallback = ThreadsafeFunction<Float32Array, UnknownReturnValue>;
+ 
+ /// Default-microphone capture converted to mono `f32` at the requested sample
+ /// rate.
++#[cfg(not(target_os = "android"))]
+ #[napi]
+ pub struct AudioCapture {
+ 	stream: Mutex<Option<CaptureStream>>,
+ }
+ 
++#[cfg(target_os = "android")]
++#[napi]
++pub struct AudioCapture {
++	_private: (),
++}
++
++#[cfg(not(target_os = "android"))]
+ #[napi]
+ impl AudioCapture {
+ 	/// Open the default microphone and deliver low-latency mono PCM chunks.
+@@ -51,13 +62,42 @@ impl AudioCapture {
+ 	}
+ }
+ 
++#[cfg(target_os = "android")]
++#[napi]
++impl AudioCapture {
++	/// Open the default microphone and deliver low-latency mono PCM chunks.
++	#[napi(constructor)]
++	pub fn new(
++		sample_rate: u32,
++		#[napi(ts_arg_type = "(error: Error | null, samples: Float32Array) => void")]
++		on_audio: CaptureCallback,
++	) -> Result<Self> {
++		let _ = (sample_rate, on_audio);
++		Err(napi::Error::from_reason("Native AudioCapture is unsupported on Android/Termux"))
++	}
++
++	/// Stop capture immediately and release the microphone.
++	#[napi]
++	pub fn stop(&self) -> Result<()> {
++		Ok(())
++	}
++}
++
+ /// Gapless mono `f32` playback through the default speaker.
++#[cfg(not(target_os = "android"))]
+ #[napi]
+ pub struct AudioPlayback {
+ 	stream: Mutex<Option<PlaybackStream>>,
+ 	state:  Arc<PlaybackState>,
+ }
+ 
++#[cfg(target_os = "android")]
++#[napi]
++pub struct AudioPlayback {
++	_private: (),
++}
++
++#[cfg(not(target_os = "android"))]
+ #[napi]
+ impl AudioPlayback {
+ 	/// Open the default speaker at the requested logical sample rate.
+@@ -124,3 +164,41 @@ impl AudioPlayback {
+ 		Ok(())
+ 	}
+ }
++
++#[cfg(target_os = "android")]
++#[napi]
++impl AudioPlayback {
++	/// Open the default speaker at the requested logical sample rate.
++	#[napi(constructor)]
++	pub fn new(sample_rate: u32) -> Result<Self> {
++		let _ = sample_rate;
++		Err(napi::Error::from_reason("Native AudioPlayback is unsupported on Android/Termux"))
++	}
++
++	/// Queue mono floating-point PCM in playback order.
++	#[napi]
++	pub fn write(&self, samples: Float32Array) -> Result<()> {
++		let _ = samples;
++		Err(napi::Error::from_reason("Native AudioPlayback is unsupported on Android/Termux"))
++	}
++
++	/// Scale audio at render time so gain changes affect already queued samples.
++	#[napi]
++	pub fn set_gain(&self, gain: f64) -> Result<()> {
++		let _ = gain;
++		Err(napi::Error::from_reason("Native AudioPlayback is unsupported on Android/Termux"))
++	}
++
++	/// Close input, wait until queued samples reach the speaker, then release
++	/// it.
++	#[napi]
++	pub async fn end(&self) -> Result<()> {
++		Ok(())
++	}
++
++	/// Stop immediately and discard all queued samples.
++	#[napi]
++	pub fn stop(&self) -> Result<()> {
++		Ok(())
++	}
++}
+diff --git a/crates/pi-natives/src/clipboard.rs b/crates/pi-natives/src/clipboard.rs
+index 50d6dab..d09bc27 100644
+--- a/crates/pi-natives/src/clipboard.rs
++++ b/crates/pi-natives/src/clipboard.rs
+@@ -5,9 +5,12 @@
+ //! caller thread.
+ //! This avoids worker-thread `AppKit` pasteboard warnings in CLI contexts.
+ 
++#[cfg(not(target_os = "android"))]
+ use std::io::Cursor;
+ 
++#[cfg(not(target_os = "android"))]
+ use arboard::{Clipboard, Error as ClipboardError, ImageData};
++#[cfg(not(target_os = "android"))]
+ use image::{DynamicImage, ImageFormat, RgbaImage};
+ use napi::{JsString, bindgen_prelude::*};
+ use napi_derive::napi;
+@@ -31,6 +34,7 @@ pub struct ClipboardImage {
+ 	pub mime_type: String,
+ }
+ 
++#[cfg(not(target_os = "android"))]
+ fn encode_png(image: ImageData<'_>) -> Result<Vec<u8>> {
+ 	let width = u32::try_from(image.width)
+ 		.map_err(|_| Error::from_reason("Clipboard image width overflow"))?;
+@@ -42,6 +46,7 @@ fn encode_png(image: ImageData<'_>) -> Result<Vec<u8>> {
+ 	rgba_to_png(buffer)
+ }
+ 
++#[cfg(not(target_os = "android"))]
+ fn rgba_to_png(buffer: RgbaImage) -> Result<Vec<u8>> {
+ 	let capacity = (buffer
+ 		.width()
+@@ -65,6 +70,7 @@ fn rgba_to_png(buffer: RgbaImage) -> Result<Vec<u8>> {
+ /// skips 12 trailing mask bytes that those headers embed instead), which is
+ /// why Qt-based screenshot tools (`PixPin`, `Snipaste`, ...) fail through
+ /// arboard in the first place (#3426).
++#[cfg(not(target_os = "android"))]
+ fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>> {
+ 	const FILE_HEADER_SIZE: u64 = 14;
+ 	const INFO_HEADER_SIZE: u64 = 40;
+@@ -150,9 +156,17 @@ fn clipboard_has_bitmap() -> bool {
+ /// Returns an error if clipboard access fails.
+ #[napi]
+ pub fn copy_to_clipboard(text: JsString) -> Result<()> {
+-	let text = js::utf8(text)?;
+-	let _access = CLIPBOARD_ACCESS.lock();
+-	set_clipboard_text(&text)
++	#[cfg(target_os = "android")]
++	{
++		let _ = text;
++		return Err(Error::from_reason("Native arboard clipboard is unsupported on Android/Termux; use Termux/OSC52 clipboard helpers"));
++	}
++	#[cfg(not(target_os = "android"))]
++	{
++		let text = js::utf8(text)?;
++		let _access = CLIPBOARD_ACCESS.lock();
++		set_clipboard_text(&text)
++	}
+ }
+ 
+ /// Linux: keep a single `arboard::Clipboard` alive for the whole process.
+@@ -191,8 +205,7 @@ fn set_clipboard_text(text: &str) -> Result<()> {
+ /// macOS / Windows: the OS retains clipboard contents after the writing process
+ /// exits, so a transient `Clipboard` is sufficient. Keeping the write on the
+ /// calling thread also avoids worker-thread `AppKit` pasteboard warnings on
+-/// macOS.
+-#[cfg(not(target_os = "linux"))]
++#[cfg(all(not(target_os = "linux"), not(target_os = "android")))]
+ fn set_clipboard_text(text: &str) -> Result<()> {
+ 	let mut clipboard = Clipboard::new()
+ 		.map_err(|err| Error::from_reason(format!("Failed to access clipboard: {err}")))?;
+@@ -212,6 +225,12 @@ fn set_clipboard_text(text: &str) -> Result<()> {
+ #[napi]
+ pub fn read_text_from_clipboard() -> task::Promise<Option<String>> {
+ 	task::blocking("clipboard.read_text", (), move |_| -> Result<Option<String>> {
++		#[cfg(target_os = "android")]
++		{
++			Err(Error::from_reason("Native arboard clipboard is unsupported on Android/Termux; use Termux/OSC52 clipboard helpers"))
++		}
++		#[cfg(not(target_os = "android"))]
++		{
+ 		let _access = CLIPBOARD_ACCESS.lock();
+ 		let mut clipboard = Clipboard::new()
+ 			.map_err(|err| Error::from_reason(format!("Failed to access clipboard: {err}")))?;
+@@ -220,6 +239,7 @@ pub fn read_text_from_clipboard() -> task::Promise<Option<String>> {
+ 			Err(ClipboardError::ContentNotAvailable) => Ok(None),
+ 			Err(err) => Err(Error::from_reason(format!("Failed to read clipboard text: {err}"))),
+ 		}
++		}
+ 	})
+ }
+ 
+@@ -227,6 +247,7 @@ pub fn read_text_from_clipboard() -> task::Promise<Option<String>> {
+ /// decoding run after [`CLIPBOARD_ACCESS`] is released: they only touch owned
+ /// buffers, and holding the lock through them would stall a synchronous copy
+ /// on the JS thread for the length of a large encode.
++#[cfg(not(target_os = "android"))]
+ enum ImageRead {
+ 	Image(ImageData<'static>),
+ 	/// arboard found no image, but a bitmap format is advertised; carries the
+@@ -238,6 +259,7 @@ enum ImageRead {
+ 	Failed(ClipboardError, Option<Vec<u8>>),
+ }
+ 
++#[cfg(not(target_os = "android"))]
+ fn png_image(bytes: Vec<u8>) -> ClipboardImage {
+ 	ClipboardImage { data: Uint8Array::from(bytes), mime_type: "image/png".to_string() }
+ }
+@@ -251,6 +273,12 @@ fn png_image(bytes: Vec<u8>) -> ClipboardImage {
+ #[napi]
+ pub fn read_image_from_clipboard() -> task::Promise<Option<ClipboardImage>> {
+ 	task::blocking("clipboard.read_image", (), move |_| -> Result<Option<ClipboardImage>> {
++		#[cfg(target_os = "android")]
++		{
++			Err(Error::from_reason("Native arboard clipboard image read is unsupported on Android/Termux"))
++		}
++		#[cfg(not(target_os = "android"))]
++		{
+ 		let read = {
+ 			let _access = CLIPBOARD_ACCESS.lock();
+ 			let mut clipboard = Clipboard::new()
+@@ -294,10 +322,14 @@ pub fn read_image_from_clipboard() -> task::Promise<Option<ClipboardImage>> {
+ 				None => Err(Error::from_reason(format!("Failed to read clipboard image: {err}"))),
+ 			},
+ 		}
++		}
+ 	})
+ }
+ 
+-#[cfg(test)]
++// `dib_to_png` is Windows/desktop-only (the CF_DIB fallback), so an Android
++// `cargo test` build must skip this module instead of importing a symbol the
++// cfg gate removed.
++#[cfg(all(test, not(target_os = "android")))]
+ mod tests {
+ 	use super::dib_to_png;
+ 
+diff --git a/crates/pi-natives/src/crash_handler.rs b/crates/pi-natives/src/crash_handler.rs
+index 68fbb8f..b697718 100644
+--- a/crates/pi-natives/src/crash_handler.rs
++++ b/crates/pi-natives/src/crash_handler.rs
+@@ -96,7 +96,7 @@ pub fn install() {
+ 				prev_panic(info);
+ 			},
+ 		}));
+-
++#[cfg(not(target_os = "android"))]
+ 		std::alloc::set_alloc_error_hook(|layout| {
+ 			// Print the canonical line before doing anything allocation-prone.
+ 			// If this is genuine process-wide OOM, report formatting/path work may
+diff --git a/crates/pi-natives/src/desktop/ax.rs b/crates/pi-natives/src/desktop/ax.rs
+index e8a5476..9fb0e12 100644
+--- a/crates/pi-natives/src/desktop/ax.rs
++++ b/crates/pi-natives/src/desktop/ax.rs
+@@ -21,6 +21,8 @@ pub enum AxHandle {
+ 	Uia(uiautomation::UIElement, Option<Box<[i32]>>),
+ 	#[cfg(target_os = "linux")]
+ 	AtSpi(atspi::ObjectRefOwned),
++	#[cfg(target_os = "android")]
++	AndroidUnused,
+ 	#[cfg(test)]
+ 	Test(u64),
+ 	/// A test element without an identity, like a UIA element whose
+@@ -41,6 +43,8 @@ impl AxHandle {
+ 			Self::Uia(_, runtime_id) => runtime_id.is_some(),
+ 			#[cfg(target_os = "linux")]
+ 			Self::AtSpi(_) => true,
++			#[cfg(target_os = "android")]
++			Self::AndroidUnused => false,
+ 			#[cfg(test)]
+ 			Self::Test(_) => true,
+ 			#[cfg(test)]
+@@ -61,6 +65,8 @@ impl PartialEq for AxHandle {
+ 			(Self::Uia(_, a), Self::Uia(_, b)) => a == b,
+ 			#[cfg(target_os = "linux")]
+ 			(Self::AtSpi(a), Self::AtSpi(b)) => a == b,
++			#[cfg(target_os = "android")]
++			(Self::AndroidUnused, Self::AndroidUnused) => true,
+ 			#[cfg(test)]
+ 			(Self::Test(a), Self::Test(b)) => a == b,
+ 			#[cfg(test)]
+@@ -82,6 +88,8 @@ impl Hash for AxHandle {
+ 			Self::Uia(_, runtime_id) => runtime_id.hash(state),
+ 			#[cfg(target_os = "linux")]
+ 			Self::AtSpi(object) => object.hash(state),
++			#[cfg(target_os = "android")]
++			Self::AndroidUnused => {},
+ 			#[cfg(test)]
+ 			Self::Test(id) => id.hash(state),
+ 			#[cfg(test)]
+diff --git a/crates/pi-natives/src/desktop/control.rs b/crates/pi-natives/src/desktop/control.rs
+index b59fa38..c7b03b7 100644
+--- a/crates/pi-natives/src/desktop/control.rs
++++ b/crates/pi-natives/src/desktop/control.rs
+@@ -483,6 +483,8 @@ struct ControlLease {
+ 	_escape: Option<windows::EscapeMonitor>,
+ 	#[cfg(target_os = "linux")]
+ 	_escape: Option<linux::EscapeMonitor>,
++	#[cfg(target_os = "android")]
++	_escape: Option<()>,
+ 	_kernel: KernelOwner,
+ 	running: AtomicBool,
+ }
+@@ -544,6 +546,8 @@ impl ControlLease {
+ 			_escape: Some(escape),
+ 			#[cfg(target_os = "linux")]
+ 			_escape: escape,
++			#[cfg(target_os = "android")]
++			_escape: None,
+ 			_kernel: kernel,
+ 			running: AtomicBool::new(false),
+ 		})
+diff --git a/crates/pi-natives/src/ipc/endpoint.rs b/crates/pi-natives/src/ipc/endpoint.rs
+index 2f9b06c..81a8446 100644
+--- a/crates/pi-natives/src/ipc/endpoint.rs
++++ b/crates/pi-natives/src/ipc/endpoint.rs
+@@ -32,19 +32,80 @@ pub fn hash16(bytes: &[u8]) -> String {
+ 	format!("{:016x}", xxh64(bytes, 0))
+ }
+ 
++/// Termux install root used when neither installed-root variable is set.
++#[cfg(any(target_os = "android", all(test, unix)))]
++const ANDROID_DEFAULT_PREFIX: &str = "/data/data/com.termux/files/usr";
++
++/// Message returned when no `sun_path`-sized endpoint can be built.
++pub const ENDPOINT_TOO_LONG: &str =
++	"socket path does not fit sockaddr_un (set OMP_ANDROID_PREFIX to the installed Termux root)";
++
+ /// Private per-user directory that hosts relocated Unix sockets.
++///
++/// The value is a pure function of the effective uid and, on Android, of the
++/// installed Termux root: `/tmp/omp-<euid>` elsewhere and
++/// `<install root>/tmp/omp-<euid>` on Android. The launcher exports the
++/// installed root as `OMP_ANDROID_PREFIX`, so every process started from the
++/// same install computes the same directory even when a shell's `PREFIX`
++/// differs or is unset. No filesystem probe takes part, so naming cannot
++/// change with a transient permission or an existing-but-unusable directory.
++/// `TMPDIR` is deliberately not consulted: shells, `termux-chroot`, and child
++/// environments set it independently of the install.
+ #[cfg_attr(windows, allow(dead_code, reason = "pure helper unit-tested on every host"))]
+ pub fn relocation_dir(euid: u32) -> String {
+-	format!("/tmp/omp-{euid}")
++	#[cfg(target_os = "android")]
++	{
++		android_relocation_dir(
++			env::var_os("OMP_ANDROID_PREFIX").as_deref().map(Path::new),
++			env::var_os("PREFIX").as_deref().map(Path::new),
++			euid,
++		)
++	}
++	#[cfg(not(target_os = "android"))]
++	{
++		format!("/tmp/omp-{euid}")
++	}
++}
++
++/// `<root>/tmp/omp-<euid>`, where `root` is the installed root exported by the
++/// launcher, else `PREFIX`, else the default Termux root. Relative candidates
++/// are ignored so the endpoint is always absolute and shared.
++#[cfg(any(target_os = "android", all(test, unix)))]
++fn android_relocation_dir(installed: Option<&Path>, prefix: Option<&Path>, euid: u32) -> String {
++	let root = installed
++		.filter(|path| path.is_absolute())
++		.or_else(|| prefix.filter(|path| path.is_absolute()))
++		.unwrap_or_else(|| Path::new(ANDROID_DEFAULT_PREFIX));
++	let tmp = root.join("tmp");
++	let tmp = tmp.to_string_lossy();
++	format!("{}/omp-{euid}", tmp.trim_end_matches('/'))
+ }
+ 
+ /// Unix socket path for `name` in the already-resolved `dir`.
+ ///
+ /// `sun_path_max` is the size of `sockaddr_un::sun_path` including the NUL
+ /// terminator; a path that does not fit is relocated under
+-/// [`relocation_dir`] with a hashed basename.
++/// [`relocation_dir`] with a hashed basename. Fails with
++/// [`ENDPOINT_TOO_LONG`] when even the relocated path cannot fit (an install
++/// root long enough to exhaust `sun_path`).
+ #[cfg_attr(windows, allow(dead_code, reason = "pure helper unit-tested on every host"))]
+-pub fn unix_endpoint(dir: &str, name: &str, euid: u32, sun_path_max: usize) -> String {
++pub fn unix_endpoint(
++	dir: &str,
++	name: &str,
++	euid: u32,
++	sun_path_max: usize,
++) -> Result<String, &'static str> {
++	unix_endpoint_with(dir, name, &relocation_dir(euid), sun_path_max)
++}
++
++/// [`unix_endpoint`] with an explicit relocation directory, for tests and for
++/// callers that already resolved it.
++fn unix_endpoint_with(
++	dir: &str,
++	name: &str,
++	relocation: &str,
++	sun_path_max: usize,
++) -> Result<String, &'static str> {
+ 	let stem = sanitize_stem(name);
+ 	let direct = if dir.ends_with('/') {
+ 		format!("{dir}{stem}.sock")
+@@ -52,13 +113,17 @@ pub fn unix_endpoint(dir: &str, name: &str, euid: u32, sun_path_max: usize) -> S
+ 		format!("{dir}/{stem}.sock")
+ 	};
+ 	if direct.len() < sun_path_max {
+-		return direct;
++		return Ok(direct);
+ 	}
+ 	let mut key = Vec::with_capacity(dir.len() + 1 + name.len());
+ 	key.extend_from_slice(dir.as_bytes());
+ 	key.push(0);
+ 	key.extend_from_slice(name.as_bytes());
+-	format!("{}/{}.sock", relocation_dir(euid), hash16(&key))
++	let relocated = format!("{relocation}/{}.sock", hash16(&key));
++	if relocated.len() >= sun_path_max {
++		return Err(ENDPOINT_TOO_LONG);
++	}
++	Ok(relocated)
+ }
+ 
+ /// Windows named-pipe path for `name` in the already-resolved `dir`.
+@@ -147,8 +212,8 @@ mod tests {
+ 
+ 	#[test]
+ 	fn unix_endpoint_keeps_short_paths_in_dir() {
+-		assert_eq!(unix_endpoint("/tmp/x", "a b", 501, 104), "/tmp/x/a_b.sock");
+-		assert_eq!(unix_endpoint("/", "s", 501, 104), "/s.sock");
++		assert_eq!(unix_endpoint("/tmp/x", "a b", 501, 104).as_deref(), Ok("/tmp/x/a_b.sock"));
++		assert_eq!(unix_endpoint("/", "s", 501, 104).as_deref(), Ok("/s.sock"));
+ 	}
+ 
+ 	#[test]
+@@ -159,22 +224,93 @@ mod tests {
+ 		let fits = format!("/{}", "d".repeat(104 - 1 - suffix_len - 1));
+ 		let direct = format!("{fits}/n.sock");
+ 		assert_eq!(direct.len(), 103);
+-		assert_eq!(unix_endpoint(&fits, name, 501, 104), direct);
++		assert_eq!(unix_endpoint(&fits, name, 501, 104).as_deref(), Ok(direct.as_str()));
+ 
+ 		let too_long = format!("{fits}d");
+-		let relocated = unix_endpoint(&too_long, name, 501, 104);
++		let relocated = unix_endpoint(&too_long, name, 501, 104).unwrap();
+ 		let mut key = too_long.clone().into_bytes();
+ 		key.push(0);
+ 		key.extend_from_slice(name.as_bytes());
+-		assert_eq!(relocated, format!("/tmp/omp-501/{}.sock", hash16(&key)));
++		assert_eq!(relocated, format!("{}/{}.sock", relocation_dir(501), hash16(&key)));
+ 		// Linux's larger sun_path keeps the same directory in place.
+-		assert_eq!(unix_endpoint(&too_long, name, 501, 108), format!("{too_long}/n.sock"));
++		assert_eq!(unix_endpoint(&too_long, name, 501, 108).unwrap(), format!("{too_long}/n.sock"));
++	}
++
++	#[cfg(unix)]
++	#[test]
++	fn unix_endpoint_rejects_relocated_paths_that_cannot_fit() {
++		let too_long = format!("/{}", "d".repeat(200));
++		let prefix_of = |len: usize| format!("/{}", "p".repeat(len - 1));
++
++		// `<root>/omp-<uid>/<hash16>.sock`: 34 bytes with uid 501 and one path
++		// separator, so an 74-byte install root lands exactly on 108.
++		let at_limit = android_relocation_dir(Some(Path::new(&prefix_of(74))), None, 501);
++		assert_eq!(at_limit.len(), 74 + "/tmp/omp-501".len());
++		assert_eq!(unix_endpoint_with(&too_long, "n", &at_limit, 108), Err(ENDPOINT_TOO_LONG));
++
++		let one_short = android_relocation_dir(Some(Path::new(&prefix_of(73))), None, 501);
++		assert_eq!(
++			unix_endpoint_with(&too_long, "n", &one_short, 108)
++				.unwrap()
++				.len(),
++			107
++		);
++
++		// The limit counts bytes, not chars: a multibyte root of the same byte
++		// length is rejected identically.
++		let multibyte = format!("/{}{}", "é".repeat(36), "p");
++		assert_eq!(multibyte.len(), 74);
++		let multibyte = android_relocation_dir(Some(Path::new(&multibyte)), None, 501);
++		assert_eq!(unix_endpoint_with(&too_long, "n", &multibyte, 108), Err(ENDPOINT_TOO_LONG));
++	}
++
++	#[cfg(unix)]
++	#[test]
++	fn android_relocation_dir_is_fixed_by_install_root() {
++		let default = "/data/data/com.termux/files/usr/tmp/omp-501";
++		assert_eq!(android_relocation_dir(None, None, 501), default);
++		assert_eq!(
++			android_relocation_dir(Some(Path::new(ANDROID_DEFAULT_PREFIX)), None, 501),
++			default
++		);
++		assert_eq!(android_relocation_dir(None, Some(Path::new("/x")), 501), "/x/tmp/omp-501");
++		assert_eq!(
++			android_relocation_dir(Some(Path::new("/x/")), Some(Path::new("/y")), 501),
++			"/x/tmp/omp-501"
++		);
++		// A relative root cannot name a shared absolute socket.
++		assert_eq!(
++			android_relocation_dir(Some(Path::new("relative")), Some(Path::new("relative")), 501),
++			default
++		);
++		// The launcher's installed root wins over a shell's differing PREFIX, so
++		// the same install names one socket regardless of the caller environment.
++		assert_eq!(
++			android_relocation_dir(Some(Path::new("/installed")), Some(Path::new("/other")), 501),
++			android_relocation_dir(Some(Path::new("/installed")), None, 501)
++		);
++	}
++
++	#[cfg(target_os = "android")]
++	#[test]
++	fn android_relocated_endpoint_uses_install_root_and_stays_bounded() {
++		let installed = std::env::var_os("OMP_ANDROID_PREFIX").map(std::path::PathBuf::from);
++		let prefix = std::env::var_os("PREFIX").map(std::path::PathBuf::from);
++		let root = android_relocation_dir(installed.as_deref(), prefix.as_deref(), 501);
++		let relocated =
++			unix_endpoint(&format!("/{}", "d".repeat(200)), "n", 501, SUN_PATH_MAX).unwrap();
++		assert!(relocated.starts_with(&format!("{root}/")), "{relocated}");
++		assert!(relocated.ends_with(".sock"));
++		assert!(relocated.len() < SUN_PATH_MAX);
+ 	}
+ 
+ 	#[test]
+ 	fn relocation_hash_separates_dir_and_name() {
+ 		let dir = format!("/{}", "x".repeat(200));
+-		assert_ne!(unix_endpoint(&dir, "ab", 0, 104), unix_endpoint(&format!("{dir}a"), "b", 0, 104));
++		assert_ne!(
++			unix_endpoint(&dir, "ab", 0, 104).unwrap(),
++			unix_endpoint(&format!("{dir}a"), "b", 0, 104).unwrap()
++		);
+ 	}
+ 
+ 	#[test]
+diff --git a/crates/pi-natives/src/ipc/mod.rs b/crates/pi-natives/src/ipc/mod.rs
+index afe6bc9..fc0f929 100644
+--- a/crates/pi-natives/src/ipc/mod.rs
++++ b/crates/pi-natives/src/ipc/mod.rs
+@@ -46,6 +46,7 @@ const DEFAULT_MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
+ const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 3000;
+ 
+ /// Transport failure carrying an errno-style code.
++#[derive(Debug)]
+ pub struct IpcError {
+ 	code:    &'static str,
+ 	message: String,
+@@ -142,20 +143,25 @@ pub struct IpcConnectOptions {
+ /// Platform endpoint for `name` scoped to directory `dir`.
+ ///
+ /// Unix: `<dir>/<stem>.sock`; when that path does not fit `sun_path` (104 bytes
+-/// on macOS/BSD, 108 on Linux, including NUL), `/tmp/omp-<euid>/<hash16>.sock`.
++/// on macOS/BSD, 108 on Linux, including NUL), the per-user relocation directory
++/// (`/tmp/omp-<euid>`; on Android `<install root>/tmp/omp-<euid>`) plus
++/// `<hash16>.sock`. Throws when even that cannot fit — an install root long
++/// enough to exhaust `sun_path`.
+ /// Windows: `\\.\pipe\omp-<stem>-<hash16(lowercase(resolve(dir)))>`.
+ /// `stem` is `name` with every char outside `[A-Za-z0-9._-]` replaced by "_".
+-/// Pure and deterministic: every process computes the same endpoint.
++/// Pure and deterministic: every process of one install computes the same
++/// endpoint.
+ #[napi(js_name = "ipcEndpoint")]
+-pub fn ipc_endpoint(dir: String, name: String) -> String {
++pub fn ipc_endpoint(dir: String, name: String) -> Result<String> {
+ 	let resolved = endpoint::resolve_dir(&dir);
+ 	#[cfg(unix)]
+ 	{
+ 		endpoint::unix_endpoint(&resolved, &name, platform::euid(), endpoint::SUN_PATH_MAX)
++			.map_err(Error::from_reason)
+ 	}
+ 	#[cfg(windows)]
+ 	{
+-		endpoint::windows_pipe_name(&resolved, &name)
++		Ok(endpoint::windows_pipe_name(&resolved, &name))
+ 	}
+ }
+ 
+diff --git a/crates/pi-natives/src/ipc/unix.rs b/crates/pi-natives/src/ipc/unix.rs
+index 332b982..3703f89 100644
+--- a/crates/pi-natives/src/ipc/unix.rs
++++ b/crates/pi-natives/src/ipc/unix.rs
+@@ -276,7 +276,25 @@ fn prepare_parent(path: &Path) -> Result<(), IpcError> {
+ 		.map_err(|error| IpcError::io(&error, &format!("create {}", parent.display())))
+ }
+ 
++/// uid/gid owning Android's system-managed data tree (`/data/data`).
++#[cfg(any(target_os = "android", test))]
++const ANDROID_SYSTEM_UID: u32 = 1000;
++#[cfg(any(target_os = "android", test))]
++const ANDROID_SYSTEM_GID: u32 = 1000;
++
++/// Create/reuse the shared relocation directory.
++///
++/// `dir` is `<base>/omp-<euid>` and the only component this process creates, so
++/// it must be a real directory of ours with mode `0700`. On Android the whole
++/// lexical base path is validated first (see [`ensure_trusted_base`]).
+ fn ensure_private_dir(dir: &Path, euid: u32) -> Result<(), IpcError> {
++	#[cfg(target_os = "android")]
++	{
++		let Some(base) = dir.parent().filter(|base| !base.as_os_str().is_empty()) else {
++			return Err(relocation_error(dir, "has no parent directory"));
++		};
++		ensure_trusted_base(base, euid)?;
++	}
+ 	match DirBuilder::new().mode(0o700).create(dir) {
+ 		Ok(()) => {},
+ 		Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+@@ -284,19 +302,120 @@ fn ensure_private_dir(dir: &Path, euid: u32) -> Result<(), IpcError> {
+ 	}
+ 	let meta = fs::symlink_metadata(dir)
+ 		.map_err(|error| IpcError::io(&error, &format!("stat {}", dir.display())))?;
+-	if !meta.file_type().is_dir() || meta.uid() != euid {
+-		return Err(IpcError::new(
+-			"EACCES",
+-			format!("{} is not a directory owned by uid {euid}", dir.display()),
++	if !meta.file_type().is_dir() {
++		return Err(relocation_error(dir, "exists and is not a directory"));
++	}
++	if meta.uid() != euid {
++		return Err(relocation_error(
++			dir,
++			format!("is owned by uid {} instead of {euid}", meta.uid()),
+ 		));
+ 	}
+-	if meta.mode() & 0o077 != 0 {
++	// We own it, so any mode other than the required `0700` is repaired: `0500`
++	// or `0600` would accept the directory and then fail when the socket file is
++	// created, and group/other access is never needed.
++	if meta.mode() & 0o777 != 0o700 {
+ 		fs::set_permissions(dir, Permissions::from_mode(0o700))
+ 			.map_err(|error| IpcError::io(&error, &format!("chmod {}", dir.display())))?;
+ 	}
+ 	Ok(())
+ }
+ 
++/// `EACCES` naming the relocation directory and the reason it is unusable.
++fn relocation_error(dir: &Path, reason: impl std::fmt::Display) -> IpcError {
++	IpcError::new(
++		"EACCES",
++		format!("no usable IPC relocation directory {}: {reason}", dir.display()),
++	)
++}
++
++/// Validate the base directory of the relocation leaf.
++///
++/// Every component of the absolute, normalized path is checked lexically with
++/// `symlink_metadata`, so nothing is resolved and there is no second path an
++/// attacker could swap between validation and use. A symlinked install root is
++/// rejected rather than followed. Each component must be owned by us, root, or
++/// Android's system uid, and must not be writable by another uid; the base
++/// itself must additionally accept a new entry.
++#[cfg(any(target_os = "android", test))]
++fn ensure_trusted_base(base: &Path, euid: u32) -> Result<(), IpcError> {
++	if !base.is_absolute() {
++		return Err(relocation_error(base, "is not an absolute path"));
++	}
++	// SAFETY: `getegid` has no preconditions and cannot fail.
++	let egid = unsafe { libc::getegid() };
++	let mut path = PathBuf::from("/");
++	for component in base.components() {
++		match component {
++			std::path::Component::RootDir => continue,
++			std::path::Component::Normal(part) => path.push(part),
++			_ => return Err(relocation_error(base, "is not a normalized path")),
++		}
++		let meta = fs::symlink_metadata(&path).map_err(|error| {
++			relocation_error(base, format!("cannot stat {}: {error}", path.display()))
++		})?;
++		if !meta.file_type().is_dir() {
++			return Err(relocation_error(base, format!("{} is not a real directory", path.display())));
++		}
++		if !trusted_component(meta.uid(), meta.gid(), meta.mode(), euid, egid) {
++			return Err(relocation_error(
++				base,
++				format!(
++					"{} is not trusted (uid {} mode {:o})",
++					path.display(),
++					meta.uid(),
++					meta.mode() & 0o7777
++				),
++			));
++		}
++		if path.as_path() == base && !base_accepts_new_entries(meta.uid(), meta.mode(), euid) {
++			return Err(relocation_error(base, "is not writable by this uid"));
++		}
++	}
++	Ok(())
++}
++
++/// Whether a directory's owner **and** write permissions keep our leaf safe.
++///
++/// The owner must be us, root, or Android's system uid — any other owner can
++/// `chmod` and rename its own entries regardless of mode. Ownership alone is
++/// not enough: a non-sticky directory writable by a group or by everyone lets a
++/// non-owner replace the leaf after validation. Only the sticky bit makes a
++/// write-open directory safe, because then only the entry owner (or root) can
++/// rename or remove our leaf, which is the `/tmp` rule. Group write is accepted
++/// only for groups that cannot contain another app: our own group and the
++/// Android system group (the `/data/data` tree is `0771 system:system`).
++#[cfg(any(target_os = "android", test))]
++fn trusted_component(uid: u32, gid: u32, mode: u32, euid: u32, egid: u32) -> bool {
++	let owner_trusted = uid == euid || uid == 0 || uid == ANDROID_SYSTEM_UID;
++	if !owner_trusted {
++		return false;
++	}
++	if mode & 0o1000 != 0 {
++		return true;
++	}
++	if mode & 0o002 != 0 {
++		return false;
++	}
++	if mode & 0o020 != 0 {
++		return gid == egid || gid == 0 || gid == ANDROID_SYSTEM_GID;
++	}
++	true
++}
++
++/// Whether the base lets this uid create the per-user entry.
++///
++/// An app-owned base needs owner write and search. A root/system-owned base is
++/// usable only when it is sticky and world-writable (`/tmp`); root-owned `0755`
++/// cannot hold the entry for an ordinary app uid.
++#[cfg(any(target_os = "android", test))]
++fn base_accepts_new_entries(uid: u32, mode: u32, euid: u32) -> bool {
++	if uid == euid {
++		return mode & 0o300 == 0o300;
++	}
++	(uid == 0 || uid == ANDROID_SYSTEM_UID) && mode & 0o1003 == 0o1003
++}
++
+ /// Dial `endpoint` and verify the server runs as our effective uid.
+ pub async fn connect(endpoint: &str, _timeout: Duration) -> Result<Stream, IpcError> {
+ 	let stream = UnixStream::connect(endpoint)
+@@ -354,3 +473,168 @@ impl Stream {
+ 		Ok(WriteFinish::HalfClosed)
+ 	}
+ }
++
++#[cfg(test)]
++mod tests {
++	use super::*;
++
++	fn scratch(tag: &str) -> PathBuf {
++		let dir = std::env::temp_dir().join(format!("omp-ipc-{}-{tag}", std::process::id()));
++		let _ = fs::remove_dir_all(&dir);
++		fs::create_dir_all(&dir).unwrap();
++		dir
++	}
++
++	fn leaf(base: &Path) -> PathBuf {
++		base.join(format!("omp-{}", euid()))
++	}
++
++	#[test]
++	fn ensure_private_dir_creates_leaf_0700() {
++		let base = scratch("create");
++		let dir = leaf(&base);
++		ensure_private_dir(&dir, euid()).unwrap();
++		let meta = fs::symlink_metadata(&dir).unwrap();
++		assert!(meta.file_type().is_dir());
++		assert_eq!(meta.mode() & 0o777, 0o700);
++		fs::remove_dir_all(base).unwrap();
++	}
++
++	#[test]
++	fn ensure_private_dir_repairs_any_non_0700_owner_mode() {
++		for mode in [0o500, 0o600, 0o200, 0o705] {
++			let base = scratch(&format!("repair-{mode:o}"));
++			let dir = leaf(&base);
++			fs::create_dir(&dir).unwrap();
++			fs::set_permissions(&dir, Permissions::from_mode(mode)).unwrap();
++			ensure_private_dir(&dir, euid()).unwrap();
++			assert_eq!(fs::symlink_metadata(&dir).unwrap().mode() & 0o777, 0o700);
++			fs::remove_dir_all(base).unwrap();
++		}
++	}
++
++	#[test]
++	fn ensure_private_dir_rejects_non_directory_leaf() {
++		let base = scratch("file");
++		let dir = leaf(&base);
++		fs::write(&dir, b"x").unwrap();
++		let error = ensure_private_dir(&dir, euid()).unwrap_err();
++		assert_eq!(error.code, "EACCES");
++		assert!(error.message.contains("not a directory"), "{}", error.message);
++		fs::remove_dir_all(base).unwrap();
++	}
++
++	#[test]
++	fn ensure_private_dir_rejects_symlink_leaf() {
++		let base = scratch("symlink");
++		let target = base.join("target");
++		fs::create_dir(&target).unwrap();
++		let dir = leaf(&base);
++		std::os::unix::fs::symlink(&target, &dir).unwrap();
++		let error = ensure_private_dir(&dir, euid()).unwrap_err();
++		assert_eq!(error.code, "EACCES");
++		assert!(error.message.contains("not a directory"), "{}", error.message);
++		fs::remove_dir_all(base).unwrap();
++	}
++
++	#[cfg(any(target_os = "android", target_os = "linux"))]
++	#[test]
++	fn ensure_trusted_base_accepts_app_private_chain() {
++		let base = scratch("trusted");
++		assert!(ensure_trusted_base(&base, euid()).is_ok());
++		fs::remove_dir_all(base).unwrap();
++	}
++
++	#[cfg(any(target_os = "android", target_os = "linux"))]
++	#[test]
++	fn ensure_trusted_base_rejects_world_writable_base() {
++		let base = scratch("open");
++		fs::set_permissions(&base, Permissions::from_mode(0o777)).unwrap();
++		let error = ensure_trusted_base(&base, euid()).unwrap_err();
++		assert_eq!(error.code, "EACCES");
++		assert!(error.message.contains("no usable IPC relocation directory"), "{}", error.message);
++		fs::set_permissions(&base, Permissions::from_mode(0o700)).unwrap();
++		fs::remove_dir_all(base).unwrap();
++	}
++
++	#[cfg(any(target_os = "android", target_os = "linux"))]
++	#[test]
++	fn ensure_trusted_base_rejects_symlink_component() {
++		let root = scratch("link");
++		let real = root.join("real");
++		fs::create_dir(&real).unwrap();
++		let link = root.join("link");
++		std::os::unix::fs::symlink(&real, &link).unwrap();
++		let error = ensure_trusted_base(&link, euid()).unwrap_err();
++		assert_eq!(error.code, "EACCES");
++		assert!(error.message.contains("not a real directory"), "{}", error.message);
++		fs::remove_dir_all(root).unwrap();
++	}
++
++	#[test]
++	fn ensure_trusted_base_requires_normalized_absolute_path() {
++		assert!(ensure_trusted_base(Path::new("relative/path"), euid()).is_err());
++		assert!(ensure_trusted_base(Path::new("/tmp/../etc"), euid()).is_err());
++	}
++
++	#[test]
++	fn trusted_component_requires_trusted_owner_and_safe_writes() {
++		let euid = 501;
++		let egid = 501;
++		assert!(trusted_component(euid, egid, 0o700, euid, egid));
++		// Own group may write (Android app dirs are 0771); a foreign group may not.
++		assert!(trusted_component(euid, egid, 0o770, euid, egid));
++		assert!(!trusted_component(euid, 20, 0o770, euid, egid));
++		assert!(!trusted_component(euid, egid, 0o702, euid, egid));
++		// A foreign owner can chmod/rename its own entries, whatever the mode.
++		assert!(!trusted_component(502, 502, 0o755, euid, egid));
++		assert!(!trusted_component(502, 502, 0o555, euid, egid));
++		// Owner alone is not enough: non-sticky group/other write is replaceable.
++		assert!(!trusted_component(0, 0, 0o777, euid, egid));
++		assert!(!trusted_component(ANDROID_SYSTEM_UID, ANDROID_SYSTEM_GID, 0o777, euid, egid));
++		assert!(!trusted_component(euid, egid, 0o777, euid, egid));
++		// Sticky write-open directories only let the entry owner rename (the /tmp rule).
++		assert!(trusted_component(0, 0, 0o1777, euid, egid));
++		assert!(trusted_component(euid, egid, 0o1770, euid, egid));
++		// Android's system tree is 0771 system:system; that group cannot hold apps.
++		assert!(trusted_component(ANDROID_SYSTEM_UID, ANDROID_SYSTEM_GID, 0o771, euid, egid));
++		assert!(!trusted_component(ANDROID_SYSTEM_UID, 20, 0o770, euid, egid));
++		// Read-only foreign-group modes are safe without the sticky bit.
++		assert!(trusted_component(euid, 20, 0o750, euid, egid));
++		assert!(trusted_component(0, 20, 0o755, euid, egid));
++	}
++
++	#[test]
++	fn base_accepts_new_entries_requires_owner_write_and_search() {
++		let euid = 501;
++		assert!(base_accepts_new_entries(euid, 0o700, euid));
++		assert!(!base_accepts_new_entries(euid, 0o600, euid));
++		assert!(!base_accepts_new_entries(euid, 0o500, euid));
++		// Root/system bases qualify only as sticky world-writable (`/tmp`), never
++		// as root-owned 0755 for an ordinary app uid.
++		assert!(base_accepts_new_entries(0, 0o1777, euid));
++		assert!(!base_accepts_new_entries(0, 0o755, euid));
++		assert!(!base_accepts_new_entries(0, 0o777, euid));
++		// Sticky but not searchable for others cannot accept our entry.
++		assert!(!base_accepts_new_entries(0, 0o1002, euid));
++		assert!(!base_accepts_new_entries(ANDROID_SYSTEM_UID, 0o777, euid));
++		assert!(base_accepts_new_entries(ANDROID_SYSTEM_UID, 0o1777, euid));
++	}
++
++	/// Exercise the real install-root ancestry: every lexical component of the
++	/// host's relocation base (`/tmp` on Linux CI, `<prefix>/tmp` on Android)
++	/// must satisfy the owner/mode policy. macOS is excluded because its `/tmp`
++	/// is a symlink the policy intentionally rejects.
++	#[cfg(any(target_os = "android", target_os = "linux"))]
++	#[test]
++	fn android_install_root_ancestry_is_trusted() {
++		let euid = euid();
++		let dir = PathBuf::from(endpoint::relocation_dir(euid));
++		let Some(base) = dir.parent() else { return };
++		if !base.is_dir() {
++			eprintln!("SKIP: {} is absent on this host", base.display());
++			return;
++		}
++		ensure_trusted_base(base, euid).unwrap();
++	}
++}
+diff --git a/crates/pi-natives/src/lib.rs b/crates/pi-natives/src/lib.rs
+index 5fa706c..859efb7 100644
+--- a/crates/pi-natives/src/lib.rs
++++ b/crates/pi-natives/src/lib.rs
+@@ -20,7 +20,7 @@
+ 
+ #![allow(clippy::trailing_empty_array, reason = "generated by napi macro")]
+ #![allow(clippy::trivially_copy_pass_by_ref, reason = "napi env idiom")]
+-#![feature(alloc_error_hook)]
++#![cfg_attr(not(target_os = "android"), feature(alloc_error_hook))]
+ 
+ // Match the host feature set of terminfo's phf generator.
+ #[cfg(unix)]
+diff --git a/crates/pi-natives/src/live.rs b/crates/pi-natives/src/live.rs
+index 9cbcd99..0fc449f 100644
+--- a/crates/pi-natives/src/live.rs
++++ b/crates/pi-natives/src/live.rs
+@@ -5,117 +5,185 @@
+ //! `pi_voice::live`. This class adapts its callbacks to non-blocking
+ //! threadsafe functions and its PCM input to `Float32Array`.
+ 
++#[cfg(not(target_os = "android"))]
+ use std::sync::Arc;
+ 
+ use napi::{
+-	bindgen_prelude::{Float32Array, Result},
+-	threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue},
++    bindgen_prelude::{Float32Array, Result},
++    threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue},
+ };
+ use napi_derive::napi;
++#[cfg(not(target_os = "android"))]
+ use pi_voice::live::{DEFAULT_OPEN_TIMEOUT_MS, LiveCallbacks, LivePeerCore};
+ 
+ type StringCallback = ThreadsafeFunction<String, UnknownReturnValue>;
+ type LevelCallback = ThreadsafeFunction<f64, UnknownReturnValue>;
+ 
+ /// WebRTC peer that accepts 16 kHz mono PCM and renders remote Opus audio.
++#[cfg(not(target_os = "android"))]
+ #[napi]
+ pub struct LiveWebRtcPeer {
+-	inner: Arc<LivePeerCore>,
++    inner: Arc<LivePeerCore>,
+ }
+ 
++#[cfg(target_os = "android")]
++#[napi]
++pub struct LiveWebRtcPeer {
++    _private: (),
++}
++
++#[cfg(not(target_os = "android"))]
+ #[napi]
+ impl LiveWebRtcPeer {
+-	/// Create an idle peer and register its event, output-level, and failure
+-	/// callbacks.
+-	#[napi(constructor)]
+-	pub fn new(
+-		#[napi(ts_arg_type = "(error: Error | null, payload: string) => void")]
+-		on_event: StringCallback,
+-		#[napi(ts_arg_type = "(error: Error | null, level: number) => void")] on_level: LevelCallback,
+-		#[napi(ts_arg_type = "(error: Error | null, message: string) => void")]
+-		on_failure: StringCallback,
+-	) -> Self {
+-		Self {
+-			inner: Arc::new(LivePeerCore::new(LiveCallbacks {
+-				event:   Box::new(move |payload| {
+-					on_event.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
+-				}),
+-				level:   Box::new(move |level| {
+-					on_level.call(Ok(level), ThreadsafeFunctionCallMode::NonBlocking);
+-				}),
+-				failure: Box::new(move |message| {
+-					on_failure.call(Ok(message), ThreadsafeFunctionCallMode::NonBlocking);
+-				}),
+-			})),
+-		}
+-	}
+-
+-	/// Start the native media peer and return its SDP offer.
+-	#[napi]
+-	pub async fn create_offer(&self) -> Result<String> {
+-		self
+-			.inner
+-			.create_offer()
+-			.await
+-			.map_err(napi::Error::from_reason)
+-	}
+-
+-	/// Apply the remote SDP answer returned by Codex signaling.
+-	#[napi]
+-	pub async fn accept_answer(&self, sdp: String) -> Result<()> {
+-		self
+-			.inner
+-			.accept_answer(sdp)
+-			.await
+-			.map_err(napi::Error::from_reason)
+-	}
+-
+-	/// Wait until the `oai-events` data channel is open.
+-	#[napi]
+-	pub async fn wait_for_open(&self, timeout_ms: Option<u32>) -> Result<()> {
+-		self
+-			.inner
+-			.wait_for_open(timeout_ms.unwrap_or(DEFAULT_OPEN_TIMEOUT_MS))
+-			.await
+-			.map_err(napi::Error::from_reason)
+-	}
+-
+-	/// Queue 16 kHz mono floating-point PCM for Opus transmission.
+-	#[napi]
+-	pub fn push_audio(&self, samples: Float32Array) -> Result<()> {
+-		self
+-			.inner
+-			.push_audio(&samples)
+-			.map_err(napi::Error::from_reason)
+-	}
+-
+-	/// Enable or disable microphone transmission, discarding partial muted
+-	/// frames.
+-	#[napi]
+-	pub fn set_muted(&self, muted: bool) -> Result<()> {
+-		self
+-			.inner
+-			.set_muted(muted)
+-			.map_err(napi::Error::from_reason)
+-	}
+-
+-	/// Close media, the data channel, the peer connection, and speaker playback.
+-	#[napi]
+-	pub async fn close(&self) {
+-		self.inner.close().await;
+-	}
++    /// Create an idle peer and register its event, output-level, and failure
++    /// callbacks.
++    #[napi(constructor)]
++    pub fn new(
++        #[napi(ts_arg_type = "(error: Error | null, payload: string) => void")]
++        on_event: StringCallback,
++        #[napi(ts_arg_type = "(error: Error | null, level: number) => void")] on_level: LevelCallback,
++        #[napi(ts_arg_type = "(error: Error | null, message: string) => void")]
++        on_failure: StringCallback,
++    ) -> Self {
++        Self {
++            inner: Arc::new(LivePeerCore::new(LiveCallbacks {
++                event: Box::new(move |payload| {
++                    on_event.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
++                }),
++                level: Box::new(move |level| {
++                    on_level.call(Ok(level), ThreadsafeFunctionCallMode::NonBlocking);
++                }),
++                failure: Box::new(move |message| {
++                    on_failure.call(Ok(message), ThreadsafeFunctionCallMode::NonBlocking);
++                }),
++            })),
++        }
++    }
++
++    /// Start the native media peer and return its SDP offer.
++    #[napi]
++    pub async fn create_offer(&self) -> Result<String> {
++        self.inner
++            .create_offer()
++            .await
++            .map_err(napi::Error::from_reason)
++    }
++
++    /// Apply the remote SDP answer returned by Codex signaling.
++    #[napi]
++    pub async fn accept_answer(&self, sdp: String) -> Result<()> {
++        self.inner
++            .accept_answer(sdp)
++            .await
++            .map_err(napi::Error::from_reason)
++    }
++
++    /// Wait until the `oai-events` data channel is open.
++    #[napi]
++    pub async fn wait_for_open(&self, timeout_ms: Option<u32>) -> Result<()> {
++        self.inner
++            .wait_for_open(timeout_ms.unwrap_or(DEFAULT_OPEN_TIMEOUT_MS))
++            .await
++            .map_err(napi::Error::from_reason)
++    }
++
++    /// Queue 16 kHz mono floating-point PCM for Opus transmission.
++    #[napi]
++    pub fn push_audio(&self, samples: Float32Array) -> Result<()> {
++        self.inner
++            .push_audio(&samples)
++            .map_err(napi::Error::from_reason)
++    }
++
++    /// Enable or disable microphone transmission, discarding partial muted
++    /// frames.
++    #[napi]
++    pub fn set_muted(&self, muted: bool) -> Result<()> {
++        self.inner
++            .set_muted(muted)
++            .map_err(napi::Error::from_reason)
++    }
++
++    /// Close media, the data channel, the peer connection, and speaker playback.
++    #[napi]
++    pub async fn close(&self) {
++        self.inner.close().await;
++    }
++}
++
++#[cfg(target_os = "android")]
++#[napi]
++impl LiveWebRtcPeer {
++    /// Create an idle peer and register its event, output-level, and failure
++    /// callbacks.
++    #[napi(constructor)]
++    pub fn new(
++        #[napi(ts_arg_type = "(error: Error | null, payload: string) => void")]
++        on_event: StringCallback,
++        #[napi(ts_arg_type = "(error: Error | null, level: number) => void")] on_level: LevelCallback,
++        #[napi(ts_arg_type = "(error: Error | null, message: string) => void")]
++        on_failure: StringCallback,
++    ) -> Result<Self> {
++        let _ = (on_event, on_level, on_failure);
++        Err(napi::Error::from_reason("LiveWebRtcPeer is unsupported on Android/Termux"))
++    }
++
++    /// Start the native media peer and return its SDP offer.
++    #[napi]
++    pub async fn create_offer(&self) -> Result<String> {
++        Err(napi::Error::from_reason("LiveWebRtcPeer is unsupported on Android/Termux"))
++    }
++
++    /// Apply the remote SDP answer returned by Codex signaling.
++    #[napi]
++    pub async fn accept_answer(&self, sdp: String) -> Result<()> {
++        let _ = sdp;
++        Err(napi::Error::from_reason("LiveWebRtcPeer is unsupported on Android/Termux"))
++    }
++
++    /// Wait until the `oai-events` data channel is open.
++    #[napi]
++    pub async fn wait_for_open(&self, timeout_ms: Option<u32>) -> Result<()> {
++        let _ = timeout_ms;
++        Err(napi::Error::from_reason("LiveWebRtcPeer is unsupported on Android/Termux"))
++    }
++
++    /// Queue 16 kHz mono floating-point PCM for Opus transmission.
++    #[napi]
++    pub fn push_audio(&self, samples: Float32Array) -> Result<()> {
++        let _ = samples;
++        Err(napi::Error::from_reason("LiveWebRtcPeer is unsupported on Android/Termux"))
++    }
++
++    /// Enable or disable microphone transmission, discarding partial muted
++    /// frames.
++    #[napi]
++    pub fn set_muted(&self, muted: bool) -> Result<()> {
++        let _ = muted;
++        Err(napi::Error::from_reason("LiveWebRtcPeer is unsupported on Android/Termux"))
++    }
++
++    /// Close media, the data channel, the peer connection, and speaker playback.
++    #[napi]
++    pub async fn close(&self) {}
++}
++
++#[cfg(not(target_os = "android"))]
++impl Drop for LiveWebRtcPeer {
++    fn drop(&mut self) {
++        if self.inner.is_closing() {
++            return;
++        }
++        let inner = Arc::clone(&self.inner);
++        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
++            runtime.spawn(async move {
++                inner.close().await;
++            });
++        }
++    }
+ }
+ 
++#[cfg(target_os = "android")]
+ impl Drop for LiveWebRtcPeer {
+-	fn drop(&mut self) {
+-		if self.inner.is_closing() {
+-			return;
+-		}
+-		let inner = Arc::clone(&self.inner);
+-		if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+-			runtime.spawn(async move {
+-				inner.close().await;
+-			});
+-		}
+-	}
++    fn drop(&mut self) {}
+ }
+diff --git a/crates/pi-shell/src/process.rs b/crates/pi-shell/src/process.rs
+index 602a829..4693842 100644
+--- a/crates/pi-shell/src/process.rs
++++ b/crates/pi-shell/src/process.rs
+@@ -16,7 +16,7 @@ pub use pi_builtins::ProcessStatus;
+ 
+ use crate::cancel::CancelToken;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod platform {
+ 	use std::{
+ 		collections::HashSet,
+diff --git a/crates/pi-vfs/src/fs.rs b/crates/pi-vfs/src/fs.rs
+index a378045..f11e5e6 100644
+--- a/crates/pi-vfs/src/fs.rs
++++ b/crates/pi-vfs/src/fs.rs
+@@ -510,8 +510,21 @@ fn may_access(path: &Path, mode: libc::c_int) -> bool {
+ 	let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+ 		return false;
+ 	};
++	// bionic rejects every nonzero faccessat flag with EINVAL, so its flags=0
++	// path checks real IDs. That matches the effective-ID contract only when
++	// real and effective IDs agree (the normal Termux case); fail closed
++	// otherwise — release is best-effort and stays blocked instead.
++	// SAFETY: the get*id calls take no arguments and never fail.
++	#[cfg(target_os = "android")]
++	if unsafe { libc::getuid() != libc::geteuid() || libc::getgid() != libc::getegid() } {
++		return false;
++	}
++	#[cfg(target_os = "android")]
++	const ACCESS_FLAGS: libc::c_int = 0;
++	#[cfg(not(target_os = "android"))]
++	const ACCESS_FLAGS: libc::c_int = libc::AT_EACCESS;
+ 	// SAFETY: `path` is a NUL-terminated string alive for the call.
+-	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, libc::AT_EACCESS) == 0 }
++	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, ACCESS_FLAGS) == 0 }
+ }
+ 
+ /// Reads a whole host file. Under a cancellable scope the read goes through
+diff --git a/packages/coding-agent/src/cli/update-cli.ts b/packages/coding-agent/src/cli/update-cli.ts
+index 8fbee0c..2b612f5 100644
+--- a/packages/coding-agent/src/cli/update-cli.ts
++++ b/packages/coding-agent/src/cli/update-cli.ts
+@@ -2275,6 +2275,54 @@ async function runManagedUpdate(
+ 	}
+ }
+ 
++/**
++ * Repo that publishes the Termux/Android port. Upstream release binaries and
++ * npm natives target desktop glibc/musl systems; the Android bundle is built
++ * and installed from here instead.
++ */
++const ANDROID_REPO = "SklUpp/omp-termux";
++const ANDROID_INSTALLER_URL = `https://raw.githubusercontent.com/${ANDROID_REPO}/main/install.sh`;
++
++/**
++ * Whether this process runs the Termux/Android port.
++ *
++ * Bun reports `android` as its platform, which no upstream release target
++ * covers; the installer's launcher also exports `OMP_PLATFORM=android`.
++ * Parameters are explicit so callers and tests do not depend on the host.
++ */
++export function isAndroidUpdateHost(
++	platform: string = process.platform,
++	platformOverride: string | undefined = process.env.OMP_PLATFORM,
++): boolean {
++	return platform === "android" || platformOverride === "android";
++}
++
++/**
++ * Reinstall instructions for the Termux/Android port. Both release profiles
++ * are shown because the installed bundle does not record which patch set it
++ * was built from.
++ */
++export function androidReinstallInstructions(): string {
++	return [
++		"OMP on Termux/Android does not support update checks or in-place updates.",
++		"Reinstall the release profile you use:",
++		`  standard: curl -fsSL ${ANDROID_INSTALLER_URL} | sh`,
++		`  extended: curl -fsSL ${ANDROID_INSTALLER_URL} | sh -s -- -ex`,
++		`Releases: https://github.com/${ANDROID_REPO}/releases`,
++	].join("\n");
++}
++
++/**
++ * Answer `omp update` on Android without consulting upstream release
++ * metadata. In-place update and the upstream check are both unsupported, so
++ * this exits non-zero after printing the reinstall commands.
++ */
++function runAndroidUpdate(): void {
++	console.log(chalk.dim(`Current version: ${VERSION}`));
++	console.error(chalk.red(androidReinstallInstructions()));
++	process.exitCode = 1;
++}
++
+ /**
+  * Run the update command.
+  *
+@@ -2288,6 +2336,10 @@ export async function runUpdateCommand(opts: {
+ 	check: boolean;
+ 	channel?: UpdateChannel;
+ }): Promise<void> {
++	if (isAndroidUpdateHost()) {
++		runAndroidUpdate();
++		return;
++	}
+ 	const ompPath = resolveOmpPath();
+ 	const manager = ompPath ? await managedInstallName(ompPath) : undefined;
+ 	if (manager) {
+diff --git a/packages/coding-agent/src/main.ts b/packages/coding-agent/src/main.ts
+index 7cef76c..d3d65de 100644
+--- a/packages/coding-agent/src/main.ts
++++ b/packages/coding-agent/src/main.ts
+@@ -43,7 +43,7 @@ import { formatKeyHint, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindi
+ import type { SessionPickerOptions } from "@oh-my-pi/pi-tui/apps/session-picker";
+ import { fetchBuild } from "./cli/build-service";
+ import { applyStartupCwd } from "./cli/startup-cwd";
+-import { getLatestRelease, isSourceCheckout, managedInstallName } from "./cli/update-cli";
++import { getLatestRelease, isAndroidUpdateHost, isSourceCheckout, managedInstallName } from "./cli/update-cli";
+ import { findConfigFile } from "./config";
+ import { ModelRegistry } from "./config/model-registry";
+ import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
+@@ -277,6 +277,11 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
+ 	if (!cfgStartupCheckUpdate.get(settings)) {
+ 		return;
+ 	}
++	// Android updates only through the port installer; `omp update` refuses, so
++	// a "run omp update" notification would be wrong advice.
++	if (isAndroidUpdateHost()) {
++		return;
++	}
+ 	try {
+ 		// Checkouts update through git and a manager (Tern) updates its omp itself:
+ 		// "run omp update" would be wrong advice for both.
+diff --git a/packages/coding-agent/src/modes/controllers/command-controller.ts b/packages/coding-agent/src/modes/controllers/command-controller.ts
+index a45781a..ba6c9ef 100644
+--- a/packages/coding-agent/src/modes/controllers/command-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/command-controller.ts
+@@ -457,12 +457,15 @@ export class CommandController {
+ 				this.ctx.showError("Advisor has no history yet.");
+ 				return;
+ 			}
+-			copyToClipboard(advisorHistory);
+-			this.ctx.showStatus("Advisor history copied to clipboard");
+-		} catch (error: unknown) {
+-			this.ctx.showError(
+-				`Failed to copy advisor history: ${error instanceof Error ? error.message : "Unknown error"}`,
++			copyToClipboard(advisorHistory).then(
++				() => this.ctx.showStatus("Advisor history copied to clipboard"),
++				(error: unknown) =>
++					this.ctx.showError(
++						`Failed to copy advisor history: ${error instanceof Error ? error.message : "Unknown error"}`,
++					),
+ 			);
++		} catch (error: unknown) {
++			this.ctx.showError(error instanceof Error ? error.message : "Unknown error");
+ 		}
+ 	}
+ 
+diff --git a/packages/coding-agent/src/modes/controllers/event-controller.ts b/packages/coding-agent/src/modes/controllers/event-controller.ts
+index 07445ca..b17ef24 100644
+--- a/packages/coding-agent/src/modes/controllers/event-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/event-controller.ts
+@@ -63,6 +63,7 @@ import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
+ import { writeDeviceDispatch } from "../../tools/resolve";
+ import { SpeechEnhancer } from "../../tts/speech-enhancer";
+ import { vocalizer } from "../../tts/vocalizer";
++import { sendAndroidNotification } from "../../utils/android-helpers";
+ import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
+ import { type RunStatus, setRunStatus } from "../../utils/run-status";
+ import { setTerminalTitleState } from "../../utils/title-generator";
+@@ -2974,6 +2975,11 @@ export class EventController {
+ 			type: "error",
+ 			actions: "focus",
+ 		});
++		// Android has no OSC terminal chrome: mirror the same gated card into the
++		// system shade with a fixed title. The session name is auto-generated from
++		// conversation text, so it must not persist into a notification-listener
++		// readable card. Best-effort and silent when Termux:API is absent.
++		void sendAndroidNotification("omp", "Stopped with error").catch(() => {});
+ 	}
+ 
+ 	sendCompletionNotification(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
+@@ -2999,5 +3005,8 @@ export class EventController {
+ 			type: "completion",
+ 			actions: "focus",
+ 		});
++		// Same gated completion card in the Android shade, fixed title (see error
++		// above for why the conversation-derived session name is not used).
++		void sendAndroidNotification("omp", "Complete").catch(() => {});
+ 	}
+ }
+diff --git a/packages/coding-agent/src/modes/controllers/input-controller.ts b/packages/coding-agent/src/modes/controllers/input-controller.ts
+index 2eb6bc5..1bf5ad9 100644
+--- a/packages/coding-agent/src/modes/controllers/input-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/input-controller.ts
+@@ -3006,14 +3006,14 @@ export class InputController {
+ 			this.ctx.showStatus("Nothing to copy");
+ 			return;
+ 		}
+-		try {
+-			copyToClipboard(text);
+-			const sanitized = sanitizeText(text);
+-			const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
+-			this.ctx.showStatus(`Copied line: ${preview}`);
+-		} catch {
+-			this.ctx.showWarning("Failed to copy to clipboard");
+-		}
++		const sanitized = sanitizeText(text);
++		const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
++		// `copyToClipboard` settles asynchronously; report the outcome instead of
++		// claiming success before the clipboard backend has run.
++		copyToClipboard(text).then(
++			() => this.ctx.showStatus(`Copied line: ${preview}`),
++			() => this.ctx.showWarning("Failed to copy to clipboard"),
++		);
+ 	}
+ 
+ 	/** Copy current prompt text to system clipboard. */
+@@ -3023,14 +3023,12 @@ export class InputController {
+ 			this.ctx.showStatus("Nothing to copy");
+ 			return;
+ 		}
+-		try {
+-			copyToClipboard(text);
+-			const sanitized = sanitizeText(text);
+-			const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
+-			this.ctx.showStatus(`Copied: ${preview}`);
+-		} catch {
+-			this.ctx.showWarning("Failed to copy to clipboard");
+-		}
++		const sanitized = sanitizeText(text);
++		const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
++		copyToClipboard(text).then(
++			() => this.ctx.showStatus(`Copied: ${preview}`),
++			() => this.ctx.showWarning("Failed to copy to clipboard"),
++		);
+ 	}
+ 
+ 	cycleThinkingLevel(): void {
+diff --git a/packages/coding-agent/src/modes/controllers/selector-controller.ts b/packages/coding-agent/src/modes/controllers/selector-controller.ts
+index e222839..f882290 100644
+--- a/packages/coding-agent/src/modes/controllers/selector-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/selector-controller.ts
+@@ -1468,8 +1468,10 @@ export class SelectorController {
+ 					this.ctx.showStatus("Nothing to copy in that item");
+ 					return;
+ 				}
+-				void copyToClipboard(content);
+-				this.ctx.showStatus(`Copied ${label} to clipboard`);
++				copyToClipboard(content).then(
++					() => this.ctx.showStatus(`Copied ${label} to clipboard`),
++					() => this.ctx.showWarning("Failed to copy to clipboard"),
++				);
+ 			},
+ 			onOpen: (href, label) => {
+ 				done();
+diff --git a/packages/coding-agent/src/modes/controllers/todo-command-controller.ts b/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
+index dab0c5a..f1c9639 100644
+--- a/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
+@@ -213,12 +213,10 @@ export class TodoCommandController {
+ 			this.ctx.showWarning("No todos to copy.");
+ 			return;
+ 		}
+-		try {
+-			copyToClipboard(phasesToMarkdown(phases));
+-			this.ctx.showStatus("Copied todos as Markdown to clipboard.");
+-		} catch (error) {
+-			this.ctx.showError(error instanceof Error ? error.message : String(error));
+-		}
++		copyToClipboard(phasesToMarkdown(phases)).then(
++			() => this.ctx.showStatus("Copied todos as Markdown to clipboard."),
++			(error: unknown) => this.ctx.showError(error instanceof Error ? error.message : String(error)),
++		);
+ 	}
+ 
+ 	#resolveTodoPath(rest: string): string {
+diff --git a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
+index b55af8d..c1ab16e 100644
+--- a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
++++ b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
+@@ -577,50 +577,52 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
+ 		description: "Pick text or code from the conversation to copy",
+ 		allowArgs: true,
+ 		handleTui: async (command, runtime) => {
+-			const arg = command.args.trim().toLowerCase();
+-			if (!arg) {
+-				runtime.ctx.showCopySelector();
+-				clearSubmittedText(runtime);
+-				return;
+-			}
+-			if (arg === "code") {
+-				const block = extractLastCodeBlock(runtime.ctx.session.messages);
+-				if (!block) {
+-					runtime.ctx.showStatus("No code block to copy.");
+-					clearSubmittedText(runtime);
++			try {
++				const arg = command.args.trim().toLowerCase();
++				if (!arg) {
++					runtime.ctx.showCopySelector();
+ 					return;
+ 				}
+-				await copyToClipboard(block.code);
+-				runtime.ctx.showStatus("Copied code block to clipboard");
+-				clearSubmittedText(runtime);
+-				return;
+-			}
+-			if (arg === "cmd" || arg === "command") {
+-				const lastCommand = extractLastCommand(runtime.ctx.session.messages);
+-				if (!lastCommand) {
+-					runtime.ctx.showStatus("No command to copy.");
+-					clearSubmittedText(runtime);
++				if (arg === "code") {
++					const block = extractLastCodeBlock(runtime.ctx.session.messages);
++					if (!block) {
++						runtime.ctx.showStatus("No code block to copy.");
++						return;
++					}
++					await copyToClipboard(block.code);
++					runtime.ctx.showStatus("Copied code block to clipboard");
+ 					return;
+ 				}
+-				await copyToClipboard(lastCommand.code);
+-				runtime.ctx.showStatus(`Copied ${lastCommand.kind === "bash" ? "bash command" : "eval code"} to clipboard`);
+-				clearSubmittedText(runtime);
+-				return;
+-			}
+-			if (arg === "link" || arg === "url") {
+-				const link = extractLastLink(runtime.ctx.session.messages);
+-				if (!link) {
+-					runtime.ctx.showStatus("No link to copy.");
+-					clearSubmittedText(runtime);
++				if (arg === "cmd" || arg === "command") {
++					const lastCommand = extractLastCommand(runtime.ctx.session.messages);
++					if (!lastCommand) {
++						runtime.ctx.showStatus("No command to copy.");
++						return;
++					}
++					await copyToClipboard(lastCommand.code);
++					runtime.ctx.showStatus(
++						`Copied ${lastCommand.kind === "bash" ? "bash command" : "eval code"} to clipboard`,
++					);
+ 					return;
+ 				}
+-				await copyToClipboard(link.href);
+-				runtime.ctx.showStatus("Copied link to clipboard");
++				if (arg === "link" || arg === "url") {
++					const link = extractLastLink(runtime.ctx.session.messages);
++					if (!link) {
++						runtime.ctx.showStatus("No link to copy.");
++						return;
++					}
++					await copyToClipboard(link.href);
++					runtime.ctx.showStatus("Copied link to clipboard");
++					return;
++				}
++				runtime.ctx.showStatus("Usage: /copy [code|cmd|link]");
++			} catch (error) {
++				// A rejected copy must not escape as an unhandled rejection and
++				// leave the draft in the editor without any feedback.
++				runtime.ctx.showWarning(`Copy failed: ${errorMessage(error)}`);
++			} finally {
+ 				clearSubmittedText(runtime);
+-				return;
+ 			}
+-			runtime.ctx.showStatus("Usage: /copy [code|cmd|link]");
+-			clearSubmittedText(runtime);
+ 		},
+ 	},
+ 	{
+diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src/task/index.ts
+index 88cd09b..98f8661 100644
+--- a/packages/coding-agent/src/task/index.ts
++++ b/packages/coding-agent/src/task/index.ts
+@@ -390,6 +390,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
+ 	}
+ 	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task, taskFile: params.taskFile };
+ 	if ("solutionSpace" in params) item.solutionSpace = params.solutionSpace;
++	if ("repoRoot" in params) item.repoRoot = params.repoRoot;
+ 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
+ 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
+ 	if ("tools" in params) item.tools = params.tools;
+@@ -462,6 +463,11 @@ function spawnParamsFor(params: TaskParams, item: ResolvedTaskItem, defaultAgent
+ 	if (item.taskFile !== undefined) spawn.taskFile = item.taskFile;
+ 	if (item.taskFileSha256 !== undefined) spawn.taskFileSha256 = item.taskFileSha256;
+ 	if (item.solutionSpace !== undefined) spawn.solutionSpace = item.solutionSpace;
++	if (item.repoRoot !== undefined) {
++		spawn.repoRoot = item.repoRoot;
++	} else if (params.repoRoot !== undefined) {
++		spawn.repoRoot = params.repoRoot;
++	}
+ 	if (params.context !== undefined) spawn.context = params.context;
+ 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
+ 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
+@@ -1087,7 +1093,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 			...spawnModelFields(params),
+ 			...this.#resultParams(params),
+ 			...this.#effortParams(params),
+-			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
++			...(params.isolated === true ? { isolation: { requested: true, repoRoot: params.repoRoot } } : {}),
+ 			blockedAgent: this.#blockedAgent,
+ 			enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
+ 			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
+@@ -1955,7 +1961,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 				...(onArtifactsRetained ? { onArtifactsRetained } : {}),
+ 				invokedAt: launchTiming?.invokedAt,
+ 				acquiredAt: launchTiming?.acquiredAt,
+-				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
++				...(params.isolated === true ? { isolation: { requested: true, repoRoot: params.repoRoot } } : {}),
+ 				blockedAgent: this.#blockedAgent,
+ 				enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
+ 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
+diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/coding-agent/src/task/isolation-runner.ts
+index 806cb6a..45486bf 100644
+--- a/packages/coding-agent/src/task/isolation-runner.ts
++++ b/packages/coding-agent/src/task/isolation-runner.ts
+@@ -142,8 +142,8 @@ export interface IsolationContext {
+  * the error as a task-tool failure. Each spawn captures its own baseline from
+  * its isolation copy (see {@link captureIsolationBaseline}).
+  */
+-export async function prepareIsolationContext(cwd: string): Promise<IsolationContext> {
+-	return { repoRoot: await getRepoRoot(cwd) };
++export async function prepareIsolationContext(cwd: string, explicitRepoRoot?: string): Promise<IsolationContext> {
++	return { repoRoot: await getRepoRoot(cwd, explicitRepoRoot) };
+ }
+ 
+ /** Fingerprint of a captured delta, used to skip re-committing an unchanged workspace on release. */
+diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/coding-agent/src/task/structured-subagent.ts
+index e2d024e..c8c8cb9 100644
+--- a/packages/coding-agent/src/task/structured-subagent.ts
++++ b/packages/coding-agent/src/task/structured-subagent.ts
+@@ -110,6 +110,7 @@ export interface StructuredSubagentIsolationControls {
+ 	requested?: boolean;
+ 	merge?: "patch" | "branch";
+ 	apply?: boolean;
++	repoRoot?: string;
+ }
+ 
+ /** Identity and presentation metadata supplied by the calling surface. */
+@@ -226,6 +227,7 @@ export interface EffectiveSubagentPolicy {
+ 	schema: StructuredSubagentSchemaResolution;
+ 	planMode: boolean;
+ 	isIsolated: boolean;
++	repoRoot?: string;
+ 	mergeMode: "patch" | "branch";
+ 	applyChanges: boolean;
+ 	enableLsp: boolean;
+@@ -311,7 +313,10 @@ function assertPlanControlsAllowed(request: StructuredSubagentRequest, planMode:
+ 	const isolation = request.isolation;
+ 	if (
+ 		isolation &&
+-		(Object.hasOwn(isolation, "requested") || Object.hasOwn(isolation, "apply") || Object.hasOwn(isolation, "merge"))
++		(Object.hasOwn(isolation, "requested") ||
++			Object.hasOwn(isolation, "apply") ||
++			Object.hasOwn(isolation, "merge") ||
++			(isolation.requested === true && Object.hasOwn(isolation, "repoRoot")))
+ 	) {
+ 		throw new StructuredSubagentError(
+ 			"preflight",
+@@ -620,6 +625,7 @@ export async function resolveEffectiveSubagentPolicy(
+ 		schema,
+ 		planMode,
+ 		isIsolated,
++		repoRoot: isIsolated ? request.isolation?.repoRoot : undefined,
+ 		mergeMode: request.isolation?.merge ?? cfgTaskIsolationMerge.get(request.session.settings),
+ 		applyChanges:
+ 			request.isolation?.apply ??
+@@ -1011,7 +1017,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
+ 		let isolationContext: IsolationContext | null = null;
+ 		if (policy.isIsolated) {
+ 			try {
+-				isolationContext = await prepareIsolationContext(request.session.cwd);
++				isolationContext = await prepareIsolationContext(request.session.cwd, policy.repoRoot);
+ 			} catch (error) {
+ 				const message = error instanceof Error ? error.message : String(error);
+ 				throw new StructuredSubagentError(
+diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src/task/types.ts
+index f896685..0ceddc2 100644
+--- a/packages/coding-agent/src/task/types.ts
++++ b/packages/coding-agent/src/task/types.ts
+@@ -77,6 +77,7 @@ export const taskItemSchema = type({
+ 	agent: "string = 'task'",
+ 	task: "string",
+ 	solutionSpace: "string",
++	"repoRoot?": "string",
+ 	"outputSchema?": outputSchemaInputSchema,
+ 	"schemaMode?": '"permissive" | "strict"',
+ 	"tools?": "string[]",
+@@ -88,6 +89,7 @@ const taskItemSchemaIsolated = type({
+ 	agent: "string = 'task'",
+ 	task: "string",
+ 	solutionSpace: "string",
++	"repoRoot?": "string",
+ 	"outputSchema?": outputSchemaInputSchema,
+ 	"schemaMode?": '"permissive" | "strict"',
+ 	"tools?": "string[]",
+@@ -101,6 +103,7 @@ export const taskSchema = type({
+ 	agent: "string = 'task'",
+ 	task: "string",
+ 	solutionSpace: "string",
++	"repoRoot?": "string",
+ 	"outputSchema?": outputSchemaInputSchema,
+ 	"schemaMode?": '"permissive" | "strict"',
+ 	"tools?": "string[]",
+@@ -113,6 +116,7 @@ const taskSchemaNoIsolation = type({
+ 	agent: "string = 'task'",
+ 	task: "string",
+ 	solutionSpace: "string",
++	"repoRoot?": "string",
+ 	"outputSchema?": outputSchemaInputSchema,
+ 	"schemaMode?": '"permissive" | "strict"',
+ 	"tools?": "string[]",
+diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/src/task/worktree.ts
+index c15b573..34fa981 100644
+--- a/packages/coding-agent/src/task/worktree.ts
++++ b/packages/coding-agent/src/task/worktree.ts
+@@ -47,18 +47,35 @@ export interface WorktreeBaseline {
+ 	nested: Array<{ relativePath: string; baseline: RepoBaseline }>;
+ }
+ 
+-export async function getRepoRoot(cwd: string): Promise<string> {
++export async function getRepoRoot(cwd: string, explicitRepoRoot?: string): Promise<string> {
++	const targetPath = explicitRepoRoot ? path.resolve(cwd, explicitRepoRoot) : cwd;
+ 	// Pure-jj check runs first so a jj workspace nested under an unrelated
+ 	// outer Git checkout is rejected at its own root rather than silently
+ 	// mutating the surrounding Git tree behind jj's back.
+-	if (vcs.isPureJj(cwd)) {
++	if (vcs.isPureJj(targetPath)) {
+ 		throw new Error(
+ 			"Isolated task execution requires a Git checkout, but this workspace is pure Jujutsu (`.jj/` without a colocated `.git/`). Run `jj git init --colocate` to add a Git checkout, or set `task.isolation.enabled: false` to disable task isolation.",
+ 		);
+ 	}
+ 
+-	const repoRoot = vcs.git(cwd)?.info().repoRoot;
+-	if (repoRoot) return repoRoot;
++	const repoInfo = vcs.git(targetPath)?.info();
++	const resolvedRoot = repoInfo?.repoRoot;
++	if (resolvedRoot) {
++		if (explicitRepoRoot) {
++			const canonicalTarget = path.resolve(targetPath);
++			const canonicalResolved = path.resolve(resolvedRoot);
++			if (canonicalTarget !== canonicalResolved && !canonicalTarget.startsWith(canonicalResolved + path.sep)) {
++				throw new Error(
++					`Explicit repoRoot '${explicitRepoRoot}' does not match resolved git repository '${resolvedRoot}'.`,
++				);
++			}
++		}
++		return resolvedRoot;
++	}
++
++	if (explicitRepoRoot) {
++		throw new Error(`Explicit repoRoot '${explicitRepoRoot}' is not a valid Git repository.`);
++	}
+ 
+ 	throw new Error("Git repository not found for isolated task execution.");
+ }
+@@ -649,8 +666,9 @@ export async function ensureIsolation(
+ 	baseCwd: string,
+ 	id: string,
+ 	preferred?: IsoBackendKind,
++	explicitRepoRoot?: string,
+ ): Promise<IsolationHandle> {
+-	const repoRoot = await getRepoRoot(baseCwd);
++	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
+ 	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
+ 	const baseDir = getWorktreeDir(getTaskIsolationSegment(repoRoot, id));
+ 	const mergedDir = path.join(baseDir, TASK_ISOLATION_MOUNT_DIR);
+diff --git a/packages/coding-agent/src/tools/ask.ts b/packages/coding-agent/src/tools/ask.ts
+index 8897536..210fe86 100644
+--- a/packages/coding-agent/src/tools/ask.ts
++++ b/packages/coding-agent/src/tools/ask.ts
+@@ -44,6 +44,12 @@ import { sessionLocalProtocolOptions } from "../internal-urls/context";
+ import { cfgAskNotify, askTimeoutMs } from "../modes/settings";
+ import { renderAttachmentSourceNotice } from "../session/attachment-source-notice";
+ import { cfgSpeechEnabled } from "../tts/settings";
++import {
++	type AndroidOutcome,
++	clearAndroidNotification,
++	newAndroidAskNotificationId,
++	sendAndroidNotification,
++} from "../utils/android-helpers";
+ import { describeAttachedImagesForTextModel, shouldDescribeImagesForTextModel } from "../utils/image-vision-fallback";
+ 
+ // =============================================================================
+@@ -589,8 +595,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+ 		return (session.canPromptUser ?? session.hasUI) || session.advertiseHeadlessAsk ? new AskTool(session) : null;
+ 	}
+ 
+-	/** Send terminal notification when ask tool is waiting for input */
+-	#sendAskNotification(): void {
++	/**
++	 * Notify that the ask dialog is waiting for input: the terminal notification
++	 * plus, on Android, a system card. The caller keeps the card's post promise
++	 * so the removal can be serialized behind it.
++	 */
++	#sendAskNotification(): { id: string; posted: Promise<AndroidOutcome> } | undefined {
+ 		if (!this.session.hasUI) return;
+ 		const method = cfgAskNotify.get(this.session.settings);
+ 		if (method === "off") return;
+@@ -601,6 +611,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+ 			urgency: "normal",
+ 			actions: "focus",
+ 		});
++		// A per-prompt id: removing it must not erase a completion/error card
++		// posted under the process status id while the dialog was pending.
++		const id = newAndroidAskNotificationId();
++		return { id, posted: sendAndroidNotification("omp", "Waiting for input", { id }) };
+ 	}
+ 
+ 	/**
+@@ -656,6 +670,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+ 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
+ 		context?: AgentToolContext,
+ 	): Promise<AgentToolResult<AskToolDetails>> {
++		// Android ask card, cleared as soon as the dialog resolves (see below).
++		let askAndroidCard: { id: string; posted: Promise<AndroidOutcome> } | undefined;
+ 		// Headless fallback
+ 		if (!context?.hasUI || !context.ui) {
+ 			// A headless fork (`/tan`) keeps `ask` advertised only to share the parent's
+@@ -769,15 +785,22 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+ 		const dialogSignal = signal ? AbortSignal.any([signal, userSteering.signal]) : userSteering.signal;
+ 		const abortError = (): ToolAbortError =>
+ 			new ToolAbortError(userSteering.signal.aborted ? "Ask interrupted by message" : "Ask input was cancelled");
++		async function clearAndroidAskCard(): Promise<void> {
++			const card = askAndroidCard;
++			if (!card) return;
++			askAndroidCard = undefined;
++			// Serialize behind the post: the two Termux:API commands are separate
++			// processes, so a removal that races an in-flight post leaves the card
++			// behind. A suppressed or failed post has no card to remove.
++			if (!(await card.posted).ok) return;
++			await clearAndroidNotification(card.id).catch(() => {});
++		}
+ 		const cancelAsk = (): never => {
+ 			if (userSteering.signal.aborted) throw abortError();
+ 			context.abort();
+ 			throw new ToolAbortError("Ask tool was cancelled by the user");
+ 		};
+ 
+-		// Send notification if waiting and not suppressed
+-		this.#sendAskNotification();
+-
+ 		if (params.questions.length === 0) {
+ 			return {
+ 				content: [{ type: "text" as const, text: "Error: questions must not be empty" }],
+@@ -785,232 +808,240 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+ 			};
+ 		}
+ 
+-		// Speak the question(s) aloud before surfacing them. Ask vocalizes in every
+-		// mode — it's the assistant addressing the user — gated only by speech.enabled
+-		// (the vocalizer re-checks the setting and no-ops when disabled).
+-		if (cfgSpeechEnabled.get(this.session.settings)) {
+-			vocalizer.speak(params.questions.map(q => q.question).join("\n"));
+-		}
++		// Notify only after validation, so no card is posted for a request that
++		// returns an error without ever waiting for input.
++		askAndroidCard = this.#sendAskNotification();
+ 
+-		const richAskDialog = extensionUi.askDialog;
+-		if (richAskDialog) {
+-			try {
+-				const showRichDialog = () =>
+-					richAskDialog(
+-						params.questions.map(q => ({
+-							id: q.id,
+-							question: q.question,
+-							...(q.header?.trim() ? { header: q.header } : {}),
+-							options: q.options.map(option => ({
+-								label: option.label,
+-								...(option.description?.trim() ? { description: option.description.trim() } : {}),
+-								...(option.preview?.trim() ? { preview: option.preview } : {}),
++		try {
++			// Speak the question(s) aloud before surfacing them. Ask vocalizes in every
++			// mode — it's the assistant addressing the user — gated only by speech.enabled
++			// (the vocalizer re-checks the setting and no-ops when disabled).
++			if (cfgSpeechEnabled.get(this.session.settings)) {
++				vocalizer.speak(params.questions.map(q => q.question).join("\n"));
++			}
++
++			const richAskDialog = extensionUi.askDialog;
++			if (richAskDialog) {
++				try {
++					const showRichDialog = () =>
++						richAskDialog(
++							params.questions.map(q => ({
++								id: q.id,
++								question: q.question,
++								...(q.header?.trim() ? { header: q.header } : {}),
++								options: q.options.map(option => ({
++									label: option.label,
++									...(option.description?.trim() ? { description: option.description.trim() } : {}),
++									...(option.preview?.trim() ? { preview: option.preview } : {}),
++								})),
++								...(q.multi !== undefined ? { multi: q.multi } : {}),
++								...(q.recommended !== undefined ? { recommended: q.recommended } : {}),
+ 							})),
+-							...(q.multi !== undefined ? { multi: q.multi } : {}),
+-							...(q.recommended !== undefined ? { recommended: q.recommended } : {}),
+-						})),
+-						{ timeout: timeout ?? undefined, signal: dialogSignal, acceptImages: true },
+-					);
+-				const richResult = await untilAborted(dialogSignal, showRichDialog);
+-				if (!richResult) return cancelAsk();
+-				if (richResult.kind === "chat") {
+-					const questionText = params.questions.map(q => q.question).join("\n");
+-					return {
+-						content: [
+-							{
+-								type: "text" as const,
+-								text: `User chose to chat about this instead of answering.\n\nQuestions asked:\n${questionText}`,
+-							},
+-						],
+-						details: { chatRedirect: true, questions: params.questions.map(q => q.question) },
+-					};
+-				}
+-				if (richResult.results.length !== params.questions.length) {
+-					throw new Error("Ask dialog returned a result count that does not match the requested questions");
+-				}
+-				const results: QuestionResult[] = [];
+-				// Each prompt numbers markers from 1; shift them so `[Image #N]` indexes all result images.
+-				const answerImages: ImageContent[] = [];
+-				for (let index = 0; index < params.questions.length; index++) {
+-					const question = params.questions[index];
+-					const result = richResult.results[index];
+-					if (!question || !result || result.id !== question.id) {
+-						throw new Error("Ask dialog returned results that do not match the requested question order");
++							{ timeout: timeout ?? undefined, signal: dialogSignal, acceptImages: true },
++						);
++					const richResult = await untilAborted(dialogSignal, showRichDialog());
++					if (!richResult) return cancelAsk();
++					if (richResult.kind === "chat") {
++						const questionText = params.questions.map(q => q.question).join("\n");
++						return {
++							content: [
++								{
++									type: "text" as const,
++									text: `User chose to chat about this instead of answering.\n\nQuestions asked:\n${questionText}`,
++								},
++							],
++							details: { chatRedirect: true, questions: params.questions.map(q => q.question) },
++						};
+ 					}
+-					const customOffset = answerImages.length;
+-					if (result.customInputImages) answerImages.push(...result.customInputImages);
+-					const noteOffset = answerImages.length;
+-					if (result.noteImages) answerImages.push(...result.noteImages);
+-					results.push({
+-						id: question.id,
+-						question: question.question,
+-						options: question.options.map(option => option.label),
+-						multi: question.multi ?? false,
+-						selectedOptions: result.selectedOptions,
+-						customInput:
+-							result.customInput === undefined
+-								? undefined
+-								: shiftImageMarkers(result.customInput, customOffset, result.customInputImages?.length ?? 0),
+-						note:
+-							result.note === undefined
+-								? undefined
+-								: shiftImageMarkers(result.note, noteOffset, result.noteImages?.length ?? 0),
+-						noteOption: result.noteOption,
+-						timedOut: result.timedOut,
+-					});
+-				}
+-				if (params.questions.length === 1) {
+-					const result = results[0];
+-					// An empty multi-select submission is a valid "select none"
+-					// answer (#8265 review); only a truly empty single-select
+-					// result counts as cancellation.
+-					if (
+-						!result ||
+-						(!result.timedOut &&
+-							!result.multi &&
+-							result.selectedOptions.length === 0 &&
+-							result.customInput === undefined)
+-					)
+-						cancelAsk();
+-					const details: AskToolDetails = {
+-						question: result.question,
+-						options: result.options,
+-						multi: result.multi,
+-						selectedOptions: result.selectedOptions,
+-						customInput: result.customInput,
+-						note: result.note,
+-						noteOption: result.noteOption,
+-						timedOut: result.timedOut,
+-					};
+-					const responseText = formatSingleQuestionResponse(result);
++					if (richResult.results.length !== params.questions.length) {
++						throw new Error("Ask dialog returned a result count that does not match the requested questions");
++					}
++					const results: QuestionResult[] = [];
++					// Each prompt numbers markers from 1; shift them so `[Image #N]` indexes all result images.
++					const answerImages: ImageContent[] = [];
++					for (let index = 0; index < params.questions.length; index++) {
++						const question = params.questions[index];
++						const result = richResult.results[index];
++						if (!question || !result || result.id !== question.id) {
++							throw new Error("Ask dialog returned results that do not match the requested question order");
++						}
++						const customOffset = answerImages.length;
++						if (result.customInputImages) answerImages.push(...result.customInputImages);
++						const noteOffset = answerImages.length;
++						if (result.noteImages) answerImages.push(...result.noteImages);
++						results.push({
++							id: question.id,
++							question: question.question,
++							options: question.options.map(option => option.label),
++							multi: question.multi ?? false,
++							selectedOptions: result.selectedOptions,
++							customInput:
++								result.customInput === undefined
++									? undefined
++									: shiftImageMarkers(result.customInput, customOffset, result.customInputImages?.length ?? 0),
++							note:
++								result.note === undefined
++									? undefined
++									: shiftImageMarkers(result.note, noteOffset, result.noteImages?.length ?? 0),
++							noteOption: result.noteOption,
++							timedOut: result.timedOut,
++						});
++					}
++					if (params.questions.length === 1) {
++						const result = results[0];
++						// An empty multi-select submission is a valid "select none"
++						// answer (#8265 review); only a truly empty single-select
++						// result counts as cancellation.
++						if (
++							!result ||
++							(!result.timedOut &&
++								!result.multi &&
++								result.selectedOptions.length === 0 &&
++								result.customInput === undefined)
++						)
++							cancelAsk();
++						const details: AskToolDetails = {
++							question: result.question,
++							options: result.options,
++							multi: result.multi,
++							selectedOptions: result.selectedOptions,
++							customInput: result.customInput,
++							note: result.note,
++							noteOption: result.noteOption,
++							timedOut: result.timedOut,
++						};
++						const responseText = formatSingleQuestionResponse(result);
++						const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
++						return { content: [{ type: "text" as const, text: responseText }, ...imageBlocks], details };
++					}
++					const details: AskToolDetails = { results };
++					const responseText = `User answers:\n${results.map(formatQuestionResult).join("\n")}`;
+ 					const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
+ 					return { content: [{ type: "text" as const, text: responseText }, ...imageBlocks], details };
++				} catch (error) {
++					if (error instanceof Error && error.name === "AbortError") throw abortError();
++					throw error;
+ 				}
+-				const details: AskToolDetails = { results };
+-				const responseText = `User answers:\n${results.map(formatQuestionResult).join("\n")}`;
+-				const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
+-				return { content: [{ type: "text" as const, text: responseText }, ...imageBlocks], details };
+-			} catch (error) {
+-				if (error instanceof Error && error.name === "AbortError") throw abortError();
+-				throw error;
+ 			}
+-		}
+ 
+-		const askQuestion = async (
+-			q: AskParams["questions"][number],
+-			options?: { previous?: QuestionResult; navigation?: NavigationControls },
+-		) => {
+-			const questionOptions = q.options.map(option => ({
+-				label: option.label,
+-				...(option.description?.trim() ? { description: option.description.trim() } : {}),
+-			}));
+-			const optionLabels = questionOptions.map(getAskOptionLabel);
+-			try {
+-				const { selectedOptions, customInput, note, navigation, cancelled, timedOut } = await askSingleQuestion(
+-					ui,
+-					q.question,
+-					questionOptions,
+-					q.multi ?? false,
+-					{
+-						recommended: q.recommended,
+-						timeout: timeout ?? undefined,
+-						signal: dialogSignal,
+-						initialSelection: options?.previous,
+-						navigation: options?.navigation,
+-					},
+-				);
+-				return { optionLabels, selectedOptions, customInput, note, navigation, cancelled, timedOut };
+-			} catch (error) {
+-				if (error instanceof Error && error.name === "AbortError") throw abortError();
+-				throw error;
+-			}
+-		};
+-
+-		if (params.questions.length === 1) {
+-			const [q] = params.questions;
+-			const { optionLabels, selectedOptions, customInput, note, cancelled, timedOut } = await askQuestion(q);
+-
+-			if (!timedOut && (cancelled || (selectedOptions.length === 0 && customInput === undefined))) cancelAsk();
+-			const details: AskToolDetails = {
+-				question: q.question,
+-				options: optionLabels,
+-				multi: q.multi ?? false,
+-				selectedOptions,
+-				customInput,
+-				note,
+-				timedOut: timedOut || undefined,
++			const askQuestion = async (
++				q: AskParams["questions"][number],
++				options?: { previous?: QuestionResult; navigation?: NavigationControls },
++			) => {
++				const questionOptions = q.options.map(option => ({
++					label: option.label,
++					...(option.description?.trim() ? { description: option.description.trim() } : {}),
++				}));
++				const optionLabels = questionOptions.map(getAskOptionLabel);
++				try {
++					const { selectedOptions, customInput, note, navigation, cancelled, timedOut } = await askSingleQuestion(
++						ui,
++						q.question,
++						questionOptions,
++						q.multi ?? false,
++						{
++							recommended: q.recommended,
++							timeout: timeout ?? undefined,
++							signal: dialogSignal,
++							initialSelection: options?.previous,
++							navigation: options?.navigation,
++						},
++					);
++					return { optionLabels, selectedOptions, customInput, note, navigation, cancelled, timedOut };
++				} catch (error) {
++					if (error instanceof Error && error.name === "AbortError") throw abortError();
++					throw error;
++				}
+ 			};
+ 
+-			const responseText = formatSingleQuestionResponse({
+-				selectedOptions,
+-				customInput,
+-				note,
+-				timedOut: timedOut || undefined,
+-				multi: q.multi ?? false,
+-			});
+-
+-			return { content: [{ type: "text" as const, text: responseText }], details };
+-		}
++			if (params.questions.length === 1) {
++				const [q] = params.questions;
++				const { optionLabels, selectedOptions, customInput, note, cancelled, timedOut } = await askQuestion(q);
++
++				if (!timedOut && (cancelled || (selectedOptions.length === 0 && customInput === undefined))) cancelAsk();
++				const details: AskToolDetails = {
++					question: q.question,
++					options: optionLabels,
++					multi: q.multi ?? false,
++					selectedOptions,
++					customInput,
++					note,
++					timedOut: timedOut || undefined,
++				};
+ 
+-		const resultsByIndex: Array<QuestionResult | undefined> = Array.from({ length: params.questions.length });
+-		let questionIndex = 0;
+-		while (questionIndex < params.questions.length) {
+-			const q = params.questions[questionIndex];
+-			if (!q) throw new Error("Ask question index exceeded the requested question list");
+-			const previous = resultsByIndex[questionIndex];
+-			const navigation: NavigationControls = {
+-				allowBack: questionIndex > 0,
+-				allowForward: true,
+-				progressText: `${questionIndex + 1}/${params.questions.length}`,
+-			};
+-			const {
+-				optionLabels,
+-				selectedOptions,
+-				customInput,
+-				note,
+-				navigation: navAction,
+-				cancelled,
+-				timedOut,
+-			} = await askQuestion(q, { previous, navigation });
+-
+-			if (cancelled && !timedOut) cancelAsk();
+-
+-			resultsByIndex[questionIndex] = {
+-				id: q.id,
+-				question: q.question,
+-				options: optionLabels,
+-				multi: q.multi ?? false,
+-				selectedOptions,
+-				customInput,
+-				note,
+-				timedOut: timedOut || undefined,
+-			};
++				const responseText = formatSingleQuestionResponse({
++					selectedOptions,
++					customInput,
++					note,
++					timedOut: timedOut || undefined,
++					multi: q.multi ?? false,
++				});
+ 
+-			if (navAction === "back") {
+-				questionIndex = Math.max(0, questionIndex - 1);
+-				continue;
++				return { content: [{ type: "text" as const, text: responseText }], details };
+ 			}
+ 
+-			questionIndex += 1;
+-		}
++			const resultsByIndex: Array<QuestionResult | undefined> = Array.from({ length: params.questions.length });
++			let questionIndex = 0;
++			while (questionIndex < params.questions.length) {
++				const q = params.questions[questionIndex];
++				if (!q) throw new Error("Ask question index exceeded the requested question list");
++				const previous = resultsByIndex[questionIndex];
++				const navigation: NavigationControls = {
++					allowBack: questionIndex > 0,
++					allowForward: true,
++					progressText: `${questionIndex + 1}/${params.questions.length}`,
++				};
++				const {
++					optionLabels,
++					selectedOptions,
++					customInput,
++					note,
++					navigation: navAction,
++					cancelled,
++					timedOut,
++				} = await askQuestion(q, { previous, navigation });
++
++				if (cancelled && !timedOut) cancelAsk();
++
++				resultsByIndex[questionIndex] = {
++					id: q.id,
++					question: q.question,
++					options: optionLabels,
++					multi: q.multi ?? false,
++					selectedOptions,
++					customInput,
++					note,
++					timedOut: timedOut || undefined,
++				};
+ 
+-		const results = params.questions.map((q, index) => {
+-			const result = resultsByIndex[index];
+-			if (result) return result;
+-			return {
+-				id: q.id,
+-				question: q.question,
+-				options: q.options.map(o => o.label),
+-				multi: q.multi ?? false,
+-				selectedOptions: [],
+-			};
+-		});
++				if (navAction === "back") {
++					questionIndex = Math.max(0, questionIndex - 1);
++					continue;
++				}
++
++				questionIndex += 1;
++			}
++
++			const results = params.questions.map((q, index) => {
++				const result = resultsByIndex[index];
++				if (result) return result;
++				return {
++					id: q.id,
++					question: q.question,
++					options: q.options.map(o => o.label),
++					multi: q.multi ?? false,
++					selectedOptions: [],
++				};
++			});
+ 
+-		const details: AskToolDetails = { results };
+-		const responseLines = results.map(formatQuestionResult);
+-		const responseText = `User answers:\n${responseLines.join("\n")}`;
++			const details: AskToolDetails = { results };
++			const responseLines = results.map(formatQuestionResult);
++			const responseText = `User answers:\n${responseLines.join("\n")}`;
+ 
+-		return { content: [{ type: "text" as const, text: responseText }], details };
++			return { content: [{ type: "text" as const, text: responseText }], details };
++		} finally {
++			await clearAndroidAskCard();
++		}
+ 	}
+ }
+ 
+diff --git a/packages/coding-agent/src/tools/browser/launch.ts b/packages/coding-agent/src/tools/browser/launch.ts
+index 95a0fda..ff56451 100644
+--- a/packages/coding-agent/src/tools/browser/launch.ts
++++ b/packages/coding-agent/src/tools/browser/launch.ts
+@@ -316,8 +316,11 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
+  * link clicks (#8673). Chrome for Testing uses a dedicated bundle id
+  * (`com.google.chrome.for.testing`) that is never a user's default handler;
+  * system Chrome is used on macOS only when Chrome for Testing cannot be
+- * obtained. Other platforms keep the download-avoiding system Chrome
+- * preference and fall back to Chrome for Testing. The managed browser is
++ * obtained. Android/Termux validates the explicit override and only accepts
++ * the external Termux:X11 package (a glibc Chrome cannot run there); when no
++ * working binary exists it throws install guidance instead of falling back to
++ * a managed Linux download. Other platforms keep the download-avoiding system
++ * Chrome preference and fall back to Chrome for Testing. The managed browser is
+  * cached under ~/.omp/puppeteer (getPuppeteerDir). Returns undefined when
+  * platform detection fails (puppeteer default resolution takes over).
+  * Exported so real-browser tests can probe launchability and skip on hosts
+@@ -326,7 +329,31 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
+ let chromiumExecutablePromise: Promise<string | undefined> | undefined;
+ export async function ensureChromiumExecutable(): Promise<string | undefined> {
+ 	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+-	if (envPath) return envPath;
++	if (envPath) {
++		// Android cannot run a generic Linux Chrome: only the Termux:X11
++		// package is Bionic-compatible. Reject a stale or broken override here
++		// instead of handing puppeteer an unusable path.
++		if (process.platform === "android" && !(await isChromiumExecutable(envPath))) {
++			throw new ToolError(
++				`PUPPETEER_EXECUTABLE_PATH="${envPath}" is not a working Chromium executable. ` +
++					`Install the Termux:X11 package:\n  pkg install -y x11-repo\n  pkg install -y chromium\n` +
++					"or unset PUPPETEER_EXECUTABLE_PATH.",
++			);
++		}
++		return envPath;
++	}
++	if (process.platform === "android") {
++		// Termux: never download a glibc Chrome build; only the external
++		// Termux:X11 package under $PREFIX can run on Bionic.
++		const sysChrome = await resolveSystemChromium();
++		if (sysChrome) return sysChrome;
++		throw new ToolError(
++			"No working Chromium executable found on Android. Install the Termux:X11 package:\n" +
++				"  pkg install -y x11-repo\n" +
++				"  pkg install -y chromium\n" +
++				"or set PUPPETEER_EXECUTABLE_PATH to a working Chromium binary.",
++		);
++	}
+ 	// macOS: never route a background daemon through the user's GUI Chrome
+ 	// bundle; prefer the isolated Chrome for Testing binary instead (#8673).
+ 	const preferManagedChromium = process.platform === "darwin";
+@@ -451,14 +478,16 @@ function isExecutableFile(p: string): boolean {
+ async function isChromiumExecutable(p: string): Promise<boolean> {
+ 	if (!isExecutableFile(p)) return false;
+ 	// The version probe below launches the candidate. It exists to reject
+-	// non-Chromium `chrome`/`chromium` wrapper scripts that appear on a Linux
+-	// PATH (ecb22957, "validate Linux browser executables"). On Windows and
+-	// macOS the candidates are fixed GUI application paths, not PATH wrappers,
+-	// and executing them is harmful: a GUI `chrome.exe --version` does not print
+-	// to a detached stdout and can hand off to the user's running instance,
+-	// opening/activating a normal browser window (#8445). Confine the probe to
+-	// Linux and trust the executable-file check elsewhere.
+-	if (process.platform !== "linux") return true;
++	// non-Chromium `chrome`/`chromium` wrapper scripts that appear on a
++	// Linux/Android PATH (ecb22957, "validate Linux browser executables"). On
++	// Windows and macOS the candidates are fixed GUI application paths, not
++	// PATH wrappers, and executing them is harmful: a GUI `chrome.exe --version`
++	// does not print to a detached stdout and can hand off to the user's
++	// running instance, opening/activating a normal browser window (#8445).
++	// Android/Termux has the same PATH-wrapper hazard as Linux (and may hold a
++	// glibc build), so it gets the probe too: an existing but broken file must
++	// be rejected rather than accepted as a browser.
++	if (process.platform !== "linux" && process.platform !== "android") return true;
+ 	try {
+ 		const probeTimeoutMs = 3000;
+ 		const proc = Bun.spawn([p, "--version"], {
+@@ -539,6 +568,25 @@ function systemChromiumCandidates(
+ 			);
+ 			break;
+ 		}
++		case "android": {
++			// Termux installs Chromium outside PATH. Prefer the package's real
++			// binary; `$PREFIX/bin` entries are wrappers and PATH may hold
++			// unrelated or glibc shims. PUPPETEER_EXECUTABLE_PATH is handled by
++			// the caller before candidates are consulted.
++			const prefix = process.env.PREFIX ?? "/data/data/com.termux/files/usr";
++			candidates.push(path.join(prefix, "lib/chromium/chrome"));
++			for (const name of ["chromium", "chromium-browser", "google-chrome", "chrome"]) {
++				const found = which(name);
++				if (found) candidates.push(found);
++			}
++			candidates.push(
++				path.join(prefix, "bin/chromium"),
++				path.join(prefix, "bin/chromium-browser"),
++				path.join(prefix, "bin/google-chrome"),
++				path.join(prefix, "bin/chrome"),
++			);
++			break;
++		}
+ 		case "win32": {
+ 			const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+ 			const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+diff --git a/packages/coding-agent/src/utils/android-helpers.ts b/packages/coding-agent/src/utils/android-helpers.ts
+new file mode 100644
+index 0000000..db76062
+--- /dev/null
++++ b/packages/coding-agent/src/utils/android-helpers.ts
+@@ -0,0 +1,172 @@
++/**
++ * Android/Termux best-effort helpers: wake-lock, notification, OOM-score.
++ * Each operation reports its actual outcome (success/failure) and never logs
++ * secrets, tokens, or raw command arguments.
++ */
++
++import * as fs from "node:fs/promises";
++import { isNotificationSuppressed } from "@oh-my-pi/pi-tui";
++
++export type AndroidOutcome = { ok: boolean; error?: string };
++
++export interface AndroidNotificationOptions {
++	/** Android notification id; a stable id overwrites instead of stacking. */
++	id?: string;
++}
++
++/**
++ * Notification id shared by this process' completion/error/ask cards.
++ *
++ * Termux:API treats `--id` as a global NotificationManager tag, so one literal
++ * id would let a second omp process (another Termux session, tmux pane, or
++ * background agent) overwrite the first one's card. Scoping the tag to the pid
++ * keeps concurrent sessions independent while one session still replaces its
++ * own card instead of stacking.
++ */
++export function androidNotificationId(): string {
++	return `omp-status-${process.pid}`;
++}
++
++let askNotificationSequence = 0;
++
++/**
++ * Id for one ask card, unique per prompt within this process.
++ *
++ * The ask card must be removed without touching the completion/error card that
++ * may be posted while the dialog is still pending, so it cannot share the
++ * status id. The pid keeps concurrent sessions independent.
++ */
++export function newAndroidAskNotificationId(): string {
++	askNotificationSequence += 1;
++	return `omp-ask-${process.pid}-${askNotificationSequence}`;
++}
++
++async function spawnBestEffort(cmd: string[], timeoutMs = 3000): Promise<AndroidOutcome> {
++	const proc = Bun.spawn(cmd, {
++		stdout: "ignore",
++		stderr: "pipe",
++	});
++	const timer = setTimeout(() => {
++		try {
++			proc.kill();
++		} catch {}
++	}, timeoutMs);
++	let stderr = "";
++	try {
++		const out = await new Response(proc.stderr).text();
++		stderr = out.slice(0, 512);
++	} catch {}
++	clearTimeout(timer);
++	const code = await proc.exited;
++	if (code === 0) return { ok: true };
++	const msg = stderr.trim() || `command ${cmd[0]} exited ${code}`;
++	// Do not log raw args; only return bounded error.
++	return { ok: false, error: msg.slice(0, 512) };
++}
++
++export async function acquireWakeLock(): Promise<AndroidOutcome> {
++	if (process.platform !== "android" && !process.env.TERMUX_VERSION) {
++		// Best-effort: on non-Android, report not applicable without claiming success.
++		return { ok: false, error: "wake-lock unavailable on this platform" };
++	}
++	try {
++		return await spawnBestEffort(["termux-wake-lock"]);
++	} catch (e) {
++		return { ok: false, error: e instanceof Error ? e.message.slice(0, 512) : String(e).slice(0, 512) };
++	}
++}
++
++export async function releaseWakeLock(): Promise<AndroidOutcome> {
++	if (process.platform !== "android" && !process.env.TERMUX_VERSION) {
++		return { ok: false, error: "wake-lock unavailable on this platform" };
++	}
++	try {
++		return await spawnBestEffort(["termux-wake-unlock"]);
++	} catch (e) {
++		return { ok: false, error: e instanceof Error ? e.message.slice(0, 512) : String(e).slice(0, 512) };
++	}
++}
++
++/**
++ * Post one Android status card through Termux:API.
++ *
++ * Best-effort: no-op when Termux:API is absent, and honours the global
++ * `PI_NOTIFICATIONS` suppression that already gates terminal notifications.
++ * Callers pass fixed status strings (`Complete`, `Stopped with error`,
++ * `Waiting for input`), never conversation text or session names; text is
++ * truncated regardless, so a card cannot carry session content or secrets.
++ */
++export async function sendAndroidNotification(
++	title: string,
++	body: string,
++	options?: AndroidNotificationOptions,
++): Promise<AndroidOutcome> {
++	if (isNotificationSuppressed()) {
++		return { ok: false, error: "notifications suppressed" };
++	}
++	// Redact before any handling: truncate and strip potential secrets.
++	const safeTitle = title.slice(0, 200);
++	const safeBody = body.slice(0, 500);
++	if (process.platform !== "android" && !process.env.TERMUX_VERSION) {
++		return { ok: false, error: "notification unavailable on this platform" };
++	}
++	try {
++		return await spawnBestEffort([
++			"termux-notification",
++			"--id",
++			options?.id ?? androidNotificationId(),
++			"--title",
++			safeTitle,
++			"--content",
++			safeBody,
++		]);
++	} catch (e) {
++		return { ok: false, error: e instanceof Error ? e.message.slice(0, 512) : String(e).slice(0, 512) };
++	}
++}
++
++/**
++ * Remove one of this process' status cards (e.g. the ask prompt once answered).
++ *
++ * Removal is not user-visible, so it intentionally ignores the global
++ * suppression flag: a card posted before the user muted notifications must
++ * still be cleared. Ids are caller-provided (`androidNotificationId()` or an
++ * explicit one) and never contain session text.
++ */
++export async function clearAndroidNotification(id: string): Promise<AndroidOutcome> {
++	if (process.platform !== "android" && !process.env.TERMUX_VERSION) {
++		return { ok: false, error: "notification unavailable on this platform" };
++	}
++	try {
++		return await spawnBestEffort(["termux-notification-remove", id]);
++	} catch (e) {
++		return { ok: false, error: e instanceof Error ? e.message.slice(0, 512) : String(e).slice(0, 512) };
++	}
++}
++
++/**
++ * Adjust OOM score for current process. Best-effort, reports denial accurately.
++ * Does not claim protection when OS denies the operation.
++ */
++export async function adjustOomScoreAdj(score: number): Promise<AndroidOutcome> {
++	const clamped = Math.max(-1000, Math.min(1000, Math.trunc(score)));
++	const candidates = ["/proc/self/oom_score_adj", "/proc/self/oom_adj"];
++	for (const p of candidates) {
++		try {
++			await fs.writeFile(p, String(clamped));
++			// Verify write succeeded by reading back
++			const readBack = (await fs.readFile(p, "utf8")).trim();
++			if (String(clamped) === readBack || (p.endsWith("oom_adj") && String(clamped) === readBack)) {
++				return { ok: true };
++			}
++			// If readback mismatch, continue to next candidate but report failure at end
++		} catch (e) {
++			const msg = e instanceof Error ? e.message.slice(0, 512) : String(e).slice(0, 512);
++			// Permission denied must be reported, not claimed as success
++			if (msg.includes("EACCES") || msg.includes("EPERM") || msg.includes("permission")) {
++				return { ok: false, error: `OOM adjust denied: ${msg.slice(0, 200)}` };
++			}
++		}
++	}
++	return { ok: false, error: "OOM adjust not available or denied" };
++}
+diff --git a/packages/coding-agent/src/utils/clipboard.ts b/packages/coding-agent/src/utils/clipboard.ts
+index 02c7e0a..3254658 100644
+--- a/packages/coding-agent/src/utils/clipboard.ts
++++ b/packages/coding-agent/src/utils/clipboard.ts
+@@ -124,10 +124,24 @@ let macClipboardWrite = Promise.resolve();
+  * The OSC 52 goes through `writeTerminalSequence`, so it cannot tear a TUI
+  * frame; from a worker thread it is skipped and only the native copy runs.
+  *
++ * Resolves once at least one channel actually emitted or accepted the text:
++ * OSC 52 written to a TTY on the main thread, `termux-clipboard-set`, `pbcopy`,
++ * or the native bridge. A worker thread cannot emit OSC 52, and a swallowed
++ * stdout write does not count. Rejects when every channel failed, so a caller
++ * cannot claim the copy succeeded when nothing received the text (for example
++ * Termux without `termux-api` and no TTY for OSC 52). OSC 52 is still
++ * best-effort even when emitted: the external terminal may ignore it.
++ *
+  * @param text - UTF-8 text to place on the clipboard.
++ * @throws Error when no channel accepted the text.
+  */
+ export async function copyToClipboard(text: string): Promise<void> {
+-	if (process.stdout.isTTY) writeTerminalSequence(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
++	// `writeTerminalSequence` reports whether it actually emitted the sequence:
++	// a Bun worker cannot reach the main thread's terminal, and a closed stdout
++	// is swallowed, so neither may count as delivery.
++	const osc52Emitted =
++		process.stdout.isTTY && writeTerminalSequence(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
++	let delivered = osc52Emitted;
+ 
+ 	// Keep pbcopy, document-header writes, and native fallbacks in invocation order.
+ 	let releaseWrite: (() => void) | undefined;
+@@ -144,9 +158,13 @@ export async function copyToClipboard(text: string): Promise<void> {
+ 		if (process.env.TERMUX_VERSION) {
+ 			try {
+ 				await spawnCapture(["termux-clipboard-set"], { input: text, timeoutMs: 5000 });
++				delivered = true;
+ 				return;
+-			} catch {
+-				// Fall through to native
++			} catch (error) {
++				logger.warn("clipboard: termux-clipboard-set failed; trying native bridge", {
++					error: String(error),
++				});
++				// Fall through to native.
+ 			}
+ 		}
+ 		// macOS: prefer `pbcopy` over the in-process AppKit write, mirroring the
+@@ -172,15 +190,21 @@ export async function copyToClipboard(text: string): Promise<void> {
+ 					timeoutMs: 5000,
+ 					env: { ...process.env, LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" },
+ 				});
++				delivered = true;
+ 				return;
+-			} catch {
++			} catch (error) {
++				logger.warn("clipboard: pbcopy failed; trying native bridge", { error: String(error) });
+ 				// Fall through to native.
+ 			}
+ 		}
+ 
+ 		await nativeCopyToClipboard(text);
+-	} catch {
+-		// Ignore — clipboard copy is best-effort
++		delivered = true;
++	} catch (error) {
++		if (!delivered) {
++			throw error instanceof Error ? error : new Error(`clipboard copy failed: ${String(error)}`);
++		}
++		logger.warn("clipboard: copy failed after OSC 52 was emitted", { error: String(error) });
+ 	} finally {
+ 		releaseWrite?.();
+ 	}
+diff --git a/packages/coding-agent/test/android-helpers.test.ts b/packages/coding-agent/test/android-helpers.test.ts
+new file mode 100644
+index 0000000..1987b3e
+--- /dev/null
++++ b/packages/coding-agent/test/android-helpers.test.ts
+@@ -0,0 +1,147 @@
++/**
++ * Android helper behaviour at the process boundary. Notification tests mock
++ * `Bun.spawn`, so running the suite on a Termux device never posts a real card.
++ */
++import { afterEach, describe, expect, it, vi } from "bun:test";
++import {
++	acquireWakeLock,
++	adjustOomScoreAdj,
++	androidNotificationId,
++	clearAndroidNotification,
++	newAndroidAskNotificationId,
++	releaseWakeLock,
++	sendAndroidNotification,
++} from "../src/utils/android-helpers";
++
++const originalTermuxVersion = process.env.TERMUX_VERSION;
++const originalPiNotifications = process.env.PI_NOTIFICATIONS;
++
++afterEach(() => {
++	vi.restoreAllMocks();
++	restoreEnv("TERMUX_VERSION", originalTermuxVersion);
++	restoreEnv("PI_NOTIFICATIONS", originalPiNotifications);
++});
++
++function restoreEnv(key: string, value: string | undefined): void {
++	if (value === undefined) {
++		delete process.env[key];
++	} else {
++		process.env[key] = value;
++	}
++}
++
++function mockSpawn(result: { code?: number; stderr?: string } = {}): string[][] {
++	process.env.TERMUX_VERSION = "0.118";
++	const calls: string[][] = [];
++	vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
++		calls.push(cmd);
++		return {
++			stderr: new ReadableStream({
++				start(controller) {
++					if (result.stderr) controller.enqueue(new TextEncoder().encode(result.stderr));
++					controller.close();
++				},
++			}),
++			kill: () => {},
++			exited: Promise.resolve(result.code ?? 0),
++		} as never;
++	}) as typeof Bun.spawn);
++	return calls;
++}
++
++describe("android helpers: notifications", () => {
++	it("posts the fixed status text, addressed to the process status id", async () => {
++		const calls = mockSpawn();
++
++		const outcome = await sendAndroidNotification("omp", "Complete");
++
++		expect(outcome).toEqual({ ok: true });
++		expect(calls).toEqual([
++			["termux-notification", "--id", androidNotificationId(), "--title", "omp", "--content", "Complete"],
++		]);
++	});
++
++	it("uses a distinct per-prompt id that cannot collide with the status card", async () => {
++		const calls = mockSpawn();
++		const first = newAndroidAskNotificationId();
++		const second = newAndroidAskNotificationId();
++
++		await sendAndroidNotification("omp", "Waiting for input", { id: first });
++		await sendAndroidNotification("omp", "Waiting for input", { id: second });
++
++		expect(first).not.toBe(second);
++		expect(first).not.toBe(androidNotificationId());
++		expect(first.startsWith(`omp-ask-${process.pid}-`)).toBe(true);
++		expect(calls.map(args => args[2])).toEqual([first, second]);
++	});
++
++	it("removes exactly the id it is given, even when notifications are muted", async () => {
++		const calls = mockSpawn();
++		process.env.PI_NOTIFICATIONS = "off";
++
++		await clearAndroidNotification("omp-ask-1-7");
++
++		expect(calls).toEqual([["termux-notification-remove", "omp-ask-1-7"]]);
++	});
++
++	it("does not spawn when PI_NOTIFICATIONS suppresses notifications", async () => {
++		const calls = mockSpawn();
++		process.env.PI_NOTIFICATIONS = "off";
++
++		const outcome = await sendAndroidNotification("omp", "Complete");
++
++		expect(calls).toHaveLength(0);
++		expect(outcome).toEqual({ ok: false, error: "notifications suppressed" });
++	});
++
++	it("bounds the reported failure message and never adds raw argv", async () => {
++		mockSpawn({ code: 1, stderr: "x".repeat(2000) });
++
++		const outcome = await sendAndroidNotification("omp", "Complete");
++
++		expect(outcome.ok).toBe(false);
++		expect(outcome.error?.length).toBeLessThanOrEqual(512);
++		expect(outcome.error).not.toContain("--id");
++	});
++
++	it("reports unavailability outside Termux without spawning", async () => {
++		const calls = mockSpawn();
++		delete process.env.TERMUX_VERSION;
++		if (process.platform === "android") return; // A real device always reports android.
++
++		const outcome = await sendAndroidNotification("omp", "Complete");
++
++		expect(calls).toHaveLength(0);
++		expect(outcome).toEqual({ ok: false, error: "notification unavailable on this platform" });
++	});
++
++	it("clamps and truncates text before spawning", async () => {
++		const calls = mockSpawn();
++
++		await sendAndroidNotification("t".repeat(400), "b".repeat(900));
++
++		expect(calls[0]).toContain("t".repeat(200));
++		expect(calls[0]).toContain("b".repeat(500));
++	});
++});
++
++describe("android helpers: wake-lock and OOM", () => {
++	it("wake-lock reports the real outcome without claiming success", async () => {
++		const res = await acquireWakeLock();
++		expect(typeof res.ok).toBe("boolean");
++		if (!res.ok) expect(res.error).toBeDefined();
++		if (res.error) expect(res.error).not.toContain("ghp_");
++	});
++
++	it("release reports the real outcome", async () => {
++		const res = await releaseWakeLock();
++		expect(typeof res.ok).toBe("boolean");
++	});
++
++	it("OOM adjust reports denial accurately and does not claim success", async () => {
++		const res = await adjustOomScoreAdj(-500);
++		expect(typeof res.ok).toBe("boolean");
++		if (!res.ok) expect(res.error).toBeDefined();
++		if (res.error) expect(res.error).not.toContain("ghp_");
++	});
++});
+diff --git a/packages/coding-agent/test/cli/update-cli.test.ts b/packages/coding-agent/test/cli/update-cli.test.ts
+index 9e9ccc2..9e70342 100644
+--- a/packages/coding-agent/test/cli/update-cli.test.ts
++++ b/packages/coding-agent/test/cli/update-cli.test.ts
+@@ -1,11 +1,16 @@
+-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
++import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+ import * as fs from "node:fs/promises";
+ import * as os from "node:os";
+ import * as path from "node:path";
+ import { removeWithRetries, setAgentDir, setProjectDir, VERSION } from "@oh-my-pi/pi-utils";
+ import { currentBuildHost } from "../../src/cli/build-service";
+ import { fixedNpmRegistry } from "../../src/cli/npm-registry";
+-import { getLatestRelease, runUpdateCommand } from "../../src/cli/update-cli";
++import {
++	androidReinstallInstructions,
++	getLatestRelease,
++	isAndroidUpdateHost,
++	runUpdateCommand,
++} from "../../src/cli/update-cli";
+ import { cfgUpdateChannel } from "../../src/modes/settings";
+ import { AgentStorage } from "../../src/session/agent-storage";
+ import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "../helpers/settings-test-state";
+@@ -18,12 +23,18 @@ type FetchInit = RequestInit | BunFetchRequestInit;
+ describe("runUpdateCommand version source", () => {
+ 	const dirs: string[] = [];
+ 	let settingsState: SettingsTestState | undefined;
++	const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
++	const platformOverride = process.env.OMP_PLATFORM;
+ 
+ 	// `runUpdateCommand` initializes the global Settings singleton from the
+ 	// project and agent dirs; point both at a scratch dir so the host's config
+ 	// is never read, and drop the singleton afterwards so later files get a
+ 	// fresh `Settings.init()`.
+ 	beforeEach(async () => {
++		// `runUpdateCommand` refuses on the Android port; these cases exercise the
++		// desktop update path, so report a desktop host regardless of the runner.
++		if (platformDescriptor) Object.defineProperty(process, "platform", { ...platformDescriptor, value: "linux" });
++		delete process.env.OMP_PLATFORM;
+ 		settingsState = beginSettingsTest();
+ 		const scratch = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-update-settings-")));
+ 		dirs.push(scratch);
+@@ -32,6 +43,9 @@ describe("runUpdateCommand version source", () => {
+ 	});
+ 
+ 	afterEach(async () => {
++		if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
++		if (platformOverride === undefined) delete process.env.OMP_PLATFORM;
++		else process.env.OMP_PLATFORM = platformOverride;
+ 		AgentStorage.close();
+ 		restoreSettingsTestState(settingsState);
+ 		settingsState = undefined;
+@@ -424,3 +438,53 @@ describe("getLatestRelease proxy errors", () => {
+ 		expect(err?.message).toMatch(/https?:\/\//i);
+ 	});
+ });
++
++describe("Termux/Android updates", () => {
++	const savedOverride = process.env.OMP_PLATFORM;
++
++	afterEach(() => {
++		vi.restoreAllMocks();
++		if (savedOverride === undefined) delete process.env.OMP_PLATFORM;
++		else process.env.OMP_PLATFORM = savedOverride;
++		process.exitCode = 0;
++	});
++
++	afterAll(() => {
++		if (savedOverride === undefined) delete process.env.OMP_PLATFORM;
++		else process.env.OMP_PLATFORM = savedOverride;
++	});
++
++	it("detects the Android host from the runtime platform or OMP_PLATFORM", () => {
++		expect(isAndroidUpdateHost("android", undefined)).toBe(true);
++		expect(isAndroidUpdateHost("linux", "android")).toBe(true);
++		expect(isAndroidUpdateHost("linux", undefined)).toBe(false);
++		expect(isAndroidUpdateHost("darwin", "linux")).toBe(false);
++	});
++
++	it("refuses both check and install without querying upstream release metadata", async () => {
++		const errors: string[] = [];
++		const logs: string[] = [];
++		const fetchStub = vi.spyOn(globalThis, "fetch");
++		vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
++			errors.push(args.join(" "));
++		});
++		vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
++			logs.push(args.join(" "));
++		});
++		process.env.OMP_PLATFORM = "android";
++
++		for (const check of [true, false]) {
++			errors.length = 0;
++			logs.length = 0;
++			process.exitCode = 0;
++
++			await runUpdateCommand({ force: false, check });
++
++			expect(fetchStub).not.toHaveBeenCalled();
++			expect(errors.join("\n")).toContain(androidReinstallInstructions());
++			expect(errors.join("\n")).toContain("| sh -s -- -ex");
++			expect(logs.join("\n")).toContain("Current version:");
++			expect(process.exitCode).toBe(1);
++		}
++	});
++});
+diff --git a/packages/coding-agent/test/fixtures/browser-executable-probe.ts b/packages/coding-agent/test/fixtures/browser-executable-probe.ts
+index 497d309..f215916 100644
+--- a/packages/coding-agent/test/fixtures/browser-executable-probe.ts
++++ b/packages/coding-agent/test/fixtures/browser-executable-probe.ts
+@@ -9,7 +9,7 @@ import {
+ // Launch policy reads `process.platform`; Chrome-for-Testing platform detection reads `os.platform()`, which Bun does
+ // not derive from the `process.platform` override. Pin both so the child resolves the emulated host's paths.
+ const platform = process.env.OMP_BROWSER_PROBE_PLATFORM;
+-if (platform === "darwin" || platform === "win32") {
++if (platform === "darwin" || platform === "win32" || platform === "android") {
+ 	Object.defineProperty(process, "platform", { value: platform });
+ 	spyOn(os, "platform").mockReturnValue(platform);
+ } else if (platform) {
+diff --git a/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts b/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
+index 98ca39a..543b1f6 100644
+--- a/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
++++ b/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
+@@ -3,23 +3,37 @@
+ // reached this worker's stdout and the native backend. The worker has its own
+ // `process`, so the fakes below do not touch the test runner.
+ import { spyOn } from "bun:test";
++import { workerData } from "node:worker_threads";
+ import { copyToClipboard } from "@oh-my-pi/pi-coding-agent/utils/clipboard";
+ import * as natives from "@oh-my-pi/pi-natives/clipboard";
+ 
+ declare const self: Worker;
++const failNativeCopy = workerData === "native-fails";
+ 
+ Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+ // Linux keeps macOS runs off the real pbcopy; the native write is stubbed.
+ Object.defineProperty(process, "platform", { value: "linux", configurable: true });
++// A Termux host inherits TERMUX_VERSION; the fixture tests OSC 52/native
++// routing, so keep the real termux-clipboard-set out of the worker.
++delete process.env.TERMUX_VERSION;
+ const stdout: string[] = [];
+ spyOn(process.stdout, "write").mockImplementation(chunk => {
+ 	stdout.push(typeof chunk === "string" ? chunk : chunk.toString());
+ 	return true;
+ });
+ const nativeCopies: string[] = [];
+-spyOn(natives, "copyToClipboard").mockImplementation(text => {
++spyOn(natives, "copyToClipboard").mockImplementation(async text => {
+ 	nativeCopies.push(text);
++	if (failNativeCopy) throw new Error("native clipboard unavailable");
+ });
+ 
+-await copyToClipboard("worker probe");
+-self.postMessage({ stdout, nativeCopies });
++try {
++	await copyToClipboard("worker probe");
++	self.postMessage({ stdout, nativeCopies });
++} catch (error) {
++	self.postMessage({
++		stdout,
++		nativeCopies,
++		error: error instanceof Error ? error.message : String(error),
++	});
++}
+diff --git a/packages/coding-agent/test/generator-android.test.ts b/packages/coding-agent/test/generator-android.test.ts
+new file mode 100644
+index 0000000..390c4b5
+--- /dev/null
++++ b/packages/coding-agent/test/generator-android.test.ts
+@@ -0,0 +1,145 @@
++import { describe, expect, it } from "bun:test";
++import * as fs from "node:fs/promises";
++import * as os from "node:os";
++import * as path from "node:path";
++import { buildGeneratedBlock, generateEnumExports } from "../../natives/scripts/gen-enums";
++
++const FAKE_DTS = `
++export declare class AudioCapture {}
++export declare class AudioPlayback {}
++export declare class LiveWebRtcPeer {}
++export declare class Process {}
++export declare function copyToClipboard(text: string): void;
++export declare function readImageFromClipboard(): Promise<unknown>;
++export declare function glob(): void;
++`;
++
++const MARKER_START = "// --- generated native exports (do not edit) ---";
++const MARKER_END = "// --- end generated native exports ---";
++
++function extractBlock(source: string): string {
++	const start = source.indexOf(MARKER_START);
++	const end = source.indexOf(MARKER_END);
++	if (start === -1 || end === -1) throw new Error("generated marker block missing");
++	return source.slice(start + MARKER_START.length, end);
++}
++
++/** Evaluate the generated exports against a fake addon and platform. */
++function instantiate(
++	block: string,
++	options: {
++		platform: NodeJS.Platform;
++		bindings: Record<string, unknown>;
++		missingNativeExport: (name: string) => unknown;
++	},
++): Record<string, any> {
++	const names = [...block.matchAll(/^export const (\w+) =/gm)].map(match => match[1]!);
++	const body = block.replace(/^export const /gm, "const ");
++	const factory = new Function(
++		"nativeBindings",
++		"missingNativeExport",
++		"process",
++		`${body}\nreturn { ${names.join(", ")} };`,
++	);
++	return factory(options.bindings, options.missingNativeExport, { platform: options.platform });
++}
++
++function missingExport(name: string): () => never {
++	return () => {
++		throw new Error(`missingNativeExport:${name}`);
++	};
++}
++
++describe("gen-enums Android platform gating", () => {
++	it("Android keeps the unsupported-on-Termux proxies", () => {
++		const missingCalls: string[] = [];
++		const exports = instantiate(buildGeneratedBlock(FAKE_DTS), {
++			platform: "android",
++			bindings: {},
++			missingNativeExport: name => {
++				missingCalls.push(name);
++				return undefined;
++			},
++		});
++
++		expect(() => exports.copyToClipboard("x")).toThrow("unsupported on Android/Termux");
++		expect(() => exports.readImageFromClipboard()).toThrow("unsupported on Android/Termux");
++		expect(() => new exports.AudioCapture()).toThrow("unsupported on Android/Termux");
++		expect(() => new exports.AudioPlayback()).toThrow("unsupported on Android/Termux");
++		expect(() => new exports.LiveWebRtcPeer()).toThrow("unsupported on Android/Termux");
++		// The unsupported names must take the Android branch, not the desktop
++		// missing-export fallback.
++		expect(missingCalls).not.toContain("copyToClipboard");
++		expect(missingCalls).not.toContain("readImageFromClipboard");
++	});
++
++	it("desktop keeps the stale-addon diagnostic instead of the Android message", () => {
++		const exports = instantiate(buildGeneratedBlock(FAKE_DTS), {
++			platform: "linux",
++			bindings: {},
++			missingNativeExport: missingExport,
++		});
++
++		expect(() => exports.copyToClipboard("x")).toThrow("missingNativeExport:copyToClipboard");
++		expect(() => exports.readImageFromClipboard()).toThrow("missingNativeExport:readImageFromClipboard");
++		// Upstream passthrough for classes: absent binding stays absent.
++		expect(exports.AudioCapture).toBeUndefined();
++	});
++
++	it("both platforms use the real binding when the addon exports it", () => {
++		const copy = () => "copied";
++		const glob = () => "globbed";
++		for (const platform of ["android", "linux"] as const) {
++			const exports = instantiate(buildGeneratedBlock(FAKE_DTS), {
++				platform,
++				bindings: { copyToClipboard: copy, glob },
++				missingNativeExport: missingExport,
++			});
++			expect(exports.copyToClipboard).toBe(copy);
++			expect(exports.glob).toBe(glob);
++		}
++	});
++});
++
++describe("generateEnumExports consumer", () => {
++	it("writes a platform-gated block that keeps desktop diagnostics", async () => {
++		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-gen-enums-"));
++		try {
++			await fs.writeFile(path.join(dir, "index.d.ts"), FAKE_DTS);
++			await fs.writeFile(
++				path.join(dir, "index.js"),
++				`import { loadNative, missingNativeExport } from "./loader-state.js";\nconst nativeBindings = loadNative();\n${MARKER_START}\n${MARKER_END}\n`,
++			);
++
++			await generateEnumExports({ nativeDir: dir });
++
++			const written = await fs.readFile(path.join(dir, "index.js"), "utf8");
++			const block = extractBlock(written);
++
++			const androidMissing: string[] = [];
++			const android = instantiate(block, {
++				platform: "android",
++				bindings: {},
++				missingNativeExport: name => {
++					androidMissing.push(name);
++					return undefined;
++				},
++			});
++			expect(androidMissing).not.toContain("copyToClipboard");
++			expect(() => android.copyToClipboard("x")).toThrow("unsupported on Android/Termux");
++
++			const glob = () => "globbed";
++			const desktop = instantiate(block, {
++				platform: "linux",
++				bindings: { glob },
++				missingNativeExport: missingExport,
++			});
++			expect(() => desktop.copyToClipboard("x")).toThrow("missingNativeExport:copyToClipboard");
++			expect(() => desktop.readImageFromClipboard()).toThrow("missingNativeExport:readImageFromClipboard");
++			// Supported exports stay direct passthroughs on both platforms.
++			expect(desktop.glob).toBe(glob);
++		} finally {
++			await fs.rm(dir, { recursive: true, force: true });
++		}
++	});
++});
+diff --git a/packages/coding-agent/test/interactive-click-focus.test.ts b/packages/coding-agent/test/interactive-click-focus.test.ts
+index 5a55fc7..3ad6cc9 100644
+--- a/packages/coding-agent/test/interactive-click-focus.test.ts
++++ b/packages/coding-agent/test/interactive-click-focus.test.ts
+@@ -862,7 +862,11 @@ describe("inline click-to-focus geometry", () => {
+ 		await term.waitForRender(() => screen().some(row => row.includes("Extension links")));
+ 		// A link handler's `ctx.ui.custom(…, { overlay: true })` draws over the browser and takes the keys.
+ 		const keys: string[] = [];
+-		const panel = { render: () => ["Handler panel"], invalidate() {}, handleInput: (data: string) => keys.push(data) };
++		const panel = {
++			render: () => ["Handler panel"],
++			invalidate() {},
++			handleInput: (data: string) => keys.push(data),
++		};
+ 		const handle = mode.ui.showOverlay(panel, { anchor: "center", width: 30 });
+ 		expect(mode.ui.getFocused()).toBe(panel);
+ 
+diff --git a/packages/coding-agent/test/repo-root-isolation.test.ts b/packages/coding-agent/test/repo-root-isolation.test.ts
+new file mode 100644
+index 0000000..c71b3bd
+--- /dev/null
++++ b/packages/coding-agent/test/repo-root-isolation.test.ts
+@@ -0,0 +1,36 @@
++import { describe, expect, it } from "bun:test";
++import * as fs from "node:fs";
++import * as path from "node:path";
++
++describe("repoRoot is only required for isolated runs", () => {
++	const structuredPath = path.resolve(import.meta.dir, "../src/task/structured-subagent.ts");
++	const taskIndexPath = path.resolve(import.meta.dir, "../src/task/index.ts");
++
++	it("does not force isolation when repoRoot is supplied alone", async () => {
++		const content = await fs.promises.readFile(structuredPath, "utf8");
++		expect(content).toContain("const isIsolated = request.isolation?.requested === true;");
++		expect(content).not.toContain("Explicit repoRoot requires isolation");
++	});
++
++	it("task spawn preserves optional repoRoot", async () => {
++		const content = await fs.promises.readFile(taskIndexPath, "utf8");
++		expect(content).toContain("repoRoot");
++		expect(content).toContain("spawn.repoRoot = item.repoRoot");
++	});
++
++	it("accepts repoRoot when isolation is omitted", () => {
++		function isRepoRootShapeValid(requested: boolean | undefined, repoRoot: string | undefined): string | undefined {
++			return requested === false && repoRoot !== undefined ? "invalid" : undefined;
++		}
++		expect(isRepoRootShapeValid(undefined, "/tmp/repo")).toBeUndefined();
++		expect(isRepoRootShapeValid(true, "/tmp/repo")).toBeUndefined();
++		expect(isRepoRootShapeValid(undefined, undefined)).toBeUndefined();
++	});
++
++	it("getRepoRoot validates explicit root for isolated execution", async () => {
++		const worktreePath = path.resolve(import.meta.dir, "../src/task/worktree.ts");
++		const content = await fs.promises.readFile(worktreePath, "utf8");
++		expect(content).toContain("getRepoRoot");
++		expect(content).toContain("Explicit repoRoot");
++	});
++});
+diff --git a/packages/coding-agent/test/slash-commands/copy.test.ts b/packages/coding-agent/test/slash-commands/copy.test.ts
+index 0946a6e..2976d99 100644
+--- a/packages/coding-agent/test/slash-commands/copy.test.ts
++++ b/packages/coding-agent/test/slash-commands/copy.test.ts
+@@ -97,6 +97,17 @@ describe("/copy slash command", () => {
+ 		expect(harness.showStatus).toHaveBeenCalledWith("No link to copy.");
+ 	});
+ 
++	it("reports a rejected copy and still clears the submitted text", async () => {
++		spyOn(clipboard, "copyToClipboard").mockRejectedValue(new Error("no clipboard channel"));
++		const harness = createRuntimeHarness([assistantText("```ts\nconst value = 1;\n```")]);
++
++		expect(await executeBuiltinSlashCommand("/copy code", harness.runtime)).toBe(true);
++
++		expect(harness.showWarning).toHaveBeenCalledWith("Copy failed: no clipboard channel");
++		expect(harness.showStatus).not.toHaveBeenCalledWith("Copied code block to clipboard");
++		expect(harness.setText).toHaveBeenCalledWith("");
++	});
++
+ 	it("keeps bare /copy on the picker", async () => {
+ 		const copySpy = spyOn(clipboard, "copyToClipboard").mockResolvedValue(undefined);
+ 		const harness = createRuntimeHarness([assistantText("answer")]);
+diff --git a/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
+new file mode 100644
+index 0000000..c9ccbce
+--- /dev/null
++++ b/packages/coding-agent/test/termux-notifications.test.ts
+@@ -0,0 +1,492 @@
++/**
++ * Termux notification wiring: the existing `completion.notify` / `error.notify` /
++ * `ask.notify` gates and the global `PI_NOTIFICATIONS` suppression decide whether
++ * an Android system notification (`termux-notification` via Termux:API) fires.
++ *
++ * Assertions stop at the real spawn boundary, so the tests exercise the same
++ * helper and gating code the binary runs — not a mocked module binding.
++ */
++import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
++import * as fs from "node:fs";
++import * as os from "node:os";
++import * as path from "node:path";
++import type { AssistantMessage } from "@oh-my-pi/pi-ai";
++import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
++import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
++import { cfgAskNotify, cfgCompletionNotify, cfgErrorNotify } from "@oh-my-pi/pi-coding-agent/modes/settings";
++import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
++import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
++import { AskTool } from "@oh-my-pi/pi-coding-agent/tools/ask";
++import {
++	androidNotificationId,
++	clearAndroidNotification,
++	sendAndroidNotification,
++} from "@oh-my-pi/pi-coding-agent/utils/android-helpers";
++import { TERMINAL } from "@oh-my-pi/pi-tui";
++import { initTheme } from "@oh-my-pi/pi-tui/theme";
++
++import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
++
++const originalWarpProtocol = process.env.WARP_CLI_AGENT_PROTOCOL_VERSION;
++const originalPiNotifications = process.env.PI_NOTIFICATIONS;
++const originalTermuxVersion = process.env.TERMUX_VERSION;
++const statusId = androidNotificationId();
++
++beforeAll(() => {
++	initTheme();
++});
++
++beforeEach(async () => {
++	resetSettingsForTest();
++	delete process.env.WARP_CLI_AGENT_PROTOCOL_VERSION;
++	delete process.env.PI_NOTIFICATIONS;
++	delete process.env.TERMUX_VERSION;
++	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-notify-test-"));
++	await Settings.init({ inMemory: true, cwd: tempDir });
++});
++
++afterEach(() => {
++	vi.restoreAllMocks();
++	resetSettingsForTest();
++	restoreEnv("WARP_CLI_AGENT_PROTOCOL_VERSION", originalWarpProtocol);
++	restoreEnv("PI_NOTIFICATIONS", originalPiNotifications);
++	restoreEnv("TERMUX_VERSION", originalTermuxVersion);
++});
++
++function restoreEnv(key: string, value: string | undefined): void {
++	if (value === undefined) {
++		delete process.env[key];
++	} else {
++		process.env[key] = value;
++	}
++}
++
++/** Capture real `termux-notification` invocations; mark the runtime as Termux. */
++function captureAndroidSpawns(): string[][] {
++	process.env.TERMUX_VERSION = "0.118";
++	const calls: string[][] = [];
++	vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
++		calls.push(cmd);
++		return {
++			stderr: new ReadableStream({
++				start(controller) {
++					controller.close();
++				},
++			}),
++			kill: () => {},
++			exited: Promise.resolve(0),
++		} as never;
++	}) as typeof Bun.spawn);
++	return calls;
++}
++
++function makeAssistantMessage(stopReason: "stop" | "aborted" | "error", text = "result text"): AssistantMessage {
++	return {
++		role: "assistant",
++		content: [{ type: "text", text }],
++		stopReason,
++		usage: { inputTokens: 0, outputTokens: 0 },
++		timestamp: Date.now(),
++	} as unknown as AssistantMessage;
++}
++
++function makeContext(sessionName = "test-session") {
++	return createInteractiveModeContext({
++		sessionManager: { getSessionName: () => sessionName },
++	});
++}
++
++function makeAgentEndEvent(
++	messages: AssistantMessage[],
++	isTerminal = true,
++): Extract<AgentSessionEvent, { type: "agent_end" }> {
++	return { type: "agent_end", messages, isTerminal } as Extract<AgentSessionEvent, { type: "agent_end" }>;
++}
++
++function makeAskSession(overrides: Partial<ToolSession> = {}): ToolSession {
++	return {
++		cwd: "/tmp",
++		hasUI: true,
++		canPromptUser: true,
++		getSessionFile: () => null,
++		getSessionSpawns: () => "*",
++		getPlanModeState: () => null,
++		settings,
++		...overrides,
++	} as unknown as ToolSession;
++}
++
++function answeredAskDialog() {
++	return vi.fn().mockResolvedValue({
++		kind: "submit",
++		results: [{ id: "q1", question: "Proceed?", selectedOptions: ["Yes"] }],
++	});
++}
++
++function askContext(dialog: ReturnType<typeof answeredAskDialog>) {
++	return {
++		hasUI: true,
++		ui: { askDialog: dialog },
++		abort: vi.fn(),
++	} as never;
++}
++
++/** Non-rich UI surface: `askDialog` is absent, like an RPC host without set_ask_dialog. */
++function plainAskContext(select: () => Promise<string | undefined>) {
++	return {
++		hasUI: true,
++		ui: {
++			select,
++			editor: async () => undefined,
++			timeoutStartsOnPresentation: false,
++		},
++		abort: vi.fn(),
++	} as never;
++}
++
++const ASK_PARAMS = { questions: [{ id: "q1", question: "Proceed?", options: [{ label: "Yes" }] }] };
++
++describe("Termux notifications: completion", () => {
++	it("posts one Android notification when completion.notify is on", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgCompletionNotify.override(settings, "on");
++
++		new EventController(makeContext("my-session")).sendCompletionNotification(
++			makeAgentEndEvent([makeAssistantMessage("stop")]),
++		);
++
++		expect(calls).toEqual([["termux-notification", "--id", statusId, "--title", "omp", "--content", "Complete"]]);
++	});
++
++	it("uses the fixed app title, never the conversation-derived session name", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgCompletionNotify.override(settings, "on");
++
++		// Session names are generated from conversation text; a notification
++		// listener must not be able to read them back.
++		new EventController(makeContext("ghp_1234567890abcdef")).sendCompletionNotification(
++			makeAgentEndEvent([makeAssistantMessage("stop")]),
++		);
++
++		expect(calls).toHaveLength(1);
++		expect(calls[0]).toContain("omp");
++		expect(calls[0]).not.toContain("ghp_");
++	});
++
++	it("never puts assistant message text into the notification", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgCompletionNotify.override(settings, "on");
++
++		new EventController(makeContext("my-session")).sendCompletionNotification(
++			makeAgentEndEvent([makeAssistantMessage("stop", "token ghp_1234567890abcdef")]),
++		);
++
++		expect(calls).toHaveLength(1);
++		expect(JSON.stringify(calls)).not.toContain("ghp_");
++	});
++
++	it("honours completion.notify=off", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgCompletionNotify.override(settings, "off");
++
++		new EventController(makeContext()).sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
++
++		expect(calls).toHaveLength(0);
++	});
++
++	it("stays silent for aborted and errored turns", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgCompletionNotify.override(settings, "on");
++		const controller = new EventController(makeContext());
++
++		controller.sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("aborted")]));
++		controller.sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("error")]));
++
++		expect(calls).toHaveLength(0);
++	});
++
++	it("stays silent when the Warp CLI-agent protocol drives native UX", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgCompletionNotify.override(settings, "on");
++		process.env.WARP_CLI_AGENT_PROTOCOL_VERSION = "1";
++
++		new EventController(makeContext()).sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
++
++		expect(calls).toHaveLength(0);
++	});
++});
++
++describe("Termux notifications: error", () => {
++	it("posts one Android notification when error.notify is on and stopReason is error", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgErrorNotify.override(settings, "on");
++
++		new EventController(makeContext("err-session")).sendErrorNotification(
++			makeAgentEndEvent([makeAssistantMessage("error")]),
++		);
++
++		expect(calls).toEqual([
++			["termux-notification", "--id", statusId, "--title", "omp", "--content", "Stopped with error"],
++		]);
++	});
++
++	it("honours error.notify=off (schema default)", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgErrorNotify.override(settings, "off");
++
++		new EventController(makeContext()).sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("error")]));
++
++		expect(calls).toHaveLength(0);
++	});
++
++	it("stays silent for normal completions and non-terminal scheduling pauses", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgErrorNotify.override(settings, "on");
++		const controller = new EventController(makeContext());
++
++		controller.sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
++		controller.sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("error")], false));
++
++		expect(calls).toHaveLength(0);
++	});
++});
++
++describe("Termux notifications: ask", () => {
++	it("posts one per-prompt card and removes it after the dialog is answered", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "on");
++
++		await new AskTool(makeAskSession()).execute(
++			"call-ask",
++			ASK_PARAMS,
++			undefined,
++			undefined,
++			askContext(answeredAskDialog()),
++		);
++
++		const post = calls.find(args => args[0] === "termux-notification");
++		const remove = calls.find(args => args[0] === "termux-notification-remove");
++		expect(post).toBeDefined();
++		// Distinct from the completion/error status id, so the removal cannot
++		// erase a card posted while the dialog was pending.
++		expect(post?.[2]?.startsWith(`omp-ask-${process.pid}-`)).toBe(true);
++		expect(post?.[2]).not.toBe(statusId);
++		// Removal is serialized behind the post promise, so it comes second.
++		expect(calls.map(args => args[0])).toEqual(["termux-notification", "termux-notification-remove"]);
++		expect(remove?.[1]).toBe(post?.[2]);
++	});
++
++	it("clears the card on the plain (non-rich-dialog) path", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "on");
++
++		await new AskTool(makeAskSession()).execute(
++			"call-ask",
++			ASK_PARAMS,
++			undefined,
++			undefined,
++			plainAskContext(async () => "Yes"),
++		);
++
++		const post = calls.find(args => args[0] === "termux-notification");
++		expect(post?.[2]?.startsWith(`omp-ask-${process.pid}-`)).toBe(true);
++		expect(calls.at(-1)).toEqual(["termux-notification-remove", post?.[2]]);
++	});
++
++	it("clears the card when the dialog throws", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "on");
++
++		await expect(
++			new AskTool(makeAskSession()).execute(
++				"call-ask",
++				ASK_PARAMS,
++				undefined,
++				undefined,
++				plainAskContext(async () => {
++					throw new Error("ui failure");
++				}),
++			),
++		).rejects.toBeDefined();
++
++		const post = calls.find(args => args[0] === "termux-notification");
++		expect(calls.at(-1)).toEqual(["termux-notification-remove", post?.[2]]);
++	});
++
++	it("clears the card when the ask is aborted before the dialog settles", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "on");
++		const controller = new AbortController();
++		controller.abort();
++
++		await expect(
++			new AskTool(makeAskSession()).execute(
++				"call-ask",
++				ASK_PARAMS,
++				controller.signal,
++				undefined,
++				askContext(vi.fn(() => new Promise(() => {}))),
++			),
++		).rejects.toBeDefined();
++
++		const post = calls.find(args => args[0] === "termux-notification");
++		expect(calls.at(-1)).toEqual(["termux-notification-remove", post?.[2]]);
++	});
++
++	it("posts and removes nothing when notifications are globally suppressed", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "on");
++		process.env.PI_NOTIFICATIONS = "off";
++
++		await new AskTool(makeAskSession()).execute(
++			"call-ask",
++			ASK_PARAMS,
++			undefined,
++			undefined,
++			askContext(answeredAskDialog()),
++		);
++
++		expect(calls).toHaveLength(0);
++	});
++
++	it("honours ask.notify=off", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "off");
++
++		await new AskTool(makeAskSession()).execute(
++			"call-ask",
++			ASK_PARAMS,
++			undefined,
++			undefined,
++			askContext(answeredAskDialog()),
++		);
++
++		expect(calls).toHaveLength(0);
++	});
++
++	it("stays silent when the session has no UI", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "on");
++
++		await new AskTool(makeAskSession({ hasUI: false })).execute(
++			"call-ask",
++			ASK_PARAMS,
++			undefined,
++			undefined,
++			askContext(answeredAskDialog()),
++		);
++
++		expect(calls).toHaveLength(0);
++	});
++});
++
++describe("Termux notifications: global suppression and failure modes", () => {
++	it("suppresses Android notifications when PI_NOTIFICATIONS is off", async () => {
++		const calls = captureAndroidSpawns();
++		process.env.PI_NOTIFICATIONS = "off";
++
++		const outcome = await sendAndroidNotification("Title", "Body");
++
++		expect(calls).toHaveLength(0);
++		expect(outcome).toEqual({ ok: false, error: "notifications suppressed" });
++	});
++
++	it("suppresses Android notifications when PI_NOTIFICATIONS is 0 or false", async () => {
++		const calls = captureAndroidSpawns();
++
++		process.env.PI_NOTIFICATIONS = "0";
++		expect((await sendAndroidNotification("T", "B")).ok).toBe(false);
++		process.env.PI_NOTIFICATIONS = "false";
++		expect((await sendAndroidNotification("T", "B")).ok).toBe(false);
++
++		expect(calls).toHaveLength(0);
++	});
++
++	it("reports unavailability instead of firing outside Termux", async () => {
++		const calls = captureAndroidSpawns();
++		delete process.env.TERMUX_VERSION;
++		if (process.platform === "android") return; // Termux itself: platform check cannot be faked.
++
++		const outcome = await sendAndroidNotification("T", "B");
++
++		expect(calls).toHaveLength(0);
++		expect(outcome).toEqual({ ok: false, error: "notification unavailable on this platform" });
++	});
++
++	it("does not throw when Termux:API is missing", async () => {
++		process.env.TERMUX_VERSION = "0.118";
++		vi.spyOn(Bun, "spawn").mockImplementation(() => {
++			throw new Error("ENOENT: termux-notification not found");
++		});
++
++		const outcome = await sendAndroidNotification("Title", "Body");
++
++		expect(outcome.ok).toBe(false);
++		expect(outcome.error).toBeDefined();
++	});
++
++	it("returns the command error without leaking arguments or secrets", async () => {
++		process.env.TERMUX_VERSION = "0.118";
++		vi.spyOn(Bun, "spawn").mockImplementation((() => {
++			return {
++				stderr: new ReadableStream({
++					start(controller) {
++						controller.enqueue(new TextEncoder().encode("generic failure\n"));
++						controller.close();
++					},
++				}),
++				kill: () => {},
++				exited: Promise.resolve(1),
++			} as never;
++		}) as typeof Bun.spawn);
++
++		const outcome = await sendAndroidNotification("Safe Title", "Contains secret: ghp_1234567890abcdef");
++
++		expect(outcome).toEqual({ ok: false, error: "generic failure" });
++		expect(outcome.error).not.toContain("ghp_");
++	});
++
++	it("truncates title to 200 and content to 500 characters", async () => {
++		const calls = captureAndroidSpawns();
++
++		await sendAndroidNotification("t".repeat(400), "b".repeat(900));
++
++		expect(calls[0]).toContain("t".repeat(200));
++		expect(calls[0]).toContain("b".repeat(500));
++	});
++
++	it("reuses one per-process id so events overwrite instead of stacking", async () => {
++		const calls = captureAndroidSpawns();
++
++		await sendAndroidNotification("First", "Complete");
++		await sendAndroidNotification("Second", "Waiting for input");
++		await sendAndroidNotification("Custom", "Body", { id: "omp-custom" });
++
++		expect(calls.map(args => args[2])).toEqual([statusId, statusId, "omp-custom"]);
++	});
++
++	it("clearAndroidNotification removes only the id it is given", async () => {
++		const calls = captureAndroidSpawns();
++		process.env.PI_NOTIFICATIONS = "off";
++
++		await clearAndroidNotification(statusId);
++
++		expect(calls).toEqual([["termux-notification-remove", statusId]]);
++	});
++});
+diff --git a/packages/coding-agent/test/tools/browser-android-chromium.test.ts b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
+new file mode 100644
+index 0000000..7720ed1
+--- /dev/null
++++ b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
+@@ -0,0 +1,151 @@
++import { afterAll, describe, expect, it } from "bun:test";
++import * as fs from "node:fs";
++import * as os from "node:os";
++import * as path from "node:path";
++
++const repoRoot = path.resolve(import.meta.dir, "../..");
++const probeFixture = path.join(import.meta.dir, "..", "fixtures", "browser-executable-probe.ts");
++// Android has no /bin; Termux and the emulator both ship /system/bin/sh.
++const shell = fs.existsSync("/system/bin/sh") ? "/system/bin/sh" : "/bin/sh";
++const tempDirs: string[] = [];
++
++function makeTempDir(): string {
++	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-android-chromium-"));
++	tempDirs.push(dir);
++	return dir;
++}
++
++function writeChrome(file: string, versionOutput: string): void {
++	fs.mkdirSync(path.dirname(file), { recursive: true });
++	fs.writeFileSync(file, `#!${shell}\necho "${versionOutput}"\n`);
++	fs.chmodSync(file, 0o755);
++}
++
++/** The parent's environment without variables that pick or relocate a browser. */
++function probeEnv(extra: Record<string, string>): Record<string, string> {
++	const env: Record<string, string> = {};
++	for (const [key, value] of Object.entries(process.env)) {
++		if (value === undefined) continue;
++		if (key.startsWith("PUPPETEER_") || key.startsWith("XDG_")) continue;
++		if (key === "PI_CODING_AGENT_DIR" || key === "PI_CONFIG_DIR" || key === "OMP_PROFILE" || key === "PI_PROFILE") {
++			continue;
++		}
++		env[key] = value;
++	}
++	env.HOME = env.HOME ?? os.homedir();
++	env.OMP_BROWSER_PROBE_PLATFORM = "android";
++	env.PUPPETEER_EXECUTABLE_PATH = "";
++	return { ...env, ...extra };
++}
++
++interface ProbeResult {
++	stdout: string;
++	stderr: string;
++	exitCode: number;
++}
++
++/** Run launch.ts in a child whose `process.platform` is forced to `android`. */
++function probeAndroid(extra: Record<string, string>): ProbeResult {
++	const result = Bun.spawnSync([process.execPath, probeFixture], {
++		cwd: repoRoot,
++		env: probeEnv(extra),
++		stdout: "pipe",
++		stderr: "pipe",
++	});
++	return {
++		stdout: new TextDecoder().decode(result.stdout).trim(),
++		stderr: new TextDecoder().decode(result.stderr),
++		exitCode: result.exitCode ?? -1,
++	};
++}
++
++afterAll(() => {
++	for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
++});
++
++// Chrome validation execs a shell script, so the fixture cannot run on Windows.
++describe.skipIf(process.platform === "win32")("Android Chromium discovery", () => {
++	it("finds the canonical Termux:X11 binary under $PREFIX/lib/chromium", () => {
++		const root = makeTempDir();
++		const prefix = path.join(root, "prefix");
++		const emptyPath = path.join(root, "empty-path");
++		fs.mkdirSync(emptyPath, { recursive: true });
++		// A PATH wrapper that also answers `--version`; the canonical package
++		// binary must still win.
++		writeChrome(path.join(prefix, "bin", "chromium"), "Chromium 100.0.0.0");
++		const chrome = path.join(prefix, "lib", "chromium", "chrome");
++		writeChrome(chrome, "Chromium 149.0.7827.155");
++
++		const result = probeAndroid({ PREFIX: prefix, PATH: emptyPath });
++
++		expect(result.exitCode, result.stderr).toBe(0);
++		expect(result.stdout).toBe(chrome);
++	});
++
++	it("falls back to the $PREFIX/bin wrapper when the canonical binary is absent", () => {
++		const root = makeTempDir();
++		const prefix = path.join(root, "prefix");
++		const emptyPath = path.join(root, "empty-path");
++		fs.mkdirSync(emptyPath, { recursive: true });
++		const wrapper = path.join(prefix, "bin", "chromium");
++		writeChrome(wrapper, "Chromium 149.0.7827.155");
++
++		const result = probeAndroid({ PREFIX: prefix, PATH: emptyPath });
++
++		expect(result.exitCode, result.stderr).toBe(0);
++		expect(result.stdout).toBe(wrapper);
++	});
++
++	it("throws install guidance when the only binary is broken", () => {
++		const root = makeTempDir();
++		const prefix = path.join(root, "prefix");
++		const emptyPath = path.join(root, "empty-path");
++		fs.mkdirSync(emptyPath, { recursive: true });
++		writeChrome(path.join(prefix, "lib", "chromium", "chrome"), "not-a-browser");
++
++		const result = probeAndroid({ PREFIX: prefix, PATH: emptyPath });
++
++		expect(result.exitCode).not.toBe(0);
++		expect(result.stderr).toContain("No working Chromium executable found on Android");
++		expect(result.stderr).toContain("pkg install -y x11-repo");
++		// The managed Linux download must never be reached on Android.
++		expect(result.stderr).not.toContain("must not download a browser");
++	});
++
++	it("accepts a working explicit PUPPETEER_EXECUTABLE_PATH", () => {
++		const root = makeTempDir();
++		const chrome = path.join(root, "custom", "chrome");
++		writeChrome(chrome, "Chromium 149.0.7827.155");
++
++		const result = probeAndroid({
++			PREFIX: path.join(root, "prefix"),
++			PATH: path.join(root, "empty-path"),
++			PUPPETEER_EXECUTABLE_PATH: chrome,
++		});
++
++		expect(result.exitCode, result.stderr).toBe(0);
++		expect(result.stdout).toBe(chrome);
++	});
++
++	it("fails an explicit PUPPETEER_EXECUTABLE_PATH that does not exist", () => {
++		const root = makeTempDir();
++		const missing = path.join(root, "missing", "chrome");
++
++		const result = probeAndroid({ PREFIX: path.join(root, "prefix"), PUPPETEER_EXECUTABLE_PATH: missing });
++
++		expect(result.exitCode).not.toBe(0);
++		expect(result.stderr).toContain("not a working Chromium executable");
++		expect(result.stderr).toContain(missing);
++	});
++
++	it("fails an explicit PUPPETEER_EXECUTABLE_PATH that is not Chromium", () => {
++		const root = makeTempDir();
++		const broken = path.join(root, "custom", "chrome");
++		writeChrome(broken, "not-a-browser");
++
++		const result = probeAndroid({ PREFIX: path.join(root, "prefix"), PUPPETEER_EXECUTABLE_PATH: broken });
++
++		expect(result.exitCode).not.toBe(0);
++		expect(result.stderr).toContain("not a working Chromium executable");
++	});
++});
+diff --git a/packages/coding-agent/test/utils/clipboard-osc52.test.ts b/packages/coding-agent/test/utils/clipboard-osc52.test.ts
+index 32b5f21..d1fff31 100644
+--- a/packages/coding-agent/test/utils/clipboard-osc52.test.ts
++++ b/packages/coding-agent/test/utils/clipboard-osc52.test.ts
+@@ -67,4 +67,24 @@ describe("copyToClipboard OSC 52 routing", () => {
+ 			worker.terminate();
+ 		}
+ 	});
++
++	// The worker fixture forces `stdout.isTTY` true; that must not count as a
++	// delivered OSC 52, or a failed native write would still report success.
++	it("rejects in a worker when the native copy fails because OSC 52 cannot be emitted there", async () => {
++		const worker = new Worker(new URL("../fixtures/clipboard-worker-copy.ts", import.meta.url).href, {
++			type: "module",
++			workerData: "native-fails",
++		});
++		const report = Promise.withResolvers<{ stdout: string[]; nativeCopies: string[]; error?: string }>();
++		worker.addEventListener("message", event => report.resolve(event.data));
++		worker.addEventListener("error", event => report.reject(event.error ?? new Error(event.message)));
++		try {
++			const result = await report.promise;
++			expect(result.stdout.join("")).not.toContain("\x1b]52;");
++			expect(result.nativeCopies).toEqual(["worker probe"]);
++			expect(result.error).toBe("native clipboard unavailable");
++		} finally {
++			worker.terminate();
++		}
++	});
+ });
+diff --git a/packages/coding-agent/test/utils/clipboard.test.ts b/packages/coding-agent/test/utils/clipboard.test.ts
+index 00a84ff..a9fe857 100644
+--- a/packages/coding-agent/test/utils/clipboard.test.ts
++++ b/packages/coding-agent/test/utils/clipboard.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+ import {
++	copyToClipboard,
+ 	isClipboardTerminalLocal,
+ 	readImageFromClipboard,
+ 	readMacFileUrlsFromClipboard,
+@@ -59,6 +60,17 @@ function restorePlatform(): void {
+ 	if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+ }
+ 
++const stdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
++
++function setStdoutIsTTY(value: boolean): void {
++	Object.defineProperty(process.stdout, "isTTY", { value, configurable: true });
++}
++
++function restoreStdoutIsTTY(): void {
++	if (stdoutIsTTY) Object.defineProperty(process.stdout, "isTTY", stdoutIsTTY);
++	else delete (process.stdout as { isTTY?: boolean }).isTTY;
++}
++
+ const ENV_KEYS = ["WSL_DISTRO_NAME", "WSL_INTEROP", "DISPLAY", "WAYLAND_DISPLAY", "TERMUX_VERSION"] as const;
+ let savedEnv: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
+ 
+@@ -77,6 +89,7 @@ afterEach(() => {
+ 		else process.env[key] = prior;
+ 	}
+ 	restorePlatform();
++	restoreStdoutIsTTY();
+ 	vi.restoreAllMocks();
+ });
+ 
+@@ -243,6 +256,97 @@ describe("readImageFromClipboard dispatch", () => {
+ 	});
+ });
+ 
++describe("Termux clipboard", () => {
++	it("copies through termux-clipboard-set with the text on stdin and skips the native bridge", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++		setStdoutIsTTY(false);
++
++		const calls: SpawnCall[] = [];
++		spySpawn(calls, "");
++		const nativeSpy = vi.spyOn(native, "copyToClipboard").mockImplementation(async () => {});
++
++		await copyToClipboard("hello");
++
++		expect(calls).toHaveLength(1);
++		expect(calls[0]?.cmd).toEqual(["termux-clipboard-set"]);
++		expect(calls[0]?.options.stdin).toEqual(Buffer.from("hello"));
++		expect(nativeSpy).not.toHaveBeenCalled();
++	});
++
++	it("rejects when termux-api is missing and no TTY received OSC 52", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++		setStdoutIsTTY(false);
++
++		vi.spyOn(Bun, "spawn").mockImplementation(() => {
++			throw new Error("ENOENT: termux-clipboard-set not found");
++		});
++		const nativeSpy = vi
++			.spyOn(native, "copyToClipboard")
++			.mockRejectedValue(new Error("Native arboard clipboard is unsupported on Android/Termux"));
++
++		await expect(copyToClipboard("hello")).rejects.toThrow(/unsupported on Android\/Termux/);
++		expect(nativeSpy).toHaveBeenCalledTimes(1);
++	});
++
++	it("rejects when the OSC 52 write is swallowed and no other channel works", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++		setStdoutIsTTY(true);
++
++		vi.spyOn(Bun, "spawn").mockImplementation(() => {
++			throw new Error("ENOENT: termux-clipboard-set not found");
++		});
++		vi.spyOn(native, "copyToClipboard").mockRejectedValue(new Error("arboard unavailable"));
++		vi.spyOn(process.stdout, "write").mockImplementation(() => {
++			throw new Error("EPIPE");
++		});
++
++		await expect(copyToClipboard("hello")).rejects.toThrow(/arboard unavailable/);
++	});
++
++	it("resolves after emitting OSC 52 even when the Termux and native backends fail", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++		setStdoutIsTTY(true);
++
++		vi.spyOn(Bun, "spawn").mockImplementation(() => {
++			throw new Error("ENOENT: termux-clipboard-set not found");
++		});
++		vi.spyOn(native, "copyToClipboard").mockRejectedValue(new Error("arboard unavailable"));
++		const writeSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
++
++		await copyToClipboard("hello");
++
++		const osc52 = `\x1b]52;c;${Buffer.from("hello").toString("base64")}\x07`;
++		expect(writeSpy.mock.calls.some(([chunk]) => String(chunk) === osc52)).toBe(true);
++	});
++
++	it("reads text through termux-clipboard-get", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++
++		const calls: SpawnCall[] = [];
++		spySpawn(calls, "hello\n");
++
++		expect(await readTextFromClipboard()).toBe("hello\n");
++		expect(calls).toHaveLength(1);
++		expect(calls[0]?.cmd).toEqual(["termux-clipboard-get"]);
++	});
++
++	it("returns an empty string and warns when the Termux read fails", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++
++		const calls: SpawnCall[] = [];
++		spySpawn(calls, "", 1);
++
++		expect(await readTextFromClipboard()).toBe("");
++		expect(calls[0]?.cmd).toEqual(["termux-clipboard-get"]);
++	});
++});
++
+ describe("readMacFileUrlsFromClipboard", () => {
+ 	it("returns an empty list on non-darwin platforms without spawning osascript", async () => {
+ 		setPlatform("linux");
+diff --git a/packages/natives/native/index.js b/packages/natives/native/index.js
+index 74a474f..e265a88 100644
+--- a/packages/natives/native/index.js
++++ b/packages/natives/native/index.js
+@@ -23,8 +23,12 @@ import { adaptDesktopSession } from "./desktop-adapter.js";
+ const nativeBindings = loadNative();
+ // --- generated native exports (do not edit) ---
+ // classes
+-export const AudioCapture = nativeBindings.AudioCapture;
+-export const AudioPlayback = nativeBindings.AudioPlayback;
++export const AudioCapture = process.platform === "android"
++	? (() => { const v = nativeBindings.AudioCapture; if (v !== undefined) return v; const err = function err() { throw new Error("Native AudioCapture is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
++	: (nativeBindings.AudioCapture);
++export const AudioPlayback = process.platform === "android"
++	? (() => { const v = nativeBindings.AudioPlayback; if (v !== undefined) return v; const err = function err() { throw new Error("Native AudioPlayback is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
++	: (nativeBindings.AudioPlayback);
+ export const DesktopSession = adaptDesktopSession(nativeBindings.DesktopSession);
+ export const DiffStream = nativeBindings.DiffStream;
+ export const EditSession = nativeBindings.EditSession;
+@@ -34,7 +38,9 @@ export const HighlightStream = nativeBindings.HighlightStream;
+ export const IpcConnection = nativeBindings.IpcConnection;
+ export const IpcServer = nativeBindings.IpcServer;
+ export const LineMatcher = nativeBindings.LineMatcher;
+-export const LiveWebRtcPeer = nativeBindings.LiveWebRtcPeer;
++export const LiveWebRtcPeer = process.platform === "android"
++	? (() => { const v = nativeBindings.LiveWebRtcPeer; if (v !== undefined) return v; const err = function err() { throw new Error("Native LiveWebRtcPeer is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
++	: (nativeBindings.LiveWebRtcPeer);
+ export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
+ export const MacOSFrontApp = nativeBindings.MacOSFrontApp;
+ export const NativeOAuthCallback = nativeBindings.NativeOAuthCallback;
+@@ -62,7 +68,9 @@ export const astGrep = nativeBindings.astGrep ?? missingNativeExport("astGrep");
+ export const astMatch = nativeBindings.astMatch ?? missingNativeExport("astMatch");
+ export const blockRangeAt = nativeBindings.blockRangeAt ?? missingNativeExport("blockRangeAt");
+ export const closeDesktopEventTaps = nativeBindings.closeDesktopEventTaps ?? missingNativeExport("closeDesktopEventTaps");
+-export const copyToClipboard = nativeBindings.copyToClipboard ?? missingNativeExport("copyToClipboard");
++export const copyToClipboard = process.platform === "android"
++	? (() => { const v = nativeBindings.copyToClipboard; if (v !== undefined) return v; const err = function err() { throw new Error("Native copyToClipboard is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
++	: (nativeBindings.copyToClipboard ?? missingNativeExport("copyToClipboard"));
+ export const cosineSimilarityPairs = nativeBindings.cosineSimilarityPairs ?? missingNativeExport("cosineSimilarityPairs");
+ export const countTokens = nativeBindings.countTokens ?? missingNativeExport("countTokens");
+ export const decodeSixelToPng = nativeBindings.decodeSixelToPng ?? missingNativeExport("decodeSixelToPng");
+@@ -131,7 +139,9 @@ export const parseKey = nativeBindings.parseKey ?? missingNativeExport("parseKey
+ export const parseKittySequence = nativeBindings.parseKittySequence ?? missingNativeExport("parseKittySequence");
+ export const pdfToMarkdown = nativeBindings.pdfToMarkdown ?? missingNativeExport("pdfToMarkdown");
+ export const rasterizeSvg = nativeBindings.rasterizeSvg ?? missingNativeExport("rasterizeSvg");
+-export const readImageFromClipboard = nativeBindings.readImageFromClipboard ?? missingNativeExport("readImageFromClipboard");
++export const readImageFromClipboard = process.platform === "android"
++	? (() => { const v = nativeBindings.readImageFromClipboard; if (v !== undefined) return v; const err = function err() { throw new Error("Native readImageFromClipboard is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
++	: (nativeBindings.readImageFromClipboard ?? missingNativeExport("readImageFromClipboard"));
+ export const readTextFromClipboard = nativeBindings.readTextFromClipboard ?? missingNativeExport("readTextFromClipboard");
+ export const renderMermaidAscii = nativeBindings.renderMermaidAscii ?? missingNativeExport("renderMermaidAscii");
+ export const renderSnapcompactPng = nativeBindings.renderSnapcompactPng ?? missingNativeExport("renderSnapcompactPng");
+diff --git a/packages/natives/native/loader-state.js b/packages/natives/native/loader-state.js
+index 1c1e959..c664b66 100644
+--- a/packages/natives/native/loader-state.js
++++ b/packages/natives/native/loader-state.js
+@@ -38,6 +38,7 @@ const SUPPORTED_PLATFORMS = [
+ 	"darwin-arm64",
+ 	"win32-x64",
+ 	"win32-arm64",
++	"android-arm64",
+ ];
+ 
+ /**
+diff --git a/packages/natives/scripts/gen-enums.ts b/packages/natives/scripts/gen-enums.ts
+index 75dcd5d..ccb5d0f 100644
+--- a/packages/natives/scripts/gen-enums.ts
++++ b/packages/natives/scripts/gen-enums.ts
+@@ -16,9 +16,7 @@
+  */
+ import * as path from "node:path";
+ 
+-const nativeDir = path.resolve(import.meta.dir, "../native");
+-const dtsPath = path.join(nativeDir, "index.d.ts");
+-const jsPath = path.join(nativeDir, "index.js");
++const defaultNativeDir = path.resolve(import.meta.dir, "../native");
+ 
+ const MARKER_START = "// --- generated native exports (do not edit) ---";
+ const MARKER_END = "// --- end generated native exports ---";
+@@ -82,7 +80,7 @@ function collectMatches(dts: string, re: RegExp): string[] {
+ 	return names;
+ }
+ 
+-function buildGeneratedBlock(dts: string): string {
++export function buildGeneratedBlock(dts: string): string {
+ 	const classes = collectMatches(dts, CLASS_RE);
+ 	const functions = collectMatches(dts, FUNCTION_RE);
+ 	const enums = collectEnums(dts);
+@@ -92,24 +90,44 @@ function buildGeneratedBlock(dts: string): string {
+ 	}
+ 
+ 	const lines: string[] = [];
++	const androidUnsupported = new Set([
++		"AudioCapture",
++		"AudioPlayback",
++		"LiveWebRtcPeer",
++		"copyToClipboard",
++		"readImageFromClipboard",
++	]);
++	// The proxy is Android-only. On other platforms the generated line must keep
++	// the upstream fallback (`missingNativeExport`) so a stale or mismatched
++	// desktop addon gets the rebuild diagnostic, not "unsupported on Android".
++	const androidStub = (name: string) =>
++		`(() => { const v = nativeBindings.${name}; if (v !== undefined) return v; const err = function err() { throw new Error("Native ${name} is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()`;
+ 	if (classes.length > 0) {
+ 		lines.push("// classes");
+ 		for (const name of classes) {
+ 			const binding =
+ 				name === "DesktopSession" ? `adaptDesktopSession(nativeBindings.${name})` : `nativeBindings.${name}`;
+-			lines.push(`export const ${name} = ${binding};`);
++			if (androidUnsupported.has(name)) {
++				lines.push(
++					`export const ${name} = process.platform === "android"\n\t? ${androidStub(name)}\n\t: (${binding});`,
++				);
++			} else {
++				lines.push(`export const ${name} = ${binding};`);
++			}
+ 		}
+ 	}
+ 	if (functions.length > 0) {
+ 		if (lines.length > 0) lines.push("");
+ 		lines.push("// functions");
+ 		for (const name of functions) {
+-			// `missingNativeExport` returns `undefined` on a current addon and a
+-			// throwing stub on a stale one, so capability probes
+-			// (`typeof native.x === "function"`) keep their meaning and only the
+-			// stale case gains an actionable failure. See `loader-state.js`.
+ 			const fallback = RELEASE_IDENTITY_NAME_RE.test(name) ? "" : ` ?? missingNativeExport("${name}")`;
+-			lines.push(`export const ${name} = nativeBindings.${name}${fallback};`);
++			if (androidUnsupported.has(name)) {
++				lines.push(
++					`export const ${name} = process.platform === "android"\n\t? ${androidStub(name)}\n\t: (nativeBindings.${name}${fallback});`,
++				);
++			} else {
++				lines.push(`export const ${name} = nativeBindings.${name}${fallback};`);
++			}
+ 		}
+ 	}
+ 	if (enums.length > 0) {
+@@ -123,7 +141,10 @@ function buildGeneratedBlock(dts: string): string {
+ 	return `${MARKER_START}\n${lines.join("\n")}\n${MARKER_END}`;
+ }
+ 
+-export async function generateEnumExports(): Promise<void> {
++export async function generateEnumExports(options: { nativeDir?: string } = {}): Promise<void> {
++	const nativeDir = options.nativeDir ?? defaultNativeDir;
++	const dtsPath = path.join(nativeDir, "index.d.ts");
++	const jsPath = path.join(nativeDir, "index.js");
+ 	const dts = await Bun.file(dtsPath).text();
+ 	const existing = await Bun.file(jsPath).text();
+ 	const generatedBlock = buildGeneratedBlock(dts);
+diff --git a/packages/natives/test/ipc.test.ts b/packages/natives/test/ipc.test.ts
+index c569d44..6cbaee0 100644
+--- a/packages/natives/test/ipc.test.ts
++++ b/packages/natives/test/ipc.test.ts
+@@ -223,7 +223,15 @@ describe("native IPC", () => {
+ 		const dir = path.join(await tempDir(), "d".repeat(120));
+ 		const name = `long-${process.pid}`;
+ 		const endpoint = ipcEndpoint(dir, name);
+-		expect(endpoint).toMatch(new RegExp(`^/tmp/omp-${process.getuid!()}/[0-9a-f]{16}\\.sock$`));
++		// Android has no /tmp: the relocation directory is <installed root>/tmp/omp-<uid>,
++		// where the launcher exports the installed root as OMP_ANDROID_PREFIX.
++		const prefix = process.env.OMP_ANDROID_PREFIX ?? process.env.PREFIX ?? "/data/data/com.termux/files/usr";
++		const relocationRoot =
++			process.platform === "android"
++				? path.join(prefix, "tmp", `omp-${process.getuid!()}`)
++				: `/tmp/omp-${process.getuid!()}`;
++		expect(endpoint.startsWith(`${relocationRoot}/`)).toBe(true);
++		expect(endpoint).toMatch(/[0-9a-f]{16}\.sock$/);
+ 		expect(ipcEndpoint(dir, name)).toBe(endpoint);
+ 		expect(Buffer.byteLength(endpoint)).toBeLessThan(104);
+ 		await listen(endpoint, { framing: "lines" }, connection => {
+@@ -239,6 +247,48 @@ describe("native IPC", () => {
+ 		expect(seen.events).toEqual(["RELOCATED"]);
+ 	});
+ 
++	test.skipIf(isWindows)("relocated endpoint is stable across processes with different TMPDIR", async () => {
++		const dir = path.join(await tempDir(), "d".repeat(120));
++		const name = `cross-${process.pid}`;
++		const endpoint = ipcEndpoint(dir, name);
++		const { accepted } = await acceptingServer(endpoint, { framing: "lines" });
++
++		// The child inherits the install (PREFIX) but a different per-shell TMPDIR.
++		// Naming must ignore it, otherwise the child dials another socket than the
++		// live broker listens on.
++		const nativeEntry = path.resolve(import.meta.dir, "../native/index.js");
++		const scriptPath = path.join(await tempDir(), "child.ts");
++		await Bun.write(
++			scriptPath,
++			`import { IpcConnection, ipcEndpoint } from ${JSON.stringify(nativeEntry)};
++const endpoint = ipcEndpoint(${JSON.stringify(dir)}, ${JSON.stringify(name)});
++process.stdout.write(\`\${endpoint}\n\`);
++const connection = await IpcConnection.connect(endpoint, { framing: "lines" });
++connection.send("from-child");
++await connection.drained();
++connection.destroy();
++`,
++		);
++		const child = Bun.spawn([process.execPath, scriptPath], {
++			env: { ...process.env, TMPDIR: await tempDir() },
++			stdout: "pipe",
++			stderr: "pipe",
++		});
++		cleanups.push(() => child.kill());
++
++		const peer = record(await accepted);
++		await peer.until(1);
++		const [stdout, stderr, exitCode] = await Promise.all([
++			new Response(child.stdout).text(),
++			new Response(child.stderr).text(),
++			child.exited,
++		]);
++		expect(stderr).toBe("");
++		expect(exitCode).toBe(0);
++		expect(stdout.trim()).toBe(endpoint);
++		expect(peer.events).toEqual(["from-child"]);
++	});
++
+ 	test("small and large frames arrive in send order, within and across tasks", async () => {
+ 		// Small frames coalesce until the end of the task while large ones may
+ 		// be written immediately; a 4 MiB frame also overflows the socket
+diff --git a/packages/tui/src/active-terminal.ts b/packages/tui/src/active-terminal.ts
+index 6ef0e4c..9501254 100644
+--- a/packages/tui/src/active-terminal.ts
++++ b/packages/tui/src/active-terminal.ts
+@@ -67,14 +67,22 @@ export function writeThroughActiveTerminal(data: string): boolean {
+  * terminal's ordered output path, and goes straight to stdout, best-effort, only
+  * when no terminal owns it. A worker thread cannot reach the main thread's
+  * terminal and would write around its pump, so it writes nothing.
++ *
++ * Returns whether the sequence was handed to a real output path (the active
++ * terminal's ordered pump, or a direct stdout write that did not throw). A
++ * worker, a terminal that never owned stdout, or a closed stdout returns
++ * `false`. Even `true` only means "emitted", not that the user's terminal
++ * honored it: OSC 52 is best-effort by design.
+  */
+-export function writeTerminalSequence(data: string): void {
+-	if (!Bun.isMainThread) return;
+-	if (writeThroughActiveTerminal(data)) return;
++export function writeTerminalSequence(data: string): boolean {
++	if (!Bun.isMainThread) return false;
++	if (writeThroughActiveTerminal(data)) return true;
+ 	installStdoutErrorListener();
+ 	try {
+ 		process.stdout.write(data);
++		return true;
+ 	} catch {
+ 		// Best-effort: a closed stdout must not fail the caller.
++		return false;
+ 	}
+ }
+diff --git a/packages/tui/src/apps/debug/log-viewer.ts b/packages/tui/src/apps/debug/log-viewer.ts
+index 04e7361..f3d058c 100644
+--- a/packages/tui/src/apps/debug/log-viewer.ts
++++ b/packages/tui/src/apps/debug/log-viewer.ts
+@@ -1205,15 +1205,19 @@ export class DebugLogViewerComponent implements Component {
+ 			return;
+ 		}
+ 
+-		try {
+-			this.#deps.copyToClipboard(selectedPayload);
+-			const message = `Copied ${selected.length} log ${selected.length === 1 ? "entry" : "entries"}`;
+-			this.#statusMessage = message;
+-			this.#onStatus?.(message);
+-		} catch (error) {
+-			const message = error instanceof Error ? error.message : String(error);
+-			this.#statusMessage = `Copy failed: ${message}`;
+-			this.#onError?.(`Failed to copy logs: ${message}`);
+-		}
++		void Promise.resolve()
++			.then(() => this.#deps.copyToClipboard(selectedPayload))
++			.then(
++				() => {
++					const message = `Copied ${selected.length} log ${selected.length === 1 ? "entry" : "entries"}`;
++					this.#statusMessage = message;
++					this.#onStatus?.(message);
++				},
++				(error: unknown) => {
++					const message = error instanceof Error ? error.message : String(error);
++					this.#statusMessage = `Copy failed: ${message}`;
++					this.#onError?.(`Failed to copy logs: ${message}`);
++				},
++			);
+ 	}
+ }
+diff --git a/packages/tui/src/apps/debug/raw-sse.ts b/packages/tui/src/apps/debug/raw-sse.ts
+index 14e294a..982c574 100644
+--- a/packages/tui/src/apps/debug/raw-sse.ts
++++ b/packages/tui/src/apps/debug/raw-sse.ts
+@@ -483,17 +483,21 @@ export class RawSseViewerComponent implements Component {
+ 			return;
+ 		}
+ 
+-		try {
+-			this.#deps.copyToClipboard(payload);
+-			const message = "Copied raw SSE stream";
+-			this.#statusMessage = message;
+-			this.#statusFailed = false;
+-			this.#onStatus?.(message);
+-		} catch (error) {
+-			const message = error instanceof Error ? error.message : String(error);
+-			this.#statusMessage = `Copy failed: ${message}`;
+-			this.#statusFailed = true;
+-		}
+-		this.#onUpdate?.();
++		void Promise.resolve()
++			.then(() => this.#deps.copyToClipboard(payload))
++			.then(
++				() => {
++					const message = "Copied raw SSE stream";
++					this.#statusMessage = message;
++					this.#statusFailed = false;
++					this.#onStatus?.(message);
++				},
++				(error: unknown) => {
++					const message = error instanceof Error ? error.message : String(error);
++					this.#statusMessage = `Copy failed: ${message}`;
++					this.#statusFailed = true;
++				},
++			)
++			.finally(() => this.#onUpdate?.());
+ 	}
+ }
+diff --git a/packages/tui/src/tools/task.ts b/packages/tui/src/tools/task.ts
+index 4e4258e..22df315 100644
+--- a/packages/tui/src/tools/task.ts
++++ b/packages/tui/src/tools/task.ts
+@@ -2261,6 +2261,8 @@ export interface TaskItem {
+ 	tools?: string[];
+ 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
+ 	isolated?: boolean;
++	/** Optional explicit git repository root for task isolation. */
++	repoRoot?: string;
+ }
+ 
+ /**
+@@ -2298,6 +2300,8 @@ export interface TaskParams {
+ 	context?: string;
+ 	/** Run in an isolated worktree (flat form; per-item in batch form). */
+ 	isolated?: boolean;
++	/** Explicit repository root (flat form or batch context override). */
++	repoRoot?: string;
+ }
+ 
+ /**
+diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
+index 612a355..71989db 100644
+--- a/packages/tui/src/tui.ts
++++ b/packages/tui/src/tui.ts
+@@ -1328,7 +1328,8 @@ export class TUI extends Container {
+ 					this.overlayStack.splice(index, 1);
+ 					// Overlays opened over this one return focus to where it would have.
+ 					for (const other of this.overlayStack) {
+-						if (other.preFocus && isOverlayFocusTarget(component, other.preFocus)) other.preFocus = entry.preFocus;
++						if (other.preFocus && isOverlayFocusTarget(component, other.preFocus))
++							other.preFocus = entry.preFocus;
+ 					}
+ 					// Restore focus if this overlay or one of its owned targets had focus
+ 					if (isOverlayFocusTarget(component, this.#focusedComponent)) {
