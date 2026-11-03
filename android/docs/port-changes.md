@@ -176,6 +176,18 @@ the persisted prompt blocks from the pre-rename path to the retained one.
 An aborted isolated run is resumable like any other, because its retained
 workspace revives through the persisted factory.
 
+A retained sandbox whose agent is not running has a public explicit release
+that never loads its session: `omp worktree release <dir>` resolves and binds
+the descriptor, proves the transcript independently (its session header cwd is
+this workspace's slot mount and the retention pointer, when present, names the
+same sandbox mount; a substituted transcript is refused before any claim or artifact
+write), claims the immutable slot for the issuing process, then runs the same
+release (capture against the persisted baseline, task-branch commit, native
+teardown). It refuses a live foreign owner, prints the artifact
+directory, and leaves the sandbox intact when capture or the commit fails, so a
+cold workspace can be finalized or discarded deliberately without relying on
+`kill` (which retains).
+
 `repoRoot` (added to the task schemas by patch `01`, preserved by every branch
 of the dynamic `task.file` schema in patch `02`) selects a different repository
 to isolate; `isolated` alone always uses the current cwd's repository, and

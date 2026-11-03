@@ -87,8 +87,8 @@ jobs:
           done
           bun test "${tests[@]}"
       # Required, not optional coverage: these exercise the retained-workspace
-      # lifecycle, dynamic-schema repoRoot, and resume-hint contracts added by
-      # patch 02, so a missing/renamed file must fail the job instead of
+      # lifecycle, dynamic-schema repoRoot, resume-hint, and explicit cold
+      # release contracts added by patch 02, so a missing/renamed file must fail the job instead of
       # silently greening the overlay check.
       - name: Run isolation lifecycle tests
         shell: bash
@@ -98,4 +98,5 @@ jobs:
             ./packages/coding-agent/test/task/persisted-revive.test.ts \
             ./packages/coding-agent/test/task/task-spawn.test.ts \
             ./packages/coding-agent/test/task/task-schema.test.ts \
-            ./packages/coding-agent/test/task/result-summary.test.ts
+            ./packages/coding-agent/test/task/result-summary.test.ts \
+            ./packages/coding-agent/test/cli/worktree-release-isolation.test.ts

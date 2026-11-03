@@ -1,5 +1,5 @@
 diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-agent/src/cli/worktree-cli.ts
-index f9f8253..39456ee 100644
+index f9f8253..1a29a9d 100644
 --- a/packages/coding-agent/src/cli/worktree-cli.ts
 +++ b/packages/coding-agent/src/cli/worktree-cli.ts
 @@ -9,9 +9,12 @@
@@ -18,13 +18,14 @@ index f9f8253..39456ee 100644
   *
   * Legacy entries from before the encoding change keep working because git still
   * tracks them by branch name. This command exists to GC them on demand.
-@@ -23,8 +26,21 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
+@@ -23,8 +26,25 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
  import { getWorktreesDir, isEnoent } from "@oh-my-pi/pi-utils";
  import chalk from "@oh-my-pi/pi-utils/chalk";
  import { Settings } from "../config/settings";
 -import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend } from "../task/isolation-ownership";
 -import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 +import {
++	claimIsolationOwner,
 +	hasLiveIsolationOwner,
 +	IsolationLeaseBusyError,
 +	ISOLATION_OWNER_FILE,
@@ -32,7 +33,10 @@ index f9f8253..39456ee 100644
 +	readRetainedMountBackend,
 +	withIsolationLease,
 +} from "../task/isolation-ownership";
++import { releaseIsolationWorkspace } from "../task/isolation-runner";
 +import {
++	bindIsolationState,
++	bindPersistedReleaseWorkspace,
 +	formatIsolationBackend,
 +	isolationSlotFromDirName,
 +	isolationStateExists,
@@ -42,7 +46,7 @@ index f9f8253..39456ee 100644
  
  import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
  
-@@ -43,6 +59,14 @@ export interface WorktreeEntry {
+@@ -43,6 +63,14 @@ export interface WorktreeEntry {
  	branch?: string;
  	/** When set, the entry is unhealthy and `omp worktree clear` will remove it. */
  	orphanReason?: string;
@@ -57,7 +61,7 @@ index f9f8253..39456ee 100644
  }
  
  export interface AddWorktreeOptions {
-@@ -60,7 +84,10 @@ export interface ListWorktreesOptions {
+@@ -60,12 +88,21 @@ export interface ListWorktreesOptions {
  }
  
  export interface ClearWorktreesOptions {
@@ -69,7 +73,18 @@ index f9f8253..39456ee 100644
  	all: boolean;
  	/** Print what would be removed without touching the filesystem. */
  	dryRun: boolean;
-@@ -79,16 +106,29 @@ export interface ClearWorktreesOptions {
+ 	json: boolean;
+ }
++
++export interface ReleaseWorktreeOptions {
++	/** Retained task-isolation workspace directory (descriptor-bearing). */
++	path: string;
++	json: boolean;
++}
+ /**
+  * Run native teardown on a retained workspace before recursive removal.
+  * Recursive `rm` through a live overlay mount destroys the preserved upper
+@@ -79,16 +116,29 @@ export interface ClearWorktreesOptions {
   * with the error, data intact.
   */
  export async function stopRetainedMount(dir: string): Promise<boolean> {
@@ -105,7 +120,52 @@ index f9f8253..39456ee 100644
  			await natives.isoStop(backend, candidate);
  			return true;
  		}
-@@ -192,25 +232,48 @@ export async function listWorktrees(options: ListWorktreesOptions): Promise<void
+@@ -96,6 +146,44 @@ export async function stopRetainedMount(dir: string): Promise<boolean> {
+ 	return false;
+ }
+ 
++/**
++ * Explicitly release a retained task-isolation workspace without loading the
++ * agent session. Reuses the lifecycle release: bind the descriptor to its
++ * transcript, claim the immutable slot as this process, capture the delta
++ * against the spawn-time baseline + commit the task branch, then tear down.
++ * Failure preserves the sandbox (release retains on capture/commit errors).
++ */
++export async function releaseWorktree(options: ReleaseWorktreeOptions): Promise<void> {
++	const dir = path.resolve(options.path);
++	const read = await readIsolationState(dir);
++	if ("error" in read) {
++		throw new Error(`Cannot release ${dir}: ${read.detail ?? read.error}`);
++	}
++	// The CLI names the workspace, not a transcript: the descriptor's own
++	// `sessionFile` is not independent evidence, so prove the session header and
++	// retention pointer place this transcript in the selected workspace before
++	// claim/capture, and take the artifact dir from that verified transcript.
++	const identity = await bindPersistedReleaseWorkspace(read.state);
++	if ("refusal" in identity) throw new Error(`Cannot release ${dir}: ${identity.refusal}`);
++	const binding = await bindIsolationState(read.state, identity.transcriptFile);
++	if ("refusal" in binding) throw new Error(`Cannot release ${dir}: ${binding.refusal}`);
++	const artifactsDir = identity.artifactsDir;
++	// Claim under the slot lease: a live foreign owner blocks; a dead/own marker
++	// is reclaimed so release's own-process check passes.
++	await claimIsolationOwner(read.state.dir, read.state.id, read.state.slot);
++	await releaseIsolationWorkspace(read.state, {
++		artifactsDir,
++		description: "omp worktree release",
++		expectedSessionFile: identity.transcriptFile,
++	});
++	if (options.json) {
++		console.log(JSON.stringify({ released: dir, artifactsDir }));
++	} else {
++		console.log(`${chalk.green("released")}  ${dir}`);
++		console.log(`          ${chalk.dim(`artifacts in ${artifactsDir}`)}`);
++	}
++}
++
+ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
+ 	if (options.branch && options.forceBranch) {
+ 		throw new Error("fatal: options '-b' and '-B' cannot be used together");
+@@ -192,25 +280,48 @@ export async function listWorktrees(options: ListWorktreesOptions): Promise<void
  
  export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{ removed: number; failed: number }> {
  	const entries = await scanWorktrees();
@@ -157,7 +217,7 @@ index f9f8253..39456ee 100644
  		}
  		return { removed: 0, failed: 0 };
  	}
-@@ -228,8 +291,39 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
+@@ -228,8 +339,39 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
  					await fs.rm(target.path, { recursive: true, force: true });
  					parentsToPrune.add(target.parentRepo);
  				}
@@ -198,7 +258,7 @@ index f9f8253..39456ee 100644
  				await fs.rm(target.path, { recursive: true, force: true });
  				if (target.parentRepo) parentsToPrune.add(target.parentRepo);
  			}
-@@ -252,7 +346,9 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
+@@ -252,7 +394,9 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
  	const failed = results.length - succeeded;
  
  	if (options.json) {
@@ -209,7 +269,7 @@ index f9f8253..39456ee 100644
  		return { removed: succeeded, failed };
  	}
  
-@@ -264,6 +360,13 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
+@@ -264,6 +408,13 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
  			if (result.error) console.log(`          ${chalk.dim(result.error)}`);
  		}
  	}
@@ -223,7 +283,7 @@ index f9f8253..39456ee 100644
  	console.log(chalk.dim(`\n${succeeded} removed${failed > 0 ? ` · ${chalk.red(`${failed} failed`)}` : ""}`));
  	return { removed: succeeded, failed };
  }
-@@ -346,9 +449,18 @@ async function classifyDir(dir: string): Promise<WorktreeEntry | null> {
+@@ -346,9 +497,18 @@ async function classifyDir(dir: string): Promise<WorktreeEntry | null> {
  	}
  	if (!isIsolation) return null;
  	const live = await hasLiveIsolationOwner(dir);
@@ -242,7 +302,7 @@ index f9f8253..39456ee 100644
  		// Only after confirming no live owner is the "no live task" claim true.
  		// A running subagent's sandbox stays live so `clear` won't delete it.
  		orphanReason: live ? undefined : "task-isolation leftover (no live task owns it)",
-@@ -415,7 +527,7 @@ function formatEntryDetail(entry: WorktreeEntry): string {
+@@ -415,7 +575,7 @@ function formatEntryDetail(entry: WorktreeEntry): string {
  		const branch = entry.branch ?? "unknown branch";
  		parts.push(`${repo} · ${branch}`);
  	} else if (entry.kind === "task-isolation") {
@@ -252,9 +312,35 @@ index f9f8253..39456ee 100644
  		parts.push("legacy project shell");
  	} else {
 diff --git a/packages/coding-agent/src/commands/worktree.ts b/packages/coding-agent/src/commands/worktree.ts
-index 1796529..4a90d84 100644
+index 1796529..d868a41 100644
 --- a/packages/coding-agent/src/commands/worktree.ts
 +++ b/packages/coding-agent/src/commands/worktree.ts
+@@ -5,7 +5,7 @@
+ import { getProjectDir } from "@oh-my-pi/pi-utils";
+ import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
+ import { worktreeHelp as commandHelp } from "../cli/command-help";
+-import { addWorktree, clearWorktrees, listWorktrees } from "../cli/worktree-cli";
++import { addWorktree, clearWorktrees, listWorktrees, releaseWorktree } from "../cli/worktree-cli";
+ import { Settings } from "../config/settings";
+ 
+ export default class Worktree extends Command {
+@@ -15,13 +15,13 @@ export default class Worktree extends Command {
+ 	static args = {
+ 		// A positional action keeps `omp worktree` (the no-arg form) useful.
+ 		action: Args.string({
+-			description: "list (default), clear, or add",
++			description: "list (default), clear, add, or release",
+ 			required: false,
+-			options: ["list", "clear", "add"],
++			options: ["list", "clear", "add", "release"],
+ 			default: "list",
+ 		}),
+ 		path: Args.string({
+-			description: "Worktree path (add)",
++			description: "Worktree path (add, release)",
+ 			required: false,
+ 		}),
+ 		commit: Args.string({
 @@ -56,7 +56,8 @@ export default class Worktree extends Command {
  			default: false,
  		}),
@@ -265,6 +351,27 @@ index 1796529..4a90d84 100644
  			default: false,
  		}),
  		"dry-run": Flags.boolean({
+@@ -107,6 +108,20 @@ export default class Worktree extends Command {
+ 		}
+ 
+ 		await Settings.init({ cwd: getProjectDir() });
++		if (args.action === "release") {
++			if (!args.path) {
++				console.error("Error: Missing required argument: path");
++				process.exitCode = 1;
++				return;
++			}
++			try {
++				await releaseWorktree({ path: args.path, json: flags.json ?? false });
++			} catch (error) {
++				console.error(error instanceof Error ? error.message : String(error));
++				process.exitCode = 1;
++			}
++			return;
++		}
+ 		if (args.action === "clear") {
+ 			const { failed } = await clearWorktrees({
+ 				all: flags.all ?? false,
 diff --git a/packages/coding-agent/src/prompts/tools/isolation-summary.md b/packages/coding-agent/src/prompts/tools/isolation-summary.md
 index 69378db..2c7a6b2 100644
 --- a/packages/coding-agent/src/prompts/tools/isolation-summary.md
@@ -1485,10 +1592,16 @@ index 0ceddc2..b146118 100644
  		...effortField,
  		...schemaFields,
 diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/src/task/worktree.ts
-index 34fa981..fb64e10 100644
+index 34fa981..95ae2be 100644
 --- a/packages/coding-agent/src/task/worktree.ts
 +++ b/packages/coding-agent/src/task/worktree.ts
-@@ -6,11 +6,18 @@ import * as path from "node:path";
+@@ -1,16 +1,24 @@
+ import { type NestedRepoPatch } from "@oh-my-pi/pi-tui/tools/task";
+ import type { Dirent } from "node:fs";
++import type { FileHandle } from "node:fs/promises";
+ import * as fs from "node:fs/promises";
+ import * as os from "node:os";
+ import * as path from "node:path";
  import type { VcsCommitAuthor, VcsGitRepo } from "@oh-my-pi/pi-natives";
  import * as natives from "@oh-my-pi/pi-natives";
  import * as vcs from "@oh-my-pi/pi-natives/vcs";
@@ -1509,7 +1622,7 @@ index 34fa981..fb64e10 100644
  import { mapWithConcurrencyLimit } from "./parallel";
  import type { cfgIsolationBackend } from "./settings";
  
-@@ -618,7 +625,22 @@ function errorMessage(err: unknown): string {
+@@ -618,7 +626,22 @@ function errorMessage(err: unknown): string {
  	return err instanceof Error ? err.message : String(err);
  }
  
@@ -1533,7 +1646,7 @@ index 34fa981..fb64e10 100644
  	const key = `${path.resolve(repoRoot)}\0${id}`;
  	const digest = Bun.hash(key).toString(16).padStart(16, "0").slice(-TASK_ISOLATION_DIR_DIGEST_CHARS);
  	return `${TASK_ISOLATION_DIR_PREFIX}${digest}`;
-@@ -670,51 +692,83 @@ export async function ensureIsolation(
+@@ -670,51 +693,83 @@ export async function ensureIsolation(
  ): Promise<IsolationHandle> {
  	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
  	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
@@ -1597,8 +1710,7 @@ index 34fa981..fb64e10 100644
 +				throw new Error(
 +					`isolation workspace ${baseDir} is owned by a live omp process; finish or release it there before spawning this agent again`,
 +				);
- 			}
--			fallbackReason ??= message;
++			}
 +			const resolution = await natives.isoResolve(preferred ?? null);
 +			const candidates = resolution.candidates.length > 0 ? resolution.candidates : [resolution.kind];
 +			let fallbackReason = resolution.reason ?? null;
@@ -1637,7 +1749,8 @@ index 34fa981..fb64e10 100644
 +					}
 +					fallbackReason ??= message;
 +				}
-+			}
+ 			}
+-			fallbackReason ??= message;
 +
 +			throw new Error(fallbackReason ?? "No isolation backend is available.");
 +		});
@@ -1657,7 +1770,7 @@ index 34fa981..fb64e10 100644
  /**
   * Tear down a handle returned by {@link ensureIsolation}. When native teardown fails for a mount or
   * subvolume backend, the workspace is kept with a retained-backend sidecar (recursive `rm` would
-@@ -747,6 +801,422 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
+@@ -747,6 +802,502 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
  	await fs.rm(baseDir, { recursive: true, force: true });
  }
  
@@ -1930,6 +2043,86 @@ index 34fa981..fb64e10 100644
 +	return { workspaceDir: workspace };
 +}
 +
++/** Outcome of proving a workspace's transcript is genuinely its own. */
++export type PersistedReleaseIdentity = { transcriptFile: string; artifactsDir: string } | { refusal: string };
++
++/** First record of a transcript, read in a bounded prefix instead of the whole file. */
++async function readSessionHeader(file: string): Promise<Record<string, unknown> | undefined> {
++	let handle: FileHandle | undefined;
++	try {
++		handle = await fs.open(file, "r");
++		const buffer = Buffer.alloc(64 * 1024);
++		const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
++		const line = buffer.subarray(0, bytesRead).toString("utf8").split("\n", 1)[0];
++		const parsed: unknown = JSON.parse(line);
++		return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
++			? (parsed as Record<string, unknown>)
++			: undefined;
++	} catch {
++		return undefined;
++	} finally {
++		await handle?.close();
++	}
++}
++
++/**
++ * Independent transcript identity for an explicit release: the descriptor alone
++ * cannot authorize capture because a copied descriptor can point its own
++ * `sessionFile` at another session. The selected workspace is authorized by
++ * the directory the user named, and the transcript must independently prove it
++ * was created in that workspace (session header cwd) — plus, when the retention
++ * pointer exists beside it, that it names the same workspace. This also fixes
++ * the artifact directory to the verified transcript's directory, so release
++ * cannot overwrite another agent's `<id>.patch`.
++ */
++export async function bindPersistedReleaseWorkspace(state: LoadedIsolationState): Promise<PersistedReleaseIdentity> {
++	const named = state.sessionFile;
++	if (!named) return { refusal: "its descriptor does not name a transcript" };
++	const transcript = await realFile(named);
++	if (!transcript) return { refusal: `its transcript ${named} is not a readable file` };
++	if (path.basename(transcript) !== `${state.id}.jsonl`) {
++		return { refusal: `transcript ${transcript} is not "${state.id}.jsonl"` };
++	}
++	const header = await readSessionHeader(transcript);
++	if (header?.type !== "session" || typeof header.cwd !== "string" || !path.isAbsolute(header.cwd)) {
++		return { refusal: `transcript ${transcript} has no usable session header` };
++	}
++	const headerCwd = path.resolve(header.cwd);
++	const slotCwd = path.resolve(getWorktreesDir(), state.slot, state.mergedDir);
++	const retainedCwd = path.resolve(state.dir, state.mergedDir);
++	if (headerCwd !== slotCwd && headerCwd !== retainedCwd) {
++		return { refusal: `transcript ${transcript} was not created in ${state.dir}` };
++	}
++	const pointerFile = path.join(path.dirname(transcript), `${state.id}.isolation.json`);
++	try {
++		const pointer: unknown = await Bun.file(pointerFile).json();
++		if (pointer !== null && typeof pointer === "object" && "workspace" in pointer) {
++			const record = pointer as { dir?: unknown; workspace?: unknown };
++			const workspace = record.workspace;
++			// Every writer stores the MOUNT: spawn writes `<base>/m`, retention
++			// writes `<base>.retained-*/m`. Compare canonically against that mount.
++			const [pointerWorkspace, mount] = await Promise.all([
++				typeof workspace === "string" ? realDirectory(workspace) : Promise.resolve(undefined),
++				realDirectory(path.join(state.dir, state.mergedDir)),
++			]);
++			if (!pointerWorkspace || !mount || pointerWorkspace !== mount) {
++				return { refusal: `transcript ${transcript} points at ${String(workspace)}, not ${state.dir}` };
++			}
++			// `dir` is the sandbox base that contains the mount, for both original
++			// and retained workspaces.
++			if (typeof record.dir === "string") {
++				const pointerDir = await realDirectory(record.dir);
++				if (!pointerDir || pointerDir !== path.dirname(pointerWorkspace)) {
++					return { refusal: `its isolation pointer ${pointerFile} has an inconsistent dir` };
++				}
++			}
++		}
++	} catch (error) {
++		if (!isEnoent(error)) return { refusal: `its isolation pointer ${pointerFile} is unreadable` };
++	}
++	return { transcriptFile: transcript, artifactsDir: path.dirname(transcript) };
++}
++
 +/**
 + * Resolve the persisted isolation descriptor for a transcript, following the
 + * retention rename, and prove it is bound to this transcript.
@@ -2080,6 +2273,244 @@ index 34fa981..fb64e10 100644
  // ═══════════════════════════════════════════════════════════════════════════
  // Branch-mode isolation
  // ═══════════════════════════════════════════════════════════════════════════
+diff --git a/packages/coding-agent/test/cli/worktree-release-isolation.test.ts b/packages/coding-agent/test/cli/worktree-release-isolation.test.ts
+new file mode 100644
+index 0000000..46e1aed
+--- /dev/null
++++ b/packages/coding-agent/test/cli/worktree-release-isolation.test.ts
+@@ -0,0 +1,232 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
++import { $ } from "bun";
++import * as fs from "node:fs/promises";
++import * as os from "node:os";
++import * as path from "node:path";
++import * as natives from "@oh-my-pi/pi-natives";
++import { getWorktreesDir, setWorktreesDir } from "@oh-my-pi/pi-utils";
++import { releaseWorktree } from "@oh-my-pi/pi-coding-agent/cli/worktree-cli";
++import {
++	ISOLATION_OWNER_FILE,
++	readIsolationOwner,
++	writeIsolationOwner,
++} from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
++import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
++import {
++	getTaskIsolationSlot,
++	type RepoBaseline,
++	type WorktreeBaseline,
++	writeIsolationState,
++} from "@oh-my-pi/pi-coding-agent/task/worktree";
++
++const tempRoots: string[] = [];
++
++beforeEach(() => {
++	vi.spyOn(console, "log").mockImplementation(() => {});
++});
++
++afterEach(async () => {
++	vi.restoreAllMocks();
++	setWorktreesDir(undefined);
++	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
++});
++
++async function tempDir(prefix: string): Promise<string> {
++	const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
++	tempRoots.push(dir);
++	return dir;
++}
++
++function repoBaseline(repoRoot: string): RepoBaseline {
++	return {
++		repoRoot,
++		headCommit: "base",
++		staged: "",
++		unstaged: "",
++		untracked: [],
++		untrackedPatch: "",
++	};
++}
++
++function baselineFor(repoRoot: string): WorktreeBaseline {
++	return { root: repoBaseline(repoRoot), nested: [] };
++}
++
++async function retainedFixture(id = "agent-1") {
++	const root = await tempDir("omp-release-root-");
++	setWorktreesDir(root);
++	const repo = await tempDir("omp-release-repo-");
++	const slot = getTaskIsolationSlot(repo, id);
++	const base = path.join(root, slot);
++	await fs.mkdir(path.join(base, "m"), { recursive: true });
++	await Bun.write(path.join(base, "m", "work.txt"), "post-handoff\n");
++	const artifactsDir = await tempDir("omp-release-artifacts-");
++	const sessionFile = path.join(artifactsDir, `${id}.jsonl`);
++	const workspace = path.join(base, "m");
++	await Bun.write(
++		sessionFile,
++		`${JSON.stringify({
++			type: "session",
++			id: `session-${id}`,
++			timestamp: new Date().toISOString(),
++			cwd: workspace,
++		})}\n`,
++	);
++	// Spawn-time writer shape: `dir` is the sandbox base, `workspace` its mount.
++	await Bun.write(path.join(artifactsDir, `${id}.isolation.json`), JSON.stringify({ dir: base, workspace }));
++	await writeIsolationState(base, {
++		version: 1,
++		id,
++		repoRoot: repo,
++		backend: natives.IsoBackendKind.Rcopy,
++		slot,
++		mergedDir: "m",
++		baseline: baselineFor(repo),
++		sessionFile,
++	});
++	return { base, artifactsDir, sessionFile };
++}
++
++describe("worktree release retained task-isolation", () => {
++	it("captures post-handoff work and tears the sandbox down on explicit release", async () => {
++		const { base, artifactsDir } = await retainedFixture();
++		const capture = vi
++			.spyOn(worktreeModule, "captureDeltaPatch")
++			.mockResolvedValue({ rootPatch: "diff --git a/work b/work", nestedPatches: [] });
++		const commit = vi
++			.spyOn(worktreeModule, "commitToBranch")
++			.mockResolvedValue({ branchName: "omp/task/agent-1", baseSha: "base", rootPatch: "", nestedPatches: [] });
++		const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
++
++		await releaseWorktree({ path: base, json: true });
++
++		expect(capture).toHaveBeenCalledTimes(1);
++		expect(commit).toHaveBeenCalledTimes(1);
++		expect(commit.mock.calls[0]?.[0]).toBe(path.join(base, "m"));
++		expect(cleanup).toHaveBeenCalledTimes(1);
++		expect(cleanup.mock.calls[0]?.[0]?.mergedDir).toBe(path.join(base, "m"));
++		expect(await Bun.file(path.join(artifactsDir, "agent-1.patch")).text()).toBe("diff --git a/work b/work");
++		// The explicit release claims the slot for this process before capture.
++		expect((await readIsolationOwner(base))?.pid).toBe(process.pid);
++	});
++
++	it("refuses a sandbox with a live foreign owner and leaves it untouched", async () => {
++		const { base } = await retainedFixture();
++		const sleeper = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
++		try {
++			await Bun.write(path.join(base, ISOLATION_OWNER_FILE), JSON.stringify({ pid: sleeper.pid, id: "agent-1" }));
++			const capture = vi.spyOn(worktreeModule, "captureDeltaPatch");
++			const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation");
++
++			await expect(releaseWorktree({ path: base, json: true })).rejects.toThrow("owned by a live omp process");
++
++			expect(capture).not.toHaveBeenCalled();
++			expect(cleanup).not.toHaveBeenCalled();
++			expect(await Bun.file(path.join(base, "m", "work.txt")).text()).toBe("post-handoff\n");
++		} finally {
++			sleeper.kill();
++			await sleeper.exited;
++		}
++	});
++
++	it("releases a retention-renamed sandbox using the retained pointer shape", async () => {
++		const { base, artifactsDir } = await retainedFixture();
++		const retainedBase = `${base}.retained-test-1`;
++		await fs.rename(base, retainedBase);
++		// Retention rewrites the pointer to the renamed sandbox's mount; `dir` is
++		// that renamed sandbox base and the header still records the original mount.
++		await Bun.write(
++			path.join(artifactsDir, "agent-1.isolation.json"),
++			JSON.stringify({ dir: retainedBase, workspace: path.join(retainedBase, "m") }),
++		);
++		const capture = vi
++			.spyOn(worktreeModule, "captureDeltaPatch")
++			.mockResolvedValue({ rootPatch: "diff --git a/work b/work", nestedPatches: [] });
++		const commit = vi
++			.spyOn(worktreeModule, "commitToBranch")
++			.mockResolvedValue({ branchName: "omp/task/agent-1", baseSha: "base", rootPatch: "", nestedPatches: [] });
++		const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
++
++		await releaseWorktree({ path: retainedBase, json: true });
++
++		expect(capture).toHaveBeenCalledTimes(1);
++		expect(commit.mock.calls[0]?.[0]).toBe(path.join(retainedBase, "m"));
++		expect(cleanup.mock.calls[0]?.[0]?.mergedDir).toBe(path.join(retainedBase, "m"));
++	});
++
++	it("rejects a transcript whose pointer names another workspace", async () => {
++		const { base, artifactsDir } = await retainedFixture();
++		const otherRoot = await tempDir("omp-release-other-");
++		const otherMount = path.join(otherRoot, "m");
++		await fs.mkdir(otherMount, { recursive: true });
++		await Bun.write(
++			path.join(artifactsDir, "agent-1.isolation.json"),
++			JSON.stringify({ dir: otherRoot, workspace: otherMount }),
++		);
++		const capture = vi.spyOn(worktreeModule, "captureDeltaPatch");
++
++		await expect(releaseWorktree({ path: base, json: true })).rejects.toThrow("points at");
++
++		expect(capture).not.toHaveBeenCalled();
++		expect(await Bun.file(path.join(base, "m", "work.txt")).text()).toBe("post-handoff\n");
++	});
++
++	it("rejects a transcript that was not created in the selected workspace", async () => {
++		const { base } = await retainedFixture();
++		const victimRoot = await tempDir("omp-release-victim-");
++		const victimArtifacts = await tempDir("omp-release-victim-artifacts-");
++		const victimWorkspace = path.join(victimRoot, "m");
++		await fs.mkdir(victimWorkspace, { recursive: true });
++		const victimTranscript = path.join(victimArtifacts, "agent-1.jsonl");
++		await Bun.write(
++			victimTranscript,
++			`${JSON.stringify({
++				type: "session",
++				id: "victim",
++				timestamp: new Date().toISOString(),
++				cwd: victimWorkspace,
++			})}\n`,
++		);
++		await Bun.write(
++			path.join(victimArtifacts, "agent-1.isolation.json"),
++			JSON.stringify({ dir: victimRoot, workspace: victimWorkspace }),
++		);
++		const descriptor = path.join(base, ".omp-isolation-state.json");
++		const state = JSON.parse(await Bun.file(descriptor).text());
++		await Bun.write(descriptor, JSON.stringify({ ...state, sessionFile: victimTranscript }));
++		const capture = vi.spyOn(worktreeModule, "captureDeltaPatch");
++		const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation");
++
++		await expect(releaseWorktree({ path: base, json: true })).rejects.toThrow("was not created in");
++
++		expect(capture).not.toHaveBeenCalled();
++		expect(cleanup).not.toHaveBeenCalled();
++		expect(await Bun.file(path.join(base, "m", "work.txt")).text()).toBe("post-handoff\n");
++		expect(await Bun.file(path.join(victimArtifacts, "agent-1.patch")).exists()).toBe(false);
++	});
++
++	it("rejects a directory without a descriptor and preserves it", async () => {
++		const root = await tempDir("omp-release-root-");
++		setWorktreesDir(root);
++		const dir = path.join(root, "not-isolated");
++		await fs.mkdir(dir, { recursive: true });
++		await expect(releaseWorktree({ path: dir, json: true })).rejects.toThrow("Cannot release");
++		expect(await fs.stat(dir)).not.toBeNull();
++		expect(await fs.stat(path.join(dir, ISOLATION_OWNER_FILE)).catch(() => null)).toBeNull();
++	});
++
++	it.skipIf(process.platform === "win32")("accepts release as a positional action through the real CLI", async () => {
++		const root = await tempDir("omp-release-cli-root-");
++		setWorktreesDir(root);
++		const home = await tempDir("omp-release-cli-home-");
++		const dir = path.join(root, "not-isolated");
++		await fs.mkdir(dir, { recursive: true });
++		const cli = path.resolve(import.meta.dir, "../../src/cli.ts");
++		const result = await $`bun ${cli} worktree release ${dir}`
++			.env({ ...process.env, OMP_WORKTREE_DIR: root, HOME: home })
++			.quiet()
++			.nothrow();
++		expect(result.exitCode).toBe(1);
++		expect(result.stderr.toString()).toContain("Cannot release");
++	});
++});
 diff --git a/packages/coding-agent/test/fixtures/isolation-lease-child.ts b/packages/coding-agent/test/fixtures/isolation-lease-child.ts
 new file mode 100644
 index 0000000..2da7523
