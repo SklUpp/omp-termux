@@ -2029,7 +2029,7 @@ index 34fa981..4355498 100644
  // ═══════════════════════════════════════════════════════════════════════════
 diff --git a/packages/coding-agent/test/task/isolation-retained.test.ts b/packages/coding-agent/test/task/isolation-retained.test.ts
 new file mode 100644
-index 0000000..dee25df
+index 0000000..b9108bf
 --- /dev/null
 +++ b/packages/coding-agent/test/task/isolation-retained.test.ts
 @@ -0,0 +1,828 @@
@@ -2043,7 +2043,6 @@ index 0000000..dee25df
 +import { clearWorktrees, stopRetainedMount } from "@oh-my-pi/pi-coding-agent/cli/worktree-cli";
 +import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 +import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
-+import * as piUtils from "@oh-my-pi/pi-utils";
 +import {
 +	claimIsolationOwner,
 +	ISOLATION_OWNER_FILE,
@@ -2065,6 +2064,7 @@ index 0000000..dee25df
 +	ISOLATION_STATE_FILE,
 +	type IsolationState,
 +	type IsolationStateRead,
++	type RepoBaseline,
 +	isolationStateExists,
 +	readIsolationState,
 +	resolveIsolationWorkspace,
@@ -2087,18 +2087,19 @@ index 0000000..dee25df
 +	return dir;
 +}
 +
-+function baselineFor(repoRoot: string): WorktreeBaseline {
++function repoBaselineFor(repoRoot: string): RepoBaseline {
 +	return {
-+		root: {
-+			repoRoot,
-+			headCommit: "a".repeat(40),
-+			staged: "",
-+			unstaged: "diff --git a/file.txt b/file.txt",
-+			untracked: ["notes.txt"],
-+			untrackedPatch: "diff --git a/notes.txt b/notes.txt",
-+		},
-+		nested: [],
++		repoRoot,
++		headCommit: "a".repeat(40),
++		staged: "",
++		unstaged: "diff --git a/file.txt b/file.txt",
++		untracked: ["notes.txt"],
++		untrackedPatch: "diff --git a/notes.txt b/notes.txt",
 +	};
++}
++
++function baselineFor(repoRoot: string): WorktreeBaseline {
++	return { root: repoBaselineFor(repoRoot), nested: [] };
 +}
 +
 +function result(id: string): SingleResult {
@@ -2112,6 +2113,11 @@ index 0000000..dee25df
 +		aborted: false,
 +		output: "done",
 +		durationMs: 1,
++		agentSource: "bundled",
++		stderr: "",
++		truncated: false,
++		tokens: 0,
++		requests: 0,
 +	};
 +}
 +
@@ -2272,7 +2278,7 @@ index 0000000..dee25df
 +		const escapingNested = structuredClone(valid.baseline);
 +		escapingNested.nested.push({
 +			relativePath: "../outside",
-+			baseline: baselineFor(base),
++			baseline: repoBaselineFor(path.join(base, "outside")),
 +		});
 +		await Bun.write(file, JSON.stringify({ ...valid, baseline: escapingNested }));
 +		expect(await readIsolationState(base)).toMatchObject({ error: "corrupt" });
@@ -2280,7 +2286,7 @@ index 0000000..dee25df
 +		const mismatchedNested = structuredClone(valid.baseline);
 +		mismatchedNested.nested.push({
 +			relativePath: "sub",
-+			baseline: baselineFor(path.join(base, "elsewhere")),
++			baseline: repoBaselineFor(path.join(base, "elsewhere")),
 +		});
 +		await Bun.write(file, JSON.stringify({ ...valid, baseline: mismatchedNested }));
 +		expect(await readIsolationState(base)).toMatchObject({ error: "corrupt" });
@@ -2808,15 +2814,9 @@ index 0000000..dee25df
 +		expect(await fs.stat(retainedDead).catch(() => null)).not.toBeNull();
 +		expect(await fs.stat(liveOwned).catch(() => null)).not.toBeNull();
 +
-+		// A platform whose lock PROBE is unsupported reports `null` for every
-+		// sandbox. `clear` must not filter on that: it attempts the real lease, so
-+		// a dead retained sandbox is still reclaimed instead of hidden forever.
-+		const probe = vi.spyOn(piUtils, "isFileLockHeld").mockReturnValue(null);
-+		try {
-+			await clearWorktrees({ all: true, dryRun: false, json: true });
-+		} finally {
-+			probe.mockRestore();
-+		}
++		// `--all` attempts the real lease instead of trusting any lock probe: a
++		// dead retained sandbox is reclaimed while a live owner stays untouched.
++		await clearWorktrees({ all: true, dryRun: false, json: true });
 +		expect(await fs.stat(retainedDead).catch(() => null)).toBeNull();
 +		expect(await fs.stat(liveOwned).catch(() => null)).not.toBeNull();
 +	});
@@ -2862,7 +2862,7 @@ index 0000000..dee25df
 +	});
 +});
 diff --git a/packages/coding-agent/test/task/persisted-revive.test.ts b/packages/coding-agent/test/task/persisted-revive.test.ts
-index 1381081..8c7d364 100644
+index 1381081..1cfffbf 100644
 --- a/packages/coding-agent/test/task/persisted-revive.test.ts
 +++ b/packages/coding-agent/test/task/persisted-revive.test.ts
 @@ -16,6 +16,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -2906,7 +2906,7 @@ index 1381081..8c7d364 100644
  		task: "persisted task",
  		tools: contract?.tools ?? ["read", "yield"],
  		restrictToolNames,
-@@ -552,19 +562,73 @@ describe("persisted subagent revival", () => {
+@@ -552,19 +562,75 @@ describe("persisted subagent revival", () => {
  		expect(capturedOptions?.customTools).toBeUndefined();
  	});
  
@@ -2982,14 +2982,16 @@ index 1381081..8c7d364 100644
 +		if (!reviver) throw new Error("Expected a persisted reviver");
 +		await reviver(ref);
 +
-+		const rendered = capturedOptions?.systemPrompt?.([]) ?? [];
++		const promptOption = capturedOptions?.systemPrompt;
++		const rawPrompt = typeof promptOption === "function" ? promptOption([]) : promptOption;
++		const rendered = rawPrompt === undefined ? [] : Array.isArray(rawPrompt) ? rawPrompt : [rawPrompt];
 +		expect(rendered.join("\n")).toContain(newWorkspace);
 +		expect(rendered.join("\n")).not.toContain(oldWorkspace);
 +		expect(await readIsolationOwner(retained)).toMatchObject({ pid: process.pid });
  	});
  
  	it("restores the persisted agent definition name on cold revival so agent-scoped rules keep matching", async () => {
-@@ -2454,3 +2518,216 @@ describe("buildWakeRelayBody", () => {
+@@ -2454,3 +2520,216 @@ describe("buildWakeRelayBody", () => {
  		});
  	});
  });
@@ -3059,7 +3061,7 @@ index 1381081..8c7d364 100644
 +	const sessionFile = manager.getSessionFile();
 +	if (!sessionFile) throw new Error("Expected a persisted session file");
 +	manager.appendSessionInit({
-+		systemPrompt: contract?.systemPrompt ?? ["persisted prompt"],
++		systemPrompt: ["persisted prompt"],
 +		task: "persisted task",
 +		tools: ["read", "yield"],
 +		isolated: true,
@@ -3114,7 +3116,7 @@ index 1381081..8c7d364 100644
 +		// Revive claims the sandbox so `worktree clear` cannot reclaim it live.
 +		expect((await readIsolationOwner(fixture.base))?.pid).toBe(process.pid);
 +		// Same transcript replayed, not a fresh one.
-+		expect(created?.sessionManager.getEntries().length).toBeGreaterThan(1);
++		expect(created?.sessionManager?.getEntries().length).toBeGreaterThan(1);
 +
 +		// Park frees the live session but keeps the workspace; the follow-up
 +		// revive must land in the same workspace again.
