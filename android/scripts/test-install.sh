@@ -40,6 +40,18 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$url" ] || { echo 'stub curl: no url' >&2; exit 2; }
 printf '%s\n' "$url" >> "${CURL_LOG:?}"
+case $url in
+	https://api.github.com/*)
+		[ "${CURL_API_FAIL:-0}" != 1 ] || { echo 'stub curl: api failure' >&2; exit 22; }
+		api_json=${CURL_API_JSON:-}
+		case $url in
+			*page=2*) api_json=${CURL_API_JSON_PAGE2:-$api_json} ;;
+		esac
+		[ -n "$api_json" ] || { echo 'stub curl: missing CURL_API_JSON' >&2; exit 22; }
+		if [ -n "$out" ]; then cp "$api_json" "$out"; else cat "$api_json"; fi
+		exit 0
+		;;
+esac
 [ -n "$out" ] || { echo 'stub curl: no -o' >&2; exit 2; }
 src=$CURL_ASSET_DIR/$(basename "$url")
 [ -f "$src" ] || { echo "stub curl: missing $src" >&2; exit 22; }
@@ -104,7 +116,9 @@ run_install() { # asset_dir [VAR=value ...]
 	env -i PATH="$stub:$base_path" HOME="$CASE/home" PREFIX="$PREFIX_T" \
 		OMP_LIB_DIR="$LIB_T" TMPDIR="$CASE/tmp" BUN_LOG="$CASE/bun.log" \
 		CURL_LOG="$CASE/curl.log" PKG_LOG="$CASE/pkg.log" CURL_ASSET_DIR="$asset" \
-		"$@" sh "$src" > "$CASE/run.log" 2>&1
+		CURL_API_JSON="${CURL_API_JSON:-}" CURL_API_JSON_PAGE2="${CURL_API_JSON_PAGE2:-}" \
+		CURL_API_FAIL="${CURL_API_FAIL:-0}" \
+		"$@" sh "$src" ${INSTALL_ARGS:-} > "$CASE/run.log" 2>&1
 }
 
 run_launcher() { # args...
@@ -119,6 +133,20 @@ make_asset "$assets/badpost" vB badpost
 make_asset "$assets/badnative" vB badnative
 cp -a "$assets/good-a" "$assets/badsum"
 { printf '0%.0s' {1..64}; printf '  omp-termux.tar.gz\n'; } > "$assets/badsum/omp-termux.tar.gz.sha256"
+
+api_extended=$root/api-extended.json
+cat > "$api_extended" <<'JSON'
+[
+  {"tag_name":"v18.16.0-termux-r421bcd8505e7","prerelease":false},
+  {"tag_name":"v18.16.0-termux-ex-r77f7e6811d20","prerelease":true}
+]
+JSON
+api_missing=$root/api-missing.json
+printf '[]\n' > "$api_missing"
+api_page1=$root/api-page1.json
+api_page2=$root/api-page2.json
+printf '[{"tag_name":"v18.16.0-termux-r421bcd8505e7"}]\n' > "$api_page1"
+printf '[{"tag_name":"v18.16.0-termux-ex"}]\n' > "$api_page2"
 
 # 1. latest install: URL, checksum, no browser packages, launcher path/args/platform
 new_case latest
@@ -238,5 +266,99 @@ $(cat "$CASE/bun.log")"
 else
 	echo 'SKIP launcher preload (no usable preload library)'
 fi
+
+# 10. -ex resolves latest extended release and installs the exact tag URL
+new_case extended
+INSTALL_ARGS=-ex CURL_API_JSON="$api_extended" run_install "$assets/good-a" \
+	|| { cat "$CASE/run.log"; die '-ex extended latest install failed'; }
+expect_version vA
+grep -Fxq 'https://api.github.com/repos/SklUpp/omp-termux/releases?per_page=100&page=1' "$CASE/curl.log" \
+	|| die 'extended API URL'
+grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/download/v18.16.0-termux-ex-r77f7e6811d20/omp-termux.tar.gz' "$CASE/curl.log" \
+	|| die 'extended tag download URL'
+! grep -q '/releases/latest/download/omp-termux.tar.gz' "$CASE/curl.log" \
+	|| die 'extended install used latest standard'
+pass '-ex resolves latest extended tag, exact download URL'
+
+# 11. -ex missing extended does not fall back to standard latest
+new_case extended-missing
+run_install "$assets/good-a" || die 'extended-missing base install failed'
+if INSTALL_ARGS=-ex CURL_API_JSON="$api_missing" run_install "$assets/good-a"; then
+	die 'missing extended release accepted'
+fi
+grep -q 'no extended release found' "$CASE/run.log" || die 'missing extended reason absent'
+expect_version vA
+expect_absent "$LIB_T.new"; expect_absent "$LIB_T.old"
+! grep -q '/releases/latest/download/omp-termux.tar.gz' "$CASE/curl.log" \
+	|| die 'missing extended fell back to standard latest'
+pass 'missing extended release fails closed without standard fallback'
+
+# 12. -ex API failure does not fall back to standard latest
+new_case extended-api-error
+run_install "$assets/good-a" || die 'extended-api base install failed'
+if INSTALL_ARGS=-ex CURL_API_FAIL=1 run_install "$assets/good-a"; then
+	die 'extended API failure accepted'
+fi
+grep -q 'failed to query GitHub releases' "$CASE/run.log" || die 'API failure reason absent'
+expect_version vA
+! grep -q '/releases/latest/download/omp-termux.tar.gz' "$CASE/curl.log" \
+	|| die 'API failure fell back to standard latest'
+pass 'extended API failure fails closed without standard fallback'
+
+# 13. pinned extended tag is exact; no release-list API call
+new_case extended-pinned
+INSTALL_ARGS=-ex run_install "$assets/good-a" OMP_VERSION=v18.16.0-termux-ex-r77f7e6811d20 \
+	|| { cat "$CASE/run.log"; die 'pinned extended install failed'; }
+expect_version vA
+grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/download/v18.16.0-termux-ex-r77f7e6811d20/omp-termux.tar.gz' "$CASE/curl.log" \
+	|| die 'pinned extended exact URL'
+! grep -q 'api.github.com' "$CASE/curl.log" || die 'pinned extended called release API'
+pass 'pinned extended tag is exact and does not query latest'
+
+# 14. pinned standard tag with -ex is rejected, not silently downgraded
+new_case extended-pinned-mismatch
+if INSTALL_ARGS=-ex run_install "$assets/good-a" OMP_VERSION=v18.16.0-termux; then
+	die 'pinned standard tag accepted with -ex'
+fi
+grep -q 'requires an extended release tag' "$CASE/run.log" || die 'pinned -ex mismatch reason absent'
+! grep -q 'api.github.com' "$CASE/curl.log" || die 'pinned -ex mismatch called API'
+pass 'pinned standard tag with -ex fails closed'
+
+# 15. stale/concurrent staging is not reused or deleted
+new_case preexisting-stage
+mkdir -p "$LIB_T.new"
+printf 'preexisting\n' > "$LIB_T.new/keep.txt"
+run_install "$assets/good-a" || { cat "$CASE/run.log"; die 'install with preexisting stage failed'; }
+expect_version vA
+[ "$(cat "$LIB_T.new/keep.txt" 2>/dev/null)" = preexisting ] || die 'preexisting staging was deleted or modified'
+pass 'preexisting staging is preserved; unique stage is used'
+
+# 16. destination lock rejects a concurrent installer
+if command -v flock >/dev/null 2>&1; then
+	new_case locked
+	exec 8>"$LIB_T.install.lock"
+	flock -n 8 || die 'could not hold test install lock'
+	if run_install "$assets/good-a"; then
+		exec 8>&-
+		die 'concurrent install was not rejected'
+	fi
+	exec 8>&-
+	grep -q 'already in progress' "$CASE/run.log" || die 'lock rejection reason absent'
+	expect_absent "$LIB_T"
+	pass 'concurrent install fails on destination lock'
+else
+	echo 'SKIP: flock unavailable'
+fi
+
+# 17. -ex follows release-list pagination to find an older extended tag
+new_case extended-page2
+INSTALL_ARGS=-ex CURL_API_JSON="$api_page1" CURL_API_JSON_PAGE2="$api_page2" run_install "$assets/good-a" \
+	|| { cat "$CASE/run.log"; die 'extended page-2 install failed'; }
+expect_version vA
+grep -Fxq 'https://api.github.com/repos/SklUpp/omp-termux/releases?per_page=100&page=2' "$CASE/curl.log" \
+	|| die 'extended API page 2 not requested'
+grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/download/v18.16.0-termux-ex/omp-termux.tar.gz' "$CASE/curl.log" \
+	|| die 'extended page-2 tag URL'
+pass '-ex follows API pagination'
 
 echo 'ALL INSTALL E2E CHECKS PASSED'

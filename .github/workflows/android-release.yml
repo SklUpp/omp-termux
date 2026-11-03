@@ -5,6 +5,8 @@ on:
     tags:
       - "v*-termux"
       - "v*-termux-r*"
+      - "v*-termux-ex"
+      - "v*-termux-ex-r*"
   workflow_dispatch:
     inputs:
       tag:
@@ -15,16 +17,21 @@ permissions:
   contents: write
 
 concurrency:
-  group: android-release-${{ inputs.tag || github.ref_name }}
+  group: ${{ contains(inputs.tag || github.ref_name, '-termux-ex') && format('android-release-extended-{0}', inputs.tag || github.ref_name) || 'android-release-standard' }}
   cancel-in-progress: false
 
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  RELEASE_VARIANT: ${{ contains(inputs.tag || github.ref_name, '-termux-ex') && 'extended' || 'standard' }}
+  OMP_PATCH_PROFILE: ${{ contains(inputs.tag || github.ref_name, '-termux-ex') && 'extended' || 'standard' }}
+  OMP_RELEASE_VARIANT: ${{ contains(inputs.tag || github.ref_name, '-termux-ex') && 'extended' || 'standard' }}
 
 jobs:
   preflight:
     name: Release preflight
     uses: ./.github/workflows/ci.yml
+    with:
+      patch-profile: ${{ contains(inputs.tag || github.ref_name, '-termux-ex') && 'extended' || 'standard' }}
     permissions:
       contents: read
 
@@ -395,10 +402,26 @@ jobs:
           bash android/scripts/verify-browser.sh --help | grep -q '149.0.7827.155'
           echo "browser bundle-absence OK"
 
+      - name: Decide latest promotion
+        id: latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          make_latest=false
+          if [ "$RELEASE_VARIANT" = "standard" ]; then
+            current=$(bash android/scripts/read-latest-tag.sh "$GITHUB_REPOSITORY")
+            make_latest=$(python3 android/scripts/should-promote-latest.py --strict "$RELEASE_TAG" "$current")
+          fi
+          echo "make_latest=$make_latest" >> "$GITHUB_OUTPUT"
+
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
+          prerelease: ${{ env.RELEASE_VARIANT == 'extended' }}
+          make_latest: ${{ steps.latest.outputs.make_latest }}
           files: |
             omp-termux.tar.gz
             omp-termux.tar.gz.sha256

@@ -9,6 +9,12 @@ on:
     branches: [main]
   workflow_dispatch:
   workflow_call:
+    inputs:
+      patch-profile:
+        description: "Patch profile (standard excludes patch 02)"
+        required: false
+        type: string
+        default: extended
 
 # Keep PR feedback current; never cancel main pushes or manual runs.
 concurrency:
@@ -17,6 +23,7 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  OMP_PATCH_PROFILE: ${{ inputs.patch-profile || 'extended' }}
 
 permissions:
   contents: read
@@ -56,6 +63,11 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
         run: bash android/scripts/test-install.sh
+      - name: Verify patch profiles and release tags
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: bash android/scripts/test-patch-profiles.sh
       - name: Build host native addon for applied tests
         run: bun --cwd=packages/natives run build
       - name: Type check applied patch queue
@@ -91,6 +103,7 @@ jobs:
       # release contracts added by patch 02, so a missing/renamed file must fail the job instead of
       # silently greening the overlay check.
       - name: Run isolation lifecycle tests
+        if: env.OMP_PATCH_PROFILE == 'extended'
         shell: bash
         run: |
           bun test \

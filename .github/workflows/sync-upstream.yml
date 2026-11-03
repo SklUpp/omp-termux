@@ -51,8 +51,12 @@ jobs:
           git -C "$probe_dir" init -q
           if ! git -C "$probe_dir" apply --check --whitespace=nowarn "$GITHUB_WORKSPACE/android/patches/01-termux.patch" 2>/dev/null; then
             rm -rf "$probe_dir"
-            echo "::warning::Patches do not apply cleanly onto upstream tip $upstream_tip; skipping automatic update"
+            echo "::warning::Standard patch 01 does not apply cleanly onto upstream tip $upstream_tip; skipping automatic update"
             exit 0
+          fi
+          git -C "$probe_dir" apply --whitespace=nowarn "$GITHUB_WORKSPACE/android/patches/01-termux.patch"
+          if ! git -C "$probe_dir" apply --check --whitespace=nowarn "$GITHUB_WORKSPACE/android/patches/02-isolated-revive.patch" 2>/dev/null; then
+            echo "::warning::Extended patch 02 does not apply onto upstream tip $upstream_tip; standard release can proceed, extended will be skipped"
           fi
           rm -rf "$probe_dir"
 

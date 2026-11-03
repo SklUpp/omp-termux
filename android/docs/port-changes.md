@@ -42,9 +42,11 @@ are **not** claimed applied here.
 
 There is **one** delivery mechanism: the sequential raw Git patch queue.
 
-`android/scripts/apply-patches.sh` validates `android/patches/MANIFEST`, checks each
-patch with `git apply --check`, then applies patches in manifest order. It also
-accepts an already-patched tree without reapplying patches.
+`android/scripts/apply-patches.sh` selects `OMP_PATCH_PROFILE=standard` or
+`extended` (default extended), validates the matching manifest
+(`MANIFEST.standard` = 01 only, `MANIFEST` = 01+02), checks each patch with
+`git apply --check`, then applies patches in manifest order. It also accepts an
+already-patched tree without reapplying patches.
 
 The queue is regenerated from clean upstream-derived source when upstream changes.
 The sync workflow applies it in CI; release workflows apply it idempotently after

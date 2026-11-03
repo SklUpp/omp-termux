@@ -72,6 +72,18 @@ curl -fsSL https://raw.githubusercontent.com/SklUpp/omp-termux/main/install.sh |
 omp --version
 ```
 
+Standard release (default) applies only `01-termux.patch`. The extended release
+adds the isolation lifecycle patch (`02-isolated-revive.patch`) and is selected
+with `-ex`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/SklUpp/omp-termux/main/install.sh | sh -s -- -ex
+```
+
+`-ex` resolves the newest `v*-termux-ex` release tag through the GitHub API and
+fails closed if none exists. `OMP_VERSION='<tag>'` pins the exact tag and never
+falls back to another release.
+
 Current `install.sh` (see `install.sh` in this repo) is now a **guarded**
 installer. It:
 

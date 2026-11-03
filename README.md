@@ -16,7 +16,7 @@ sh "$PREFIX/tmp/omp-install.sh"
 omp --version
 ```
 
-Установка: `$PREFIX/lib/omp-termux`, launcher: `$PREFIX/bin/omp`. Обновление и выбор версии — повторный запуск: `OMP_VERSION='<release-tag>' sh "$PREFIX/tmp/omp-install.sh"` (по умолчанию `latest`).
+Установка: `$PREFIX/lib/omp-termux`, launcher: `$PREFIX/bin/omp`. По умолчанию ставится standard release (без isolation patch 02). Extended release: `sh "$PREFIX/tmp/omp-install.sh" -ex` (или `curl ... | sh -s -- -ex`), выбирает latest extended tag. Точная версия: `OMP_VERSION='<release-tag>' sh "$PREFIX/tmp/omp-install.sh"`; pinned tag используется без fallback.
 
 ## Браузер (опционально)
 
