@@ -2261,6 +2261,8 @@ export interface TaskItem {
 	tools?: string[];
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
+	/** Optional explicit git repository root for task isolation. */
+	repoRoot?: string;
 }
 
 /**
@@ -2298,6 +2300,8 @@ export interface TaskParams {
 	context?: string;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
+	/** Explicit repository root (flat form or batch context override). */
+	repoRoot?: string;
 }
 
 /**
@@ -2526,9 +2530,10 @@ export interface SingleResult {
 	/** Output path for the task result */
 	outputPath?: string;
 	/**
-	 * Ran inside an isolation worktree. Such agents are parked without a
-	 * reviver once the worktree is torn down, so they are never resumable or
-	 * messageable after the run — summaries must not suggest otherwise.
+	 * Ran inside an isolation worktree. The workspace is retained until an
+	 * explicit release: an isolated agent stays revivable from its transcript
+	 * and resumes in that workspace, never in the parent cwd. Summaries must
+	 * not claim messaging is impossible.
 	 */
 	isolated?: boolean;
 	/** Patch path for isolated worktree output */

@@ -6,11 +6,18 @@ import * as path from "node:path";
 import type { VcsCommitAuthor, VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { formatBytes, getWorktreeDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { formatBytes, getWorktreeDir, getWorktreesDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { SettingValueOf } from "../config/registry";
 
 import { withRepoLock } from "../utils/repo-lock";
-import { needsNativeTeardown, writeIsolationOwner, writeRetainedBackend } from "./isolation-ownership";
+import {
+	hasLiveIsolationOwner,
+	IsolationLeaseBusyError,
+	needsNativeTeardown,
+	withIsolationLease,
+	writeIsolationOwner,
+	writeRetainedBackend,
+} from "./isolation-ownership";
 import { mapWithConcurrencyLimit } from "./parallel";
 import type { cfgIsolationBackend } from "./settings";
 
@@ -47,18 +54,35 @@ export interface WorktreeBaseline {
 	nested: Array<{ relativePath: string; baseline: RepoBaseline }>;
 }
 
-export async function getRepoRoot(cwd: string): Promise<string> {
+export async function getRepoRoot(cwd: string, explicitRepoRoot?: string): Promise<string> {
+	const targetPath = explicitRepoRoot ? path.resolve(cwd, explicitRepoRoot) : cwd;
 	// Pure-jj check runs first so a jj workspace nested under an unrelated
 	// outer Git checkout is rejected at its own root rather than silently
 	// mutating the surrounding Git tree behind jj's back.
-	if (vcs.isPureJj(cwd)) {
+	if (vcs.isPureJj(targetPath)) {
 		throw new Error(
 			"Isolated task execution requires a Git checkout, but this workspace is pure Jujutsu (`.jj/` without a colocated `.git/`). Run `jj git init --colocate` to add a Git checkout, or set `task.isolation.enabled: false` to disable task isolation.",
 		);
 	}
 
-	const repoRoot = vcs.git(cwd)?.info().repoRoot;
-	if (repoRoot) return repoRoot;
+	const repoInfo = vcs.git(targetPath)?.info();
+	const resolvedRoot = repoInfo?.repoRoot;
+	if (resolvedRoot) {
+		if (explicitRepoRoot) {
+			const canonicalTarget = path.resolve(targetPath);
+			const canonicalResolved = path.resolve(resolvedRoot);
+			if (canonicalTarget !== canonicalResolved && !canonicalTarget.startsWith(canonicalResolved + path.sep)) {
+				throw new Error(
+					`Explicit repoRoot '${explicitRepoRoot}' does not match resolved git repository '${resolvedRoot}'.`,
+				);
+			}
+		}
+		return resolvedRoot;
+	}
+
+	if (explicitRepoRoot) {
+		throw new Error(`Explicit repoRoot '${explicitRepoRoot}' is not a valid Git repository.`);
+	}
 
 	throw new Error("Git repository not found for isolated task execution.");
 }
@@ -601,7 +625,22 @@ function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
 
-function getTaskIsolationSegment(repoRoot: string, id: string): string {
+const TASK_ISOLATION_SLOT_RE = new RegExp(`^${TASK_ISOLATION_DIR_PREFIX}[0-9a-f]{${TASK_ISOLATION_DIR_DIGEST_CHARS}}$`);
+const TASK_ISOLATION_RETAINED_SUFFIX_RE = /^\.retained-[0-9a-z]+-[0-9a-f]+$/;
+
+/**
+ * Slot basename carried by a sandbox directory: the plain slot or a
+ * `.retained-*` sibling, so both map to the SAME persistent lease key.
+ */
+export function isolationSlotFromDirName(name: string): string | undefined {
+	const at = name.indexOf(".retained-");
+	const slot = at === -1 ? name : name.slice(0, at);
+	if (!TASK_ISOLATION_SLOT_RE.test(slot)) return undefined;
+	if (at !== -1 && !TASK_ISOLATION_RETAINED_SUFFIX_RE.test(name.slice(at))) return undefined;
+	return slot;
+}
+
+export function getTaskIsolationSlot(repoRoot: string, id: string): string {
 	const key = `${path.resolve(repoRoot)}\0${id}`;
 	const digest = Bun.hash(key).toString(16).padStart(16, "0").slice(-TASK_ISOLATION_DIR_DIGEST_CHARS);
 	return `${TASK_ISOLATION_DIR_PREFIX}${digest}`;
@@ -649,54 +688,87 @@ export async function ensureIsolation(
 	baseCwd: string,
 	id: string,
 	preferred?: IsoBackendKind,
+	explicitRepoRoot?: string,
 ): Promise<IsolationHandle> {
-	const repoRoot = await getRepoRoot(baseCwd);
+	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
 	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
-	const baseDir = getWorktreeDir(getTaskIsolationSegment(repoRoot, id));
+	const slot = getTaskIsolationSlot(repoRoot, id);
+	const baseDir = getWorktreeDir(slot);
 	const mergedDir = path.join(baseDir, TASK_ISOLATION_MOUNT_DIR);
-	const resolution = await natives.isoResolve(preferred ?? null);
-	const candidates = resolution.candidates.length > 0 ? resolution.candidates : [resolution.kind];
-	let fallbackReason = resolution.reason ?? null;
-
-	for (const candidate of candidates) {
-		await fs.rm(baseDir, { recursive: true, force: true });
-		// Claim ownership before the backend materialises `m`. Backends only
-		// create/replace `mergedDir` (and overlay upper/work), never the base
-		// dir, so the marker survives `isoStart` — and a concurrent
-		// `omp worktree clear` never sees this sandbox without a live owner,
-		// even while a large clone is still in progress.
-		await fs.mkdir(baseDir, { recursive: true });
-		await writeIsolationOwner(baseDir, id);
-		try {
-			await natives.isoStart(candidate, repoRoot, mergedDir);
-			// Sever the isolation's git metadata from the source checkout. Copy
-			// backends duplicate `repoRoot`'s `.git` verbatim — a linked-worktree
-			// pointer file (or the rcopy `git worktree add` registration) leaves
-			// the isolation sharing the source's HEAD/index/ref namespace, so a
-			// task's git operations would mutate the parent checkout and stack
-			// parallel task branches. Detaching gives each isolation a private,
-			// frozen repo that still borrows the source object DB via alternates.
-			await detachSubmodules(repoRoot, mergedDir);
-			await vcs.detachGitDir(mergedDir, sourceCommonDir);
-			return {
-				mergedDir,
-				backend: candidate,
-				fellBack: candidate !== resolution.kind || resolution.fellBack,
-				fallbackReason,
-			};
-		} catch (err) {
-			await fs.rm(baseDir, { recursive: true, force: true });
-			const message = errorMessage(err);
-			if (!natives.isoIsUnavailableError(message)) {
-				throw err;
+	// Everything from the retained-workspace check through the destructive
+	// replacement and the fresh owner marker happens under the SAME external
+	// slot lease `clear` and release take. Without it, `clear` could classify a
+	// dead leftover, then delete the sandbox this spawn just replaced (or two
+	// same-id spawns could both rebuild the slot). The lease is keyed by the
+	// immutable slot and lives outside the sandbox, so the rm below cannot move
+	// the locked inode; it ends only after the new owner marker is published.
+	let handle: IsolationHandle | undefined;
+	try {
+		handle = await withIsolationLease(slot, async () => {
+			// A descriptor means the workspace is retained until an explicit
+			// release. Refuse BEFORE the candidate loop's unconditional `rm`
+			// could wipe it.
+			await assertIsolationWorkspaceReleased(baseDir, id);
+			// A live owner is never reclaimed, even marker-only: the spawn that
+			// wrote it is mid-setup, and deleting its base dir would leave the
+			// backend writing into a freshly recreated slot.
+			if (await hasLiveIsolationOwner(baseDir)) {
+				throw new Error(
+					`isolation workspace ${baseDir} is owned by a live omp process; finish or release it there before spawning this agent again`,
+				);
 			}
-			fallbackReason ??= message;
+			const resolution = await natives.isoResolve(preferred ?? null);
+			const candidates = resolution.candidates.length > 0 ? resolution.candidates : [resolution.kind];
+			let fallbackReason = resolution.reason ?? null;
+
+			for (const candidate of candidates) {
+				await fs.rm(baseDir, { recursive: true, force: true });
+				// Claim ownership before the backend materialises `m`. Backends only
+				// create/replace `mergedDir` (and overlay upper/work), never the base
+				// dir, so the marker survives `isoStart` — and a concurrent
+				// `omp worktree clear` never sees this sandbox without a live owner,
+				// even while a large clone is still in progress.
+				await fs.mkdir(baseDir, { recursive: true });
+				await writeIsolationOwner(baseDir, id);
+				try {
+					await natives.isoStart(candidate, repoRoot, mergedDir);
+					// Sever the isolation's git metadata from the source checkout. Copy
+					// backends duplicate `repoRoot`'s `.git` verbatim — a linked-worktree
+					// pointer file (or the rcopy `git worktree add` registration) leaves
+					// the isolation sharing the source's HEAD/index/ref namespace, so a
+					// task's git operations would mutate the parent checkout and stack
+					// parallel task branches. Detaching gives each isolation a private,
+					// frozen repo that still borrows the source object DB via alternates.
+					await detachSubmodules(repoRoot, mergedDir);
+					await vcs.detachGitDir(mergedDir, sourceCommonDir);
+					return {
+						mergedDir,
+						backend: candidate,
+						fellBack: candidate !== resolution.kind || resolution.fellBack,
+						fallbackReason,
+					};
+				} catch (err) {
+					await fs.rm(baseDir, { recursive: true, force: true });
+					const message = errorMessage(err);
+					if (!natives.isoIsUnavailableError(message)) {
+						throw err;
+					}
+					fallbackReason ??= message;
+				}
+			}
+
+			throw new Error(fallbackReason ?? "No isolation backend is available.");
+		});
+	} catch (error) {
+		if (error instanceof IsolationLeaseBusyError) {
+			throw new Error(
+				`another omp process is preparing or using isolation workspace ${slot}; retry when it finishes`,
+			);
 		}
+		throw error;
 	}
-
-	throw new Error(fallbackReason ?? "No isolation backend is available.");
+	return handle;
 }
-
 /**
  * Tear down a handle returned by {@link ensureIsolation}. When native teardown fails for a mount or
  * subvolume backend, the workspace is kept with a retained-backend sidecar (recursive `rm` would
@@ -727,6 +799,422 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
 		}
 	}
 	await fs.rm(baseDir, { recursive: true, force: true });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Isolation state descriptor
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Descriptor recording everything a later process needs to capture an
+ * isolation run's changes and tear the workspace down. Written beside the
+ * ownership marker, so the {@link retainIsolationWorkspace} rename carries it
+ * along.
+ */
+export const ISOLATION_STATE_FILE = ".omp-isolation-state.json";
+
+/**
+ * Persisted recovery contract for one isolation workspace.
+ *
+ * The release that lands a run's changes can happen in a later process, so the
+ * baseline — the only exact record of what the workspace started from — has to
+ * outlive the spawn. It is stored verbatim, as the same serializable
+ * {@link WorktreeBaseline} `captureIsolationBaseline` already holds (bounded by
+ * {@link ISOLATION_BASELINE_MAX_CONTENT_BYTES}), rather than a reduced copy
+ * that could drift from the capture path; that duplicate is the price of cold
+ * release and the only fields a cold capture needs.
+ *
+ * `mergedDir` is the mount dir's NAME, not a path: retention renames the
+ * sandbox base dir, and the descriptor travels with it. `dir` is deliberately
+ * not persisted for the same reason.
+ */
+export interface IsolationState {
+	version: 1;
+	id: string;
+	repoRoot: string;
+	backend: IsoBackendKind;
+	/** Deterministic sandbox slot basename (`t<digest>`); survives retention renames. */
+	slot: string;
+	/** Mount dir name inside the sandbox base dir (`m`). */
+	mergedDir: string;
+	baseline: WorktreeBaseline;
+	/** Transcript this workspace belongs to; the binding that makes a matching id insufficient on its own. */
+	sessionFile?: string;
+	/** {@link deltaFingerprint} of the run-end handoff, as a decimal string (JSON has no bigint). */
+	handedOff?: string;
+}
+
+/** A descriptor loaded from disk, anchored to the sandbox dir that holds it. */
+export interface LoadedIsolationState extends IsolationState {
+	/** Absolute sandbox base dir (renamed by retention, so never persisted). */
+	dir: string;
+}
+
+/** Outcome of {@link readIsolationState}: a validated descriptor or why it is unusable. */
+export type IsolationStateRead =
+	| { state: LoadedIsolationState }
+	| { error: "missing" | "corrupt" | "mismatch"; detail: string };
+
+/** Backends a descriptor may record: the PAL enum, not an arbitrary integer. */
+const ISO_BACKEND_KINDS: ReadonlySet<number> = new Set(
+	Object.values(natives.IsoBackendKind).filter((value): value is number => typeof value === "number"),
+);
+
+/** Normalized, absolute path? Both halves matter: the value becomes an object-store or removal root. */
+function isNormalizedAbsolutePath(value: string): boolean {
+	return path.isAbsolute(value) && path.normalize(value) === value;
+}
+
+/** A relative path that stays inside its base after normalisation (`..`, `.`, absolute forms rejected). */
+function isContainedRelativePath(value: string): boolean {
+	if (value.length === 0 || value === "." || path.isAbsolute(value) || path.normalize(value) !== value) return false;
+	return !value.split(/[\\/]/).includes("..");
+}
+
+function parseRepoBaseline(value: unknown): RepoBaseline | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const record = value as Record<string, unknown>;
+	const { repoRoot, headCommit, staged, unstaged, untrackedPatch, untracked } = record;
+	if (
+		typeof repoRoot !== "string" ||
+		!isNormalizedAbsolutePath(repoRoot) ||
+		typeof headCommit !== "string" ||
+		typeof staged !== "string" ||
+		typeof unstaged !== "string" ||
+		typeof untrackedPatch !== "string"
+	) {
+		return undefined;
+	}
+	if (!Array.isArray(untracked) || untracked.some(entry => typeof entry !== "string")) return undefined;
+	return { repoRoot, headCommit, staged, unstaged, untracked: [...untracked], untrackedPatch };
+}
+
+function parseWorktreeBaseline(value: unknown): WorktreeBaseline | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const record = value as Record<string, unknown>;
+	const root = parseRepoBaseline(record.root);
+	if (!root || !Array.isArray(record.nested)) return undefined;
+	const nested: WorktreeBaseline["nested"] = [];
+	for (const entry of record.nested) {
+		if (typeof entry !== "object" || entry === null) return undefined;
+		const item = entry as Record<string, unknown>;
+		const relativePath = item.relativePath;
+		const baseline = parseRepoBaseline(item.baseline);
+		// A nested root is DERIVED from the parent root plus its relative path;
+		// any other value could point capture/commit at an unrelated repository.
+		if (typeof relativePath !== "string" || !isContainedRelativePath(relativePath) || !baseline) return undefined;
+		if (path.join(root.repoRoot, relativePath) !== baseline.repoRoot) return undefined;
+		nested.push({ relativePath, baseline });
+	}
+	return { root, nested };
+}
+
+/**
+ * Validate a decoded descriptor. Every field a cold release dereferences is
+ * checked here — the file crosses a process boundary and may have been edited,
+ * truncated, or written by an older build, so a shape error must refuse
+ * revival instead of producing a bogus capture or teardown.
+ */
+function parseIsolationState(value: unknown): IsolationState | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const record = value as Record<string, unknown>;
+	const { version, id, repoRoot, backend, slot, mergedDir, baseline, sessionFile, handedOff } = record;
+	if (version !== 1 || typeof id !== "string" || id.length === 0) return undefined;
+	if (typeof repoRoot !== "string" || !isNormalizedAbsolutePath(repoRoot)) return undefined;
+	if (typeof backend !== "number" || !ISO_BACKEND_KINDS.has(backend)) return undefined;
+	if (typeof slot !== "string" || slot.length === 0 || path.basename(slot) !== slot) return undefined;
+	// A bare name keeps the mount dir inside the sandbox after a retain rename
+	// and rejects any traversal smuggled into the file.
+	if (typeof mergedDir !== "string" || mergedDir.length === 0 || path.basename(mergedDir) !== mergedDir) {
+		return undefined;
+	}
+	if (mergedDir === "." || mergedDir === "..") return undefined;
+	const parsedBaseline = parseWorktreeBaseline(baseline);
+	if (!parsedBaseline) return undefined;
+	// The transcript binding must be a usable path, not just any string.
+	if (sessionFile !== undefined && (typeof sessionFile !== "string" || !isNormalizedAbsolutePath(sessionFile))) {
+		return undefined;
+	}
+	if (handedOff !== undefined && typeof handedOff !== "string") return undefined;
+	return {
+		version: 1,
+		id,
+		repoRoot,
+		backend: backend as IsoBackendKind,
+		slot,
+		mergedDir,
+		baseline: parsedBaseline,
+		...(sessionFile === undefined ? {} : { sessionFile }),
+		...(handedOff === undefined ? {} : { handedOff }),
+	};
+}
+
+/** Whether `baseDir` carries a persisted isolation descriptor (claim marker). */
+export async function isolationStateExists(baseDir: string): Promise<boolean> {
+	return Bun.file(path.join(baseDir, ISOLATION_STATE_FILE)).exists();
+}
+
+/**
+ * Refuse to reuse an isolation slot that still holds a retained workspace.
+ *
+ * The candidate loop in {@link ensureIsolation} removes the slot before every
+ * backend attempt, so the guard has to run first. A marker-only dir (setup
+ * crashed before the baseline existed) keeps the old reclaim semantics.
+ */
+export async function assertIsolationWorkspaceReleased(baseDir: string, id: string): Promise<void> {
+	if (!(await isolationStateExists(baseDir))) return;
+	throw new Error(
+		`Isolation workspace for "${id}" is retained at ${baseDir}. Release it first: revive the agent and release it, or run \`omp worktree clear --all\` once its owner has exited.`,
+	);
+}
+
+/**
+ * Read and validate the descriptor in `baseDir`. `expectedId` rejects a
+ * workspace that belongs to another agent; a missing file, malformed JSON, and
+ * an invalid shape are reported as distinct errors so revival can refuse with
+ * the precise cause.
+ */
+export async function readIsolationState(baseDir: string, expectedId?: string): Promise<IsolationStateRead> {
+	// The sandbox dir becomes a removal target, so it must be an absolute,
+	// already-normalised path: a relative or `..`-bearing base could resolve the
+	// descriptor (and the later cleanup) somewhere unrelated.
+	if (!path.isAbsolute(baseDir) || path.normalize(baseDir) !== baseDir) {
+		return { error: "corrupt", detail: `isolation state dir ${baseDir} is not a normalized absolute path` };
+	}
+	const file = path.join(baseDir, ISOLATION_STATE_FILE);
+	let decoded: unknown;
+	try {
+		decoded = await Bun.file(file).json();
+	} catch (error) {
+		if (isEnoent(error)) return { error: "missing", detail: `no isolation state at ${file}` };
+		return { error: "corrupt", detail: `isolation state at ${file} is unreadable: ${errorMessage(error)}` };
+	}
+	const state = parseIsolationState(decoded);
+	if (!state) return { error: "corrupt", detail: `isolation state at ${file} is malformed` };
+	if (expectedId !== undefined && state.id !== expectedId) {
+		return { error: "mismatch", detail: `isolation state at ${file} belongs to "${state.id}", not "${expectedId}"` };
+	}
+	return { state: { ...state, dir: baseDir } };
+}
+
+/** Outcome of resolving a transcript's retained workspace. */
+export type IsolationWorkspaceResolution = { state: LoadedIsolationState; workspaceDir: string } | { refusal: string };
+
+async function realDirectory(candidate: string): Promise<string | undefined> {
+	try {
+		const real = await fs.realpath(candidate);
+		return (await fs.stat(real)).isDirectory() ? real : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Canonical path of a regular FILE; transcripts are `.jsonl` files, never directories. */
+async function realFile(candidate: string): Promise<string | undefined> {
+	try {
+		const real = await fs.realpath(candidate);
+		return (await fs.stat(real)).isFile() ? real : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Verify that `state` really describes `sessionFile`'s workspace before anything
+ * destructive happens.
+ *
+ * An agent id is reusable across sessions, so id equality alone would let a
+ * copied/stale pointer hand one transcript another transcript's sandbox, which
+ * release would then capture and delete. The binding is: descriptor belongs to
+ * this transcript, was born in the deterministic slot derived from its own repo
+ * root and id, still lives under the omp worktrees root (plain slot or
+ * `.retained-*` sibling), its source repo/baseline roots agree, and the mount
+ * dir stays inside that sandbox after symlink resolution.
+ */
+export async function bindIsolationState(
+	state: LoadedIsolationState,
+	sessionFile: string,
+): Promise<{ workspaceDir: string } | { refusal: string }> {
+	const root = await realDirectory(getWorktreesDir());
+	if (!root) return { refusal: `isolation root ${getWorktreesDir()} is unavailable` };
+	const dir = await realDirectory(state.dir);
+	if (!dir || path.dirname(dir) !== root) {
+		return { refusal: `isolation workspace ${state.dir} is not inside the omp worktrees root` };
+	}
+	if (isolationSlotFromDirName(path.basename(dir)) !== state.slot) {
+		return { refusal: `isolation workspace ${state.dir} is not slot "${state.slot}" or its retained sibling` };
+	}
+	if (state.slot !== getTaskIsolationSlot(state.repoRoot, state.id)) {
+		return { refusal: `isolation slot "${state.slot}" does not belong to repo ${state.repoRoot} and "${state.id}"` };
+	}
+	if (!state.sessionFile) return { refusal: "isolation state is not bound to a transcript" };
+	// `expectedSessionFile` is passed by the lifecycle caller independently of the
+	// descriptor: both sides must resolve to the SAME regular file, so a forged
+	// descriptor cannot self-verify by naming its own transcript.
+	const [bound, transcript] = await Promise.all([realFile(state.sessionFile), realFile(sessionFile)]);
+	if (!bound || !transcript || bound !== transcript) {
+		return { refusal: `isolation state belongs to transcript ${state.sessionFile}, not ${sessionFile}` };
+	}
+	const [source, baselineRoot] = await Promise.all([
+		realDirectory(state.repoRoot),
+		realDirectory(state.baseline.root.repoRoot),
+	]);
+	if (!source || !baselineRoot || source !== baselineRoot) {
+		return { refusal: `isolation baseline root ${state.baseline.root.repoRoot} does not match ${state.repoRoot}` };
+	}
+	const workspace = path.join(dir, state.mergedDir);
+	const workspaceReal = await realDirectory(workspace);
+	if (!workspaceReal || !workspaceReal.startsWith(`${dir}${path.sep}`)) {
+		return { refusal: `isolation workspace ${workspace} is gone or escapes its sandbox` };
+	}
+	return { workspaceDir: workspace };
+}
+
+/**
+ * Resolve the persisted isolation descriptor for a transcript, following the
+ * retention rename, and prove it is bound to this transcript.
+ *
+ * The header cwd is the deterministic sandbox mount; retention renames the
+ * whole sandbox, so the pointer beside the transcript is the second candidate.
+ * A descriptor is REQUIRED: a bare workspace directory cannot be revived,
+ * because without the persisted baseline the run could neither capture its
+ * delta nor stop the recorded backend, and reviving in the parent cwd would
+ * contradict the isolation contract.
+ */
+/**
+ * Find slot-named ancestor/retained leftovers whose descriptor is bound to this transcript.
+ *
+ * The pointer is written after the rename, so a failed write (disk full) or a
+ * crash in between leaves the renamed workspace undiscoverable from the header
+ * cwd. The deterministic slot prefix makes it recoverable by scan; a workspace
+ * only counts when its descriptor binds to this transcript, and more than one
+ * match is ambiguous — reviving into a guess could capture the wrong copy.
+ */
+async function findBoundRetainedSiblings(
+	sessionFile: string,
+	id: string,
+): Promise<{ state: LoadedIsolationState; workspaceDir: string }[]> {
+	const root = await realDirectory(getWorktreesDir());
+	if (!root) return [];
+	let names: string[];
+	try {
+		names = await fs.readdir(root);
+	} catch {
+		return [];
+	}
+	const matches: { state: LoadedIsolationState; workspaceDir: string }[] = [];
+	for (const name of names.sort()) {
+		// One parser defines the shape: a plain slot or its `.retained-*` sibling.
+		// Concatenating anchored sources would yield `^…$^…$`, which matches
+		// nothing, so the scan reuses the parser instead of a second regex.
+		if (isolationSlotFromDirName(name) === undefined) continue;
+		const read = await readIsolationState(path.join(root, name), id);
+		if ("error" in read) continue;
+		const bound = await bindIsolationState(read.state, sessionFile);
+		if ("refusal" in bound) continue;
+		matches.push({ state: read.state, workspaceDir: bound.workspaceDir });
+	}
+	return matches;
+}
+
+export async function resolveIsolationWorkspace(
+	sessionFile: string,
+	id: string,
+	headerCwd: string,
+): Promise<IsolationWorkspaceResolution> {
+	const candidates: string[] = [];
+	if (isNormalizedAbsolutePath(headerCwd)) candidates.push(path.dirname(headerCwd));
+	try {
+		const pointer: unknown = await Bun.file(path.join(path.dirname(sessionFile), `${id}.isolation.json`)).json();
+		if (pointer !== null && typeof pointer === "object" && "dir" in pointer && typeof pointer.dir === "string") {
+			// The pointer comes from a file next to the transcript, not from this
+			// process: only an absolute, normalized dir may become a candidate, and
+			// the descriptor binding below still has to prove ownership.
+			if (isNormalizedAbsolutePath(pointer.dir)) candidates.push(pointer.dir);
+		}
+	} catch {
+		// No pointer: an unrenamed workspace still resolves through the header cwd.
+	}
+	let refusal: string | undefined;
+	for (const dir of candidates) {
+		const read = await readIsolationState(dir, id);
+		if ("error" in read) {
+			if (read.error !== "missing" && refusal === undefined) refusal = read.detail;
+			continue;
+		}
+		const bound = await bindIsolationState(read.state, sessionFile);
+		if ("refusal" in bound) {
+			refusal = bound.refusal;
+			continue;
+		}
+		return { state: read.state, workspaceDir: bound.workspaceDir };
+	}
+	const recovered = await findBoundRetainedSiblings(sessionFile, id);
+	if (recovered.length === 1) return recovered[0];
+	if (recovered.length > 1) {
+		return {
+			refusal: `${recovered.length} retained workspaces are bound to this transcript (${recovered
+				.map(match => match.state.dir)
+				.join(", ")}); refusing to guess which one to revive`,
+		};
+	}
+	return { refusal: refusal ?? "isolation state missing (its workspace was never retained or was already released)" };
+}
+
+/** Atomically replace the descriptor: a crash leaves either the old file or the new one, never a torn one. */
+export async function writeIsolationState(baseDir: string, state: IsolationState): Promise<void> {
+	const file = path.join(baseDir, ISOLATION_STATE_FILE);
+	const temp = `${file}.${process.pid}-${Math.random().toString(16).slice(2)}.tmp`;
+	await Bun.write(temp, JSON.stringify(state));
+	try {
+		await fs.rename(temp, file);
+	} catch (error) {
+		await fs.rm(temp, { force: true }).catch(() => undefined);
+		throw error;
+	}
+}
+
+/**
+ * Merge run-end facts into an existing descriptor. Best-effort by design: a
+ * missing or unreadable descriptor only degrades a later release to an
+ * unconditional re-capture, which is why the caller logs instead of failing the
+ * run that already produced its result.
+ *
+ * Each write is an atomic replace that preserves the fields this call does not
+ * touch, but the read/merge/write is not a cross-process transaction: run-end
+ * facts have a single writer per run, and a racing writer can only replace the
+ * whole file (last write wins), never tear it into an invalid descriptor.
+ */
+export async function patchIsolationState(
+	baseDir: string,
+	patch: { sessionFile?: string; handedOff?: string },
+): Promise<boolean> {
+	const read = await readIsolationState(baseDir);
+	if (!("state" in read)) return false;
+	const sessionFile = patch.sessionFile ?? read.state.sessionFile;
+	const handedOff = patch.handedOff ?? read.state.handedOff;
+	await writeIsolationState(baseDir, {
+		version: read.state.version,
+		id: read.state.id,
+		repoRoot: read.state.repoRoot,
+		backend: read.state.backend,
+		slot: read.state.slot,
+		mergedDir: read.state.mergedDir,
+		baseline: read.state.baseline,
+		...(sessionFile === undefined ? {} : { sessionFile }),
+		...(handedOff === undefined ? {} : { handedOff }),
+	});
+	return true;
+}
+
+/** Handle for tearing down a workspace described by a loaded descriptor. */
+export function isolationHandle(state: LoadedIsolationState): IsolationHandle {
+	return {
+		mergedDir: path.join(state.dir, state.mergedDir),
+		backend: state.backend,
+		fellBack: false,
+		fallbackReason: null,
+	};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

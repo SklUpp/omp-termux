@@ -390,6 +390,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	}
 	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task, taskFile: params.taskFile };
 	if ("solutionSpace" in params) item.solutionSpace = params.solutionSpace;
+	if ("repoRoot" in params) item.repoRoot = params.repoRoot;
 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
 	if ("tools" in params) item.tools = params.tools;
@@ -462,6 +463,11 @@ function spawnParamsFor(params: TaskParams, item: ResolvedTaskItem, defaultAgent
 	if (item.taskFile !== undefined) spawn.taskFile = item.taskFile;
 	if (item.taskFileSha256 !== undefined) spawn.taskFileSha256 = item.taskFileSha256;
 	if (item.solutionSpace !== undefined) spawn.solutionSpace = item.solutionSpace;
+	if (item.repoRoot !== undefined) {
+		spawn.repoRoot = item.repoRoot;
+	} else if (params.repoRoot !== undefined) {
+		spawn.repoRoot = params.repoRoot;
+	}
 	if (params.context !== undefined) spawn.context = params.context;
 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
@@ -1087,7 +1093,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			...spawnModelFields(params),
 			...this.#resultParams(params),
 			...this.#effortParams(params),
-			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
+			...(params.isolated === true ? { isolation: { requested: true, repoRoot: params.repoRoot } } : {}),
 			blockedAgent: this.#blockedAgent,
 			enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
 			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
@@ -1567,11 +1573,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// its widget has no tool tap to read.
 		let spawnRun: SpawnRun | undefined = run;
 		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
-			// Isolated runs are parked without a reviver once the run ends
-			// (`finalizeSubagentLifecycle`), so "message it" would point the
-			// caller at a follow-up path that no longer exists. The template says
-			// nothing about the worktree itself: the runner keeps it when captured
-			// changes could not be written, and names that path in the result.
+			// An isolated workspace is retained until an explicit release, so its
+			// transcript stays revivable: the hint may point at the follow-up path
+			// like any other parked agent, and the runner names any workspace it
+			// could not capture.
 			const isolated = spawnParams.isolated === true;
 			const ref = aborted ? AgentRegistry.global().get(agentId) : undefined;
 			return `\n\n${prompt.render(taskFollowUpTemplate, {
@@ -1579,7 +1584,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				aborted,
 				isolated,
 				ircEnabled,
-				resumable: !isolated && isResumable(ref),
+				resumable: isResumable(ref),
 				transcriptAvailable: aborted ? await hasResolvableTranscript(agentId) : true,
 			})}`;
 		};
@@ -1955,7 +1960,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				...(onArtifactsRetained ? { onArtifactsRetained } : {}),
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
-				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
+				...(params.isolated === true ? { isolation: { requested: true, repoRoot: params.repoRoot } } : {}),
 				blockedAgent: this.#blockedAgent,
 				enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
