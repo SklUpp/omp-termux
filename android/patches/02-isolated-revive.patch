@@ -1,4 +1,5 @@
 diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-agent/src/cli/worktree-cli.ts
+index f9f8253..11d0b94 100644
 --- a/packages/coding-agent/src/cli/worktree-cli.ts
 +++ b/packages/coding-agent/src/cli/worktree-cli.ts
 @@ -9,9 +9,11 @@
@@ -16,7 +17,7 @@ diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-age
   *
   * Legacy entries from before the encoding change keep working because git still
   * tracks them by branch name. This command exists to GC them on demand.
-@@ -23,8 +25,21 @@
+@@ -23,8 +25,21 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
  import { getWorktreesDir, isEnoent } from "@oh-my-pi/pi-utils";
  import chalk from "@oh-my-pi/pi-utils/chalk";
  import { Settings } from "../config/settings";
@@ -40,7 +41,7 @@ diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-age
  
  import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
  
-@@ -43,6 +58,14 @@
+@@ -43,6 +58,14 @@ export interface WorktreeEntry {
  	branch?: string;
  	/** When set, the entry is unhealthy and `omp worktree clear` will remove it. */
  	orphanReason?: string;
@@ -55,7 +56,7 @@ diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-age
  }
  
  export interface AddWorktreeOptions {
-@@ -79,16 +102,29 @@
+@@ -79,16 +102,29 @@ export interface ClearWorktreesOptions {
   * with the error, data intact.
   */
  export async function stopRetainedMount(dir: string): Promise<boolean> {
@@ -91,7 +92,7 @@ diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-age
  			await natives.isoStop(backend, candidate);
  			return true;
  		}
-@@ -192,13 +228,31 @@
+@@ -192,13 +228,29 @@ export async function listWorktrees(options: ListWorktreesOptions): Promise<void
  
  export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{ removed: number; failed: number }> {
  	const entries = await scanWorktrees();
@@ -116,16 +117,14 @@ diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-age
 -			console.log(JSON.stringify({ removed: 0, kept: entries.length }));
 +			// Keep the published shape: `kept` stays the total scanned count and
 +			// `keptLive` carries the paths a caller may act on.
-+			console.log(
-+				JSON.stringify({ removed: 0, kept: entries.length, keptLive: keptLive.map(entry => entry.path) }),
-+			);
++			console.log(JSON.stringify({ removed: 0, kept: entries.length, keptLive: keptLive.map(entry => entry.path) }));
  		} else {
  			console.log(chalk.dim(options.all ? "No worktrees to remove." : "No orphaned worktrees to remove."));
 +			for (const entry of keptLive) console.log(`${chalk.dim("kept  ")}  ${entry.path}`);
  		}
  		return { removed: 0, failed: 0 };
  	}
-@@ -228,8 +282,33 @@
+@@ -228,8 +280,33 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
  					await fs.rm(target.path, { recursive: true, force: true });
  					parentsToPrune.add(target.parentRepo);
  				}
@@ -160,7 +159,7 @@ diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-age
  				await fs.rm(target.path, { recursive: true, force: true });
  				if (target.parentRepo) parentsToPrune.add(target.parentRepo);
  			}
-@@ -252,7 +331,9 @@
+@@ -252,7 +329,9 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
  	const failed = results.length - succeeded;
  
  	if (options.json) {
@@ -171,20 +170,21 @@ diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-age
  		return { removed: succeeded, failed };
  	}
  
-@@ -264,6 +345,12 @@
+@@ -264,6 +343,13 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
  			if (result.error) console.log(`          ${chalk.dim(result.error)}`);
  		}
  	}
 +	for (const entry of keptLive) {
 +		console.log(`${chalk.dim("kept  ")}  ${entry.path}`);
 +		if (entry.ownerAlive) console.log(`          ${chalk.dim("live owner; release the agent to remove it")}`);
-+		else if (entry.retained) console.log(`          ${chalk.dim("retained; revive and release the agent, or pass --all")}`);
++		else if (entry.retained)
++			console.log(`          ${chalk.dim("retained; revive and release the agent, or pass --all")}`);
 +		else console.log(`          ${chalk.dim("another process is claiming it; retry when that claim finishes")}`);
 +	}
  	console.log(chalk.dim(`\n${succeeded} removed${failed > 0 ? ` · ${chalk.red(`${failed} failed`)}` : ""}`));
  	return { removed: succeeded, failed };
  }
-@@ -346,9 +433,18 @@
+@@ -346,9 +432,18 @@ async function classifyDir(dir: string): Promise<WorktreeEntry | null> {
  	}
  	if (!isIsolation) return null;
  	const live = await hasLiveIsolationOwner(dir);
@@ -203,7 +203,7 @@ diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-age
  		// Only after confirming no live owner is the "no live task" claim true.
  		// A running subagent's sandbox stays live so `clear` won't delete it.
  		orphanReason: live ? undefined : "task-isolation leftover (no live task owns it)",
-@@ -415,7 +511,7 @@
+@@ -415,7 +510,7 @@ function formatEntryDetail(entry: WorktreeEntry): string {
  		const branch = entry.branch ?? "unknown branch";
  		parts.push(`${repo} · ${branch}`);
  	} else if (entry.kind === "task-isolation") {
@@ -213,9 +213,10 @@ diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-age
  		parts.push("legacy project shell");
  	} else {
 diff --git a/packages/coding-agent/src/prompts/tools/isolation-summary.md b/packages/coding-agent/src/prompts/tools/isolation-summary.md
+index 69378db..719fd12 100644
 --- a/packages/coding-agent/src/prompts/tools/isolation-summary.md
 +++ b/packages/coding-agent/src/prompts/tools/isolation-summary.md
-@@ -79,3 +79,6 @@
+@@ -79,3 +79,6 @@ Nested repository patches (not applied):
  {{#list nestedPatchPaths prefix="- "}}{{this}}{{/list}}
  {{/if}}
  {{/when}}
@@ -223,6 +224,7 @@ diff --git a/packages/coding-agent/src/prompts/tools/isolation-summary.md b/pack
 +Isolation workspace retained at `{{retainedDir}}`; revive and release the agent to capture its changes, or `omp worktree clear --all` once its owner has exited.
 +{{/if}}
 diff --git a/packages/coding-agent/src/prompts/tools/task-follow-up.md b/packages/coding-agent/src/prompts/tools/task-follow-up.md
+index 574e9be..8fc5486 100644
 --- a/packages/coding-agent/src/prompts/tools/task-follow-up.md
 +++ b/packages/coding-agent/src/prompts/tools/task-follow-up.md
 @@ -6,7 +6,7 @@
@@ -235,9 +237,10 @@ diff --git a/packages/coding-agent/src/prompts/tools/task-follow-up.md b/package
  {{agentId}} is now idle — {{#if ircEnabled}}message it via `write agent://{{agentId}}` to follow up; {{/if}}transcript at history://{{agentId}}
  {{/if}}
 diff --git a/packages/coding-agent/src/prompts/tools/task.md b/packages/coding-agent/src/prompts/tools/task.md
+index 6189613..0a6d1ce 100644
 --- a/packages/coding-agent/src/prompts/tools/task.md
 +++ b/packages/coding-agent/src/prompts/tools/task.md
-@@ -26,7 +26,8 @@
+@@ -26,7 +26,8 @@ Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate v
  {{/if}}{{#if structured}}`schemaMode`: default permissive warns after retries; strict fails.
  {{/if}}{{#if isolationEnabled}}{{#if applyIsolatedChanges}}`isolated`: worktree; successful changes apply to parent.
  {{else}}`isolated`: worktree; changes retained, not applied.
@@ -248,9 +251,10 @@ diff --git a/packages/coding-agent/src/prompts/tools/task.md b/packages/coding-a
  # Format
  {{#if batchEnabled}}`context`: shared (`# Goal`, `# Contract` interfaces); NEVER repeat per task.
 diff --git a/packages/coding-agent/src/registry/agent-lifecycle.ts b/packages/coding-agent/src/registry/agent-lifecycle.ts
+index 805bd51..4182ed0 100644
 --- a/packages/coding-agent/src/registry/agent-lifecycle.ts
 +++ b/packages/coding-agent/src/registry/agent-lifecycle.ts
-@@ -63,25 +63,40 @@
+@@ -63,25 +63,40 @@ async function removeAgentTombstone(id: string, sessionFile: string): Promise<vo
   * Builds a reviver for a `parked` ref restored from disk (Agent Hub scan,
   * collab mirror, resumed process) that carries a sessionFile but no in-memory
   * adoption. Returns undefined when the ref cannot be faithfully rebuilt (no
@@ -297,7 +301,7 @@ diff --git a/packages/coding-agent/src/registry/agent-lifecycle.ts b/packages/co
  	timer?: NodeJS.Timeout;
  }
  
-@@ -460,7 +475,7 @@
+@@ -460,7 +475,7 @@ export class AgentLifecycleManager {
  		}
  		if (!reviver) {
  			throw new Error(
@@ -306,7 +310,7 @@ diff --git a/packages/coding-agent/src/registry/agent-lifecycle.ts b/packages/co
  			);
  		}
  		const reopened = this.#registry.reopen(id, killed);
-@@ -481,7 +496,7 @@
+@@ -481,7 +496,7 @@ export class AgentLifecycleManager {
  		let revive = adoption?.ref === ref ? adoption.revive : undefined;
  		let coldAdopted = false;
  		if (!revive && ref.status === "parked" && ref.sessionFile && this.#persistedReviverFactory) {
@@ -315,7 +319,7 @@ diff --git a/packages/coding-agent/src/registry/agent-lifecycle.ts b/packages/co
  			// Teardown can complete during the factory await. A late cold revive must
  			// not cold-adopt (and later attach a live session + TTL) into a disposed
  			// manager — reject deterministically before creating any session.
-@@ -490,8 +505,9 @@
+@@ -490,8 +505,9 @@ export class AgentLifecycleManager {
  					`Agent "${id}" revival aborted: its lifecycle was disposed while its persisted session was being prepared.`,
  				);
  			}
@@ -327,17 +331,16 @@ diff --git a/packages/coding-agent/src/registry/agent-lifecycle.ts b/packages/co
  				this.#adopted.set(id, adoption);
  				coldAdopted = true;
  			}
-@@ -529,8 +545,16 @@
+@@ -529,8 +545,16 @@ export class AgentLifecycleManager {
  	 * `finalizeSubagentLifecycle`'s explicit-kill path. The kill stops the agent,
  	 * it does not destroy it: {@link ensureLive} (a message, Hub revive/focus)
  	 * reopens the transcript.
--	 */
--	async release(id: string, expected?: AgentRefExpectation, options?: { tombstone?: boolean }): Promise<boolean> {
 +	 *
 +	 * `retainWorkspace` keeps whatever the adoption owns (an isolation
 +	 * workspace) without capturing it, for teardown paths that must leave the
 +	 * work recoverable; a plain release destroys it after capturing.
-+	 */
+ 	 */
+-	async release(id: string, expected?: AgentRefExpectation, options?: { tombstone?: boolean }): Promise<boolean> {
 +	async release(
 +		id: string,
 +		expected?: AgentRefExpectation,
@@ -346,7 +349,7 @@ diff --git a/packages/coding-agent/src/registry/agent-lifecycle.ts b/packages/co
  		const adopted = this.#adopted.get(id);
  		const current = this.#registry.get(id);
  		const currentMatches =
-@@ -583,7 +607,7 @@
+@@ -583,7 +607,7 @@ export class AgentLifecycleManager {
  				}
  			}
  			try {
@@ -355,7 +358,7 @@ diff --git a/packages/coding-agent/src/registry/agent-lifecycle.ts b/packages/co
  			} catch (error) {
  				logger.warn("AgentLifecycleManager.release: owned resource cleanup failed", {
  					id,
-@@ -603,7 +627,7 @@
+@@ -603,7 +627,7 @@ export class AgentLifecycleManager {
  		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])];
  		await Promise.all(
  			ids.map(async id => {
@@ -365,9 +368,10 @@ diff --git a/packages/coding-agent/src/registry/agent-lifecycle.ts b/packages/co
  					await untilAborted(AbortSignal.timeout(Math.max(0, deadlineAt - Date.now())), () => release);
  				} catch (error) {
 diff --git a/packages/coding-agent/src/registry/agent-registry.ts b/packages/coding-agent/src/registry/agent-registry.ts
+index e5acd41..060ae1d 100644
 --- a/packages/coding-agent/src/registry/agent-registry.ts
 +++ b/packages/coding-agent/src/registry/agent-registry.ts
-@@ -61,6 +61,12 @@
+@@ -61,6 +61,12 @@ export interface AgentHistorySummary {
  	branchName?: string;
  	/** Captured nested-repo patches (`<id>.nested-<n>-<path>.patch`), one per nested repository the agent changed. */
  	nestedPatchPaths?: string[];
@@ -381,12 +385,14 @@ diff --git a/packages/coding-agent/src/registry/agent-registry.ts b/packages/cod
  
  export interface AgentRef {
 diff --git a/packages/coding-agent/src/registry/persisted-agents.ts b/packages/coding-agent/src/registry/persisted-agents.ts
+index b41fa7c..db6a78c 100644
 --- a/packages/coding-agent/src/registry/persisted-agents.ts
 +++ b/packages/coding-agent/src/registry/persisted-agents.ts
-@@ -330,6 +330,25 @@
+@@ -329,6 +329,25 @@ function nestedPatchFilesFor(dir: string, transcriptName: string, entries: reado
+ 		.map(name => path.join(dir, name));
  }
  
- /**
++/**
 + * Workspace a retained isolated transcript can still resume in. The pointer
 + * beside the transcript names the sandbox (retention renames it), and a
 + * missing workspace reads as "not revivable" without touching the descriptor:
@@ -405,11 +411,10 @@ diff --git a/packages/coding-agent/src/registry/persisted-agents.ts b/packages/c
 +	}
 +}
 +
-+/**
+ /**
   * Read only the small session prefix needed by the Hub. A subagent's first
   * `session_init` is written before its conversation, so this never walks a
-  * multi-megabyte historical transcript just to populate one roster row.
-@@ -352,7 +371,11 @@
+@@ -352,7 +371,11 @@ async function readPersistedAgentMetadata(
  	const artifactBase = sessionFile.slice(0, -".jsonl".length);
  	const outputPath = `${artifactBase}.md`;
  	const patchPath = `${artifactBase}.patch`;
@@ -422,7 +427,7 @@ diff --git a/packages/coding-agent/src/registry/persisted-agents.ts b/packages/c
  	let createdAt: number | undefined;
  	let activity: string | undefined;
  	let history: AgentHistorySummary = {};
-@@ -416,7 +439,7 @@
+@@ -416,7 +439,7 @@ async function readPersistedAgentMetadata(
  		// prefix still yields what it can.
  		if (isFilesystemError(error)) throw error;
  	}
@@ -431,7 +436,7 @@ diff --git a/packages/coding-agent/src/registry/persisted-agents.ts b/packages/c
  	// A transient stat fault surfaces now that both reads have settled; ENOENT
  	// already degraded to an undefined file above.
  	if (statResult.error !== undefined) throw statResult.error;
-@@ -431,6 +454,7 @@
+@@ -431,6 +454,7 @@ async function readPersistedAgentMetadata(
  			...(hasOutput ? { outputPath } : {}),
  			...(hasPatch ? { patchPath } : {}),
  			...(nestedPatchPaths.length > 0 ? { nestedPatchPaths: [...nestedPatchPaths] } : {}),
@@ -440,9 +445,10 @@ diff --git a/packages/coding-agent/src/registry/persisted-agents.ts b/packages/c
  	};
  }
 diff --git a/packages/coding-agent/src/session/session-entries.ts b/packages/coding-agent/src/session/session-entries.ts
+index 2161b58..7c56592 100644
 --- a/packages/coding-agent/src/session/session-entries.ts
 +++ b/packages/coding-agent/src/session/session-entries.ts
-@@ -309,7 +309,11 @@
+@@ -309,7 +309,11 @@ export interface SessionInitEntry extends SessionEntryBase {
  	advisor?: string;
  	/** Effective thresholds for a child with an explicit compaction override. */
  	compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
@@ -456,9 +462,10 @@ diff --git a/packages/coding-agent/src/session/session-entries.ts b/packages/cod
  	/** Work-pool yield items of the last model call; revival restores them so the yield tool matches. Absent when none. */
  	workPoolYieldItems?: WorkPoolYieldItem[];
 diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/src/task/executor.ts
+index bb4539e..3866ff3 100644
 --- a/packages/coding-agent/src/task/executor.ts
 +++ b/packages/coding-agent/src/task/executor.ts
-@@ -15,6 +15,8 @@
+@@ -15,6 +15,8 @@ import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager, type
  import type { Rule } from "../capability/rule";
  import type { EffectiveExtensionRoots } from "../capability/types";
  import { ModelRegistry } from "../config/model-registry";
@@ -467,7 +474,7 @@ diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/
  import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
  import {
  	previewLine,
-@@ -601,8 +603,8 @@
+@@ -601,8 +603,8 @@ export interface ExecutorOptions {
  	keepAlive?: boolean;
  	/** Internal ownership handoff for cleanup that outlives the visible Task result. */
  	onCleanupDeferred?: (completion: Promise<void>) => void;
@@ -478,7 +485,7 @@ diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/
  	/**
  	 * Takes over releasing the run's IRC wake hold (see `AgentSession.holdIrcWakes`),
  	 * for a caller that must finish with the agent's workspace before a held
-@@ -3564,7 +3566,8 @@
+@@ -3564,7 +3566,8 @@ export async function finalizeSubagentLifecycle(args: {
  	reviveSession: AgentReviver | null;
  	cleanupDeadlineAt?: number;
  	onCleanupDeferred?: (completion: Promise<void>) => void;
@@ -488,7 +495,7 @@ diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/
  }): Promise<void> {
  	const registry = AgentRegistry.global();
  	const ref = registry.get(args.id);
-@@ -3597,7 +3600,10 @@
+@@ -3597,7 +3600,10 @@ export async function finalizeSubagentLifecycle(args: {
  	};
  	const releaseOwnedResources = async (): Promise<void> => {
  		try {
@@ -500,7 +507,7 @@ diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/
  		} catch (error) {
  			logger.warn("Subagent lifecycle resource cleanup failed", { id: args.id, error: String(error) });
  		}
-@@ -3615,7 +3621,7 @@
+@@ -3615,7 +3621,7 @@ export async function finalizeSubagentLifecycle(args: {
  		if (ref && ownsRef) {
  			if (args.abortKind === "shutdown") {
  				try {
@@ -509,7 +516,7 @@ diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/
  				} catch (error) {
  					logger.warn("runSubagent: failed to release session during manager shutdown", {
  						id: args.id,
-@@ -4146,6 +4152,28 @@
+@@ -4146,6 +4152,28 @@ export async function replayRevivedAgentStart(session: AgentSession): Promise<vo
  function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
  	return async expectedAgentRef => {
  		const { id } = capture.spec.prompt;
@@ -538,7 +545,7 @@ diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/
  		const reopened = await SessionManager.open(capture.sessionFile, undefined, undefined, {
  			suppressBreadcrumb: true,
  			throwIfMissing: true,
-@@ -4191,6 +4219,9 @@
+@@ -4191,6 +4219,9 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
  					reopened,
  					expectedAgentRef,
  				);
@@ -548,7 +555,7 @@ diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/
  				({ session: revived } = await createAgentSession({
  					...options,
  					...(sessionLocalModel
-@@ -5029,9 +5060,8 @@
+@@ -5029,9 +5060,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
  				outputSchema,
  				outputSchemaMode: options.outputSchemaMode,
  				restrictToolNames: restrictToolNames || undefined,
@@ -561,9 +568,10 @@ diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/
  			});
  
 diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src/task/index.ts
+index 98f8661..91df2a1 100644
 --- a/packages/coding-agent/src/task/index.ts
 +++ b/packages/coding-agent/src/task/index.ts
-@@ -1573,11 +1573,10 @@
+@@ -1573,11 +1573,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  		// its widget has no tool tap to read.
  		let spawnRun: SpawnRun | undefined = run;
  		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
@@ -579,7 +587,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  			const isolated = spawnParams.isolated === true;
  			const ref = aborted ? AgentRegistry.global().get(agentId) : undefined;
  			return `\n\n${prompt.render(taskFollowUpTemplate, {
-@@ -1585,7 +1584,7 @@
+@@ -1585,7 +1584,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  				aborted,
  				isolated,
  				ircEnabled,
@@ -589,6 +597,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  			})}`;
  		};
 diff --git a/packages/coding-agent/src/task/isolation-ownership.ts b/packages/coding-agent/src/task/isolation-ownership.ts
+index dc4655c..2a8c434 100644
 --- a/packages/coding-agent/src/task/isolation-ownership.ts
 +++ b/packages/coding-agent/src/task/isolation-ownership.ts
 @@ -6,8 +6,10 @@
@@ -602,16 +611,7 @@ diff --git a/packages/coding-agent/src/task/isolation-ownership.ts b/packages/co
  import { $ } from "bun";
  
  const { IsoBackendKind } = natives;
-@@ -15,6 +17,8 @@
- /** Marker file written into a task-isolation base dir identifying its owner. */
- export const ISOLATION_OWNER_FILE = ".omp-isolation-owner.json";
- 
-+
-+
- /** Recorded owner of a task-isolation sandbox. */
- export interface IsolationOwner {
- 	/** PID of the omp process that created and owns the sandbox. */
-@@ -73,37 +77,54 @@
+@@ -73,37 +75,54 @@ export async function writeIsolationOwner(baseDir: string, id: string): Promise<
  }
  
  /**
@@ -684,7 +684,7 @@ diff --git a/packages/coding-agent/src/task/isolation-ownership.ts b/packages/co
  	}
  	return true;
  }
-@@ -165,3 +186,77 @@
+@@ -165,3 +184,77 @@ export async function readRetainedMountBackend(dir: string): Promise<number | un
  	if (!needsNativeTeardown(backend)) return undefined;
  	return backend;
  }
@@ -763,9 +763,10 @@ diff --git a/packages/coding-agent/src/task/isolation-ownership.ts b/packages/co
 +	});
 +}
 diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/coding-agent/src/task/isolation-runner.ts
+index 45486bf..a578091 100644
 --- a/packages/coding-agent/src/task/isolation-runner.ts
 +++ b/packages/coding-agent/src/task/isolation-runner.ts
-@@ -22,7 +22,7 @@
+@@ -22,7 +22,7 @@ import * as fs from "node:fs/promises";
  import * as path from "node:path";
  import type * as natives from "@oh-my-pi/pi-natives";
  import * as vcs from "@oh-my-pi/pi-natives/vcs";
@@ -774,7 +775,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  import isolationErrorTemplate from "../prompts/tools/isolation-error.md" with { type: "text" };
  import isolationSummaryTemplate from "../prompts/tools/isolation-summary.md" with { type: "text" };
  import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-@@ -32,7 +32,12 @@
+@@ -32,7 +32,12 @@ import { generateCommitMessage } from "../utils/commit-message-generator";
  import { trackLateCleanup } from "../utils/late-cleanup";
  import type { ExecutorOptions } from "./executor";
  import { runSubprocess } from "./executor";
@@ -788,7 +789,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  import type { NestedRepoPatch, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
  import {
  	applyNestedPatches,
-@@ -41,11 +46,16 @@
+@@ -41,11 +46,16 @@ import {
  	cleanupIsolation,
  	cleanupTaskBranches,
  	type CommitToBranchResult,
@@ -805,7 +806,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  	type WorktreeBaseline,
  } from "./worktree";
  
-@@ -73,6 +83,8 @@
+@@ -73,6 +83,8 @@ export interface IsolationSummaryContext {
  	nestedPatchPaths?: string[];
  	error?: string;
  	conflict?: string;
@@ -814,7 +815,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  }
  
  /**
-@@ -356,6 +368,158 @@
+@@ -356,6 +368,160 @@ function renderIsolationError(context: IsolationErrorContext): string {
  	return prompt.render(isolationErrorTemplate, { ...context });
  }
  
@@ -850,11 +851,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
 + * lets a later process find the descriptor, and the Hub row can show where the
 + * retained work lives.
 + */
-+async function rememberRetainedWorkspace(
-+	artifactsDir: string,
-+	id: string,
-+	retained: RetainedWorkspace,
-+): Promise<void> {
++async function rememberRetainedWorkspace(artifactsDir: string, id: string, retained: RetainedWorkspace): Promise<void> {
 +	AgentRegistry.global().setHistory(id, { isolationDir: retained.dir });
 +	await writeIsolationPointer(artifactsDir, id, path.dirname(retained.dir), retained.dir);
 +}
@@ -934,7 +931,13 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
 +			if (state.handedOff !== undefined && String(capture.fingerprint) === state.handedOff) return;
 +			let commitResult: CommitToBranchResult | null;
 +			try {
-+				commitResult = await commitToBranch(handle.mergedDir, state.baseline, state.id, opts.description, undefined);
++				commitResult = await commitToBranch(
++					handle.mergedDir,
++					state.baseline,
++					state.id,
++					opts.description,
++					undefined,
++				);
 +			} catch (commitErr) {
 +				// The written patch holds the diff, but commits made inside the
 +				// workspace and the branch ref live only there. Keep the workspace
@@ -973,7 +976,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  /**
   * Run a subagent inside an isolation worktree and capture its changes.
   *
-@@ -385,6 +549,10 @@
+@@ -385,6 +551,10 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  	/** Fingerprint of the delta already handed to the caller at run end; release only re-captures on change. */
  	let handedOff: bigint | number | undefined;
  	let handle: IsolationHandle | undefined;
@@ -984,7 +987,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  	let deferredCleanup: Promise<void> | undefined;
  	let retainWorkspace = false;
  	let baseReleasePromise: Promise<void> | undefined;
-@@ -403,60 +571,79 @@
+@@ -403,60 +573,79 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  		})();
  		return cleanupPromise;
  	};
@@ -1104,7 +1107,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  		const result = await runSubprocess({
  			...opts.baseOptions,
  			worktree: isolationDir,
-@@ -467,17 +654,15 @@
+@@ -467,17 +656,15 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  				deferredCleanup = completion;
  				opts.baseOptions.onCleanupDeferred?.(completion);
  			},
@@ -1126,7 +1129,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  		// A successful result cannot be captured while deferred owner jobs or
  		// shutdown hooks may still write the worktree. Failed runs skip capture,
  		// so their cleanup remains asynchronous.
-@@ -519,6 +704,8 @@
+@@ -519,6 +706,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  				} catch (patchErr) {
  					retainWorkspace = true;
  					const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
@@ -1135,7 +1138,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  					return rememberAgentArtifacts({
  						...result,
  						error: renderIsolationError({
-@@ -551,6 +738,8 @@
+@@ -551,6 +740,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  			} catch (persistErr) {
  				retainWorkspace = true;
  				const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
@@ -1144,7 +1147,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  				return rememberAgentArtifacts({
  					...result,
  					branchName: commitResult?.branchName,
-@@ -573,6 +762,8 @@
+@@ -573,6 +764,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  			} catch (patchErr) {
  				retainWorkspace = true;
  				const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
@@ -1153,7 +1156,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  				return rememberAgentArtifacts({
  					...result,
  					error: renderIsolationError({
-@@ -588,8 +779,28 @@
+@@ -588,8 +781,28 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  	} catch (err) {
  		return rememberAgentArtifacts(opts.buildFailureResult(err));
  	} finally {
@@ -1182,7 +1185,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  			!retainWorkspace &&
  			!releasePromise &&
  			!(opts.baseOptions.keepAlive !== false && AgentLifecycleManager.global().has(opts.agentId))
-@@ -642,6 +853,9 @@
+@@ -642,6 +855,9 @@ export interface IsolationMergeOutcome {
  export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise<IsolationMergeOutcome> {
  	const { result, repoRoot, mergeMode } = opts;
  	const repo = vcs.requireGit(repoRoot);
@@ -1192,7 +1195,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  	try {
  		if (mergeMode === "branch") {
  			if (!result.branchName && result.exitCode === 0 && !result.aborted && result.error) {
-@@ -651,6 +865,7 @@
+@@ -651,6 +867,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
  						error: result.error,
  						rootPatchPath: result.patchPath,
  						nestedPatchPaths: result.nestedPatchPaths,
@@ -1200,7 +1203,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  					}),
  					changesApplied: false,
  					hadAnyChanges: false,
-@@ -759,6 +974,7 @@
+@@ -759,6 +976,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
  				kind: "not-applied",
  				rootPatchPath: result.patchPath,
  				nestedPatchPaths: result.nestedPatchPaths,
@@ -1209,6 +1212,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  		}
  		return { summary, changesApplied, hadAnyChanges, mergedBranchForNestedPatches: false };
 diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/coding-agent/src/task/persisted-revive.ts
+index 16f34c6..dbd1155 100644
 --- a/packages/coding-agent/src/task/persisted-revive.ts
 +++ b/packages/coding-agent/src/task/persisted-revive.ts
 @@ -1,6 +1,6 @@
@@ -1219,7 +1223,7 @@ diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/codin
  import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
  import { validateAgentAccountPools } from "../config/account-pools";
  import type { Model } from "@oh-my-pi/pi-ai";
-@@ -16,7 +16,7 @@
+@@ -16,7 +16,7 @@ import { formatModelRoleAlias } from "../config/model-roles";
  import type { Settings } from "../config/settings";
  import { MCPManager } from "../mcp/manager";
  import { initializeExtensions } from "../modes/runtime-init";
@@ -1228,7 +1232,7 @@ diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/codin
  import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
  import { createAgentSession } from "../sdk";
  import type { AgentSession } from "../session/agent-session";
-@@ -51,6 +51,9 @@
+@@ -51,6 +51,9 @@ import { cfgTaskAgentAccountPools, cfgTaskMaxEffort } from "./settings";
  import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
  import { seanceIsolationOptions } from "./seance-policy";
  import type { AgentDefinition } from "./types";
@@ -1238,10 +1242,11 @@ diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/codin
  
  /**
   * Ambient context the reviver needs at revive time. The top-level session is
-@@ -90,6 +93,17 @@
+@@ -89,6 +92,17 @@ export function persistedAgentDefinition(displayName: string, init: PersistedSes
+ 	};
  }
  
- /**
++/**
 + * The persisted prompt was rendered at spawn, before retention renamed the
 + * workspace. Rebind those old path occurrences to the workspace the descriptor
 + * now proves, so revived instructions and the session cwd describe the SAME
@@ -1252,11 +1257,10 @@ diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/codin
 +	return prompt.map(block => block.split(staleWorkspace).join(workspaceDir));
 +}
 +
-+/**
+ /**
   * Build the factory the {@link AgentLifecycleManager} uses to cold-revive a
   * `parked` subagent ref restored from disk (Agent Hub scan, collab mirror, or a
-  * resumed process). Such a ref carries a sessionFile but no in-memory adoption —
-@@ -135,17 +149,34 @@
+@@ -135,17 +149,32 @@ export function createPersistedSubagentReviverFactory(
  			if (!restoredSeance) return undefined;
  		}
  		const seanceOptions = restoredSeance ? seanceIsolationOptions(restoredSeance.cwd) : {};
@@ -1275,9 +1279,7 @@ diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/codin
 +		// descriptor keeps the baseline a later release must capture against and
 +		// the backend it must stop. Missing/broken state refuses with the reason
 +		// instead of silently resurrecting the agent in the parent cwd.
-+		const isolation = peek.init.isolated
-+			? await resolveIsolationWorkspace(sessionFile, ref.id, peek.cwd)
-+			: undefined;
++		const isolation = peek.init.isolated ? await resolveIsolationWorkspace(sessionFile, ref.id, peek.cwd) : undefined;
 +		if (isolation && "refusal" in isolation) {
 +			throw new Error(
 +				`Cannot revive subagent "${ref.id}": ${isolation.refusal}. Its transcript remains readable at history://${ref.id}.`,
@@ -1302,7 +1304,7 @@ diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/codin
  		}
  		// taskDepth drives real capability gating (task-spawn allowance, memory
  		// startup, …); derive it from the persisted parent chain rather than
-@@ -158,7 +189,10 @@
+@@ -158,7 +187,10 @@ export function createPersistedSubagentReviverFactory(
  			taskDepth++;
  			parentId = registry.get(parentId)?.parentId;
  		}
@@ -1314,7 +1316,7 @@ diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/codin
  			// Re-open fresh on every revive: park closes the writer, so this takes
  			// the single-writer lock cleanly and restores the full message history.
  			const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
-@@ -341,7 +375,8 @@
+@@ -341,7 +373,8 @@ export function createPersistedSubagentReviverFactory(
  			let session: AgentSession;
  			try {
  				({ session } = await createAgentSession({
@@ -1324,7 +1326,7 @@ diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/codin
  					costGate: ctx.session.costGate,
  					authStorage: ctx.authStorage,
  					// Revived agents join the root session tree, so their observability
-@@ -400,7 +435,7 @@
+@@ -400,7 +433,7 @@ export function createPersistedSubagentReviverFactory(
  					outputSchemaMode: init.outputSchemaMode,
  					restrictToolNames: restrictToolNames || undefined,
  					requireYieldTool: structured,
@@ -1333,7 +1335,7 @@ diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/codin
  					// Inherit current owner policy, never extension authority from a transcript.
  					extensionRoots: () => ctx.session.effectiveExtensionRoots,
  					preloadedPreparedExtensions: ctx.session.preparedExtensions,
-@@ -473,7 +508,7 @@
+@@ -473,7 +506,7 @@ export function createPersistedSubagentReviverFactory(
  			registry.syncSessionStatus(ref.id, session);
  			attachIrcWakeTurnMonitor(session, {
  				id: ref.id,
@@ -1342,7 +1344,7 @@ diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/codin
  				completionProbe: isCompletionProbeEnabled(ctx.settings, taskDepth - 1),
  				eventBus: ctx.eventBus,
  				subagentEventBus: ctx.subagentEventBus,
-@@ -487,5 +522,19 @@
+@@ -487,5 +520,19 @@ export function createPersistedSubagentReviverFactory(
  			});
  			return session;
  		};
@@ -1362,10 +1364,29 @@ diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/codin
 +		});
  	};
  }
+diff --git a/packages/coding-agent/src/task/result-summary.ts b/packages/coding-agent/src/task/result-summary.ts
+index 26ca0dc..f50339c 100644
+--- a/packages/coding-agent/src/task/result-summary.ts
++++ b/packages/coding-agent/src/task/result-summary.ts
+@@ -68,9 +68,10 @@ export function formatTaskResultSummary(
+ 	const error = result.exitCode !== 0 && !result.aborted && result.output.trim().length > 0 ? result.error : undefined;
+ 	const outputCharCount = result.outputMeta?.charCount ?? output.length;
+ 	// A stopped agent stays messageable; tell the parent so it can resume via
+-	// irc instead of redoing the work. Isolated runs are parked without a
+-	// reviver (their worktree is gone), so they must not read as resumable.
+-	const resumable = result.aborted && !result.isolated && isResumable(AgentRegistry.global().get(result.id));
++	// irc instead of redoing the work. Isolation no longer parks the agent
++	// without a reviver: retained workspaces revive through the persisted
++	// factory, so an isolated abort is as resumable as any other.
++	const resumable = result.aborted && isResumable(AgentRegistry.global().get(result.id));
+ 	const render = (truncated: boolean): string =>
+ 		prompt.render(taskSummaryTemplate, {
+ 			agentName: result.agent,
 diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src/task/types.ts
+index 0ceddc2..b146118 100644
 --- a/packages/coding-agent/src/task/types.ts
 +++ b/packages/coding-agent/src/task/types.ts
-@@ -189,6 +189,10 @@
+@@ -189,6 +189,10 @@ function createTaskSchema(options: {
  }): BaseType {
  	const agent = taskAgentSchemaRule(options.defaultAgent);
  	const taskFields = options.file ? { "task?": "string", "taskFile?": "string" } : { task: "string" };
@@ -1376,7 +1397,7 @@ diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src
  	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
  	const schemaFields = options.structured
  		? { "outputSchema?": outputSchemaInputSchema, "schemaMode?": '"permissive" | "strict"' }
-@@ -203,6 +207,7 @@
+@@ -203,6 +207,7 @@ function createTaskSchema(options: {
  				"name?": "string",
  				agent,
  				...taskFields,
@@ -1384,7 +1405,7 @@ diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src
  				solutionSpace: "string",
  				...effortField,
  				...schemaFields,
-@@ -223,6 +228,7 @@
+@@ -223,6 +228,7 @@ function createTaskSchema(options: {
  			"name?": "string",
  			agent,
  			...taskFields,
@@ -1392,7 +1413,7 @@ diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src
  			solutionSpace: "string",
  			...effortField,
  			...schemaFields,
-@@ -243,6 +249,7 @@
+@@ -243,6 +249,7 @@ function createTaskSchema(options: {
  			"name?": "string",
  			agent,
  			...taskFields,
@@ -1400,7 +1421,7 @@ diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src
  			solutionSpace: "string",
  			...effortField,
  			...schemaFields,
-@@ -256,6 +263,7 @@
+@@ -256,6 +263,7 @@ function createTaskSchema(options: {
  		"name?": "string",
  		agent,
  		...taskFields,
@@ -1409,9 +1430,10 @@ diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src
  		...effortField,
  		...schemaFields,
 diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/src/task/worktree.ts
+index 34fa981..4355498 100644
 --- a/packages/coding-agent/src/task/worktree.ts
 +++ b/packages/coding-agent/src/task/worktree.ts
-@@ -6,11 +6,18 @@
+@@ -6,11 +6,18 @@ import * as path from "node:path";
  import type { VcsCommitAuthor, VcsGitRepo } from "@oh-my-pi/pi-natives";
  import * as natives from "@oh-my-pi/pi-natives";
  import * as vcs from "@oh-my-pi/pi-natives/vcs";
@@ -1432,7 +1454,7 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
  import { mapWithConcurrencyLimit } from "./parallel";
  import type { cfgIsolationBackend } from "./settings";
  
-@@ -618,7 +625,22 @@
+@@ -618,7 +625,22 @@ function errorMessage(err: unknown): string {
  	return err instanceof Error ? err.message : String(err);
  }
  
@@ -1456,7 +1478,7 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
  	const key = `${path.resolve(repoRoot)}\0${id}`;
  	const digest = Bun.hash(key).toString(16).padStart(16, "0").slice(-TASK_ISOLATION_DIR_DIGEST_CHARS);
  	return `${TASK_ISOLATION_DIR_PREFIX}${digest}`;
-@@ -670,51 +692,83 @@
+@@ -670,51 +692,83 @@ export async function ensureIsolation(
  ): Promise<IsolationHandle> {
  	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
  	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
@@ -1520,7 +1542,8 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
 +				throw new Error(
 +					`isolation workspace ${baseDir} is owned by a live omp process; finish or release it there before spawning this agent again`,
 +				);
-+			}
+ 			}
+-			fallbackReason ??= message;
 +			const resolution = await natives.isoResolve(preferred ?? null);
 +			const candidates = resolution.candidates.length > 0 ? resolution.candidates : [resolution.kind];
 +			let fallbackReason = resolution.reason ?? null;
@@ -1559,8 +1582,7 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
 +					}
 +					fallbackReason ??= message;
 +				}
- 			}
--			fallbackReason ??= message;
++			}
 +
 +			throw new Error(fallbackReason ?? "No isolation backend is available.");
 +		});
@@ -1580,10 +1602,11 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
  /**
   * Tear down a handle returned by {@link ensureIsolation}. When native teardown fails for a mount or
   * subvolume backend, the workspace is kept with a retained-backend sidecar (recursive `rm` would
-@@ -748,6 +802,424 @@
+@@ -747,6 +801,422 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
+ 	await fs.rm(baseDir, { recursive: true, force: true });
  }
  
- // ═══════════════════════════════════════════════════════════════════════════
++// ═══════════════════════════════════════════════════════════════════════════
 +// Isolation state descriptor
 +// ═══════════════════════════════════════════════════════════════════════════
 +
@@ -1780,9 +1803,7 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
 +}
 +
 +/** Outcome of resolving a transcript's retained workspace. */
-+export type IsolationWorkspaceResolution =
-+	| { state: LoadedIsolationState; workspaceDir: string }
-+	| { refusal: string };
++export type IsolationWorkspaceResolution = { state: LoadedIsolationState; workspaceDir: string } | { refusal: string };
 +
 +async function realDirectory(candidate: string): Promise<string | undefined> {
 +	try {
@@ -2001,15 +2022,15 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
 +	};
 +}
 +
-+// ═══════════════════════════════════════════════════════════════════════════
+ // ═══════════════════════════════════════════════════════════════════════════
  // Branch-mode isolation
  // ═══════════════════════════════════════════════════════════════════════════
- 
 diff --git a/packages/coding-agent/test/task/isolation-retained.test.ts b/packages/coding-agent/test/task/isolation-retained.test.ts
 new file mode 100644
+index 0000000..dee25df
 --- /dev/null
 +++ b/packages/coding-agent/test/task/isolation-retained.test.ts
-@@ -0,0 +1,838 @@
+@@ -0,0 +1,828 @@
 +import { afterEach, describe, expect, it, vi } from "bun:test";
 +import { type } from "@oh-my-pi/omptype";
 +import * as fs from "node:fs/promises";
@@ -2331,14 +2352,10 @@ new file mode 100644
 +				artifactsDir: fixture.artifactsDir,
 +				expectedSessionFile: fixture.sessionFile,
 +			}),
-+		).rejects.toThrow(
-+			/commit failed|retained/,
-+		);
++		).rejects.toThrow(/commit failed|retained/);
 +
 +		expect(cleanup).not.toHaveBeenCalled();
-+		const retained = (await fs.readdir(fixture.root)).filter(name =>
-+			name.startsWith(`${fixture.slot}.retained-`),
-+		);
++		const retained = (await fs.readdir(fixture.root)).filter(name => name.startsWith(`${fixture.slot}.retained-`));
 +		expect(retained).toHaveLength(1);
 +	});
 +
@@ -2353,15 +2370,11 @@ new file mode 100644
 +				artifactsDir: fixture.artifactsDir,
 +				expectedSessionFile: fixture.sessionFile,
 +			}),
-+		).rejects.toThrow(
-+			/retained|disk full/,
-+		);
++		).rejects.toThrow(/retained|disk full/);
 +
 +		expect(cleanup).not.toHaveBeenCalled();
 +		expect(await Bun.file(path.join(fixture.base, ISOLATION_STATE_FILE)).exists()).toBe(false);
-+		const retained = (await fs.readdir(fixture.root)).filter(name =>
-+			name.startsWith(`${fixture.slot}.retained-`),
-+		);
++		const retained = (await fs.readdir(fixture.root)).filter(name => name.startsWith(`${fixture.slot}.retained-`));
 +		expect(retained).toHaveLength(1);
 +		// The transcript pointer follows the rename so a later revive can release it.
 +		const pointer: unknown = await Bun.file(path.join(fixture.artifactsDir, "agent-1.isolation.json")).json();
@@ -2376,7 +2389,9 @@ new file mode 100644
 +		const otherTranscript = path.join(fixture.artifactsDir, "other.jsonl");
 +		await Bun.write(otherTranscript, "");
 +		const forged = loadedState(await readIsolationState(fixture.base, fixture.id));
-+		const capture = vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "", nestedPatches: [] });
++		const capture = vi
++			.spyOn(worktreeModule, "captureDeltaPatch")
++			.mockResolvedValue({ rootPatch: "", nestedPatches: [] });
 +		const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 +
 +		await expect(
@@ -2628,9 +2643,7 @@ new file mode 100644
 +		await fs.mkdir(base, { recursive: true });
 +		await writeIsolationOwner(base, id);
 +
-+		await expect(ensureIsolation(repo, id, undefined, repo)).rejects.toThrow(
-+			/owned by a live omp process/,
-+		);
++		await expect(ensureIsolation(repo, id, undefined, repo)).rejects.toThrow(/owned by a live omp process/);
 +		expect(await readIsolationOwner(base)).toMatchObject({ pid: process.pid });
 +	});
 +});
@@ -2689,10 +2702,7 @@ new file mode 100644
 +		// Marker-only leftovers keep today's reclaim semantics.
 +		const markerOnly = path.join(fixture.root, "marker-only");
 +		await fs.mkdir(path.join(markerOnly, "m"), { recursive: true });
-+		await Bun.write(
-+			path.join(markerOnly, ISOLATION_OWNER_FILE),
-+			JSON.stringify({ pid: 1, id: fixture.id }),
-+		);
++		await Bun.write(path.join(markerOnly, ISOLATION_OWNER_FILE), JSON.stringify({ pid: 1, id: fixture.id }));
 +		await expect(assertIsolationWorkspaceReleased(markerOnly, fixture.id)).resolves.toBeUndefined();
 +
 +		await expect(assertIsolationWorkspaceReleased(fixture.base, fixture.id)).rejects.toThrow(/retained/);
@@ -2737,7 +2747,11 @@ new file mode 100644
 +		if (defaultRepo instanceof type.errors) throw new Error(defaultRepo.summary);
 +		expect(defaultRepo).toMatchObject({ isolated: true });
 +
-+		const rootAlone = schema({ taskFile: "local://assignment.md", solutionSpace: "one change", repoRoot: "/repo/other" });
++		const rootAlone = schema({
++			taskFile: "local://assignment.md",
++			solutionSpace: "one change",
++			repoRoot: "/repo/other",
++		});
 +		if (rootAlone instanceof type.errors) throw new Error(rootAlone.summary);
 +		expect(rootAlone).toMatchObject({ repoRoot: "/repo/other" });
 +		expect(rootAlone).not.toHaveProperty("isolated");
@@ -2825,10 +2839,7 @@ new file mode 100644
 +			baseline: baselineFor(repo),
 +			sessionFile: transcript,
 +		});
-+		await Bun.write(
-+			path.join(base, ISOLATION_OWNER_FILE),
-+			JSON.stringify({ pid: await deadPid(), id }),
-+		);
++		await Bun.write(path.join(base, ISOLATION_OWNER_FILE), JSON.stringify({ pid: await deadPid(), id }));
 +		const scripts = await tempDir("omp-iso-rename-script-");
 +		// Acquire the lease on the ORIGINAL sandbox, then let retention rename it.
 +		// The lease lives outside the sandbox and is keyed by the immutable slot,
@@ -2849,9 +2860,10 @@ new file mode 100644
 +	});
 +});
 diff --git a/packages/coding-agent/test/task/persisted-revive.test.ts b/packages/coding-agent/test/task/persisted-revive.test.ts
+index 1381081..8c7d364 100644
 --- a/packages/coding-agent/test/task/persisted-revive.test.ts
 +++ b/packages/coding-agent/test/task/persisted-revive.test.ts
-@@ -16,6 +16,7 @@
+@@ -16,6 +16,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
  import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
  import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
  import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
@@ -2859,19 +2871,23 @@ diff --git a/packages/coding-agent/test/task/persisted-revive.test.ts b/packages
  import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
  import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
  import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-@@ -39,7 +40,11 @@
+@@ -39,7 +40,15 @@ import {
  } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
  import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
  import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 +import * as natives from "@oh-my-pi/pi-natives";
  import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 +import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
-+import { getTaskIsolationSlot, ISOLATION_STATE_FILE, writeIsolationState } from "@oh-my-pi/pi-coding-agent/task/worktree";
++import {
++	getTaskIsolationSlot,
++	ISOLATION_STATE_FILE,
++	writeIsolationState,
++} from "@oh-my-pi/pi-coding-agent/task/worktree";
 +import { ISOLATION_OWNER_FILE, readIsolationOwner } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
  import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
  import { PerCallModelError, PerCallModelUnavailableError } from "@oh-my-pi/pi-coding-agent/task/model-approval";
  import { cfgTaskMaxEffort } from "@oh-my-pi/pi-coding-agent/task/settings";
-@@ -162,6 +167,7 @@
+@@ -162,6 +171,7 @@ async function createPersistedSession(
  	advisor?: string,
  	contract?: {
  		tools?: string[];
@@ -2879,7 +2895,7 @@ diff --git a/packages/coding-agent/test/task/persisted-revive.test.ts b/packages
  		readOnly?: boolean;
  		agent?: string;
  		isolated?: boolean;
-@@ -177,7 +183,7 @@
+@@ -177,7 +187,7 @@ async function createPersistedSession(
  	const sessionFile = manager.getSessionFile();
  	if (!sessionFile) throw new Error("Expected a persisted session file");
  	manager.appendSessionInit({
@@ -2888,7 +2904,7 @@ diff --git a/packages/coding-agent/test/task/persisted-revive.test.ts b/packages
  		task: "persisted task",
  		tools: contract?.tools ?? ["read", "yield"],
  		restrictToolNames,
-@@ -552,19 +558,73 @@
+@@ -552,19 +562,73 @@ describe("persisted subagent revival", () => {
  		expect(capturedOptions?.customTools).toBeUndefined();
  	});
  
@@ -2971,11 +2987,10 @@ diff --git a/packages/coding-agent/test/task/persisted-revive.test.ts b/packages
  	});
  
  	it("restores the persisted agent definition name on cold revival so agent-scoped rules keep matching", async () => {
-@@ -2454,3 +2514,217 @@
+@@ -2454,3 +2518,216 @@ describe("buildWakeRelayBody", () => {
  		});
  	});
  });
-+
 +
 +function isolationBaseline(repoRoot: string): {
 +	root: {
@@ -3189,72 +3204,53 @@ diff --git a/packages/coding-agent/test/task/persisted-revive.test.ts b/packages
 +		expect(cleanup).toHaveBeenCalledWith(expect.objectContaining({ mergedDir: path.join(moved, "m") }));
 +	});
 +});
-diff --git a/packages/coding-agent/test/task/task-spawn.test.ts b/packages/coding-agent/test/task/task-spawn.test.ts
---- a/packages/coding-agent/test/task/task-spawn.test.ts
-+++ b/packages/coding-agent/test/task/task-spawn.test.ts
-@@ -328,10 +328,10 @@
- 			await job!.promise;
+diff --git a/packages/coding-agent/test/task/result-summary.test.ts b/packages/coding-agent/test/task/result-summary.test.ts
+index 727adeb..3ee3050 100644
+--- a/packages/coding-agent/test/task/result-summary.test.ts
++++ b/packages/coding-agent/test/task/result-summary.test.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, it } from "bun:test";
+ import { ASYNC_INLINE_RESULT_MAX_CHARS } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
++import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+ import { formatTaskResultSummary, INLINE_OUTPUT_CHARS } from "@oh-my-pi/pi-coding-agent/task/result-summary";
+ import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
  
- 			const delivered = `${job!.resultText ?? ""}${job!.errorText ?? ""}`;
--			expect(delivered).toContain("Sandboxed ran isolated and cannot be resumed or messaged");
-+			expect(delivered).toContain("Sandboxed ran isolated; its workspace is retained, so it stays resumable");
- 			expect(delivered).toContain("history://Sandboxed");
-+			expect(delivered).toContain("message it via `write agent://Sandboxed` to continue there");
- 			expect(delivered).not.toContain("is now idle");
--			expect(delivered).not.toContain("message it via");
- 			expect(delivered).not.toContain("removed");
- 			if (expectRetained) {
- 				expect(job!.status).toBe("failed");
-diff --git a/packages/tui/src/overlays/agent-hub-types.ts b/packages/tui/src/overlays/agent-hub-types.ts
---- a/packages/tui/src/overlays/agent-hub-types.ts
-+++ b/packages/tui/src/overlays/agent-hub-types.ts
-@@ -60,6 +60,8 @@
- 		patchPath?: string;
- 		branchName?: string;
- 		nestedPatchPaths?: string[];
-+		/** Retained isolated workspace; a revived agent runs there until released. */
-+		isolationDir?: string;
- 	};
- 	lifecycle?: { responseAt?: number; acceptedAt?: number; terminalAt?: number };
- }
-diff --git a/packages/tui/src/tools/task.ts b/packages/tui/src/tools/task.ts
---- a/packages/tui/src/tools/task.ts
-+++ b/packages/tui/src/tools/task.ts
-@@ -2530,9 +2530,10 @@
- 	/** Output path for the task result */
- 	outputPath?: string;
- 	/**
--	 * Ran inside an isolation worktree. Such agents are parked without a
--	 * reviver once the worktree is torn down, so they are never resumable or
--	 * messageable after the run — summaries must not suggest otherwise.
-+	 * Ran inside an isolation worktree. The workspace is retained until an
-+	 * explicit release: an isolated agent stays revivable from its transcript
-+	 * and resumes in that workspace, never in the parent cwd. Summaries must
-+	 * not claim messaging is impossible.
- 	 */
- 	isolated?: boolean;
- 	/** Patch path for isolated worktree output */
-diff --git a/packages/coding-agent/src/task/result-summary.ts b/packages/coding-agent/src/task/result-summary.ts
---- a/packages/coding-agent/src/task/result-summary.ts
-+++ b/packages/coding-agent/src/task/result-summary.ts
-@@ -68,9 +68,10 @@
- 	const error = result.exitCode !== 0 && !result.aborted && result.output.trim().length > 0 ? result.error : undefined;
- 	const outputCharCount = result.outputMeta?.charCount ?? output.length;
- 	// A stopped agent stays messageable; tell the parent so it can resume via
--	// irc instead of redoing the work. Isolated runs are parked without a
--	// reviver (their worktree is gone), so they must not read as resumable.
--	const resumable = result.aborted && !result.isolated && isResumable(AgentRegistry.global().get(result.id));
-+	// irc instead of redoing the work. Isolation no longer parks the agent
-+	// without a reviver: retained workspaces revive through the persisted
-+	// factory, so an isolated abort is as resumable as any other.
-+	const resumable = result.aborted && isResumable(AgentRegistry.global().get(result.id));
- 	const render = (truncated: boolean): string =>
- 		prompt.render(taskSummaryTemplate, {
- 			agentName: result.agent,
+@@ -45,6 +46,30 @@ describe("formatTaskResultSummary", () => {
+ 		expect(preview.length).toBeLessThanOrEqual(5000);
+ 	});
+ 
++	it("marks an aborted isolated run resumable now that retained workspaces revive", () => {
++		// Isolation used to park the agent with no reviver, so the summary
++		// suppressed the resume hint. Retained workspaces now revive through the
++		// persisted factory, and `isResumable` is the single source of truth.
++		const registry = AgentRegistry.global();
++		registry.register({
++			id: "Isolated",
++			displayName: "Isolated",
++			kind: "sub",
++			session: null,
++			sessionFile: "/tmp/Isolated.jsonl",
++			status: "parked",
++		});
++		try {
++			const summary = formatTaskResultSummary(
++				{ ...settledResult("partial audit"), id: "Isolated", aborted: true, isolated: true, abortReason: "user" },
++				{ totalDurationMs: 5 },
++			);
++			expect(summary).toContain("write agent://Isolated");
++		} finally {
++			registry.unregister("Isolated");
++		}
++	});
++
+ 	it("keeps a markdown preview on a line boundary when one is in range", () => {
+ 		const lines = Array.from({ length: 700 }, (_, i) => `- item ${i} ${"x".repeat(20)}`);
+ 		const summary = formatTaskResultSummary(settledResult(lines.join("\n")), {
 diff --git a/packages/coding-agent/test/task/task-schema.test.ts b/packages/coding-agent/test/task/task-schema.test.ts
+index e7e3901..e87d070 100644
 --- a/packages/coding-agent/test/task/task-schema.test.ts
 +++ b/packages/coding-agent/test/task/task-schema.test.ts
-@@ -83,6 +83,31 @@
+@@ -83,6 +83,31 @@ describe("task schema (single-spawn)", () => {
  		}
  	});
  
@@ -3286,44 +3282,51 @@ diff --git a/packages/coding-agent/test/task/task-schema.test.ts b/packages/codi
  	it("removes eval tool names from the wire shape when eval.tools.enabled is off", () => {
  		const schema = getTaskSchema({
  			isolationEnabled: false,
-diff --git a/packages/coding-agent/test/task/result-summary.test.ts b/packages/coding-agent/test/task/result-summary.test.ts
---- a/packages/coding-agent/test/task/result-summary.test.ts
-+++ b/packages/coding-agent/test/task/result-summary.test.ts
-@@ -1,5 +1,6 @@
- import { describe, expect, it } from "bun:test";
- import { ASYNC_INLINE_RESULT_MAX_CHARS } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
-+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
- import { formatTaskResultSummary, INLINE_OUTPUT_CHARS } from "@oh-my-pi/pi-coding-agent/task/result-summary";
- import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+diff --git a/packages/coding-agent/test/task/task-spawn.test.ts b/packages/coding-agent/test/task/task-spawn.test.ts
+index 518511d..3da92dd 100644
+--- a/packages/coding-agent/test/task/task-spawn.test.ts
++++ b/packages/coding-agent/test/task/task-spawn.test.ts
+@@ -328,10 +328,10 @@ describe("task spawn routing", () => {
+ 			await job!.promise;
  
-@@ -45,6 +46,30 @@
- 		expect(preview.length).toBeLessThanOrEqual(5000);
- 	});
- 
-+	it("marks an aborted isolated run resumable now that retained workspaces revive", () => {
-+		// Isolation used to park the agent with no reviver, so the summary
-+		// suppressed the resume hint. Retained workspaces now revive through the
-+		// persisted factory, and `isResumable` is the single source of truth.
-+		const registry = AgentRegistry.global();
-+		registry.register({
-+			id: "Isolated",
-+			displayName: "Isolated",
-+			kind: "sub",
-+			session: null,
-+			sessionFile: "/tmp/Isolated.jsonl",
-+			status: "parked",
-+		});
-+		try {
-+			const summary = formatTaskResultSummary(
-+				{ ...settledResult("partial audit"), id: "Isolated", aborted: true, isolated: true, abortReason: "user" },
-+				{ totalDurationMs: 5 },
-+			);
-+			expect(summary).toContain("write agent://Isolated");
-+		} finally {
-+			registry.unregister("Isolated");
-+		}
-+	});
-+
- 	it("keeps a markdown preview on a line boundary when one is in range", () => {
- 		const lines = Array.from({ length: 700 }, (_, i) => `- item ${i} ${"x".repeat(20)}`);
- 		const summary = formatTaskResultSummary(settledResult(lines.join("\n")), {
+ 			const delivered = `${job!.resultText ?? ""}${job!.errorText ?? ""}`;
+-			expect(delivered).toContain("Sandboxed ran isolated and cannot be resumed or messaged");
++			expect(delivered).toContain("Sandboxed ran isolated; its workspace is retained, so it stays resumable");
+ 			expect(delivered).toContain("history://Sandboxed");
++			expect(delivered).toContain("message it via `write agent://Sandboxed` to continue there");
+ 			expect(delivered).not.toContain("is now idle");
+-			expect(delivered).not.toContain("message it via");
+ 			expect(delivered).not.toContain("removed");
+ 			if (expectRetained) {
+ 				expect(job!.status).toBe("failed");
+diff --git a/packages/tui/src/overlays/agent-hub-types.ts b/packages/tui/src/overlays/agent-hub-types.ts
+index dfb8821..7d42d1f 100644
+--- a/packages/tui/src/overlays/agent-hub-types.ts
++++ b/packages/tui/src/overlays/agent-hub-types.ts
+@@ -60,6 +60,8 @@ export interface AgentRecordLike {
+ 		patchPath?: string;
+ 		branchName?: string;
+ 		nestedPatchPaths?: string[];
++		/** Retained isolated workspace; a revived agent runs there until released. */
++		isolationDir?: string;
+ 	};
+ 	lifecycle?: { responseAt?: number; acceptedAt?: number; terminalAt?: number };
+ }
+diff --git a/packages/tui/src/tools/task.ts b/packages/tui/src/tools/task.ts
+index 22df315..a1c7422 100644
+--- a/packages/tui/src/tools/task.ts
++++ b/packages/tui/src/tools/task.ts
+@@ -2530,9 +2530,10 @@ export interface SingleResult {
+ 	/** Output path for the task result */
+ 	outputPath?: string;
+ 	/**
+-	 * Ran inside an isolation worktree. Such agents are parked without a
+-	 * reviver once the worktree is torn down, so they are never resumable or
+-	 * messageable after the run — summaries must not suggest otherwise.
++	 * Ran inside an isolation worktree. The workspace is retained until an
++	 * explicit release: an isolated agent stays revivable from its transcript
++	 * and resumes in that workspace, never in the parent cwd. Summaries must
++	 * not claim messaging is impossible.
+ 	 */
+ 	isolated?: boolean;
+ 	/** Patch path for isolated worktree output */
