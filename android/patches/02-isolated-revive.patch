@@ -1122,7 +1122,7 @@ index 2161b58..7c56592 100644
  	workPoolYieldItems?: WorkPoolYieldItem[];
 diff --git a/packages/coding-agent/src/task/deferred-integration.ts b/packages/coding-agent/src/task/deferred-integration.ts
 new file mode 100644
-index 0000000..a7748bf
+index 0000000..9823829
 --- /dev/null
 +++ b/packages/coding-agent/src/task/deferred-integration.ts
 @@ -0,0 +1,697 @@
@@ -1353,8 +1353,8 @@ index 0000000..a7748bf
 +			if (owner && owner.pid !== process.pid && (await hasLiveIsolationOwner(resolved.state.dir))) {
 +				throw new Error(`isolation workspace is owned by live omp process ${owner.pid}; retry after it exits`);
 +			}
-+			await writeIsolationOwner(resolved.state.dir, ref.id);
-+			return runIntegration(ref, resolved.state, resolved.identity, resolved.artifactsDir);
++			await writeIsolationOwner(resolved.state.dir, reservedRef.id);
++			return runIntegration(reservedRef, resolved.state, resolved.identity, resolved.artifactsDir);
 +		});
 +	} finally {
 +		releaseReservation();
