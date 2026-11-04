@@ -1,0 +1,172 @@
+name: Bun bytecode experiment
+
+# Spike: does `bytecode: true` help the Termux JS bundle at all?
+# Builds the JS bundle only (no native addon, no release, no tags).
+# Variants: shipped ESM+splitting baseline, ESM+bytecode, CJS+bytecode.
+on:
+  workflow_dispatch:
+    inputs:
+      upstream-commit:
+        description: "Upstream commit override (default: android/UPSTREAM_TRACKED)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  OMP_PATCH_PROFILE: standard
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bytecode:
+    name: Bytecode spike (JS bundle only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Pin upstream commit from android/UPSTREAM_TRACKED
+        run: |
+          set -euo pipefail
+          override='${{ inputs.upstream-commit }}'
+          if [ -n "$override" ]; then
+            printf '%s\n' "$override" > android/UPSTREAM_COMMIT
+          else
+            tr -d '[:space:]' < android/UPSTREAM_TRACKED > android/UPSTREAM_COMMIT
+          fi
+          echo "upstream commit: $(cat android/UPSTREAM_COMMIT)"
+
+      - name: Prepare clean upstream (patch 01 only)
+        run: bash android/scripts/prepare-clean-upstream.sh
+
+      - name: Install JS dependencies
+        run: |
+          set -euo pipefail
+          if ! bun install --frozen-lockfile; then
+            echo "::warning title=frozen lockfile::bun install --frozen-lockfile failed; retrying without it"
+            bun install --minimum-release-age 0
+          fi
+
+      - name: Build variants and record results
+        run: |
+          set -uo pipefail
+          src=android/scripts/build-termux-js.ts
+          orig="$RUNNER_TEMP/build-termux-js.orig.ts"
+          report=bytecode-results.txt
+          cp "$src" "$orig"
+          : > "$report"
+
+          note() { printf '%s\n' "$*" | tee -a "$report"; }
+
+          record() {
+            local label="$1" log="$RUNNER_TEMP/build-$1.log"
+            rm -rf termux-build termux-bundle termux-js.tar.gz
+            if ! bun android/scripts/build-termux-js.ts >"$log" 2>&1; then
+              note "build: FAILED"
+              note "build log (first 40 lines):"
+              sed -n '1,40p' "$log" | tee -a "$report"
+              return 0
+            fi
+            note "build: OK"
+            local cli=termux-bundle/cli.js
+            note "cli.js bytes: $(stat -c%s "$cli")"
+            if [ -f "$cli.jsc" ]; then
+              note "cli.js.jsc bytes: $(stat -c%s "$cli.jsc")"
+              note "js+jsc bytes: $(( $(stat -c%s "$cli") + $(stat -c%s "$cli.jsc") ))"
+            else
+              note "cli.js.jsc: ABSENT (no bytecode emitted)"
+            fi
+            note "termux-js.tar.gz bytes: $(stat -c%s termux-js.tar.gz)"
+            note "tar members containing .jsc: $(tar -tzf termux-js.tar.gz | grep -c 'jsc')"
+            local out rc
+            out=$(cd termux-bundle && timeout 180 bun ./cli.js --version 2>&1); rc=$?
+            note "runtime: bun ./cli.js --version exit=$rc"
+            printf '%s\n' "$out" | head -5 | tee -a "$report"
+          }
+
+          note "# Bun bytecode spike"
+          note "bun: $(bun --version)"
+          note "upstream: $(tr -d '[:space:]' < android/UPSTREAM_COMMIT)"
+          note "build script sha before edit: $(sha256sum "$orig" | cut -d' ' -f1)"
+          note ""
+
+          note "## variant 1: baseline (ESM + splitting, no bytecode)"
+          record baseline
+
+          note ""
+          note "## variant 2: ESM + bytecode (splitting disabled)"
+          cp "$orig" "$src"
+          sed -i 's/splitting: true,/splitting: false,/' "$src"
+          sed -i 's/target: "bun",/target: "bun",\n\t\t\tbytecode: true,/' "$src"
+          if grep -q 'bytecode: true' "$src"; then
+            note "build opts: $(grep -n 'target:\|splitting:\|bytecode:\|format:' "$src" | tr '\n' ' ')"
+          else
+            note "INLINE PATCH FAILED: bytecode option never injected"
+          fi
+          record esm-bytecode
+
+          note ""
+          note "## variant 3: CJS + bytecode (splitting disabled)"
+          cp "$orig" "$src"
+          sed -i 's/splitting: true,/splitting: false,\n\t\t\tformat: "cjs",\n\t\t\tbytecode: true,/' "$src"
+          if grep -q 'format: "cjs"' "$src"; then
+            note "build opts: $(grep -n 'target:\|splitting:\|bytecode:\|format:' "$src" | tr '\n' ' ')"
+          else
+            note "INLINE PATCH FAILED: format/bytecode options never injected"
+          fi
+          record cjs-bytecode
+
+          cp "$orig" "$src"
+
+          note ""
+          note "## verdict inputs"
+          if grep -q 'build: OK' "$report" && grep -q 'cli.js.jsc bytes' "$report"; then
+            note "at least one variant emitted bytecode"
+          else
+            note "NO variant emitted bytecode"
+          fi
+
+      - name: Summarize
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Bun bytecode spike'
+            echo '```'
+            cat bytecode-results.txt 2>/dev/null || echo 'no report produced'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bytecode-results
+          path: bytecode-results.txt
+          if-no-files-found: warn
+
+      - name: Fail when nothing was learned
+        run: |
+          set -euo pipefail
+          if ! grep -q '^## variant 1' bytecode-results.txt; then
+            echo "baseline variant never ran" >&2
+            exit 1
+          fi
+          if sed -n '/^## variant 1/,/^## variant 2/p' bytecode-results.txt | grep -q 'build: FAILED'; then
+            echo "baseline (ESM + splitting) build failed; upstream/patch prepare is broken" >&2
+            exit 1
+          fi
+          if ! grep -q 'cli.js.jsc bytes' bytecode-results.txt; then
+            echo "no bytecode emitted by any variant" >&2
+            exit 1
+          fi
