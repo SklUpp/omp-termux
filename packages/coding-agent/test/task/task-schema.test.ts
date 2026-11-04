@@ -83,6 +83,31 @@ describe("task schema (single-spawn)", () => {
 		}
 	});
 
+	it.each([false, true])("preserves an explicit repoRoot in every dynamic shape (batch=%s)", batchEnabled => {
+		// Non-default options select `createTaskSchema` instead of the static
+		// schemas. Its `"+": "delete"` strips any field it does not declare, so
+		// each of the four returns (isolation × batch) must declare repoRoot;
+		// otherwise a per-call workspace override silently vanished.
+		for (const isolationEnabled of [false, true]) {
+			const schema = getTaskSchema({
+				batchEnabled,
+				isolationEnabled,
+				effortEnabled: true,
+				structured: false,
+				file: true,
+			});
+			const item = {
+				taskFile: "local://assignment.md",
+				solutionSpace: "one defined change",
+				repoRoot: "/repo/override",
+			};
+			const parsed = schema(batchEnabled ? { context: "shared context", tasks: [item] } : item);
+			if (parsed instanceof type.errors) throw new Error(parsed.summary);
+			const parsedItem = batchEnabled ? (parsed as { tasks: unknown[] }).tasks[0] : parsed;
+			expect(parsedItem).toMatchObject({ repoRoot: "/repo/override" });
+		}
+	});
+
 	it("removes eval tool names from the wire shape when eval.tools.enabled is off", () => {
 		const schema = getTaskSchema({
 			isolationEnabled: false,
