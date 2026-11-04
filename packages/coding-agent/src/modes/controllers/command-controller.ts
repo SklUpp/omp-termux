@@ -457,12 +457,15 @@ export class CommandController {
 				this.ctx.showError("Advisor has no history yet.");
 				return;
 			}
-			copyToClipboard(advisorHistory);
-			this.ctx.showStatus("Advisor history copied to clipboard");
-		} catch (error: unknown) {
-			this.ctx.showError(
-				`Failed to copy advisor history: ${error instanceof Error ? error.message : "Unknown error"}`,
+			copyToClipboard(advisorHistory).then(
+				() => this.ctx.showStatus("Advisor history copied to clipboard"),
+				(error: unknown) =>
+					this.ctx.showError(
+						`Failed to copy advisor history: ${error instanceof Error ? error.message : "Unknown error"}`,
+					),
 			);
+		} catch (error: unknown) {
+			this.ctx.showError(error instanceof Error ? error.message : "Unknown error");
 		}
 	}
 
