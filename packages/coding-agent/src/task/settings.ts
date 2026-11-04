@@ -159,6 +159,21 @@ export const cfgTaskIsolationApply = register({
 	},
 });
 
+export const cfgTaskIsolationDeferIntegration = register({
+	id: "task.isolation.deferIntegration",
+	protocolDefault: ["rpc", "acp"],
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "tasks",
+		group: "Isolation",
+		label: "Defer Integration",
+		description:
+			"Keep successful isolated task changes in their workspace until the parent sends `/integrate`; requires Apply Isolated Changes. Off applies them automatically as before",
+		condition: "isolationApplyEnabled",
+	},
+});
+
 export const cfgTaskIsolationMerge = register({
 	id: "task.isolation.merge",
 	protocolDefault: ["rpc", "acp"],
