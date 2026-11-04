@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import os
 import re
+import sys
 ROOT = Path.cwd()
 
 def read(path):
@@ -21,11 +22,25 @@ def read_required(path):
 
 version = json.loads(read("packages/coding-agent/package.json"))["version"]
 tag = os.environ.get("RELEASE_TAG", "")
-if tag and not re.fullmatch(rf"v{re.escape(version)}-termux(?:-r[0-9a-f]{{12}})?", tag):
+profile = os.environ.get("OMP_PATCH_PROFILE", "extended")
+variant = os.environ.get("OMP_RELEASE_VARIANT") or profile
+if profile not in ("standard", "extended"):
+    raise SystemExit(f"version/tag mismatch: unknown patch profile {profile!r}")
+if variant not in ("standard", "extended"):
+    raise SystemExit(f"version/tag mismatch: unknown release variant {variant!r}")
+if variant != profile:
+    raise SystemExit(
+        f"version/tag mismatch: release variant {variant!r} does not match patch profile {profile!r}"
+    )
+expected_tag = f"v{version}-termux" + ("-ex" if variant == "extended" else "")
+if tag and not re.fullmatch(rf"{re.escape(expected_tag)}(?:-r[0-9a-f]{{12}})?", tag):
     raise SystemExit(
         f"version/tag mismatch: package={version}, tag={tag}; expected "
-        f"v{version}-termux or v{version}-termux-r<12 lowercase hex>"
+        f"{expected_tag} or {expected_tag}-r<12 lowercase hex>"
     )
+if "--check-tag" in sys.argv:
+    print(f"release tag verified: {tag or '<unset>'} ({variant})")
+    raise SystemExit(0)
 
 checks = {
     "crates/pi-natives/src/lib.rs": "#![cfg_attr(not(target_os = \"android\"), feature(alloc_error_hook))]",

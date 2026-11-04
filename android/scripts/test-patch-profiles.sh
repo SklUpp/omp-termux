@@ -99,7 +99,7 @@ printf '01-one.patch\n' > "$release/android/patches/MANIFEST.standard"
 check() { # profile tag expected
 	local profile=$1 tag=$2 want=$3
 	set +e
-	(cd "$release" && RELEASE_TAG="$tag" OMP_PATCH_PROFILE="$profile" \
+	(cd "$release" && env -u OMP_RELEASE_VARIANT RELEASE_TAG="$tag" OMP_PATCH_PROFILE="$profile" \
 		python3 android/scripts/check-release-inputs.py >/dev/null 2>&1)
 	local got=$?
 	set -e
@@ -112,11 +112,92 @@ check extended v18.16.0-termux-ex pass
 check extended v18.16.0-termux-ex-r0123456789ab pass
 check standard v18.16.0-termux-ex fail
 check extended v18.16.0-termux fail
+
+check_no_variant() { # profile tag expected
+	local profile=$1 tag=$2 want=$3
+	set +e
+	(cd "$release" && env -u OMP_RELEASE_VARIANT RELEASE_TAG="$tag" OMP_PATCH_PROFILE="$profile" \
+		python3 android/scripts/check-release-inputs.py >/dev/null 2>&1)
+	local got=$?
+	set -e
+	if [ "$want" = pass ] && [ "$got" -ne 0 ]; then fail "check-release rejected omitted variant $profile/$tag"; fi
+	if [ "$want" = fail ] && [ "$got" -eq 0 ]; then fail "check-release accepted omitted variant $profile/$tag"; fi
+}
+check_no_variant standard v18.16.0-termux pass
+check_no_variant extended v18.16.0-termux-ex pass
+check_no_variant standard v18.16.0-termux-ex fail
+
+check_no_env() { # tag expected
+	local tag=$1 want=$2
+	set +e
+	(cd "$release" && env -u OMP_RELEASE_VARIANT -u OMP_PATCH_PROFILE RELEASE_TAG="$tag" \
+		python3 android/scripts/check-release-inputs.py >/dev/null 2>&1)
+	local got=$?
+	set -e
+	if [ "$want" = pass ] && [ "$got" -ne 0 ]; then fail "check-release rejected default profile/$tag"; fi
+	if [ "$want" = fail ] && [ "$got" -eq 0 ]; then fail "check-release accepted default profile/$tag"; fi
+}
+check_no_env v18.16.0-termux-ex pass
+check_no_env v18.16.0-termux fail
+
 mkdir -p "$release/packages/coding-agent/test/task"
 : > "$release/packages/coding-agent/test/task/isolation-retained.test.ts"
 check standard v18.16.0-termux fail
 rm -f "$release/packages/coding-agent/test/task/isolation-retained.test.ts"
 pass 'release-input profile/tag matching and extended-file rejection'
+
+# verify-overlay.py must accept the same profile-qualified tags as the release
+# workflow (`-termux-ex` for extended) and reject cross-profile tags.
+mkdir -p "$release/packages/coding-agent"
+printf '{"version":"18.16.0"}\n' > "$release/packages/coding-agent/package.json"
+cp "$repo_root/android/scripts/verify-overlay.py" "$release/android/scripts/"
+
+check_overlay() { # profile tag expected [variant]
+	local profile=$1 tag=$2 want=$3 variant=${4:-$1}
+	set +e
+	(cd "$release" && env -u OMP_RELEASE_VARIANT RELEASE_TAG="$tag" OMP_PATCH_PROFILE="$profile" OMP_RELEASE_VARIANT="$variant" \
+		python3 android/scripts/verify-overlay.py --check-tag >/dev/null 2>&1)
+	local got=$?
+	set -e
+	if [ "$want" = pass ] && [ "$got" -ne 0 ]; then fail "verify-overlay rejected $profile/$tag"; fi
+	if [ "$want" = fail ] && [ "$got" -eq 0 ]; then fail "verify-overlay accepted $profile/$tag"; fi
+}
+check_overlay standard v18.16.0-termux pass
+check_overlay standard v18.16.0-termux-r0123456789ab pass
+check_overlay extended v18.16.0-termux-ex pass
+check_overlay extended v18.16.0-termux-ex-r0123456789ab pass
+check_overlay standard v18.16.0-termux-ex fail
+check_overlay extended v18.16.0-termux fail
+check_overlay extended v18.16.0-termux-ex-rABCDEF012345 fail
+check_overlay extended v18.16.0-termux-ex standard fail
+
+check_overlay_no_variant() { # profile tag expected
+	local profile=$1 tag=$2 want=$3
+	set +e
+	(cd "$release" && env -u OMP_RELEASE_VARIANT RELEASE_TAG="$tag" OMP_PATCH_PROFILE="$profile" \
+		python3 android/scripts/verify-overlay.py --check-tag >/dev/null 2>&1)
+	local got=$?
+	set -e
+	if [ "$want" = pass ] && [ "$got" -ne 0 ]; then fail "verify-overlay rejected omitted variant $profile/$tag"; fi
+	if [ "$want" = fail ] && [ "$got" -eq 0 ]; then fail "verify-overlay accepted omitted variant $profile/$tag"; fi
+}
+check_overlay_no_variant standard v18.16.0-termux pass
+check_overlay_no_variant extended v18.16.0-termux-ex pass
+check_overlay_no_variant extended v18.16.0-termux fail
+
+check_overlay_no_env() { # tag expected
+	local tag=$1 want=$2
+	set +e
+	(cd "$release" && env -u OMP_RELEASE_VARIANT -u OMP_PATCH_PROFILE RELEASE_TAG="$tag" \
+		python3 android/scripts/verify-overlay.py --check-tag >/dev/null 2>&1)
+	local got=$?
+	set -e
+	if [ "$want" = pass ] && [ "$got" -ne 0 ]; then fail "verify-overlay rejected default profile/$tag"; fi
+	if [ "$want" = fail ] && [ "$got" -eq 0 ]; then fail "verify-overlay accepted default profile/$tag"; fi
+}
+check_overlay_no_env v18.16.0-termux-ex pass
+check_overlay_no_env v18.16.0-termux fail
+pass 'overlay tag validation follows the profile and rejects mismatches'
 
 # read-latest-tag.sh must distinguish 404 from auth/rate/network and reject
 # malformed or empty latest tags.
