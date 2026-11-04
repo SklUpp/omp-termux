@@ -263,3 +263,101 @@ cold workspace can be finalized or discarded deliberately without relying on
 of the dynamic `task.file` schema in patch `02`) selects a different repository
 to isolate; `isolated` alone always uses the current cwd's repository, and
 `repoRoot` alone enables nothing.
+
+## Fork feature: deferred integration (patch `02`)
+
+`task.isolation.deferIntegration` (default `false`) is the explicit-consent
+variant of `task.isolation.apply`. It is shown only while
+`task.isolation.apply` is on. When both are on and the effective apply is
+true — task `isolated: true`, or eval `agent(..., { isolated: true, apply: true })` —
+a successful isolated run captures its patch/nested artifacts, marks the
+descriptor `deferred`, and returns without touching the parent checkout. The
+result and follow-up hint name the signal:
+
+```
+write  path: "worktree://<id>"  content: "/integrate"
+```
+
+`worktree://<id>` is the isolation manager endpoint, not the child agent. The
+write is a reserved coordination control (not chat and not a prompt), so the
+handoff never depends on the child running or accepting a message. It:
+
+- binds the child transcript's session-header id, the spawning parent session
+  file + header id, and the descriptor slot/repo/baseline; legacy descriptors
+  without that tuple are refused for integration (release still works) and are
+  never cleaned up by a refused signal;
+- holds a shared lifecycle reservation that blocks revive/park/release races,
+  and keeps the workspace owner claim inside the immutable-slot lease until the
+  handoff finishes;
+- captures the latest delta against the persisted baseline — including work
+  done after a revive — and calls the existing merge path with the
+  `task.isolation.merge` strategy recorded at spawn (`patch` applies the
+  captured diff; `branch` commits the latest delta onto `omp/task/<id>` and
+  merges that branch through the existing cherry-pick path). The merge engine
+  itself is unchanged;
+- validates nested patches for unambiguous application before the handoff. On
+  conflict it fails closed before mutation. If the stock merge fails, or nested
+  apply reports warnings after the root landed, the journal records the partial
+  state, the workspace/artifacts are kept, and the error says exactly what may
+  have landed; no custom rollback is attempted;
+- writes an `applying` journal before the first parent mutation, then a
+  `merged` journal plus a `<id>.integration.json` tombstone beside the child
+  transcript. A retry after a crashed/partial attempt fails closed instead of
+  replaying;
+- reads `<id>.integration.json` state as final: a completed handoff is a pure
+  no-op and never removes a (possibly revived and edited) workspace;
+- owner markers are checked with the shared start-token liveness rule under the
+  lease, so a dead process is reclaimed and a live foreign owner is refused;
+- records `deferredReady` only from the run-end success path. A failed or
+  aborted deferred run is refused, exactly like the automatic apply path;
+- the write policy is `workspace`-scoped, so `worktree://` cannot bypass the
+  plan-mode write guard;
+
+## Legacy retained workspace recovery
+
+Descriptors written before `childSessionId` existed are refused by cold revive
+and by automatic/lifecycle release. There is one explicit recovery path:
+`omp worktree release <sandbox>`, which re-verifies the transcript session
+header cwd, the retention pointer (mandatory when `childSessionId` is absent),
+and the slot/repo/baseline binding before claim/capture. An existing pointer
+must be an object with a non-empty `workspace` string that canonically resolves
+to the selected mount; `null`, `{}`, strings, malformed or mismatched pointers
+are refused before claim/capture. It never trusts the descriptor's id/path
+match alone.
+
+1. Locate the sandbox and read `<sandbox>/.omp-isolation-state.json`; note
+   `sessionFile` and `repoRoot`.
+2. Check the first transcript line: `head -1 <sessionFile>`. Its `cwd` must
+   point at `<sandbox>/m` (or the retained mount). A missing `id` is possible
+   for a child killed before its header completed; it is not used as proof.
+3. Copy everything out first:
+   `cp -a <sandbox> <safe-dir>/workspace-copy` and
+   `cp -a <artifactsDir>/<id>.jsonl <artifactsDir>/<id>.patch <safe-dir>/`.
+4. Run the explicit release and review the reported capture:
+   `omp worktree release <sandbox>`.
+5. If release refuses, the independent checks did not pass. Keep the sandbox
+   and artifacts and recover manually; do not delete.
+6. Moving it aside with `mv <sandbox> <sandbox>.legacy-retained` is allowed
+   after the copy is verified; deletion is your decision, never automatic.
+
+## Generation binding
+
+Every isolated run records its child session-header id twice: as soon as the
+child transcript header exists, before the child executes, and again in the
+run-end descriptor patch. An abrupt crash before run end therefore still leaves
+a cold-revivable descriptor. `bindIsolationState` (the shared revive/release
+binding) refuses a descriptor whose generation is missing or does not match the
+current transcript header, so reusing an agent id and `<id>.jsonl` path cannot
+revive/release/overwrite the previous generation’s workspace. Older descriptors
+without the token fail safe and use only the explicit CLI recovery above.
+
+`apply=false` keeps its existing contract (capture artifacts, never apply), and
+turning the setting off restores automatic apply unchanged. Deferral also
+requires the global `task.isolation.apply=true`: a per-call `apply=true` does
+not activate a hidden hold while that setting is off. The descriptor
+fields (`deferred`, `deferredReady`, `mergeMode`, `childSessionId`,
+`parentSessionFile`, `parentSessionId`) are optional only for reading old
+files; a descriptor missing the session tuple is refused for revive/release and
+integration rather than falling back to id-only authorization. The handoff
+never takes its repository from the message: it always uses the descriptor's
+parent `repoRoot`, so a signal cannot redirect the merge.

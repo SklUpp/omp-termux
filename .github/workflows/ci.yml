@@ -130,6 +130,7 @@ jobs:
         shell: bash
         run: |
           bun test \
+            ./packages/coding-agent/test/task/deferred-integration.test.ts \
             ./packages/coding-agent/test/task/isolation-retained.test.ts \
             ./packages/coding-agent/test/task/persisted-revive.test.ts \
             ./packages/coding-agent/test/task/task-spawn.test.ts \
