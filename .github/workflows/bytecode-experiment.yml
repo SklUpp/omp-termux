@@ -10,6 +10,11 @@ on:
         description: "Upstream commit override (default: android/UPSTREAM_TRACKED)"
         required: false
         default: ""
+  # workflow_dispatch needs the file on the default branch, so this spike branch
+  # also runs on its own pushes.
+  push:
+    branches: [feat/bun-bytecode-spike]
+    paths: [.github/workflows/bytecode-experiment.yml]
 
 permissions:
   contents: read
