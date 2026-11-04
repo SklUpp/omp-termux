@@ -4322,10 +4322,10 @@ index 0000000..2da7523
 +}
 diff --git a/packages/coding-agent/test/task/deferred-integration.test.ts b/packages/coding-agent/test/task/deferred-integration.test.ts
 new file mode 100644
-index 0000000..72f903c
+index 0000000..b432444
 --- /dev/null
 +++ b/packages/coding-agent/test/task/deferred-integration.test.ts
-@@ -0,0 +1,551 @@
+@@ -0,0 +1,552 @@
 +import { afterEach, describe, expect, it, vi } from "bun:test";
 +import * as fs from "node:fs/promises";
 +import * as os from "node:os";
@@ -4509,7 +4509,7 @@ index 0000000..72f903c
 +		file.includes("parent") ? "parent-1" : "child-1",
 +	);
 +	vi.spyOn(ownershipModule, "withIsolationLease").mockImplementation(async (_slot, fn) => fn());
-+	vi.spyOn(ownershipModule, "readIsolationOwner").mockResolvedValue(undefined);
++	const readOwner = vi.spyOn(ownershipModule, "readIsolationOwner").mockResolvedValue(undefined);
 +	vi.spyOn(ownershipModule, "writeIsolationOwner").mockResolvedValue();
 +	const capture = {
 +		artifacts: {
@@ -4522,7 +4522,7 @@ index 0000000..72f903c
 +	};
 +	vi.spyOn(runnerModule, "writeIsolationPatch").mockResolvedValue(capture);
 +	const applyNested = vi.spyOn(worktreeModule, "applyNestedPatches").mockResolvedValue([]);
-+	vi.spyOn(worktreeModule, "cleanupIsolation").mockImplementation(async () => {
++	const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockImplementation(async () => {
 +		await fs.rm(state.dir, { recursive: true, force: true });
 +	});
 +	const commit = vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue({
@@ -4546,6 +4546,8 @@ index 0000000..72f903c
 +		merge,
 +		commit,
 +		applyNested,
++		cleanup,
++		readOwner,
 +		request: {
 +			registry,
 +			senderId: MAIN_AGENT_ID,
@@ -4689,10 +4691,9 @@ index 0000000..72f903c
 +	});
 +
 +	it("is a durable no-op after success, without touching a revived workspace", async () => {
-+		const { request, merge } = await deferredFixture();
++		const { request, merge, cleanup } = await deferredFixture();
 +		const first = await integrateDeferredAgent(request);
 +		expect(first.isError).toBe(false);
-+		const cleanup = vi.mocked(worktreeModule.cleanupIsolation);
 +		cleanup.mockClear();
 +		const second = await integrateDeferredAgent(request);
 +		expect(second.isError).toBe(false);
@@ -4751,8 +4752,8 @@ index 0000000..72f903c
 +	});
 +
 +	it("rejects a different parent session file", async () => {
-+		const { request, state, merge } = await deferredFixture();
-+		const other = path.join(path.dirname(state.parentSessionFile), "other-parent.jsonl");
++		const { request, parentSessionFile, state, merge } = await deferredFixture();
++		const other = path.join(path.dirname(parentSessionFile), "other-parent.jsonl");
 +		await Bun.write(other, `${JSON.stringify({ type: "session", id: "parent-1", cwd: "/tmp" })}\n`);
 +		state.parentSessionFile = other;
 +		const outcome = await integrateDeferredAgent(request);
@@ -4793,8 +4794,8 @@ index 0000000..72f903c
 +	});
 +
 +	it("reclaims a dead owner marker under the lease", async () => {
-+		const { request, merge } = await deferredFixture();
-+		vi.mocked(ownershipModule.readIsolationOwner).mockResolvedValue({ pid: 999_999, id: "Worker" });
++		const { request, merge, readOwner } = await deferredFixture();
++		readOwner.mockResolvedValue({ pid: 999_999, id: "Worker" });
 +		vi.spyOn(ownershipModule, "hasLiveIsolationOwner").mockResolvedValue(false);
 +		const outcome = await integrateDeferredAgent(request);
 +		expect(outcome.isError).toBe(false);
@@ -4802,8 +4803,8 @@ index 0000000..72f903c
 +	});
 +
 +	it("refuses a live foreign owner", async () => {
-+		const { request, merge } = await deferredFixture();
-+		vi.mocked(ownershipModule.readIsolationOwner).mockResolvedValue({ pid: 999_999, id: "Worker" });
++		const { request, merge, readOwner } = await deferredFixture();
++		readOwner.mockResolvedValue({ pid: 999_999, id: "Worker" });
 +		vi.spyOn(ownershipModule, "hasLiveIsolationOwner").mockResolvedValue(true);
 +		const outcome = await integrateDeferredAgent(request);
 +		expect(outcome.isError).toBe(true);
@@ -6495,6 +6496,18 @@ index 518511d..3da92dd 100644
  			expect(delivered).not.toContain("removed");
  			if (expectRetained) {
  				expect(job!.status).toBe("failed");
+diff --git a/packages/coding-agent/test/task/workpool.test.ts b/packages/coding-agent/test/task/workpool.test.ts
+index 7796d7b..73433c0 100644
+--- a/packages/coding-agent/test/task/workpool.test.ts
++++ b/packages/coding-agent/test/task/workpool.test.ts
+@@ -34,6 +34,7 @@ const POLICY = {
+ 	applyChanges: true,
+ 	enableLsp: false,
+ 	enableIrc: true,
++	deferIntegration: false,
+ } satisfies EffectiveSubagentPolicy;
+ 
+ const managers = new Set<AsyncJobManager>();
 diff --git a/packages/tui/src/overlays/agent-hub-types.ts b/packages/tui/src/overlays/agent-hub-types.ts
 index dfb8821..7d42d1f 100644
 --- a/packages/tui/src/overlays/agent-hub-types.ts
