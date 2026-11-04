@@ -12,11 +12,18 @@ BIN_DIR="${OMP_BIN_DIR:-$PREFIX_DIR/bin}"
 LIB_DIR="${OMP_LIB_DIR:-$PREFIX_DIR/lib/omp-termux}"
 REPO="${OMP_REPO:-SklUpp/omp-termux}"
 TAG="${OMP_VERSION:-latest}"
-EXTENDED=0
+# Empty means "not chosen yet": flags > environment > prompt > default.
+EXTENDED=""
+EXTENDED_EXPLICIT=0
+BROWSER=""
+BROWSER_ASKED=0
 
 for arg in "$@"; do
     case "$arg" in
-        -ex|--extended) EXTENDED=1 ;;
+        -ex|--extended) EXTENDED=1; EXTENDED_EXPLICIT=1 ;;
+        --standard) EXTENDED=0; EXTENDED_EXPLICIT=1 ;;
+        --browser) BROWSER=1 ;;
+        --no-browser) BROWSER=0 ;;
         --) ;;
         *) echo "error: unknown installer argument: $arg" >&2; exit 2 ;;
     esac
@@ -50,7 +57,91 @@ pkg_deps=""
 command -v curl >/dev/null 2>&1 || pkg_deps="$pkg_deps curl"
 command -v tar >/dev/null 2>&1 || pkg_deps="$pkg_deps tar"
 if [ -n "$pkg_deps" ]; then
+    command -v pkg >/dev/null 2>&1 || { echo 'error: curl/tar missing and Termux pkg unavailable' >&2; exit 1; }
     pkg install -y $pkg_deps
+fi
+
+# Commands used directly by the install path and the generated launcher.
+# curl/tar are handled above; these have no fallback, so fail early with a
+# clear message instead of a confusing error mid-swap. flock is optional
+# (mkdir fallback below).
+missing=""
+for dep in sha256sum sed grep find mktemp dirname env; do
+    command -v "$dep" >/dev/null 2>&1 || missing="$missing $dep"
+done
+if [ -n "$missing" ]; then
+    echo "error: missing required command(s):$missing (Termux: pkg install coreutils findutils)" >&2
+    exit 1
+fi
+
+# Extended and Chromium are independent choices. Flags beat environment, the
+# environment beats an interactive prompt. Non-terminals (`curl ... | sh`,
+# redirected stdin) never read stdin: they keep the standard build and no
+# browser, so a piped installer cannot hang waiting for an answer.
+case "${OMP_EXTENDED:-}" in
+    "") ;;
+    0|1)
+        if [ -z "$EXTENDED" ]; then
+            EXTENDED=$OMP_EXTENDED
+            EXTENDED_EXPLICIT=1
+        fi
+        ;;
+    *) echo "error: OMP_EXTENDED must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${OMP_INSTALL_BROWSER:-}" in
+    "") ;;
+    0|1) [ -n "$BROWSER" ] || BROWSER=$OMP_INSTALL_BROWSER ;;
+    *) echo "error: OMP_INSTALL_BROWSER must be 0 or 1" >&2; exit 2 ;;
+esac
+
+# A pinned tag is authoritative: classify it once. Reject a suffix that looks
+# extended but is malformed, and reject an explicit choice that disagrees with
+# the pinned tag instead of silently installing another channel.
+PINNED_EXTENDED=0
+if [ "$TAG" != latest ]; then
+    case "$TAG" in
+        *-termux-ex|*-termux-ex-r[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) PINNED_EXTENDED=1 ;;
+        *-termux-ex-*) echo "error: malformed extended release tag (got '$TAG')" >&2; exit 2 ;;
+    esac
+fi
+if [ "$EXTENDED_EXPLICIT" = 1 ] && [ "$EXTENDED" = 0 ] && [ "$PINNED_EXTENDED" = 1 ]; then
+    echo "error: standard build requested with extended release tag '$TAG' (drop --standard/OMP_EXTENDED=0 or use -ex)" >&2
+    exit 2
+fi
+
+ask() { # prompt default -> REPLY; EOF or any other answer takes the default
+    printf '%s ' "$1" >&2
+    if ! IFS= read -r REPLY; then
+        REPLY=
+        printf '\n' >&2
+    fi
+    case "$REPLY" in
+        [Yy]|[Yy][Ee][Ss]) REPLY=1 ;;
+        [Nn]|[Nn][Oo]) REPLY=0 ;;
+        *) REPLY=$2 ;;
+    esac
+}
+
+if [ -z "$EXTENDED" ]; then
+    if [ "$TAG" != latest ]; then
+        # Infer from the pinned tag so existing pinned installs never prompt
+        # or change meaning.
+        EXTENDED=$PINNED_EXTENDED
+    elif [ -t 0 ]; then
+        ask 'Install extended build (-ex)? [y/N]' 0
+        EXTENDED=$REPLY
+    else
+        EXTENDED=0
+    fi
+fi
+if [ -z "$BROWSER" ]; then
+    if [ -t 0 ]; then
+        ask 'Install optional Chromium? This also updates the shared libc++ runtime used by other apps. [y/N]' 0
+        BROWSER=$REPLY
+        BROWSER_ASKED=1
+    else
+        BROWSER=0
+    fi
 fi
 
 # Resolve -ex only after curl is available. A pinned tag never calls the API.
@@ -73,10 +164,16 @@ fi
 BASE="https://github.com/$REPO/releases"
 [ "$TAG" = latest ] && BASE="$BASE/latest/download" || BASE="$BASE/download/$TAG"
 
-# Chromium stays outside OMP bundle. Install Termux:X11 package in separate
-# transactions so repository setup completes before Chromium resolution.
-if [ "${OMP_INSTALL_BROWSER:-0}" = "1" ]; then
+# Chromium stays outside OMP bundle. Installing it also updates the shared
+# libc++ runtime used by other Termux apps; warn and update it explicitly in
+# the same choice. These transactions run before runtime staging/swap, so any
+# failure aborts with the previous runtime untouched (set -e, no fallback).
+if [ "$BROWSER" = 1 ]; then
+    if [ "$BROWSER_ASKED" = 0 ]; then
+        printf '%s\n' 'warning: installing Chromium also updates the shared libc++ runtime (affects other Termux apps)' >&2
+    fi
     pkg install -y x11-repo
+    pkg install -y libc++
     pkg install -y chromium
 fi
 
@@ -273,6 +370,7 @@ printf '%s\n' 'Installed omp. Run: omp'
 # Browser is external — not bundled (Termux:X11 chromium 149.0.7827.155 at $PREFIX/lib/chromium/chrome, verified by android/scripts/verify-browser.sh).
 # If you have the omp-termux clone, run from repo root:
 #   pkg install -y x11-repo
+#   pkg install -y libc++
 #   pkg install -y chromium
 #   bash android/scripts/verify-browser.sh
 #   bash android/scripts/smoke-browser.sh --no-network
@@ -283,6 +381,7 @@ printf '%s\n' 'Installed omp. Run: omp'
 #   bash "$PREFIX/tmp/smoke-browser.sh" --no-network
 printf '%s\n' 'Browser: for OMP browser tool, install external Chromium separately:'
 printf '%s\n' '  pkg install -y x11-repo'
+printf '%s\n' '  pkg install -y libc++'
 printf '%s\n' '  pkg install -y chromium'
 printf '%s\n' '  bash android/scripts/verify-browser.sh  # from clone, or fetch from release:'
 printf '%s\n' "  curl -fsSL https://github.com/$REPO/releases/latest/download/verify-browser.sh -o \"\${TMPDIR:-$PREFIX_DIR/tmp}/verify-browser.sh\" && bash \"\${TMPDIR:-$PREFIX_DIR/tmp}/verify-browser.sh\""

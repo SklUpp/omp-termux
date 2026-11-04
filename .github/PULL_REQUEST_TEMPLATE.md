@@ -1,14 +1,10 @@
 ## What
 
-<!-- Brief description of the change -->
-
 ## Why
-
-<!-- Motivation, context, or link to issue (fixes #N) -->
 
 ## Testing
 
-<!-- How was this tested? -->
+<!-- How you tested it. -->
 
 ---
 

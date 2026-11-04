@@ -2,10 +2,14 @@
 
 ## Automated CI checks
 
-1. `python3 android/scripts/verify-overlay.py` checks Android overlay markers.
-2. `python3 android/scripts/check-release-inputs.py` checks package metadata and official Bun manifest fields.
-3. Release downloads `BUN_ARCHIVE_NAME` from the official Bun release URL, verifies `BUN_SHA256`, extracts executable `bun`, and checks aarch64 ELF architecture.
-4. Release checks runtime version and package contents:
+1. `python3 android/scripts/verify-overlay.py` checks the Android overlay
+   markers.
+2. `python3 android/scripts/check-release-inputs.py` checks the package metadata
+   and the official Bun manifest fields.
+3. The release downloads `BUN_ARCHIVE_NAME` from the official Bun release URL.
+   It verifies `BUN_SHA256`, extracts the executable `bun`, and checks the
+   aarch64 ELF architecture.
+4. The release checks the native addon version stamp and package contents. It does not execute Android Bun in CI:
 
 ```sh
 sha256sum -c omp-termux.tar.gz.sha256
@@ -14,7 +18,8 @@ tar -tzf omp-termux.tar.gz | grep -Fx './bun'
 tar -tzf omp-termux.tar.gz | grep -F './node_modules/@oh-my-pi/pi-natives/native/pi_natives.android-arm64.node'
 ```
 
-5. Release verifies the OMP bundle **does not bundle Chromium** and browser pin is intact:
+5. The release checks that the OMP bundle **does not bundle Chromium** and that
+   the browser pin is intact:
 
 ```sh
 # browser pin metadata (fail closed on mismatch)
@@ -22,6 +27,7 @@ grep -q '149.0.7827.155' android/scripts/verify-browser.sh
 grep -q '36500e23ad23bf2616bb4f215a297ba5a2b9e625992362b9b9c6bd05e0a27272' android/scripts/verify-browser.sh
 grep -q 'packages.termux.dev/apt/termux-x11' android/scripts/verify-browser.sh
 bash android/scripts/verify-browser.sh --help >/dev/null
+bash android/scripts/smoke-browser.sh --help >/dev/null
 bash -n android/scripts/verify-browser.sh
 bash -n android/scripts/smoke-browser.sh
 # bundle must remain free of Chromium (external apt install only)
@@ -30,18 +36,11 @@ bash android/scripts/verify-browser.sh --check-bundle ./omp-termux.tar.gz
 ! tar -tzf omp-termux.tar.gz | grep -q './chrome'
 ```
 
-6. Shellcheck-like syntax check for browser scripts where `shellcheck` unavailable:
+   `shellcheck` is not available on the runners, so `bash -n` and `--help`
+   cover script syntax. On device, full validation also probes the installed
+   Chromium (see [Device browser gate](#device-browser-gate-external-termuxx11-chromium)).
 
-```sh
-bash -n android/scripts/verify-browser.sh
-bash -n android/scripts/smoke-browser.sh
-bash android/scripts/verify-browser.sh --help
-bash android/scripts/smoke-browser.sh --help
-```
-
-   On device, full validation also probes the installed Chromium (see Device browser gate).
-
-7. Android behavior tests on the applied patch queue:
+6. The release runs Android behavior tests on the applied patch queue:
 
 ```sh
 # browser discovery runs the real probe fixture with a forced android platform;
@@ -73,8 +72,8 @@ bun test ./packages/natives/test/ipc.test.ts
 # sun_path limits, multibyte roots) live in the ipc::endpoint unit tests above.
 ```
 
-   `cargo test`/`bun test` run on the Linux CI host: they compile and execute
-   the relocation logic, but the `target_os = "android"` branch itself only
+   `cargo test` and `bun test` run on the Linux CI host. They compile and
+   execute the relocation logic, but the `target_os = "android"` branch only
    runs on the device build.
 
 ## Local verification
@@ -103,16 +102,22 @@ cargo test --profile local -p pi-natives --lib ipc::
 bun test ./packages/natives/test/ipc.test.ts
 ```
 
-`verify-browser.sh` is **fail-closed**: missing `chromium` package, missing
-`$PREFIX/lib/chromium/chrome`, wrong version/arch/repo, SHA256 mismatch,
-non-Bionic interpreter (`ld-linux`), `libc.so.6` dependency, or non-ARM64 ELF
-all produce an explicit error. Use `--install` for idempotent
-`pkg install -y x11-repo chromium`, and `--skip-deb-sha256` only on CI without
-a cached `.deb`.
+`verify-browser.sh` is **fail-closed**. An explicit error means:
+
+- The `chromium` package is missing.
+- `$PREFIX/lib/chromium/chrome` is missing.
+- The version, architecture, or repository is wrong.
+- The SHA256 does not match.
+- The interpreter is not Bionic (`ld-linux`).
+- The binary depends on `libc.so.6`.
+- The ELF is not ARM64.
+
+Use `--install` for an idempotent `pkg install -y x11-repo chromium`. If no
+`.deb` is cached, use `--skip-deb-sha256` on CI only.
 
 ## Device smoke gate
 
-After installing a release on Android ARM64 / Termux:
+After you install a release on Android ARM64 / Termux:
 
 ```sh
 omp --version
@@ -123,13 +128,15 @@ omp logs --help
 omp stats --json
 ```
 
-Then exercise one read tool and one bash tool, and launch interactive `omp`. Do not call a release fully verified until `stats --json` and interactive startup pass on device.
+Then exercise one read tool and one bash tool, and launch interactive `omp`. Do
+not call a release fully verified until `stats --json` and interactive startup
+pass on device.
 
 ### Device browser gate (external Termux:X11 Chromium)
 
 The browser tool has its own hard gate. It requires the pinned external
-Chromium and **fails closed** if the package/binary is absent — it is not a
-passing `SKIP` for local-browser acceptance.
+Chromium. If the package or the binary is absent, it **fails closed**. An
+absent package is not a passing `SKIP` for local-browser acceptance.
 
 ```text
 package:  chromium 149.0.7827.155 aarch64
@@ -140,8 +147,8 @@ binary:   $PREFIX/lib/chromium/chrome
 ELF:      ARM aarch64, Android API 24, Bionic /system/bin/linker64
 ```
 
-`headless_shell` is **not** accepted — that binary rejects remote debugging
-while the main `chrome` binary supports `--headless=new` with CDP.
+`headless_shell` is **not** accepted. That binary rejects remote debugging. The
+main `chrome` binary supports `--headless=new` with CDP.
 
 Run:
 
@@ -173,25 +180,29 @@ tar -tzf omp-termux.tar.gz | grep -qi chromium && echo "FAIL: bundled chromium" 
 
 `smoke-browser.sh` covers:
 
-1. `chromium` version/arch/repo is `149.0.7827.155 aarch64` from Termux:X11;
-2. cached `.deb` SHA256 is `36500e23a…` (or fails the provenance gate);
-3. ELF/Bionic/API validation (ARM64, `/system/bin/linker64`, API 24, NDK r29, no `ld-linux`, no `libc.so.6`);
-4. `"$PREFIX/lib/chromium/chrome" --version`;
-5. headless launch (`--headless=new --no-sandbox --disable-dev-shm-usage`);
-6. loopback CDP attach (`http://127.0.0.1:<ephemeral>/json/version` → `ws://127.0.0.1`);
-7. navigation to `https://example.com` (or data URL with `--no-network`);
-8. viewport screenshot;
-9. full-page screenshot;
-10. element screenshot;
-11. model `ImageContent` delivery (PNG signature + base64 length);
-12. shared daemon reuse;
-13. daemon restart after executable/spec change;
-14. failed-binary rejection/rollback with prior daemon/install preserved, and **no**
-    puppeteer-managed Linux download on Android.
+1. The `chromium` version, architecture, and repository are
+   `149.0.7827.155 aarch64` from Termux:X11.
+2. The cached `.deb` SHA256 is `36500e23a…`, or the provenance gate fails.
+3. ELF/Bionic/API validation: ARM64, `/system/bin/linker64`, API 24 from
+   `.note.android.ident`, no `ld-linux`, no `libc.so.6`. The script does not verify the Chromium NDK version.
+4. `"$PREFIX/lib/chromium/chrome" --version`.
+5. Headless launch (`--headless=new --no-sandbox --disable-dev-shm-usage`).
+6. Loopback CDP attach (`http://127.0.0.1:<ephemeral>/json/version` →
+   `ws://127.0.0.1`).
+7. Navigation to `https://example.com`, or to a data URL with `--no-network`.
+8. Viewport screenshot.
+9. Full-page screenshot.
+10. Element screenshot.
+11. Model `ImageContent` delivery (PNG signature + base64 length).
+12. Shared daemon reuse.
+13. Daemon restart after an executable or spec change.
+14. Failed-binary rejection and rollback, with the prior daemon and install
+    preserved, and **no** puppeteer-managed Linux download on Android.
 
-CI on `x86_64` cannot replace this device gate. It may only validate scripts
-and metadata (`bash -n`, `--help`, `--skip-deb-sha256`, `--check-bundle`).
+CI on `x86_64` cannot replace this device gate. CI can only validate the
+scripts and the metadata (`bash -n`, `--help`, `--skip-deb-sha256`,
+`--check-bundle`).
 
-Future Chromium upgrades require a new pinned version + new SHA256 + same
-ELF/Bionic/API checks + same device smoke. The scripts and this doc are the
-source of truth for the current pin.
+A future Chromium upgrade requires a new pinned version, a new SHA256, the same
+ELF/Bionic/API checks, and the same device smoke. The scripts and this doc are
+the source of truth for the current pin.

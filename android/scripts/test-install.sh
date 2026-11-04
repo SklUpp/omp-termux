@@ -26,6 +26,10 @@ SH
 cat > "$stub/pkg" <<'SH'
 #!/bin/sh
 printf '%s\n' "$*" >> "${PKG_LOG:?}"
+if [ -n "${PKG_FAIL:-}" ] && [ "$*" = "$PKG_FAIL" ]; then
+	echo "stub pkg: simulated failure: $*" >&2
+	exit 1
+fi
 exit 0
 SH
 cat > "$stub/curl" <<'SH'
@@ -117,9 +121,31 @@ run_install() { # asset_dir [VAR=value ...]
 		OMP_LIB_DIR="$LIB_T" TMPDIR="$CASE/tmp" BUN_LOG="$CASE/bun.log" \
 		CURL_LOG="$CASE/curl.log" PKG_LOG="$CASE/pkg.log" CURL_ASSET_DIR="$asset" \
 		CURL_API_JSON="${CURL_API_JSON:-}" CURL_API_JSON_PAGE2="${CURL_API_JSON_PAGE2:-}" \
-		CURL_API_FAIL="${CURL_API_FAIL:-0}" \
-		"$@" sh "$src" ${INSTALL_ARGS:-} > "$CASE/run.log" 2>&1
+		CURL_API_FAIL="${CURL_API_FAIL:-0}" PKG_FAIL="${PKG_FAIL:-}" \
+		"$@" sh "$src" ${INSTALL_ARGS:-} < "${RUN_STDIN:-/dev/null}" > "$CASE/run.log" 2>&1
 }
+
+run_install_tty() { # answers asset [VAR=value ...]; answers fed through a real pty
+	local answers=$1 asset=$2
+	shift 2
+	: > "$CASE/curl.log"; : > "$CASE/pkg.log"; : > "$CASE/bun.log"
+	printf '%b' "$answers" | env -i PATH="$stub:$base_path" HOME="$CASE/home" PREFIX="$PREFIX_T" \
+		OMP_LIB_DIR="$LIB_T" TMPDIR="$CASE/tmp" BUN_LOG="$CASE/bun.log" \
+		CURL_LOG="$CASE/curl.log" PKG_LOG="$CASE/pkg.log" CURL_ASSET_DIR="$asset" \
+		CURL_API_JSON="${CURL_API_JSON:-}" CURL_API_JSON_PAGE2="${CURL_API_JSON_PAGE2:-}" \
+		CURL_API_FAIL="${CURL_API_FAIL:-0}" PKG_FAIL="${PKG_FAIL:-}" \
+		"$@" script -qec "sh '$src' ${INSTALL_ARGS:-}" /dev/null > "$CASE/run.log" 2>&1
+}
+
+have_script=0
+if command -v script >/dev/null 2>&1 &&
+	script -qec ':' /dev/null < /dev/null > /dev/null 2>&1; then
+	have_script=1
+fi
+
+# Chromium choice installs the external package and updates the shared libc++
+# runtime in the same transaction sequence.
+browser_pkgs=$'install -y x11-repo\ninstall -y libc++\ninstall -y chromium'
 
 run_launcher() { # args...
 	env -u PREFIX -u OMP_LIB_DIR -u LD_PRELOAD BUN_LOG="$CASE/bun.log" "$BIN_T/omp" "$@"
@@ -235,13 +261,28 @@ expect_absent "$LIB_T.new"; expect_absent "$LIB_T.old"
 run_launcher --version >/dev/null || die 'badnative rollback did not restore launcher'
 pass 'native-loader post-swap rollback restores previous install'
 
-# 8. browser opt-in installs packages in order
+# 8. browser opt-in updates libc++ and installs packages in order
 new_case browser
 run_install "$assets/good-a" OMP_INSTALL_BROWSER=1 || { cat "$CASE/run.log"; die 'browser opt-in install failed'; }
-[ "$(cat "$CASE/pkg.log")" = $'install -y x11-repo\ninstall -y chromium' ] \
+[ "$(cat "$CASE/pkg.log")" = "$browser_pkgs" ] \
 	|| die "unexpected pkg calls: $(cat "$CASE/pkg.log")"
+grep -q 'shared libc++' "$CASE/run.log" || die 'browser opt-in warning missing'
 expect_version vA
-pass 'OMP_INSTALL_BROWSER=1 installs x11-repo then chromium'
+pass 'OMP_INSTALL_BROWSER=1 updates libc++, installs x11-repo then chromium'
+
+# 8b. libc++ update failure aborts before the runtime swap
+new_case browser-libcxx-fail
+run_install "$assets/good-a" || die 'libc++-fail base install failed'
+if run_install "$assets/good-b" OMP_INSTALL_BROWSER=1 PKG_FAIL='install -y libc++'; then
+	die 'libc++ update failure accepted'
+fi
+grep -q 'stub pkg: simulated failure' "$CASE/run.log" || die 'pkg failure reason absent'
+expect_version vA
+expect_absent "$LIB_T.new"; expect_absent "$LIB_T.old"
+run_launcher --version >/dev/null || die 'libc++ failure damaged previous launcher'
+[ "$(cat "$CASE/pkg.log")" = $'install -y x11-repo\ninstall -y libc++' ] \
+	|| die "libc++ failure continued past failure: $(cat "$CASE/pkg.log")"
+pass 'libc++ update failure aborts before runtime swap'
 
 # 9. optional launcher preload (space-free lib: LD_PRELOAD cannot name spaces).
 preload=""
@@ -367,5 +408,183 @@ grep -Fxq 'https://api.github.com/repos/SklUpp/omp-termux/releases?per_page=100&
 grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/download/v18.16.0-termux-ex/omp-termux.tar.gz' "$CASE/curl.log" \
 	|| die 'extended page-2 tag URL'
 pass '-ex follows API pagination'
+
+# 18. piped non-terminal stdin keeps standard build and no browser
+new_case noninteractive-default
+printf 'y\ny\n' > "$CASE/answers"
+RUN_STDIN="$CASE/answers" run_install "$assets/good-a" \
+	|| { cat "$CASE/run.log"; die 'non-interactive install failed'; }
+expect_version vA
+grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/latest/download/omp-termux.tar.gz' "$CASE/curl.log" \
+	|| die 'piped stdin changed the standard release URL'
+[ ! -s "$CASE/pkg.log" ] || die "piped stdin installed packages: $(cat "$CASE/pkg.log")"
+pass 'piped non-terminal stdin keeps standard build and no browser'
+
+# 19. OMP_EXTENDED=1 selects extended without a flag
+new_case env-extended
+run_install "$assets/good-a" OMP_EXTENDED=1 CURL_API_JSON="$api_extended" \
+	|| { cat "$CASE/run.log"; die 'OMP_EXTENDED=1 install failed'; }
+grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/download/v18.16.0-termux-ex-r77f7e6811d20/omp-termux.tar.gz' "$CASE/curl.log" \
+	|| die 'OMP_EXTENDED=1 did not select the extended tag'
+pass 'OMP_EXTENDED=1 selects extended release'
+
+# 20. explicit -ex flag overrides OMP_EXTENDED=0
+new_case flag-extended
+INSTALL_ARGS=-ex run_install "$assets/good-a" OMP_EXTENDED=0 CURL_API_JSON="$api_extended" \
+	|| { cat "$CASE/run.log"; die '-ex with OMP_EXTENDED=0 failed'; }
+grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/download/v18.16.0-termux-ex-r77f7e6811d20/omp-termux.tar.gz' "$CASE/curl.log" \
+	|| die '-ex did not override OMP_EXTENDED=0'
+pass '-ex overrides OMP_EXTENDED=0'
+
+# 21. explicit --standard flag overrides OMP_EXTENDED=1
+new_case flag-standard
+INSTALL_ARGS=--standard run_install "$assets/good-a" OMP_EXTENDED=1 CURL_API_JSON="$api_extended" \
+	|| { cat "$CASE/run.log"; die '--standard with OMP_EXTENDED=1 failed'; }
+grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/latest/download/omp-termux.tar.gz' "$CASE/curl.log" \
+	|| die '--standard did not override OMP_EXTENDED=1'
+! grep -q 'api.github.com' "$CASE/curl.log" || die '--standard still queried the release API'
+pass '--standard overrides OMP_EXTENDED=1'
+
+# 22. browser flags override the environment in both directions
+new_case browser-flag-on
+INSTALL_ARGS=--browser run_install "$assets/good-a" OMP_INSTALL_BROWSER=0 \
+	|| { cat "$CASE/run.log"; die '--browser with OMP_INSTALL_BROWSER=0 failed'; }
+[ "$(cat "$CASE/pkg.log")" = "$browser_pkgs" ] \
+	|| die "--browser packages: $(cat "$CASE/pkg.log")"
+grep -q 'shared libc++' "$CASE/run.log" || die '--browser warning missing'
+pass '--browser overrides OMP_INSTALL_BROWSER=0 and updates libc++'
+
+new_case browser-flag-off
+INSTALL_ARGS=--no-browser run_install "$assets/good-a" OMP_INSTALL_BROWSER=1 \
+	|| { cat "$CASE/run.log"; die '--no-browser with OMP_INSTALL_BROWSER=1 failed'; }
+[ ! -s "$CASE/pkg.log" ] || die "--no-browser installed packages: $(cat "$CASE/pkg.log")"
+! grep -q 'shared libc++' "$CASE/run.log" || die '--no-browser printed the libc++ warning'
+pass '--no-browser overrides OMP_INSTALL_BROWSER=1 and leaves libc++ alone'
+
+new_case browser-env-off
+run_install "$assets/good-a" OMP_INSTALL_BROWSER=0 \
+	|| { cat "$CASE/run.log"; die 'OMP_INSTALL_BROWSER=0 install failed'; }
+[ ! -s "$CASE/pkg.log" ] || die "OMP_INSTALL_BROWSER=0 installed packages: $(cat "$CASE/pkg.log")"
+pass 'OMP_INSTALL_BROWSER=0 installs no browser packages'
+
+# 23. pinned extended tag works without -ex, env, or prompt
+new_case pinned-extended-implicit
+run_install "$assets/good-a" OMP_VERSION=v18.16.0-termux-ex-r77f7e6811d20 \
+	|| { cat "$CASE/run.log"; die 'implicit pinned extended install failed'; }
+grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/download/v18.16.0-termux-ex-r77f7e6811d20/omp-termux.tar.gz' "$CASE/curl.log" \
+	|| die 'implicit pinned extended URL'
+! grep -q 'api.github.com' "$CASE/curl.log" || die 'implicit pinned extended called the release API'
+pass 'pinned extended tag installs without -ex'
+
+# 24. invalid choice environment fails closed before installing
+new_case bad-env-extended
+if run_install "$assets/good-a" OMP_EXTENDED=2; then die 'OMP_EXTENDED=2 accepted'; fi
+grep -q 'OMP_EXTENDED must be 0 or 1' "$CASE/run.log" || die 'OMP_EXTENDED validation message missing'
+expect_absent "$LIB_T"
+new_case bad-env-browser
+if run_install "$assets/good-a" OMP_INSTALL_BROWSER=yes; then die 'OMP_INSTALL_BROWSER=yes accepted'; fi
+grep -q 'OMP_INSTALL_BROWSER must be 0 or 1' "$CASE/run.log" || die 'OMP_INSTALL_BROWSER validation message missing'
+expect_absent "$LIB_T"
+pass 'invalid OMP_EXTENDED/OMP_INSTALL_BROWSER fail closed'
+
+# 25. explicit standard choice conflicts with a pinned extended tag
+new_case pinned-extended-standard-flag
+if INSTALL_ARGS=--standard run_install "$assets/good-a" OMP_VERSION=v18.16.0-termux-ex-r77f7e6811d20; then
+	die '--standard with pinned extended tag accepted'
+fi
+grep -q "standard build requested with extended release tag" "$CASE/run.log" \
+	|| die "pinned mismatch reason absent: $(cat "$CASE/run.log")"
+expect_absent "$LIB_T"
+[ ! -s "$CASE/curl.log" ] || die 'pinned mismatch downloaded something'
+
+new_case pinned-extended-standard-env
+if run_install "$assets/good-a" OMP_VERSION=v18.16.0-termux-ex-r77f7e6811d20 OMP_EXTENDED=0; then
+	die 'OMP_EXTENDED=0 with pinned extended tag accepted'
+fi
+grep -q "standard build requested with extended release tag" "$CASE/run.log" \
+	|| die "pinned env mismatch reason absent: $(cat "$CASE/run.log")"
+expect_absent "$LIB_T"
+[ ! -s "$CASE/curl.log" ] || die 'pinned env mismatch downloaded something'
+pass 'explicit standard choice rejects pinned extended tag'
+
+# 26. malformed extended suffix fails closed instead of guessing a channel
+new_case malformed-extended-tag
+if run_install "$assets/good-a" OMP_VERSION=v18.16.0-termux-ex-r77f7e6811d2; then
+	die 'malformed extended tag accepted'
+fi
+grep -q 'malformed extended release tag' "$CASE/run.log" \
+	|| die "malformed tag reason absent: $(cat "$CASE/run.log")"
+expect_absent "$LIB_T"
+[ ! -s "$CASE/curl.log" ] || die 'malformed tag downloaded something'
+pass 'malformed extended suffix fails closed'
+
+# 27. missing prerequisite command fails before touching the install
+new_case missing-prereq
+limited=$CASE/bin
+mkdir -p "$limited"
+ln -s "$stub/uname" "$limited/uname"
+for c in sh pkg curl tar sed grep find mktemp dirname sha256sum; do
+	p=$(command -v "$c") || die "test lacks $c"
+	ln -s "$p" "$limited/$c"
+done
+# 'env' is deliberately absent: it is required by the generated launcher.
+if env -i PATH="$limited" HOME="$CASE/home" PREFIX="$PREFIX_T" \
+	OMP_LIB_DIR="$LIB_T" TMPDIR="$CASE/tmp" sh "$src" > "$CASE/run.log" 2>&1; then
+	die 'missing prerequisite accepted'
+fi
+grep -q 'missing required command(s): env' "$CASE/run.log" \
+	|| die "prerequisite message: $(cat "$CASE/run.log")"
+expect_absent "$LIB_T"
+pass 'missing prerequisite fails before install with a clear message'
+
+# 28. interactive terminal: each choice prompted separately, flags/env not needed
+if [ "$have_script" = 1 ]; then
+	new_case tty-both
+	CURL_API_JSON="$api_extended" run_install_tty 'y\ny\n' "$assets/good-a" \
+		|| { cat "$CASE/run.log"; die 'interactive both-yes install failed'; }
+	grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/download/v18.16.0-termux-ex-r77f7e6811d20/omp-termux.tar.gz' "$CASE/curl.log" \
+		|| die 'interactive yes did not select extended'
+	[ "$(cat "$CASE/pkg.log")" = "$browser_pkgs" ] \
+		|| die "interactive yes did not update libc++/install browser: $(cat "$CASE/pkg.log")"
+	grep -q 'shared libc++' "$CASE/run.log" || die 'interactive prompt lacks libc++ warning'
+	pass 'interactive y,y selects extended, warns about libc++, updates libc++ and Chromium'
+
+	new_case tty-declined
+	run_install_tty 'n\nn\n' "$assets/good-a" \
+		|| { cat "$CASE/run.log"; die 'interactive both-no install failed'; }
+	grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/latest/download/omp-termux.tar.gz' "$CASE/curl.log" \
+		|| die 'interactive no did not keep standard release'
+	[ ! -s "$CASE/pkg.log" ] || die "interactive no installed packages: $(cat "$CASE/pkg.log")"
+	pass 'interactive n,n keeps standard and no browser'
+
+	new_case tty-independent
+	CURL_API_JSON="$api_extended" run_install_tty 'n\ny\n' "$assets/good-a" \
+		|| { cat "$CASE/run.log"; die 'interactive mixed install failed'; }
+	grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/latest/download/omp-termux.tar.gz' "$CASE/curl.log" \
+		|| die 'interactive mixed changed standard release'
+	[ "$(cat "$CASE/pkg.log")" = "$browser_pkgs" ] \
+		|| die "interactive mixed did not update libc++/install browser: $(cat "$CASE/pkg.log")"
+	pass 'interactive choices are independent'
+
+	new_case tty-eof
+	# Two VEOF chars: tty EOF is per-read, so an empty pipe would block the
+	# second prompt instead of reaching end-of-input.
+	run_install_tty '\004\004' "$assets/good-a" \
+		|| { cat "$CASE/run.log"; die 'interactive EOF install failed'; }
+	grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/latest/download/omp-termux.tar.gz' "$CASE/curl.log" \
+		|| die 'interactive EOF changed standard release'
+	[ ! -s "$CASE/pkg.log" ] || die "interactive EOF installed packages: $(cat "$CASE/pkg.log")"
+	pass 'interactive EOF defaults to standard and no browser'
+
+	new_case tty-invalid
+	run_install_tty 'maybe\n\n' "$assets/good-a" \
+		|| { cat "$CASE/run.log"; die 'interactive invalid-answer install failed'; }
+	grep -Fxq 'https://github.com/SklUpp/omp-termux/releases/latest/download/omp-termux.tar.gz' "$CASE/curl.log" \
+		|| die 'invalid interactive answers changed standard release'
+	[ ! -s "$CASE/pkg.log" ] || die "invalid interactive answers installed packages: $(cat "$CASE/pkg.log")"
+	pass 'interactive invalid/empty answers take defaults'
+else
+	echo 'SKIP interactive pty cases (script unavailable)'
+fi
 
 echo 'ALL INSTALL E2E CHECKS PASSED'
