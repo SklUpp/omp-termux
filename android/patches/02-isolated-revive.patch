@@ -3174,10 +3174,10 @@ index 0ceddc2..b146118 100644
  		...effortField,
  		...schemaFields,
 diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/src/task/worktree.ts
-index 34fa981..76c661b 100644
+index 34fa981..1d838bb 100644
 --- a/packages/coding-agent/src/task/worktree.ts
 +++ b/packages/coding-agent/src/task/worktree.ts
-@@ -1,16 +1,24 @@
+@@ -1,16 +1,25 @@
  import { type NestedRepoPatch } from "@oh-my-pi/pi-tui/tools/task";
  import type { Dirent } from "node:fs";
 +import type { FileHandle } from "node:fs/promises";
@@ -3193,6 +3193,7 @@ index 34fa981..76c661b 100644
  
  import { withRepoLock } from "../utils/repo-lock";
 -import { needsNativeTeardown, writeIsolationOwner, writeRetainedBackend } from "./isolation-ownership";
++import { parseTitleSlotLine } from "../session/session-title-slot";
 +import {
 +	hasLiveIsolationOwner,
 +	IsolationLeaseBusyError,
@@ -3204,7 +3205,7 @@ index 34fa981..76c661b 100644
  import { mapWithConcurrencyLimit } from "./parallel";
  import type { cfgIsolationBackend } from "./settings";
  
-@@ -249,7 +257,10 @@ async function captureRepoBaseline(repoRoot: string, budgetBytes: number): Promi
+@@ -249,7 +258,10 @@ async function captureRepoBaseline(repoRoot: string, budgetBytes: number): Promi
  		// The renderer's cap and the budget are UTF-8 bytes; a render that
  		// succeeded is at most `budgetBytes` of them, so the remainder is never
  		// negative.
@@ -3216,7 +3217,7 @@ index 34fa981..76c661b 100644
  	} catch (error) {
  		if (vcs.isVcsError(error) && error.code === "OutputTooLarge") {
  			throw new IsolationBaselineTooLargeError(repoRoot, undefined, budgetBytes);
-@@ -618,7 +629,22 @@ function errorMessage(err: unknown): string {
+@@ -618,7 +630,22 @@ function errorMessage(err: unknown): string {
  	return err instanceof Error ? err.message : String(err);
  }
  
@@ -3240,7 +3241,7 @@ index 34fa981..76c661b 100644
  	const key = `${path.resolve(repoRoot)}\0${id}`;
  	const digest = Bun.hash(key).toString(16).padStart(16, "0").slice(-TASK_ISOLATION_DIR_DIGEST_CHARS);
  	return `${TASK_ISOLATION_DIR_PREFIX}${digest}`;
-@@ -670,51 +696,83 @@ export async function ensureIsolation(
+@@ -670,51 +697,83 @@ export async function ensureIsolation(
  ): Promise<IsolationHandle> {
  	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
  	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
@@ -3364,7 +3365,7 @@ index 34fa981..76c661b 100644
  /**
   * Tear down a handle returned by {@link ensureIsolation}. When native teardown fails for a mount or
   * subvolume backend, the workspace is kept with a retained-backend sidecar (recursive `rm` would
-@@ -747,6 +805,618 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
+@@ -747,6 +806,633 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
  	await fs.rm(baseDir, { recursive: true, force: true });
  }
  
@@ -3713,16 +3714,31 @@ index 34fa981..76c661b 100644
 +/** Outcome of proving a workspace's transcript is genuinely its own. */
 +export type PersistedReleaseIdentity = { transcriptFile: string; artifactsDir: string } | { refusal: string };
 +
-+/** First record of a transcript, read in a bounded prefix instead of the whole file. */
++/** Session header of a transcript, read from a bounded prefix. Only the physical title slot may precede it. */
 +async function readSessionHeader(file: string): Promise<Record<string, unknown> | undefined> {
 +	let handle: FileHandle | undefined;
 +	try {
 +		handle = await fs.open(file, "r");
 +		const buffer = Buffer.alloc(64 * 1024);
 +		const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-+		const line = buffer.subarray(0, bytesRead).toString("utf8").split("\n", 1)[0];
-+		const parsed: unknown = JSON.parse(line);
-+		return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
++		const content = buffer.subarray(0, bytesRead).toString("utf8");
++		const firstEnd = content.indexOf("\n");
++		if (firstEnd < 0) return undefined;
++		const firstLine = content.slice(0, firstEnd);
++		let headerLine: string;
++		if (parseTitleSlotLine(firstLine)) {
++			const rest = content.slice(firstEnd + 1);
++			const headerEnd = rest.indexOf("\n");
++			if (headerEnd < 0) return undefined;
++			headerLine = rest.slice(0, headerEnd);
++		} else {
++			headerLine = firstLine;
++		}
++		const parsed: unknown = JSON.parse(headerLine);
++		return typeof parsed === "object" &&
++			parsed !== null &&
++			!Array.isArray(parsed) &&
++			(parsed as Record<string, unknown>).type === "session"
 +			? (parsed as Record<string, unknown>)
 +			: undefined;
 +	} catch {
@@ -3985,10 +4001,10 @@ index 34fa981..76c661b 100644
  // ═══════════════════════════════════════════════════════════════════════════
 diff --git a/packages/coding-agent/test/cli/worktree-release-isolation.test.ts b/packages/coding-agent/test/cli/worktree-release-isolation.test.ts
 new file mode 100644
-index 0000000..5a0f297
+index 0000000..466b7a2
 --- /dev/null
 +++ b/packages/coding-agent/test/cli/worktree-release-isolation.test.ts
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,348 @@
 +import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 +import { $ } from "bun";
 +import * as fs from "node:fs/promises";
@@ -3999,6 +4015,7 @@ index 0000000..5a0f297
 +import { releaseWorktree } from "@oh-my-pi/pi-coding-agent/cli/worktree-cli";
 +import { ISOLATION_OWNER_FILE, readIsolationOwner } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
 +import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
++import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 +import {
 +	getTaskIsolationSlot,
 +	type RepoBaseline,
@@ -4127,6 +4144,61 @@ index 0000000..5a0f297
 +
 +			await expect(releaseWorktree({ path: base, json: true })).rejects.toThrow("pointer");
 +			expect(capture).not.toHaveBeenCalled();
++		});
++	}
++
++	it("accepts a validated title slot before the session header", async () => {
++		const { base, sessionFile } = await retainedFixture();
++		const workspace = path.join(base, "m");
++		const header = `${JSON.stringify({
++			type: "session",
++			id: "session-agent-1",
++			timestamp: new Date().toISOString(),
++			cwd: workspace,
++		})}\n`;
++		await Bun.write(
++			sessionFile,
++			`${serializeTitleSlot({ title: "title", updatedAt: new Date().toISOString() })}${header}`,
++		);
++		const capture = vi
++			.spyOn(worktreeModule, "captureDeltaPatch")
++			.mockResolvedValue({ rootPatch: "diff --git a/work b/work", nestedPatches: [] });
++		vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue(null);
++		vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
++
++		await releaseWorktree({ path: base, json: true });
++
++		expect(capture).toHaveBeenCalledTimes(1);
++	});
++
++	for (const [label, body] of [
++		[
++			"a nested session object inside a multiline record",
++			(header: string) => `{"type":"custom","id":"c1","data":[\n${header}\n]}\n`,
++		],
++		[
++			"a later session record after a valid non-header record",
++			(header: string) => `{"type":"custom","id":"c1","data":{}}\n${header}\n`,
++		],
++		["a malformed title slot before the header", (header: string) => `{"type":"title","v":1}\n${header}\n`],
++	] as const) {
++		it(`refuses a transcript with ${label}`, async () => {
++			const { base, sessionFile } = await retainedFixture();
++			const workspace = path.join(base, "m");
++			const header = JSON.stringify({
++				type: "session",
++				id: "session-agent-1",
++				timestamp: new Date().toISOString(),
++				cwd: workspace,
++			});
++			await Bun.write(sessionFile, body(header));
++			const capture = vi.spyOn(worktreeModule, "captureDeltaPatch");
++			const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
++
++			await expect(releaseWorktree({ path: base, json: true })).rejects.toThrow(/session header/);
++			expect(capture).not.toHaveBeenCalled();
++			expect(cleanup).not.toHaveBeenCalled();
++			expect(await Bun.file(path.join(workspace, "work.txt")).text()).toBe("post-handoff\n");
 +		});
 +	}
 +
@@ -4987,7 +5059,7 @@ index 6f23a65..915d267 100644
  		mergeMode: "branch",
 diff --git a/packages/coding-agent/test/task/isolation-retained.test.ts b/packages/coding-agent/test/task/isolation-retained.test.ts
 new file mode 100644
-index 0000000..9a7f569
+index 0000000..f193757
 --- /dev/null
 +++ b/packages/coding-agent/test/task/isolation-retained.test.ts
 @@ -0,0 +1,1060 @@
@@ -5752,7 +5824,7 @@ index 0000000..9a7f569
 +		});
 +
 +		await runIsolatedSubprocess({
-+			baseOptions: { keepAlive: false } as never,
++			baseOptions: { id, keepAlive: false } as never,
 +			context: { repoRoot: repo },
 +			preferredBackend: undefined,
 +			agentId: id,
@@ -5807,7 +5879,7 @@ index 0000000..9a7f569
 +		});
 +
 +		await runIsolatedSubprocess({
-+			baseOptions: { keepAlive: false } as never,
++			baseOptions: { id, keepAlive: false } as never,
 +			context: { repoRoot: repo },
 +			preferredBackend: undefined,
 +			agentId: id,
@@ -5853,7 +5925,7 @@ index 0000000..9a7f569
 +		});
 +
 +		const outcome = await runIsolatedSubprocess({
-+			baseOptions: { keepAlive: false } as never,
++			baseOptions: { id, keepAlive: false } as never,
 +			context: { repoRoot: repo },
 +			preferredBackend: undefined,
 +			agentId: id,
