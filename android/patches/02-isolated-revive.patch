@@ -464,10 +464,10 @@ index 86b6792..aba2a3f 100644
  		// Reserved OMP-owned security-analysis namespace; vendor adapters normalize into its store.
 diff --git a/packages/coding-agent/src/internal-urls/worktree-protocol.ts b/packages/coding-agent/src/internal-urls/worktree-protocol.ts
 new file mode 100644
-index 0000000..aa87cbe
+index 0000000..429b37c
 --- /dev/null
 +++ b/packages/coding-agent/src/internal-urls/worktree-protocol.ts
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,101 @@
 +/**
 + * Protocol handler for `worktree://`: the isolation manager's explicit
 + * integration endpoint.
@@ -520,7 +520,9 @@ index 0000000..aa87cbe
 +		if (!registry || !senderId) throw new Error("The isolation manager is unavailable in this session.");
 +		const id = agentId(url);
 +		if (!isDeferredIntegrationSignal(content)) {
-+			throw new Error(`worktree://${id} accepts only \`/integrate\`; write that signal to merge its retained changes.`);
++			throw new Error(
++				`worktree://${id} accepts only \`/integrate\`; write that signal to merge its retained changes.`,
++			);
 +		}
 +		// Restore a parked roster through the integration call: an unknown id
 +		// then reports through the shared outcome instead of a raw bus error.
@@ -651,10 +653,23 @@ index 6189613..922fa32 100644
  # Format
  {{#if batchEnabled}}`context`: shared (`# Goal`, `# Contract` interfaces); NEVER repeat per task.
 diff --git a/packages/coding-agent/src/registry/agent-lifecycle.ts b/packages/coding-agent/src/registry/agent-lifecycle.ts
-index 805bd51..72e17f9 100644
+index 805bd51..1774790 100644
 --- a/packages/coding-agent/src/registry/agent-lifecycle.ts
 +++ b/packages/coding-agent/src/registry/agent-lifecycle.ts
-@@ -63,25 +63,40 @@ async function removeAgentTombstone(id: string, sessionFile: string): Promise<vo
+@@ -41,7 +41,11 @@ const AGENT_RELEASE_GRACE_MS = 5000;
+ 
+ async function persistAgentTombstone(sessionFile: string): Promise<void> {
+ 	try {
+-		await fs.writeFile(getAgentTombstonePath(sessionFile), "", { encoding: "utf8", flag: "wx", mode: 0o600 });
++		await fs.writeFile(getAgentTombstonePath(sessionFile), "", {
++			encoding: "utf8",
++			flag: "wx",
++			mode: 0o600,
++		});
+ 	} catch (error) {
+ 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+ 	}
+@@ -63,25 +67,40 @@ async function removeAgentTombstone(id: string, sessionFile: string): Promise<vo
   * Builds a reviver for a `parked` ref restored from disk (Agent Hub scan,
   * collab mirror, resumed process) that carries a sessionFile but no in-memory
   * adoption. Returns undefined when the ref cannot be faithfully rebuilt (no
@@ -664,14 +679,14 @@ index 805bd51..72e17f9 100644
 + * revivable but is not (missing/corrupt isolation state, moved workspace).
 + * Injected from the top-level session so this manager stays free of
 + * sdk/SessionManager imports.
-  */
--export type PersistedSubagentReviverFactory = (ref: AgentRef) => Promise<AgentReviver | undefined>;
++ */
 +export type PersistedSubagentReviverFactory = (ref: AgentRef) => Promise<PersistedSubagentReviver | undefined>;
 +
 +/**
 + * A cold reviver with the release it owns. The release rides on the reviver
 + * function itself so existing reviver call sites stay plain functions.
-+ */
+  */
+-export type PersistedSubagentReviverFactory = (ref: AgentRef) => Promise<AgentReviver | undefined>;
 +export type PersistedSubagentReviver = AgentReviver & {
 +	/** Terminal release of resources the revived run owns (e.g. its isolation workspace). */
 +	onRelease?: (opts?: { retain?: boolean }) => Promise<void>;
@@ -701,7 +716,7 @@ index 805bd51..72e17f9 100644
  	timer?: NodeJS.Timeout;
  }
  
-@@ -150,6 +165,8 @@ export class AgentLifecycleManager {
+@@ -150,6 +169,8 @@ export class AgentLifecycleManager {
  		this.#revivals.clear();
  		this.#reopens.clear();
  		this.#parks.clear();
@@ -710,7 +725,7 @@ index 805bd51..72e17f9 100644
  		this.#persistedReviverFactory = undefined;
  	}
  
-@@ -165,6 +182,15 @@ export class AgentLifecycleManager {
+@@ -165,6 +186,15 @@ export class AgentLifecycleManager {
  	readonly #revivals = new Map<string, RevivingAgent>();
  	/** In-flight reopens of killed refs, bound to the killed ref, so concurrent {@link ensureLive} calls coalesce. */
  	readonly #reopens = new Map<string, ReopeningAgent>();
@@ -726,7 +741,31 @@ index 805bd51..72e17f9 100644
  	#unsubscribe: (() => void) | undefined;
  	#persistedReviverFactory: PersistedSubagentReviverFactory | undefined;
  	/** Resolves the TTL applied when a cold-revived ref is adopted on demand (read per revive). */
-@@ -367,6 +393,53 @@ export class AgentLifecycleManager {
+@@ -342,7 +372,10 @@ export class AgentLifecycleManager {
+ 						this.#registry.setHistory(id, { directCost }, ref.sessionFile ?? undefined);
+ 					}
+ 				} catch (error) {
+-					logger.debug("AgentLifecycleManager.park: cost snapshot failed", { id, error: String(error) });
++					logger.debug("AgentLifecycleManager.park: cost snapshot failed", {
++						id,
++						error: String(error),
++					});
+ 				}
+ 
+ 				// Commit: detach + parked *before* dispose so callers never see a
+@@ -354,7 +387,10 @@ export class AgentLifecycleManager {
+ 				try {
+ 					await session.dispose();
+ 				} catch (error) {
+-					logger.warn("AgentLifecycleManager.park: session dispose failed", { id, error: String(error) });
++					logger.warn("AgentLifecycleManager.park: session dispose failed", {
++						id,
++						error: String(error),
++					});
+ 				}
+ 			} finally {
+ 				// Only clear if we are still the in-flight entry (a later park would
+@@ -367,6 +403,53 @@ export class AgentLifecycleManager {
  		return park.promise;
  	}
  
@@ -780,19 +819,17 @@ index 805bd51..72e17f9 100644
  	/**
  	 * Return the live session, reviving from the sessionFile if parked or
  	 * killed. Throws a plain Error if the id is unknown, or its transcript
-@@ -377,6 +450,11 @@ export class AgentLifecycleManager {
+@@ -377,6 +460,9 @@ export class AgentLifecycleManager {
  	 * cancelled (session still live) or awaited to completion before revive.
  	 */
  	async ensureLive(id: string): Promise<AgentSession> {
 +		if (this.#reservations.has(id)) {
-+			throw new Error(
-+				`Agent "${id}" is reserved for an isolation handoff; retry after that operation finishes.`,
-+			);
++			throw new Error(`Agent "${id}" is reserved for an isolation handoff; retry after that operation finishes.`);
 +		}
  		const park = this.#parks.get(id);
  		if (park) {
  			const parked = this.#registry.get(id);
-@@ -460,7 +538,7 @@ export class AgentLifecycleManager {
+@@ -460,7 +546,7 @@ export class AgentLifecycleManager {
  		}
  		if (!reviver) {
  			throw new Error(
@@ -801,7 +838,7 @@ index 805bd51..72e17f9 100644
  			);
  		}
  		const reopened = this.#registry.reopen(id, killed);
-@@ -477,11 +555,14 @@ export class AgentLifecycleManager {
+@@ -477,11 +563,14 @@ export class AgentLifecycleManager {
  	 * when the agent is not revivable or no reviver can be produced.
  	 */
  	async #resolveAndRevive(id: string, ref: AgentRef): Promise<AgentSession> {
@@ -817,7 +854,7 @@ index 805bd51..72e17f9 100644
  			// Teardown can complete during the factory await. A late cold revive must
  			// not cold-adopt (and later attach a live session + TTL) into a disposed
  			// manager — reject deterministically before creating any session.
-@@ -490,8 +571,9 @@ export class AgentLifecycleManager {
+@@ -490,8 +579,14 @@ export class AgentLifecycleManager {
  					`Agent "${id}" revival aborted: its lifecycle was disposed while its persisted session was being prepared.`,
  				);
  			}
@@ -825,11 +862,16 @@ index 805bd51..72e17f9 100644
 -				adoption = { ref, idleTtlMs: this.#persistedReviveTtlMs(), revive };
 +			if (built) {
 +				revive = built;
-+				adoption = { ref, idleTtlMs: this.#persistedReviveTtlMs(), revive, onRelease: built.onRelease };
++				adoption = {
++					ref,
++					idleTtlMs: this.#persistedReviveTtlMs(),
++					revive,
++					onRelease: built.onRelease,
++				};
  				this.#adopted.set(id, adoption);
  				coldAdopted = true;
  			}
-@@ -529,8 +611,16 @@ export class AgentLifecycleManager {
+@@ -529,8 +624,16 @@ export class AgentLifecycleManager {
  	 * `finalizeSubagentLifecycle`'s explicit-kill path. The kill stops the agent,
  	 * it does not destroy it: {@link ensureLive} (a message, Hub revive/focus)
  	 * reopens the transcript.
@@ -847,39 +889,125 @@ index 805bd51..72e17f9 100644
  		const adopted = this.#adopted.get(id);
  		const current = this.#registry.get(id);
  		const currentMatches =
-@@ -540,6 +630,12 @@ export class AgentLifecycleManager {
+@@ -540,59 +643,73 @@ export class AgentLifecycleManager {
  		const ref = currentMatches ? current : adoptedMatches ? adopted.ref : undefined;
  		const onRelease = adopted && adopted.ref === ref ? adopted.onRelease : undefined;
  		if (!ref) return false;
+-		if (adopted?.ref === ref) {
+-			clearTimeout(adopted.timer);
+-			this.#adopted.delete(id);
 +		if (!this.#disposed && this.isReserved(id, ref)) {
 +			logger.warn("AgentLifecycleManager.release: refused during an active operation hold", { id });
 +			return false;
-+		}
+ 		}
 +		this.#releasing.add(id);
 +		try {
- 		if (adopted?.ref === ref) {
- 			clearTimeout(adopted.timer);
- 			this.#adopted.delete(id);
-@@ -583,7 +679,7 @@ export class AgentLifecycleManager {
++			if (adopted?.ref === ref) {
++				clearTimeout(adopted.timer);
++				this.#adopted.delete(id);
++			}
+ 
+-		const park = this.#parks.get(id);
+-		if (park && park.ref === ref) {
+-			// Prefer cancel when the session is still live so release owns dispose.
+-			if (!park.detached) park.cancel();
+-			await park.promise;
+-		}
++			const park = this.#parks.get(id);
++			if (park && park.ref === ref) {
++				// Prefer cancel when the session is still live so release owns dispose.
++				if (!park.detached) park.cancel();
++				await park.promise;
++			}
+ 
+-		const live = this.#registry.get(id) === ref ? ref.session : null;
+-		if (options?.tombstone) {
+-			// Apply the terminal transition synchronously, before any await. The
+-			// dying session's own dispose path calls unregisterUnlessParked
+-			// (sdk.ts), which spares a ref only when it is already `aborted` AND
+-			// already detached; awaiting persistAgentTombstone before this
+-			// transition left a window in which that unregister deleted the ref
+-			// (issue #10531). Persisting the sidecar afterward is safe: within the
+-			// process the still-registered `aborted` row already blocks re-adoption
+-			// via the `if (!registry.get(id))` discovery guard, and the sidecar
+-			// only needs to exist before a later cross-restart discovery pass —
+-			// release awaits the write below before returning.
+-			// Detach before publishing `aborted`: setStatus emits synchronously, so
+-			// every subscriber must observe a terminal ref with session === null.
+-			if (!this.#registry.detachSession(id, ref) || !this.#registry.setStatus(id, "aborted", ref)) {
+-				logger.warn("AgentLifecycleManager.release: terminal transition rejected", { id });
++			const live = this.#registry.get(id) === ref ? ref.session : null;
++			if (options?.tombstone) {
++				// Apply the terminal transition synchronously, before any await. The
++				// dying session's own dispose path calls unregisterUnlessParked
++				// (sdk.ts), which spares a ref only when it is already `aborted` AND
++				// already detached; awaiting persistAgentTombstone before this
++				// transition left a window in which that unregister deleted the ref
++				// (issue #10531). Persisting the sidecar afterward is safe: within the
++				// process the still-registered `aborted` row already blocks re-adoption
++				// via the `if (!registry.get(id))` discovery guard, and the sidecar
++				// only needs to exist before a later cross-restart discovery pass —
++				// release awaits the write below before returning.
++				// Detach before publishing `aborted`: setStatus emits synchronously, so
++				// every subscriber must observe a terminal ref with session === null.
++				if (!this.#registry.detachSession(id, ref) || !this.#registry.setStatus(id, "aborted", ref)) {
++					logger.warn("AgentLifecycleManager.release: terminal transition rejected", { id });
++				}
+ 			}
+-		}
+-		try {
+-			if (options?.tombstone && ref.sessionFile) await persistAgentTombstone(ref.sessionFile);
+-		} finally {
+-			// Detaching removes the registry's only route to the live session. Always
+-			// dispose the captured session, even when tombstone persistence fails.
+-			if (live) {
++			try {
++				if (options?.tombstone && ref.sessionFile) await persistAgentTombstone(ref.sessionFile);
++			} finally {
++				// Detaching removes the registry's only route to the live session. Always
++				// dispose the captured session, even when tombstone persistence fails.
++				if (live) {
++					try {
++						await live.dispose();
++					} catch (error) {
++						logger.warn("AgentLifecycleManager.release: session dispose failed", {
++							id,
++							error: String(error),
++						});
++					}
++				}
+ 				try {
+-					await live.dispose();
++					await onRelease?.({
++						retain: Boolean(options?.tombstone) || Boolean(options?.retainWorkspace),
++					});
+ 				} catch (error) {
+-					logger.warn("AgentLifecycleManager.release: session dispose failed", { id, error: String(error) });
++					logger.warn("AgentLifecycleManager.release: owned resource cleanup failed", {
++						id,
++						error: String(error),
++					});
  				}
  			}
- 			try {
+-			try {
 -				await onRelease?.();
-+				await onRelease?.({ retain: Boolean(options?.tombstone) || Boolean(options?.retainWorkspace) });
- 			} catch (error) {
- 				logger.warn("AgentLifecycleManager.release: owned resource cleanup failed", {
- 					id,
-@@ -593,6 +689,9 @@ export class AgentLifecycleManager {
- 		}
- 		if (!options?.tombstone) this.#registry.unregister(id, ref);
- 		return true;
+-			} catch (error) {
+-				logger.warn("AgentLifecycleManager.release: owned resource cleanup failed", {
+-					id,
+-					error: String(error),
+-				});
+-			}
++			if (!options?.tombstone) this.#registry.unregister(id, ref);
++			return true;
 +		} finally {
 +			this.#releasing.delete(id);
-+		}
+ 		}
+-		if (!options?.tombstone) this.#registry.unregister(id, ref);
+-		return true;
  	}
  
  	/** Teardown everything; disposing the global manager makes its next owner a fresh instance. */
-@@ -603,7 +702,7 @@ export class AgentLifecycleManager {
+@@ -603,7 +720,7 @@ export class AgentLifecycleManager {
  		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])];
  		await Promise.all(
  			ids.map(async id => {
@@ -994,10 +1122,10 @@ index 2161b58..7c56592 100644
  	workPoolYieldItems?: WorkPoolYieldItem[];
 diff --git a/packages/coding-agent/src/task/deferred-integration.ts b/packages/coding-agent/src/task/deferred-integration.ts
 new file mode 100644
-index 0000000..56364c6
+index 0000000..a7748bf
 --- /dev/null
 +++ b/packages/coding-agent/src/task/deferred-integration.ts
-@@ -0,0 +1,678 @@
+@@ -0,0 +1,697 @@
 +/**
 + * Explicit handoff for deferred isolated runs.
 + *
@@ -1112,9 +1240,7 @@ index 0000000..56364c6
 + * Handle `/integrate` for one agent. Only called when the message matched the
 + * reserved signal, so every outcome is an explicit answer.
 + */
-+export async function integrateDeferredAgent(
-+	request: DeferredIntegrationRequest,
-+): Promise<DeferredIntegrationOutcome> {
++export async function integrateDeferredAgent(request: DeferredIntegrationRequest): Promise<DeferredIntegrationOutcome> {
 +	try {
 +		return await integrateDeferredAgentUnchecked(request);
 +	} catch (error) {
@@ -1155,7 +1281,10 @@ index 0000000..56364c6
 +		};
 +	}
 +	if (ref.kind === "advisor") {
-+		return { text: `Cannot integrate "${target}": advisor transcripts own no workspace.`, isError: true };
++		return {
++			text: `Cannot integrate "${target}": advisor transcripts own no workspace.`,
++			isError: true,
++		};
 +	}
 +	if (ref.parentId !== senderId) {
 +		return {
@@ -1164,7 +1293,10 @@ index 0000000..56364c6
 +		};
 +	}
 +	if (!ref.sessionFile) {
-+		return { text: `Cannot integrate "${target}": it has no transcript to bind its workspace to.`, isError: true };
++		return {
++			text: `Cannot integrate "${target}": it has no transcript to bind its workspace to.`,
++			isError: true,
++		};
 +	}
 +
 +	const lifecycle = AgentLifecycleManager.global();
@@ -1179,7 +1311,10 @@ index 0000000..56364c6
 +			throw new Error("the agent was replaced while its handoff hold was acquired");
 +		}
 +		if (ref.history?.deferredIntegration === "merged") {
-+			return { text: `Agent "${target}" was already integrated; nothing is left to apply.`, isError: false };
++			return {
++				text: `Agent "${target}" was already integrated; nothing is left to apply.`,
++				isError: false,
++			};
 +		}
 +		if (ref.status === "running") {
 +			return {
@@ -1191,7 +1326,9 @@ index 0000000..56364c6
 +			try {
 +				await lifecycle.park(ref.id);
 +			} catch (error) {
-+				throw new Error(`parking its live session failed: ${error instanceof Error ? error.message : String(error)}`);
++				throw new Error(
++					`parking its live session failed: ${error instanceof Error ? error.message : String(error)}`,
++				);
 +			}
 +			ref = registry.get(target);
 +			if (!ref || ref !== reservedRef) {
@@ -1236,12 +1373,17 @@ index 0000000..56364c6
 +	if (!sessionFile) return { outcome: { text: `Cannot integrate "${ref.id}": no transcript.`, isError: true } };
 +	const peek = await SessionManager.peekSessionInit(sessionFile);
 +	if (!peek?.init || peek.init.isolated !== true) {
-+		return { outcome: { text: `Cannot integrate "${ref.id}": it did not run isolated.`, isError: true } };
++		return {
++			outcome: { text: `Cannot integrate "${ref.id}": it did not run isolated.`, isError: true },
++		};
 +	}
 +	const childSessionId = await readSessionHeaderId(sessionFile);
 +	if (!childSessionId) {
 +		return {
-+			outcome: { text: `Cannot integrate "${ref.id}": its transcript has no session-header id.`, isError: true },
++			outcome: {
++				text: `Cannot integrate "${ref.id}": its transcript has no session-header id.`,
++				isError: true,
++			},
 +		};
 +	}
 +	const artifactsDir = path.dirname(sessionFile);
@@ -1251,7 +1393,11 @@ index 0000000..56364c6
 +	const tombstone = await readTombstone(artifactsDir, ref.id);
 +	if (
 +		tombstone &&
-+		(await tombstoneMatches(tombstone, { id: ref.id, childSessionFile: sessionFile, childSessionId })) &&
++		(await tombstoneMatches(tombstone, {
++			id: ref.id,
++			childSessionFile: sessionFile,
++			childSessionId,
++		})) &&
 +		tombstone.parentSessionFile === (await canonicalFile(parentSessionFile)) &&
 +		tombstone.parentSessionId === parentSessionId
 +	) {
@@ -1445,7 +1591,11 @@ index 0000000..56364c6
 +		startedAt: new Date().toISOString(),
 +	});
 +	const warnings = skippedNested ? "\nAlready-applied nested patches were skipped." : "";
-+	const outcomeLabel = hadChanges ? (mergeMode === "branch" ? "branch merged" : "patch applied") : "no changes to apply";
++	const outcomeLabel = hadChanges
++		? mergeMode === "branch"
++			? "branch merged"
++			: "patch applied"
++		: "no changes to apply";
 +	try {
 +		await cleanupIsolation(handle);
 +	} catch (error) {
@@ -1547,7 +1697,8 @@ index 0000000..56364c6
 +		repo.canApplyPatch(patch, { reverse: true }).catch(() => false),
 +	]);
 +	if (!forward && !reverse) throw new Error("the root patch applies neither forward nor in reverse");
-+	if (forward && reverse) throw new Error("the root patch is ambiguous (applies both ways); parent may already contain it");
++	if (forward && reverse)
++		throw new Error("the root patch is ambiguous (applies both ways); parent may already contain it");
 +}
 +
 +/**
@@ -1618,11 +1769,7 @@ index 0000000..56364c6
 +	await writeJsonAtomic(journalPath(dir), journal);
 +}
 +
-+async function writeTombstone(
-+	artifactsDir: string,
-+	id: string,
-+	identity: IntegrationIdentity,
-+): Promise<void> {
++async function writeTombstone(artifactsDir: string, id: string, identity: IntegrationIdentity): Promise<void> {
 +	const tombstone: IntegrationTombstone = {
 +		version: 1,
 +		id,
@@ -1797,7 +1944,7 @@ index bb4539e..20fc46e 100644
  			});
  
 diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src/task/index.ts
-index 98f8661..dba0b6c 100644
+index 98f8661..617a162 100644
 --- a/packages/coding-agent/src/task/index.ts
 +++ b/packages/coding-agent/src/task/index.ts
 @@ -88,6 +88,7 @@ import {
@@ -1824,7 +1971,34 @@ index 98f8661..dba0b6c 100644
  		batchEnabled: options.batchEnabled,
  		effortEnabled: options.effortEnabled,
  		perCallModelEnabled: options.perCallModelEnabled,
-@@ -909,6 +912,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -388,7 +391,12 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
+ 	if (Array.isArray(params.tasks) && params.tasks.length > 0) {
+ 		return params.tasks;
+ 	}
+-	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task, taskFile: params.taskFile };
++	const item: TaskItem = {
++		name: params.name,
++		agent: params.agent,
++		task: params.task,
++		taskFile: params.taskFile,
++	};
+ 	if ("solutionSpace" in params) item.solutionSpace = params.solutionSpace;
+ 	if ("repoRoot" in params) item.repoRoot = params.repoRoot;
+ 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
+@@ -436,7 +444,11 @@ async function resolveTaskFile(session: ToolSession, item: TaskItem): Promise<Re
+ 				throw new Error("contains invalid UTF-8");
+ 			}
+ 			if (!task.trim()) throw new Error("must contain non-empty task instructions");
+-			return { ...item, task, taskFileSha256: new Bun.CryptoHasher("sha256").update(bytes).digest("hex") };
++			return {
++				...item,
++				task,
++				taskFileSha256: new Bun.CryptoHasher("sha256").update(bytes).digest("hex"),
++			};
+ 		} finally {
+ 			await file.close();
+ 		}
+@@ -909,6 +921,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  			sessionAgents,
  			isolationEnabled: !planMode && isolationEnabled,
  			applyIsolatedChanges: cfgTaskIsolationApply.get(this.session.settings),
@@ -1832,7 +2006,18 @@ index 98f8661..dba0b6c 100644
  			disabledAgents,
  			batchEnabled: this.#isBatchEnabled(),
  			effortEnabled: cfgTaskEnableEffort.get(this.session.settings),
-@@ -1573,11 +1577,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1177,7 +1190,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 				try {
+ 					return { policy: await this.#resolveSpawnPreflight(spawn) };
+ 				} catch (error) {
+-					return { error: error instanceof StructuredSubagentError ? error.message : String(error) };
++					return {
++						error: error instanceof StructuredSubagentError ? error.message : String(error),
++					};
+ 				}
+ 			}),
+ 		);
+@@ -1573,11 +1588,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  		// its widget has no tool tap to read.
  		let spawnRun: SpawnRun | undefined = run;
  		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
@@ -1848,17 +2033,29 @@ index 98f8661..dba0b6c 100644
  			const isolated = spawnParams.isolated === true;
  			const ref = aborted ? AgentRegistry.global().get(agentId) : undefined;
  			return `\n\n${prompt.render(taskFollowUpTemplate, {
-@@ -1585,7 +1588,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1585,7 +1599,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  				aborted,
  				isolated,
  				ircEnabled,
 -				resumable: !isolated && isResumable(ref),
 +				resumable: isResumable(ref),
-+				deferredIntegration:
-+					AgentRegistry.global().get(agentId)?.history?.deferredIntegration === "pending",
++				deferredIntegration: AgentRegistry.global().get(agentId)?.history?.deferredIntegration === "pending",
  				transcriptAvailable: aborted ? await hasResolvableTranscript(agentId) : true,
  			})}`;
  		};
+@@ -1969,7 +1984,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 				signal,
+ 				...(tools ? { onToolResult: (result: SubagentToolResult) => appendToolResult(tools, result) } : {}),
+ 				onProgress: progress => {
+-					latestProgress = { ...progress, ...taskFileMetadata, recentTools: progress.recentTools.slice() };
++					latestProgress = {
++						...progress,
++						...taskFileMetadata,
++						recentTools: progress.recentTools.slice(),
++					};
+ 					onUpdate?.({
+ 						content: [{ type: "text", text: `Running agent ${progress.id}...` }],
+ 						details: {
 diff --git a/packages/coding-agent/src/task/isolation-ownership.ts b/packages/coding-agent/src/task/isolation-ownership.ts
 index dc4655c..bf196c1 100644
 --- a/packages/coding-agent/src/task/isolation-ownership.ts
@@ -2026,7 +2223,7 @@ index dc4655c..bf196c1 100644
 +	});
 +}
 diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/coding-agent/src/task/isolation-runner.ts
-index 45486bf..d38b99d 100644
+index 45486bf..4511fd0 100644
 --- a/packages/coding-agent/src/task/isolation-runner.ts
 +++ b/packages/coding-agent/src/task/isolation-runner.ts
 @@ -22,7 +22,7 @@ import * as fs from "node:fs/promises";
@@ -2139,7 +2336,7 @@ index 45486bf..d38b99d 100644
  	isolationDir: string,
  	baseline: WorktreeBaseline,
  	artifactsDir: string,
-@@ -356,6 +382,186 @@ function renderIsolationError(context: IsolationErrorContext): string {
+@@ -356,6 +382,184 @@ function renderIsolationError(context: IsolationErrorContext): string {
  	return prompt.render(isolationErrorTemplate, { ...context });
  }
  
@@ -2231,9 +2428,7 @@ index 45486bf..d38b99d 100644
 +	if (!state.childSessionId) {
 +		const persisted = await readIsolationState(state.dir, state.id);
 +		const persistedId = "state" in persisted ? persisted.state.childSessionId : undefined;
-+		const headerId = opts.allowHeaderGeneration
-+			? await readSessionHeaderId(opts.expectedSessionFile)
-+			: undefined;
++		const headerId = opts.allowHeaderGeneration ? await readSessionHeaderId(opts.expectedSessionFile) : undefined;
 +		const generation = persistedId ?? headerId;
 +		if (generation) state = { ...state, childSessionId: generation };
 +	}
@@ -2326,7 +2521,7 @@ index 45486bf..d38b99d 100644
  /**
   * Run a subagent inside an isolation worktree and capture its changes.
   *
-@@ -385,6 +591,14 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -385,6 +589,14 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  	/** Fingerprint of the delta already handed to the caller at run end; release only re-captures on change. */
  	let handedOff: bigint | number | undefined;
  	let handle: IsolationHandle | undefined;
@@ -2341,7 +2536,7 @@ index 45486bf..d38b99d 100644
  	let deferredCleanup: Promise<void> | undefined;
  	let retainWorkspace = false;
  	let baseReleasePromise: Promise<void> | undefined;
-@@ -403,63 +617,99 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -403,63 +615,99 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  		})();
  		return cleanupPromise;
  	};
@@ -2481,7 +2676,7 @@ index 45486bf..d38b99d 100644
  			preloadedExtensionPaths: undefined,
  			preloadedPreparedExtensions: undefined,
  			preloadedCustomToolPaths: undefined,
-@@ -467,17 +717,15 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -467,17 +715,15 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  				deferredCleanup = completion;
  				opts.baseOptions.onCleanupDeferred?.(completion);
  			},
@@ -2503,7 +2698,7 @@ index 45486bf..d38b99d 100644
  		// A successful result cannot be captured while deferred owner jobs or
  		// shutdown hooks may still write the worktree. Failed runs skip capture,
  		// so their cleanup remains asynchronous.
-@@ -519,6 +767,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -519,6 +765,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  				} catch (patchErr) {
  					retainWorkspace = true;
  					const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
@@ -2512,7 +2707,7 @@ index 45486bf..d38b99d 100644
  					return rememberAgentArtifacts({
  						...result,
  						error: renderIsolationError({
-@@ -541,6 +791,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -541,6 +789,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  					opts.agentId,
  					commitResult?.nestedPatches ?? [],
  				);
@@ -2520,7 +2715,7 @@ index 45486bf..d38b99d 100644
  				return rememberAgentArtifacts({
  					...result,
  					branchName: commitResult?.branchName,
-@@ -551,6 +802,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -551,6 +800,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  			} catch (persistErr) {
  				retainWorkspace = true;
  				const retained = await retainIsolationWorkspace(isolationDir, isolationBackend);
@@ -2529,7 +2724,7 @@ index 45486bf..d38b99d 100644
  				return rememberAgentArtifacts({
  					...result,
  					branchName: commitResult?.branchName,
-@@ -569,10 +822,13 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -569,10 +820,13 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  			try {
  				const capture = await writeIsolationPatch(isolationDir, baseline, opts.artifactsDir, opts.agentId);
  				handedOff = capture.fingerprint;
@@ -2543,7 +2738,7 @@ index 45486bf..d38b99d 100644
  				return rememberAgentArtifacts({
  					...result,
  					error: renderIsolationError({
-@@ -588,8 +844,34 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
+@@ -588,8 +842,33 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
  	} catch (err) {
  		return rememberAgentArtifacts(opts.buildFailureResult(err));
  	} finally {
@@ -2552,8 +2747,7 @@ index 45486bf..d38b99d 100644
 +		// unconditional re-capture, never to a lost workspace.
 +		if (stateWritten && stateDir) {
 +			const sessionFile = AgentRegistry.global().get(opts.agentId)?.sessionFile ?? undefined;
-+			const childSessionId =
-+				sessionFile !== undefined ? await readSessionHeaderId(sessionFile) : undefined;
++			const childSessionId = sessionFile !== undefined ? await readSessionHeaderId(sessionFile) : undefined;
 +			try {
 +				await patchIsolationState(stateDir, {
 +					...(sessionFile === undefined ? {} : { sessionFile }),
@@ -2578,7 +2772,7 @@ index 45486bf..d38b99d 100644
  			!retainWorkspace &&
  			!releasePromise &&
  			!(opts.baseOptions.keepAlive !== false && AgentLifecycleManager.global().has(opts.agentId))
-@@ -642,6 +924,9 @@ export interface IsolationMergeOutcome {
+@@ -642,6 +921,9 @@ export interface IsolationMergeOutcome {
  export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise<IsolationMergeOutcome> {
  	const { result, repoRoot, mergeMode } = opts;
  	const repo = vcs.requireGit(repoRoot);
@@ -2588,7 +2782,7 @@ index 45486bf..d38b99d 100644
  	try {
  		if (mergeMode === "branch") {
  			if (!result.branchName && result.exitCode === 0 && !result.aborted && result.error) {
-@@ -651,6 +936,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
+@@ -651,6 +933,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
  						error: result.error,
  						rootPatchPath: result.patchPath,
  						nestedPatchPaths: result.nestedPatchPaths,
@@ -2596,7 +2790,7 @@ index 45486bf..d38b99d 100644
  					}),
  					changesApplied: false,
  					hadAnyChanges: false,
-@@ -759,6 +1045,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
+@@ -759,6 +1042,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
  				kind: "not-applied",
  				rootPatchPath: result.patchPath,
  				nestedPatchPaths: result.nestedPatchPaths,
@@ -2980,7 +3174,7 @@ index 0ceddc2..b146118 100644
  		...effortField,
  		...schemaFields,
 diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/src/task/worktree.ts
-index 34fa981..370ed62 100644
+index 34fa981..76c661b 100644
 --- a/packages/coding-agent/src/task/worktree.ts
 +++ b/packages/coding-agent/src/task/worktree.ts
 @@ -1,16 +1,24 @@
@@ -3010,7 +3204,19 @@ index 34fa981..370ed62 100644
  import { mapWithConcurrencyLimit } from "./parallel";
  import type { cfgIsolationBackend } from "./settings";
  
-@@ -618,7 +626,22 @@ function errorMessage(err: unknown): string {
+@@ -249,7 +257,10 @@ async function captureRepoBaseline(repoRoot: string, budgetBytes: number): Promi
+ 		// The renderer's cap and the budget are UTF-8 bytes; a render that
+ 		// succeeded is at most `budgetBytes` of them, so the remainder is never
+ 		// negative.
+-		unstaged = await repo.diffText({ binary: true, maxBytes: budgetBytes - Buffer.byteLength(staged) });
++		unstaged = await repo.diffText({
++			binary: true,
++			maxBytes: budgetBytes - Buffer.byteLength(staged),
++		});
+ 	} catch (error) {
+ 		if (vcs.isVcsError(error) && error.code === "OutputTooLarge") {
+ 			throw new IsolationBaselineTooLargeError(repoRoot, undefined, budgetBytes);
+@@ -618,7 +629,22 @@ function errorMessage(err: unknown): string {
  	return err instanceof Error ? err.message : String(err);
  }
  
@@ -3034,7 +3240,7 @@ index 34fa981..370ed62 100644
  	const key = `${path.resolve(repoRoot)}\0${id}`;
  	const digest = Bun.hash(key).toString(16).padStart(16, "0").slice(-TASK_ISOLATION_DIR_DIGEST_CHARS);
  	return `${TASK_ISOLATION_DIR_PREFIX}${digest}`;
-@@ -670,51 +693,83 @@ export async function ensureIsolation(
+@@ -670,51 +696,83 @@ export async function ensureIsolation(
  ): Promise<IsolationHandle> {
  	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
  	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
@@ -3158,7 +3364,7 @@ index 34fa981..370ed62 100644
  /**
   * Tear down a handle returned by {@link ensureIsolation}. When native teardown fails for a mount or
   * subvolume backend, the workspace is kept with a retained-backend sidecar (recursive `rm` would
-@@ -747,6 +802,601 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
+@@ -747,6 +805,618 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
  	await fs.rm(baseDir, { recursive: true, force: true });
  }
  
@@ -3378,7 +3584,10 @@ index 34fa981..370ed62 100644
 +	// already-normalised path: a relative or `..`-bearing base could resolve the
 +	// descriptor (and the later cleanup) somewhere unrelated.
 +	if (!path.isAbsolute(baseDir) || path.normalize(baseDir) !== baseDir) {
-+		return { error: "corrupt", detail: `isolation state dir ${baseDir} is not a normalized absolute path` };
++		return {
++			error: "corrupt",
++			detail: `isolation state dir ${baseDir} is not a normalized absolute path`,
++		};
 +	}
 +	const file = path.join(baseDir, ISOLATION_STATE_FILE);
 +	let decoded: unknown;
@@ -3386,12 +3595,18 @@ index 34fa981..370ed62 100644
 +		decoded = await Bun.file(file).json();
 +	} catch (error) {
 +		if (isEnoent(error)) return { error: "missing", detail: `no isolation state at ${file}` };
-+		return { error: "corrupt", detail: `isolation state at ${file} is unreadable: ${errorMessage(error)}` };
++		return {
++			error: "corrupt",
++			detail: `isolation state at ${file} is unreadable: ${errorMessage(error)}`,
++		};
 +	}
 +	const state = parseIsolationState(decoded);
 +	if (!state) return { error: "corrupt", detail: `isolation state at ${file} is malformed` };
 +	if (expectedId !== undefined && state.id !== expectedId) {
-+		return { error: "mismatch", detail: `isolation state at ${file} belongs to "${state.id}", not "${expectedId}"` };
++		return {
++			error: "mismatch",
++			detail: `isolation state at ${file} belongs to "${state.id}", not "${expectedId}"`,
++		};
 +	}
 +	return { state: { ...state, dir: baseDir } };
 +}
@@ -3442,10 +3657,14 @@ index 34fa981..370ed62 100644
 +		return { refusal: `isolation workspace ${state.dir} is not inside the omp worktrees root` };
 +	}
 +	if (isolationSlotFromDirName(path.basename(dir)) !== state.slot) {
-+		return { refusal: `isolation workspace ${state.dir} is not slot "${state.slot}" or its retained sibling` };
++		return {
++			refusal: `isolation workspace ${state.dir} is not slot "${state.slot}" or its retained sibling`,
++		};
 +	}
 +	if (state.slot !== getTaskIsolationSlot(state.repoRoot, state.id)) {
-+		return { refusal: `isolation slot "${state.slot}" does not belong to repo ${state.repoRoot} and "${state.id}"` };
++		return {
++			refusal: `isolation slot "${state.slot}" does not belong to repo ${state.repoRoot} and "${state.id}"`,
++		};
 +	}
 +	if (!state.sessionFile) return { refusal: "isolation state is not bound to a transcript" };
 +	// `expectedSessionFile` is passed by the lifecycle caller independently of the
@@ -3453,7 +3672,9 @@ index 34fa981..370ed62 100644
 +	// descriptor cannot self-verify by naming its own transcript.
 +	const [bound, transcript] = await Promise.all([realFile(state.sessionFile), realFile(sessionFile)]);
 +	if (!bound || !transcript || bound !== transcript) {
-+		return { refusal: `isolation state belongs to transcript ${state.sessionFile}, not ${sessionFile}` };
++		return {
++			refusal: `isolation state belongs to transcript ${state.sessionFile}, not ${sessionFile}`,
++		};
 +	}
 +	// Paths are reused when an agent id is reused; the session-header id is the
 +	// generation token. Descriptors written before it are fail-safe, not trusted.
@@ -3477,7 +3698,9 @@ index 34fa981..370ed62 100644
 +		realDirectory(state.baseline.root.repoRoot),
 +	]);
 +	if (!source || !baselineRoot || source !== baselineRoot) {
-+		return { refusal: `isolation baseline root ${state.baseline.root.repoRoot} does not match ${state.repoRoot}` };
++		return {
++			refusal: `isolation baseline root ${state.baseline.root.repoRoot} does not match ${state.repoRoot}`,
++		};
 +	}
 +	const workspace = path.join(dir, state.mergedDir);
 +	const workspaceReal = await realDirectory(workspace);
@@ -3515,9 +3738,7 @@ index 34fa981..370ed62 100644
 + */
 +export async function readSessionHeaderId(file: string): Promise<string | undefined> {
 +	const header = await readSessionHeader(file);
-+	return header?.type === "session" && typeof header.id === "string" && header.id.length > 0
-+		? header.id
-+		: undefined;
++	return header?.type === "session" && typeof header.id === "string" && header.id.length > 0 ? header.id : undefined;
 +}
 +
 +/**
@@ -3681,7 +3902,9 @@ index 34fa981..370ed62 100644
 +				.join(", ")}); refusing to guess which one to revive`,
 +		};
 +	}
-+	return { refusal: refusal ?? "isolation state missing (its workspace was never retained or was already released)" };
++	return {
++		refusal: refusal ?? "isolation state missing (its workspace was never retained or was already released)",
++	};
 +}
 +
 +/** Atomically replace the descriptor: a crash leaves either the old file or the new one, never a torn one. */
@@ -3762,7 +3985,7 @@ index 34fa981..370ed62 100644
  // ═══════════════════════════════════════════════════════════════════════════
 diff --git a/packages/coding-agent/test/cli/worktree-release-isolation.test.ts b/packages/coding-agent/test/cli/worktree-release-isolation.test.ts
 new file mode 100644
-index 0000000..ce5e1ba
+index 0000000..5a0f297
 --- /dev/null
 +++ b/packages/coding-agent/test/cli/worktree-release-isolation.test.ts
 @@ -0,0 +1,292 @@
@@ -3772,13 +3995,9 @@ index 0000000..ce5e1ba
 +import * as os from "node:os";
 +import * as path from "node:path";
 +import * as natives from "@oh-my-pi/pi-natives";
-+import { getWorktreesDir, setWorktreesDir } from "@oh-my-pi/pi-utils";
++import { setWorktreesDir } from "@oh-my-pi/pi-utils";
 +import { releaseWorktree } from "@oh-my-pi/pi-coding-agent/cli/worktree-cli";
-+import {
-+	ISOLATION_OWNER_FILE,
-+	readIsolationOwner,
-+	writeIsolationOwner,
-+} from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
++import { ISOLATION_OWNER_FILE, readIsolationOwner } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
 +import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
 +import {
 +	getTaskIsolationSlot,
@@ -3916,9 +4135,12 @@ index 0000000..ce5e1ba
 +		const capture = vi
 +			.spyOn(worktreeModule, "captureDeltaPatch")
 +			.mockResolvedValue({ rootPatch: "diff --git a/work b/work", nestedPatches: [] });
-+		const commit = vi
-+			.spyOn(worktreeModule, "commitToBranch")
-+			.mockResolvedValue({ branchName: "omp/task/agent-1", baseSha: "base", rootPatch: "", nestedPatches: [] });
++		const commit = vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue({
++			branchName: "omp/task/agent-1",
++			baseSha: "base",
++			rootPatch: "",
++			nestedPatches: [],
++		});
 +		const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 +
 +		await releaseWorktree({ path: base, json: true });
@@ -3941,9 +4163,7 @@ index 0000000..ce5e1ba
 +			const capture = vi.spyOn(worktreeModule, "captureDeltaPatch");
 +			const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation");
 +
-+			await expect(releaseWorktree({ path: base, json: true })).rejects.toThrow(
-+				/owned by (a )?live omp process/,
-+			);
++			await expect(releaseWorktree({ path: base, json: true })).rejects.toThrow(/owned by (a )?live omp process/);
 +
 +			expect(capture).not.toHaveBeenCalled();
 +			expect(cleanup).not.toHaveBeenCalled();
@@ -3967,9 +4187,12 @@ index 0000000..ce5e1ba
 +		const capture = vi
 +			.spyOn(worktreeModule, "captureDeltaPatch")
 +			.mockResolvedValue({ rootPatch: "diff --git a/work b/work", nestedPatches: [] });
-+		const commit = vi
-+			.spyOn(worktreeModule, "commitToBranch")
-+			.mockResolvedValue({ branchName: "omp/task/agent-1", baseSha: "base", rootPatch: "", nestedPatches: [] });
++		const commit = vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue({
++			branchName: "omp/task/agent-1",
++			baseSha: "base",
++			rootPatch: "",
++			nestedPatches: [],
++		});
 +		const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 +
 +		await releaseWorktree({ path: retainedBase, json: true });
@@ -4655,7 +4878,7 @@ index 0000000..72f903c
 +	});
 +});
 diff --git a/packages/coding-agent/test/task/isolation-release.test.ts b/packages/coding-agent/test/task/isolation-release.test.ts
-index 6f23a65..0b31a98 100644
+index 6f23a65..915d267 100644
 --- a/packages/coding-agent/test/task/isolation-release.test.ts
 +++ b/packages/coding-agent/test/task/isolation-release.test.ts
 @@ -9,15 +9,19 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -4678,7 +4901,7 @@ index 6f23a65..0b31a98 100644
  	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
  });
  
-@@ -47,12 +51,22 @@ function result(id: string): SingleResult {
+@@ -47,22 +51,47 @@ function result(id: string): SingleResult {
  async function commitsAcrossRelease(id: string, runEndPatch: string, releasePatch: string): Promise<number> {
  	const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-release-"));
  	tempRoots.push(artifactsDir);
@@ -4694,7 +4917,14 @@ index 6f23a65..0b31a98 100644
 +	const sessionFile = path.join(artifactsDir, `${id}.jsonl`);
  	const baseline = {
 -		root: { repoRoot: "/repo", headCommit: "base", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
-+		root: { repoRoot: repo, headCommit: "base", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
++		root: {
++			repoRoot: repo,
++			headCommit: "base",
++			staged: "",
++			unstaged: "",
++			untracked: [],
++			untrackedPatch: "",
++		},
  		nested: [],
  	};
  	vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
@@ -4703,14 +4933,31 @@ index 6f23a65..0b31a98 100644
  		backend: natives.IsoBackendKind.Rcopy,
  		fellBack: false,
  		fallbackReason: null,
-@@ -70,12 +84,16 @@ async function commitsAcrossRelease(id: string, runEndPatch: string, releasePatc
+ 	});
+ 	vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(baseline);
+ 	vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
+-	vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: releasePatch, nestedPatches: [] });
++	vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
++		rootPatch: releasePatch,
++		nestedPatches: [],
++	});
+ 	const commitSpy = vi.spyOn(worktreeModule, "commitToBranch").mockImplementation(async () => {
+ 		events.push("commit");
+-		return { branchName: `omp/task/${id}`, baseSha: "base", rootPatch: runEndPatch, nestedPatches: [] };
++		return {
++			branchName: `omp/task/${id}`,
++			baseSha: "base",
++			rootPatch: runEndPatch,
++			nestedPatches: [],
++		};
+ 	});
+ 	const session = {
+ 		prepareForHeadlessAdvisorDrain: () => {},
+@@ -70,12 +99,13 @@ async function commitsAcrossRelease(id: string, runEndPatch: string, releasePatc
  		dispose: async () => {},
  	} as unknown as AgentSession;
  	vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
-+		await Bun.write(
-+			sessionFile,
-+			`${JSON.stringify({ type: "session", id: `session-${id}`, cwd: workspace })}\n`,
-+		);
++		await Bun.write(sessionFile, `${JSON.stringify({ type: "session", id: `session-${id}`, cwd: workspace })}\n`);
  		AgentRegistry.global().register({
  			id: options.id,
  			displayName: options.id,
@@ -4721,7 +4968,7 @@ index 6f23a65..0b31a98 100644
  			status: "running",
  		});
  		// A held peer message would wake a turn in the worktree once released.
-@@ -95,13 +113,13 @@ async function commitsAcrossRelease(id: string, runEndPatch: string, releasePatc
+@@ -95,13 +125,13 @@ async function commitsAcrossRelease(id: string, runEndPatch: string, releasePatc
  
  	await runIsolatedSubprocess({
  		baseOptions: {
@@ -4739,10 +4986,10 @@ index 6f23a65..0b31a98 100644
  		mergeMode: "branch",
 diff --git a/packages/coding-agent/test/task/isolation-retained.test.ts b/packages/coding-agent/test/task/isolation-retained.test.ts
 new file mode 100644
-index 0000000..64625f3
+index 0000000..9a7f569
 --- /dev/null
 +++ b/packages/coding-agent/test/task/isolation-retained.test.ts
-@@ -0,0 +1,1042 @@
+@@ -0,0 +1,1060 @@
 +import { afterEach, describe, expect, it, vi } from "bun:test";
 +import { type } from "@oh-my-pi/omptype";
 +import * as fs from "node:fs/promises";
@@ -5077,7 +5324,10 @@ index 0000000..64625f3
 +		expect(capture).toHaveBeenCalledWith(fixture.workspace, fixture.baseline);
 +		expect(commit).toHaveBeenCalledTimes(1);
 +		expect(cleanup).toHaveBeenCalledWith(
-+			expect.objectContaining({ mergedDir: fixture.workspace, backend: natives.IsoBackendKind.Rcopy }),
++			expect.objectContaining({
++				mergedDir: fixture.workspace,
++				backend: natives.IsoBackendKind.Rcopy,
++			}),
 +		);
 +	});
 +
@@ -5116,7 +5366,10 @@ index 0000000..64625f3
 +			baseline: fixture.baseline,
 +			sessionFile: fixture.sessionFile,
 +		});
-+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "live", nestedPatches: [] });
++		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
++			rootPatch: "live",
++			nestedPatches: [],
++		});
 +		vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue(null);
 +		const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 +
@@ -5151,7 +5404,10 @@ index 0000000..64625f3
 +			handedOff,
 +		});
 +		const state = loadedState(await readIsolationState(fixture.base, fixture.id));
-+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "same delta", nestedPatches: [] });
++		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
++			rootPatch: "same delta",
++			nestedPatches: [],
++		});
 +		const commit = vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue(null);
 +		const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 +
@@ -5480,7 +5736,10 @@ index 0000000..64625f3
 +			fallbackReason: null,
 +		});
 +		vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(baseline);
-+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "one shot", nestedPatches: [] });
++		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
++			rootPatch: "one shot",
++			nestedPatches: [],
++		});
 +		const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 +		let onRelease: ((opts?: { retain?: boolean }) => Promise<void>) | undefined;
 +		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
@@ -5528,13 +5787,13 @@ index 0000000..64625f3
 +			fallbackReason: null,
 +		});
 +		vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(baselineFor(repo));
-+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "deferred", nestedPatches: [] });
++		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
++			rootPatch: "deferred",
++			nestedPatches: [],
++		});
 +		vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 +		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
-+			await Bun.write(
-+				sessionFile,
-+				`${JSON.stringify({ type: "session", id: "child-ready", cwd: workspace })}\n`,
-+			);
++			await Bun.write(sessionFile, `${JSON.stringify({ type: "session", id: "child-ready", cwd: workspace })}\n`);
 +			AgentRegistry.global().register({
 +				id: options.id,
 +				displayName: options.id,
@@ -5585,10 +5844,7 @@ index 0000000..64625f3
 +		vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(baselineFor(repo));
 +		vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
 +		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
-+			await Bun.write(
-+				sessionFile,
-+				`${JSON.stringify({ type: "session", id: "child-crash", cwd: workspace })}\n`,
-+			);
++			await Bun.write(sessionFile, `${JSON.stringify({ type: "session", id: "child-crash", cwd: workspace })}\n`);
 +			await options.onSessionFileReady?.(sessionFile);
 +			const early = loadedState(await readIsolationState(base, id));
 +			expect(early.childSessionId).toBe("child-crash");
@@ -5650,7 +5906,12 @@ index 0000000..64625f3
 +
 +describe("task schema keeps an explicit repoRoot", () => {
 +	it("preserves repoRoot with taskFile without implying isolated", () => {
-+		const schema = getTaskSchema({ isolationEnabled: true, batchEnabled: false, file: true, structured: true });
++		const schema = getTaskSchema({
++			isolationEnabled: true,
++			batchEnabled: false,
++			file: true,
++			structured: true,
++		});
 +		const withIsolation = schema({
 +			taskFile: "local://assignment.md",
 +			solutionSpace: "one change",
@@ -5660,7 +5921,11 @@ index 0000000..64625f3
 +		if (withIsolation instanceof type.errors) throw new Error(withIsolation.summary);
 +		expect(withIsolation).toMatchObject({ isolated: true, repoRoot: "/repo/other" });
 +
-+		const defaultRepo = schema({ taskFile: "local://assignment.md", solutionSpace: "one change", isolated: true });
++		const defaultRepo = schema({
++			taskFile: "local://assignment.md",
++			solutionSpace: "one change",
++			isolated: true,
++		});
 +		if (defaultRepo instanceof type.errors) throw new Error(defaultRepo.summary);
 +		expect(defaultRepo).toMatchObject({ isolated: true });
 +
