@@ -24,9 +24,11 @@ Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate v
 {{/if}}{{#if effortEnabled}}`effort`: `"lo"`|`"med"`|`"hi"` by how open-ended the problem is.
 {{/if}}{{#if perCallModelEnabled}}`model`: one exact `provider/model-id[@upstream][:level]` string for this spawn only{{#if batchEnabled}}; per `tasks[]` item{{/if}}. `@upstream` pins an aggregator route and is part of the model identity. Only operator-approved models; no roles, arrays, globs or partial IDs. Approved: {{#list perCallModelAdvertisement.roles join=", "}}{{#list patterns join=", "}}`{{this}}`{{/list}} ({{role}}){{/list}}{{#if perCallModelAdvertisement.roles.length}}; {{/if}}{{#if perCallModelAdvertisement.parentModelWithheld}}{{else}}your own current model; {{/if}}the selected bundled/user agent's own configured model. A listed glob approves matching exact IDs; write the exact ID, NEVER the glob.{{#if perCallModelAdvertisement.allowlist.length}} Allowlist: {{#list perCallModelAdvertisement.allowlist join=", "}}`{{this}}`{{/list}} (must also be approved).{{/if}} An agent's `task.agentModelOverrides` entry conflicts with `model`. Omit unless needed. Requested model unavailable → stop and report; NEVER substitute another. Every request requires an approved model; retry fallback, context promotion and prewalk are off.
 {{/if}}{{#if structured}}`schemaMode`: default permissive warns after retries; strict fails.
-{{/if}}{{#if isolationEnabled}}{{#if applyIsolatedChanges}}`isolated`: worktree; successful changes apply to parent.
-{{else}}`isolated`: worktree; changes retained, not applied.
-{{/if}}{{/if}}Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
+{{/if}}{{#if isolationEnabled}}{{#if applyIsolatedChanges}}{{#if deferIntegration}}`isolated`: worktree; successful changes stay there until you write `/integrate` to `worktree://<id>` (deferred integration).
+{{else}}`isolated`: worktree; successful changes apply to parent.
+{{/if}}{{else}}`isolated`: worktree; changes retained, not applied.
+{{/if}}`repoRoot`: with `isolated`, an explicit repo root to copy when the work belongs to a DIFFERENT repo than the current cwd (`isolated` alone always uses the current cwd's repo). `repoRoot` alone enables nothing, and it never changes the parent cwd.
+{{/if}}Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
 
 # Format
 {{#if batchEnabled}}`context`: shared (`# Goal`, `# Contract` interfaces); NEVER repeat per task.
