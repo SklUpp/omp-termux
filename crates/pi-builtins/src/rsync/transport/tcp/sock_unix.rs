@@ -133,13 +133,18 @@ pub(super) fn resolve(
 /// The numeric form of an address (`getnameinfo(NI_NUMERICHOST)`).
 pub(super) fn numeric_host(addr: &Addr) -> String {
 	let mut buf = [0 as libc::c_char; 1025];
+	// bionic declares `getnameinfo` hostlen/servlen as `size_t`, not `socklen_t`.
+	#[cfg(target_os = "android")]
+	let host_len = buf.len();
+	#[cfg(not(target_os = "android"))]
+	let host_len = buf.len() as libc::socklen_t;
 	// SAFETY: `addr` holds `len` valid bytes; `buf` is writable for its length.
 	let rc = unsafe {
 		libc::getnameinfo(
 			addr.as_ptr(),
 			addr.len,
 			buf.as_mut_ptr(),
-			buf.len() as libc::socklen_t,
+			host_len,
 			std::ptr::null_mut(),
 			0,
 			libc::NI_NUMERICHOST,
