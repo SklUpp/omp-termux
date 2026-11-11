@@ -267,11 +267,33 @@ pub(crate) fn mknodat(
 	}))
 }
 
+/// bionic exports `mkfifoat` since API 23, but the Rust `libc` Android module
+/// omits the binding; the workspace targets API 24+.
+#[cfg(target_os = "android")]
+unsafe extern "C" {
+	#[link_name = "mkfifoat"]
+	fn bionic_mkfifoat(
+		dirfd: libc::c_int,
+		path: *const libc::c_char,
+		mode: libc::mode_t,
+	) -> libc::c_int;
+}
+
 /// `mkfifoat(dir, name, mode)`.
+#[cfg(not(target_os = "android"))]
 pub(crate) fn mkfifoat(dir: Option<BorrowedFd<'_>>, name: &CStr, mode: u32) -> io::Result<()> {
 	check(retry(|| {
 		// SAFETY: valid C string and dirfd.
 		unsafe { libc::mkfifoat(dirfd(dir), name.as_ptr(), mode as libc::mode_t) }
+	}))
+}
+
+/// `mkfifoat(dir, name, mode)` via bionic's symbol.
+#[cfg(target_os = "android")]
+pub(crate) fn mkfifoat(dir: Option<BorrowedFd<'_>>, name: &CStr, mode: u32) -> io::Result<()> {
+	check(retry(|| {
+		// SAFETY: valid C string and dirfd; bionic provides the symbol on API 23+.
+		unsafe { bionic_mkfifoat(dirfd(dir), name.as_ptr(), mode as libc::mode_t) }
 	}))
 }
 
