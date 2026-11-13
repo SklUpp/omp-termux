@@ -16,6 +16,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
+import { setWorktreesDir } from "@oh-my-pi/pi-utils";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -39,7 +40,16 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import * as natives from "@oh-my-pi/pi-natives";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
+import {
+	getTaskIsolationSlot,
+	ISOLATION_STATE_FILE,
+	readSessionHeaderId,
+	writeIsolationState,
+} from "@oh-my-pi/pi-coding-agent/task/worktree";
+import { ISOLATION_OWNER_FILE, readIsolationOwner } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { PerCallModelError, PerCallModelUnavailableError } from "@oh-my-pi/pi-coding-agent/task/model-approval";
 import { cfgTaskMaxEffort } from "@oh-my-pi/pi-coding-agent/task/settings";
@@ -162,6 +172,7 @@ async function createPersistedSession(
 	advisor?: string,
 	contract?: {
 		tools?: string[];
+		systemPrompt?: string[];
 		readOnly?: boolean;
 		agent?: string;
 		isolated?: boolean;
@@ -177,7 +188,7 @@ async function createPersistedSession(
 	const sessionFile = manager.getSessionFile();
 	if (!sessionFile) throw new Error("Expected a persisted session file");
 	manager.appendSessionInit({
-		systemPrompt: ["persisted prompt"],
+		systemPrompt: contract?.systemPrompt ?? ["persisted prompt"],
 		task: "persisted task",
 		tools: contract?.tools ?? ["read", "yield"],
 		restrictToolNames,
@@ -552,19 +563,76 @@ describe("persisted subagent revival", () => {
 		expect(capturedOptions?.customTools).toBeUndefined();
 	});
 
-	it("leaves isolated sessions transcript-only even when the workspace still exists", async () => {
-		// Isolated runs are never resumable: the worktree is merged + cleaned,
-		// and the parent is told messaging is impossible. A retained workspace
-		// (capture/persist failure) still passes the cwd probe, so the stamped
-		// contract — not directory existence — must gate revival. Otherwise a
-		// restart + Hub message revives the agent in the parent cwd, outside
-		// isolation.
+	it("refuses an isolated transcript whose workspace has no persisted isolation state", async () => {
+		// The descriptor, not directory existence, gates revival: without the
+		// persisted baseline a revive could neither capture the delta nor stop
+		// the recorded backend, and running in the parent cwd would break the
+		// isolation contract. The refusal names that cause.
 		const cwd = makeTempDir("@pi-isolated-revive-");
 		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, { isolated: true });
 
 		const ref = createRef(sessionFile);
-		const reviver = await createFactory(cwd)(ref);
-		expect(reviver).toBeUndefined();
+		await expect(createFactory(cwd)(ref)).rejects.toThrow(/isolation state missing/);
+	});
+
+	it("renders the revived prompt at the renamed workspace, not the pre-retention path", async () => {
+		// Retention renames the sandbox; the persisted prompt still holds the
+		// spawn-time path. A revive must describe the directory it actually runs
+		// in (cwd and prompt must agree), and the renamed sibling must be found
+		// even when the pointer beside the transcript is missing.
+		const root = makeTempDir("@pi-isolated-prompt-root-");
+		setWorktreesDir(root);
+		const repo = makeTempDir("@pi-isolated-prompt-repo-");
+		const id = "persisted-restricted";
+		const slot = getTaskIsolationSlot(repo, id);
+		const base = path.join(root, slot);
+		const oldWorkspace = path.join(base, "m");
+		await fs.promises.mkdir(oldWorkspace, { recursive: true });
+		const sessionFile = await createPersistedSession(root, undefined, undefined, undefined, {
+			isolated: true,
+			systemPrompt: [`workspace is ${oldWorkspace}`],
+		});
+		await writeIsolationState(base, {
+			version: 1,
+			id,
+			repoRoot: repo,
+			backend: natives.IsoBackendKind.Rcopy,
+			slot,
+			mergedDir: "m",
+			baseline: {
+				root: {
+					repoRoot: repo,
+					headCommit: "head",
+					staged: "",
+					unstaged: "",
+					untrackedPatch: "",
+					untracked: [],
+				},
+				nested: [],
+			},
+			sessionFile,
+			childSessionId: await readSessionHeaderId(sessionFile),
+		});
+		const retained = `${base}.retained-1-abc`;
+		await fs.promises.rename(base, retained);
+		const newWorkspace = path.join(retained, "m");
+		let capturedOptions: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			capturedOptions = options;
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(root)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		const promptOption = capturedOptions?.systemPrompt;
+		const rawPrompt = typeof promptOption === "function" ? promptOption([]) : promptOption;
+		const rendered = rawPrompt === undefined ? [] : Array.isArray(rawPrompt) ? rawPrompt : [rawPrompt];
+		expect(rendered.join("\n")).toContain(newWorkspace);
+		expect(rendered.join("\n")).not.toContain(oldWorkspace);
+		expect(await readIsolationOwner(retained)).toMatchObject({ pid: process.pid });
 	});
 
 	it("restores the persisted agent definition name on cold revival so agent-scoped rules keep matching", async () => {
@@ -2452,5 +2520,219 @@ describe("buildWakeRelayBody", () => {
 			await expect(reviver(ref)).rejects.toThrow(/no persisted session contract/);
 			expect(await Bun.file(sessionFile).text()).toBe(withoutInit);
 		});
+	});
+});
+
+function isolationBaseline(repoRoot: string): {
+	root: {
+		repoRoot: string;
+		headCommit: string;
+		staged: string;
+		unstaged: string;
+		untracked: string[];
+		untrackedPatch: string;
+	};
+	nested: [];
+} {
+	return {
+		root: {
+			repoRoot,
+			headCommit: "b".repeat(40),
+			staged: "",
+			unstaged: "diff --git a/file.txt b/file.txt",
+			untracked: [],
+			untrackedPatch: "",
+		},
+		nested: [],
+	};
+}
+
+interface IsolatedFixture {
+	root: string;
+	repo: string;
+	id: string;
+	slot: string;
+	base: string;
+	workspace: string;
+}
+
+/** Sandbox in its derived slot under the worktrees root, plus a separate repo. */
+function isolatedFixture(): IsolatedFixture {
+	const root = makeTempDir("@pi-revive-iso-root-");
+	setWorktreesDir(root);
+	const repo = makeTempDir("@pi-revive-iso-repo-");
+	const id = "persisted-restricted";
+	const slot = getTaskIsolationSlot(repo, id);
+	const base = path.join(root, slot);
+	return { root, repo, id, slot, base, workspace: path.join(base, "m") };
+}
+
+/** Persist the recovery descriptor an isolated spawn writes before running. */
+async function writeIsolationDescriptor(fixture: IsolatedFixture, sessionFile: string): Promise<void> {
+	await writeIsolationState(fixture.base, {
+		version: 1,
+		id: fixture.id,
+		repoRoot: fixture.repo,
+		backend: natives.IsoBackendKind.Rcopy,
+		slot: fixture.slot,
+		mergedDir: "m",
+		baseline: isolationBaseline(fixture.repo),
+		sessionFile,
+		childSessionId: await readSessionHeaderId(sessionFile),
+		handedOff: String(Bun.hash("unchanged")),
+	});
+}
+
+/** Transcript whose header cwd is the retained workspace, stored outside the sandbox. */
+async function isolatedTranscript(workspace: string, sessionDir: string): Promise<string> {
+	const manager = SessionManager.create(workspace, sessionDir);
+	const sessionFile = manager.getSessionFile();
+	if (!sessionFile) throw new Error("Expected a persisted session file");
+	manager.appendSessionInit({
+		systemPrompt: ["persisted prompt"],
+		task: "persisted task",
+		tools: ["read", "yield"],
+		isolated: true,
+	});
+	manager.appendMessage({
+		role: "assistant",
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+		content: [{ type: "text", text: "persisted" }],
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		api: "anthropic-messages",
+		stopReason: "stop",
+		timestamp: Date.now(),
+	});
+	await manager.close();
+	return sessionFile;
+}
+
+describe("isolated cold revival", () => {
+	it("revives in the retained workspace, then captures its delta on explicit release", async () => {
+		AgentRegistry.resetGlobalForTests();
+		AgentLifecycleManager.resetGlobalForTests();
+		const fixture = isolatedFixture();
+		await fs.promises.mkdir(fixture.workspace, { recursive: true });
+		const sessionFile = await isolatedTranscript(fixture.workspace, path.join(fixture.root, "sessions"));
+		await writeIsolationDescriptor(fixture, sessionFile);
+		MCPManager.setInstance(fakeMcpManager(() => []));
+		let created: CreateAgentSessionOptions | undefined;
+		const create = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			created = options;
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+		vi.spyOn(executorModule, "attachIrcWakeTurnMonitor").mockImplementation(() => {});
+		vi.spyOn(executorModule, "replayRevivedAgentStart").mockResolvedValue(undefined);
+		const capture = vi
+			.spyOn(worktreeModule, "captureDeltaPatch")
+			.mockResolvedValue({ rootPatch: "diff --git a/file.txt b/file.txt", nestedPatches: [] });
+		const commit = vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue(null);
+		const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
+		const ref = AgentRegistry.global().register(createRef(sessionFile));
+		AgentLifecycleManager.global().setPersistedSubagentReviverFactory(createFactory(fixture.workspace), () => 0);
+
+		await AgentLifecycleManager.global().ensureLive(ref.id);
+		expect(created?.cwd).toBe(fixture.workspace);
+		// Revive claims the sandbox so `worktree clear` cannot reclaim it live.
+		expect((await readIsolationOwner(fixture.base))?.pid).toBe(process.pid);
+		// Same transcript replayed, not a fresh one.
+		expect(created?.sessionManager?.getEntries().length).toBeGreaterThan(1);
+
+		// Park frees the live session but keeps the workspace; the follow-up
+		// revive must land in the same workspace again.
+		await AgentLifecycleManager.global().park(ref.id);
+		await AgentLifecycleManager.global().ensureLive(ref.id);
+		expect(create).toHaveBeenCalledTimes(2);
+		expect(created?.cwd).toBe(fixture.workspace);
+
+		await AgentLifecycleManager.global().release(ref.id);
+		expect(capture).toHaveBeenCalledWith(fixture.workspace, isolationBaseline(fixture.repo));
+		expect(commit).toHaveBeenCalledTimes(1);
+		expect(cleanup).toHaveBeenCalledWith(expect.objectContaining({ mergedDir: fixture.workspace }));
+		expect(AgentRegistry.global().get(ref.id)).toBeUndefined();
+		AgentRegistry.resetGlobalForTests();
+	});
+
+	it("refuses revival with the precise reason when the descriptor is missing or corrupt", async () => {
+		const fixture = isolatedFixture();
+		await fs.promises.mkdir(fixture.workspace, { recursive: true });
+		const sessionFile = await isolatedTranscript(fixture.workspace, path.join(fixture.root, "sessions"));
+		const factory = createFactory(fixture.workspace);
+
+		await expect(factory(createRef(sessionFile))).rejects.toThrow(/isolation state missing/);
+
+		const descriptor = path.join(fixture.base, ISOLATION_STATE_FILE);
+		await Bun.write(descriptor, "{oops");
+		await expect(factory(createRef(sessionFile))).rejects.toThrow(/malformed|unreadable/);
+		// A refused revive is not a cleanup: the workspace and file stay as evidence.
+		expect(await Bun.file(descriptor).text()).toBe("{oops");
+		expect(await fs.promises.stat(fixture.workspace)).toBeDefined();
+	});
+
+	it("refuses a workspace owned by another live omp process", async () => {
+		const fixture = isolatedFixture();
+		await fs.promises.mkdir(fixture.workspace, { recursive: true });
+		const sessionFile = await isolatedTranscript(fixture.workspace, path.join(fixture.root, "sessions"));
+		await writeIsolationDescriptor(fixture, sessionFile);
+		const other = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+		try {
+			await Bun.write(path.join(fixture.base, ISOLATION_OWNER_FILE), JSON.stringify({ pid: other.pid, id: "x" }));
+			const reviver = await createFactory(fixture.workspace)(createRef(sessionFile));
+			if (!reviver) throw new Error("Expected a persisted reviver");
+			await expect(reviver(createRef(sessionFile))).rejects.toThrow(/owned by live omp process/);
+			// A refused revive leaves the marker and descriptor untouched.
+			expect((await readIsolationOwner(fixture.base))?.pid).toBe(other.pid);
+		} finally {
+			other.kill();
+			await other.exited;
+		}
+	});
+
+	it("ignores a pointer that is not an absolute normalized directory", async () => {
+		const fixture = isolatedFixture();
+		await fs.promises.mkdir(fixture.workspace, { recursive: true });
+		const sessionFile = await isolatedTranscript(fixture.workspace, path.join(fixture.root, "sessions"));
+		await Bun.write(
+			path.join(path.dirname(sessionFile), "persisted-restricted.isolation.json"),
+			JSON.stringify({ dir: "relative/sandbox", workspace: fixture.workspace }),
+		);
+		await expect(createFactory(fixture.workspace)(createRef(sessionFile))).rejects.toThrow(/isolation state missing/);
+	});
+
+	it("follows the pointer to a moved retained workspace and releases it there", async () => {
+		const fixture = isolatedFixture();
+		await fs.promises.mkdir(fixture.workspace, { recursive: true });
+		const sessionFile = await isolatedTranscript(fixture.workspace, path.join(fixture.root, "sessions"));
+		await writeIsolationDescriptor(fixture, sessionFile);
+		const moved = `${fixture.base}.retained-1-abc`;
+		await fs.promises.rename(fixture.base, moved);
+		await Bun.write(
+			path.join(path.dirname(sessionFile), "persisted-restricted.isolation.json"),
+			JSON.stringify({ dir: moved, workspace: path.join(moved, "m") }),
+		);
+		MCPManager.setInstance(fakeMcpManager(() => []));
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
+			async () => ({ session: createRevivedSession([]).session }) as CreateAgentSessionResult,
+		);
+		vi.spyOn(executorModule, "attachIrcWakeTurnMonitor").mockImplementation(() => {});
+		vi.spyOn(executorModule, "replayRevivedAgentStart").mockResolvedValue(undefined);
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "", nestedPatches: [] });
+		vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue(null);
+		const cleanup = vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
+
+		const reviver = await createFactory(fixture.workspace)(createRef(sessionFile));
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		// Revive claims the moved sandbox; release requires that ownership.
+		await reviver(createRef(sessionFile));
+		await reviver.onRelease?.();
+		expect(cleanup).toHaveBeenCalledWith(expect.objectContaining({ mergedDir: path.join(moved, "m") }));
 	});
 });

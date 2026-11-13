@@ -328,10 +328,10 @@ describe("task spawn routing", () => {
 			await job!.promise;
 
 			const delivered = `${job!.resultText ?? ""}${job!.errorText ?? ""}`;
-			expect(delivered).toContain("Sandboxed ran isolated and cannot be resumed or messaged");
+			expect(delivered).toContain("Sandboxed ran isolated; its workspace is retained, so it stays resumable");
 			expect(delivered).toContain("history://Sandboxed");
+			expect(delivered).toContain("message it via `write agent://Sandboxed` to continue there");
 			expect(delivered).not.toContain("is now idle");
-			expect(delivered).not.toContain("message it via");
 			expect(delivered).not.toContain("removed");
 			if (expectRetained) {
 				expect(job!.status).toBe("failed");

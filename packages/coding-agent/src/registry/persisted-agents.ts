@@ -330,6 +330,25 @@ function nestedPatchFilesFor(dir: string, transcriptName: string, entries: reado
 }
 
 /**
+ * Workspace a retained isolated transcript can still resume in. The pointer
+ * beside the transcript names the sandbox (retention renames it), and a
+ * missing workspace reads as "not revivable" without touching the descriptor:
+ * this runs per roster row, so it must never parse a multi-GiB baseline.
+ */
+async function persistedIsolationDir(sessionFile: string): Promise<string | undefined> {
+	const id = path.basename(sessionFile, ".jsonl");
+	try {
+		const pointer: unknown = await Bun.file(path.join(path.dirname(sessionFile), `${id}.isolation.json`)).json();
+		if (pointer === null || typeof pointer !== "object" || !("workspace" in pointer)) return undefined;
+		const workspace = pointer.workspace;
+		if (typeof workspace !== "string") return undefined;
+		return (await fs.promises.stat(workspace)).isDirectory() ? workspace : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Read only the small session prefix needed by the Hub. A subagent's first
  * `session_init` is written before its conversation, so this never walks a
  * multi-megabyte historical transcript just to populate one roster row.
@@ -352,7 +371,11 @@ async function readPersistedAgentMetadata(
 	const artifactBase = sessionFile.slice(0, -".jsonl".length);
 	const outputPath = `${artifactBase}.md`;
 	const patchPath = `${artifactBase}.patch`;
-	const artifactFiles = Promise.all([Bun.file(outputPath).exists(), Bun.file(patchPath).exists()]);
+	const artifactFiles = Promise.all([
+		Bun.file(outputPath).exists(),
+		Bun.file(patchPath).exists(),
+		persistedIsolationDir(sessionFile),
+	]);
 	let createdAt: number | undefined;
 	let activity: string | undefined;
 	let history: AgentHistorySummary = {};
@@ -416,7 +439,7 @@ async function readPersistedAgentMetadata(
 		// prefix still yields what it can.
 		if (isFilesystemError(error)) throw error;
 	}
-	const [statResult, [hasOutput, hasPatch]] = await Promise.all([stat, artifactFiles]);
+	const [statResult, [hasOutput, hasPatch, isolationDir]] = await Promise.all([stat, artifactFiles]);
 	// A transient stat fault surfaces now that both reads have settled; ENOENT
 	// already degraded to an undefined file above.
 	if (statResult.error !== undefined) throw statResult.error;
@@ -431,6 +454,7 @@ async function readPersistedAgentMetadata(
 			...(hasOutput ? { outputPath } : {}),
 			...(hasPatch ? { patchPath } : {}),
 			...(nestedPatchPaths.length > 0 ? { nestedPatchPaths: [...nestedPatchPaths] } : {}),
+			...(isolationDir ? { isolationDir } : {}),
 		},
 	};
 }
