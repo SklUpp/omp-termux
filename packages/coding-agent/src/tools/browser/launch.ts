@@ -316,8 +316,11 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
  * link clicks (#8673). Chrome for Testing uses a dedicated bundle id
  * (`com.google.chrome.for.testing`) that is never a user's default handler;
  * system Chrome is used on macOS only when Chrome for Testing cannot be
- * obtained. Other platforms keep the download-avoiding system Chrome
- * preference and fall back to Chrome for Testing. The managed browser is
+ * obtained. Android/Termux validates the explicit override and only accepts
+ * the external Termux:X11 package (a glibc Chrome cannot run there); when no
+ * working binary exists it throws install guidance instead of falling back to
+ * a managed Linux download. Other platforms keep the download-avoiding system
+ * Chrome preference and fall back to Chrome for Testing. The managed browser is
  * cached under ~/.omp/puppeteer (getPuppeteerDir). Returns undefined when
  * platform detection fails (puppeteer default resolution takes over).
  * Exported so real-browser tests can probe launchability and skip on hosts
@@ -326,7 +329,31 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
 let chromiumExecutablePromise: Promise<string | undefined> | undefined;
 export async function ensureChromiumExecutable(): Promise<string | undefined> {
 	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
-	if (envPath) return envPath;
+	if (envPath) {
+		// Android cannot run a generic Linux Chrome: only the Termux:X11
+		// package is Bionic-compatible. Reject a stale or broken override here
+		// instead of handing puppeteer an unusable path.
+		if (process.platform === "android" && !(await isChromiumExecutable(envPath))) {
+			throw new ToolError(
+				`PUPPETEER_EXECUTABLE_PATH="${envPath}" is not a working Chromium executable. ` +
+					`Install the Termux:X11 package:\n  pkg install -y x11-repo\n  pkg install -y chromium\n` +
+					"or unset PUPPETEER_EXECUTABLE_PATH.",
+			);
+		}
+		return envPath;
+	}
+	if (process.platform === "android") {
+		// Termux: never download a glibc Chrome build; only the external
+		// Termux:X11 package under $PREFIX can run on Bionic.
+		const sysChrome = await resolveSystemChromium();
+		if (sysChrome) return sysChrome;
+		throw new ToolError(
+			"No working Chromium executable found on Android. Install the Termux:X11 package:\n" +
+				"  pkg install -y x11-repo\n" +
+				"  pkg install -y chromium\n" +
+				"or set PUPPETEER_EXECUTABLE_PATH to a working Chromium binary.",
+		);
+	}
 	// macOS: never route a background daemon through the user's GUI Chrome
 	// bundle; prefer the isolated Chrome for Testing binary instead (#8673).
 	const preferManagedChromium = process.platform === "darwin";
@@ -451,14 +478,16 @@ function isExecutableFile(p: string): boolean {
 async function isChromiumExecutable(p: string): Promise<boolean> {
 	if (!isExecutableFile(p)) return false;
 	// The version probe below launches the candidate. It exists to reject
-	// non-Chromium `chrome`/`chromium` wrapper scripts that appear on a Linux
-	// PATH (ecb22957, "validate Linux browser executables"). On Windows and
-	// macOS the candidates are fixed GUI application paths, not PATH wrappers,
-	// and executing them is harmful: a GUI `chrome.exe --version` does not print
-	// to a detached stdout and can hand off to the user's running instance,
-	// opening/activating a normal browser window (#8445). Confine the probe to
-	// Linux and trust the executable-file check elsewhere.
-	if (process.platform !== "linux") return true;
+	// non-Chromium `chrome`/`chromium` wrapper scripts that appear on a
+	// Linux/Android PATH (ecb22957, "validate Linux browser executables"). On
+	// Windows and macOS the candidates are fixed GUI application paths, not
+	// PATH wrappers, and executing them is harmful: a GUI `chrome.exe --version`
+	// does not print to a detached stdout and can hand off to the user's
+	// running instance, opening/activating a normal browser window (#8445).
+	// Android/Termux has the same PATH-wrapper hazard as Linux (and may hold a
+	// glibc build), so it gets the probe too: an existing but broken file must
+	// be rejected rather than accepted as a browser.
+	if (process.platform !== "linux" && process.platform !== "android") return true;
 	try {
 		const probeTimeoutMs = 3000;
 		const proc = Bun.spawn([p, "--version"], {
@@ -536,6 +565,25 @@ function systemChromiumCandidates(
 				"/usr/bin/ungoogled-chromium-browser",
 				`/var/lib/flatpak/exports/bin/${UNGOOGLED_CHROMIUM_FLATPAK_ID}`,
 				path.join(home, ".local/share/flatpak/exports/bin", UNGOOGLED_CHROMIUM_FLATPAK_ID),
+			);
+			break;
+		}
+		case "android": {
+			// Termux installs Chromium outside PATH. Prefer the package's real
+			// binary; `$PREFIX/bin` entries are wrappers and PATH may hold
+			// unrelated or glibc shims. PUPPETEER_EXECUTABLE_PATH is handled by
+			// the caller before candidates are consulted.
+			const prefix = process.env.PREFIX ?? "/data/data/com.termux/files/usr";
+			candidates.push(path.join(prefix, "lib/chromium/chrome"));
+			for (const name of ["chromium", "chromium-browser", "google-chrome", "chrome"]) {
+				const found = which(name);
+				if (found) candidates.push(found);
+			}
+			candidates.push(
+				path.join(prefix, "bin/chromium"),
+				path.join(prefix, "bin/chromium-browser"),
+				path.join(prefix, "bin/google-chrome"),
+				path.join(prefix, "bin/chrome"),
 			);
 			break;
 		}
