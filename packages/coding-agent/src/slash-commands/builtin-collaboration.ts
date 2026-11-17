@@ -577,50 +577,52 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 		description: "Pick text or code from the conversation to copy",
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
-			const arg = command.args.trim().toLowerCase();
-			if (!arg) {
-				runtime.ctx.showCopySelector();
-				clearSubmittedText(runtime);
-				return;
-			}
-			if (arg === "code") {
-				const block = extractLastCodeBlock(runtime.ctx.session.messages);
-				if (!block) {
-					runtime.ctx.showStatus("No code block to copy.");
-					clearSubmittedText(runtime);
+			try {
+				const arg = command.args.trim().toLowerCase();
+				if (!arg) {
+					runtime.ctx.showCopySelector();
 					return;
 				}
-				await copyToClipboard(block.code);
-				runtime.ctx.showStatus("Copied code block to clipboard");
-				clearSubmittedText(runtime);
-				return;
-			}
-			if (arg === "cmd" || arg === "command") {
-				const lastCommand = extractLastCommand(runtime.ctx.session.messages);
-				if (!lastCommand) {
-					runtime.ctx.showStatus("No command to copy.");
-					clearSubmittedText(runtime);
+				if (arg === "code") {
+					const block = extractLastCodeBlock(runtime.ctx.session.messages);
+					if (!block) {
+						runtime.ctx.showStatus("No code block to copy.");
+						return;
+					}
+					await copyToClipboard(block.code);
+					runtime.ctx.showStatus("Copied code block to clipboard");
 					return;
 				}
-				await copyToClipboard(lastCommand.code);
-				runtime.ctx.showStatus(`Copied ${lastCommand.kind === "bash" ? "bash command" : "eval code"} to clipboard`);
-				clearSubmittedText(runtime);
-				return;
-			}
-			if (arg === "link" || arg === "url") {
-				const link = extractLastLink(runtime.ctx.session.messages);
-				if (!link) {
-					runtime.ctx.showStatus("No link to copy.");
-					clearSubmittedText(runtime);
+				if (arg === "cmd" || arg === "command") {
+					const lastCommand = extractLastCommand(runtime.ctx.session.messages);
+					if (!lastCommand) {
+						runtime.ctx.showStatus("No command to copy.");
+						return;
+					}
+					await copyToClipboard(lastCommand.code);
+					runtime.ctx.showStatus(
+						`Copied ${lastCommand.kind === "bash" ? "bash command" : "eval code"} to clipboard`,
+					);
 					return;
 				}
-				await copyToClipboard(link.href);
-				runtime.ctx.showStatus("Copied link to clipboard");
+				if (arg === "link" || arg === "url") {
+					const link = extractLastLink(runtime.ctx.session.messages);
+					if (!link) {
+						runtime.ctx.showStatus("No link to copy.");
+						return;
+					}
+					await copyToClipboard(link.href);
+					runtime.ctx.showStatus("Copied link to clipboard");
+					return;
+				}
+				runtime.ctx.showStatus("Usage: /copy [code|cmd|link]");
+			} catch (error) {
+				// A rejected copy must not escape as an unhandled rejection and
+				// leave the draft in the editor without any feedback.
+				runtime.ctx.showWarning(`Copy failed: ${errorMessage(error)}`);
+			} finally {
 				clearSubmittedText(runtime);
-				return;
 			}
-			runtime.ctx.showStatus("Usage: /copy [code|cmd|link]");
-			clearSubmittedText(runtime);
 		},
 	},
 	{

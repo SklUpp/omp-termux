@@ -6,8 +6,10 @@
  * it. `omp worktree clear` consults the marker so it can distinguish a live
  * subagent's sandbox from a crashed run's leftover instead of deleting both.
  */
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as natives from "@oh-my-pi/pi-natives";
+import { acquireFileLock, type FileLockHandle, getWorktreesDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 
 const { IsoBackendKind } = natives;
@@ -73,37 +75,54 @@ export async function writeIsolationOwner(baseDir: string, id: string): Promise<
 }
 
 /**
- * Whether a live omp process still owns the sandbox at `baseDir`.
- *
- * A missing or malformed marker means no verifiable owner — a crashed run or a
- * sandbox from before markers existed, both safe to reclaim. `process.kill(pid,
- * 0)` can fail with `EPERM` even when the process is alive, so only an explicit
- * `ESRCH` ("no such process") counts as dead; any other error is treated as
- * alive to avoid deleting a sandbox that is actually in use. When the marker
- * carries a {@link IsolationOwner.startToken}, a live pid whose current token no
- * longer matches is a recycled pid — a different process — and counts as dead.
+ * Parsed owner marker of `baseDir`, or undefined when absent/malformed. Lets a
+ * cold revive tell "no verifiable owner" apart from "another live process owns
+ * this workspace" before it rewrites the marker.
  */
-export async function hasLiveIsolationOwner(baseDir: string): Promise<boolean> {
+export async function readIsolationOwner(baseDir: string): Promise<IsolationOwner | undefined> {
 	let decoded: unknown;
 	try {
 		decoded = await Bun.file(path.join(baseDir, ISOLATION_OWNER_FILE)).json();
 	} catch {
-		return false;
+		return undefined;
 	}
-	if (typeof decoded !== "object" || decoded === null || !("pid" in decoded)) return false;
+	if (typeof decoded !== "object" || decoded === null || !("pid" in decoded)) return undefined;
 	const pid = decoded.pid;
-	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return undefined;
+	const id = "id" in decoded && typeof decoded.id === "string" ? decoded.id : "";
+	const startToken =
+		"startToken" in decoded && typeof decoded.startToken === "string" && decoded.startToken.length > 0
+			? decoded.startToken
+			: undefined;
+	return { pid, id, ...(startToken ? { startToken } : {}) };
+}
+
+/**
+ * Whether a live omp process still owns the sandbox at `baseDir`.
+ *
+ * A missing or malformed marker means no verifiable owner — a crashed run or a
+ * sandbox from before markers existed, both safe to reclaim. See
+ * {@link isProcessAliveWithToken} for the recycled-pid rule.
+ */
+export async function hasLiveIsolationOwner(baseDir: string): Promise<boolean> {
+	const owner = await readIsolationOwner(baseDir);
+	return owner ? isProcessAliveWithToken(owner.pid, owner.startToken) : false;
+}
+
+/**
+ * Liveness of a recorded pid, with recycled-pid rejection: `process.kill(pid, 0)`
+ * can fail with `EPERM` for a live process, so only `ESRCH` counts as dead, and
+ * a pinned start-time token that no longer matches proves the pid was recycled.
+ */
+async function isProcessAliveWithToken(pid: number, startToken?: string): Promise<boolean> {
 	try {
 		process.kill(pid, 0);
 	} catch (err) {
 		if ((err as NodeJS.ErrnoException).code === "ESRCH") return false;
 	}
-	// The pid is live (or unknowable via EPERM). Reject a recycled pid: if the
-	// marker pinned the owner's start-time token, the process wearing that pid
-	// now must still present the same token.
-	if ("startToken" in decoded && typeof decoded.startToken === "string" && decoded.startToken.length > 0) {
+	if (startToken) {
 		const current = await processStartToken(pid);
-		if (current !== null && current !== decoded.startToken) return false;
+		if (current !== null && current !== startToken) return false;
 	}
 	return true;
 }
@@ -164,4 +183,78 @@ export async function readRetainedMountBackend(dir: string): Promise<number | un
 	}
 	if (!needsNativeTeardown(backend)) return undefined;
 	return backend;
+}
+
+/** Lease sidecars live OUTSIDE the sandbox: retention renames must never move a held lock. */
+function isolationLeaseDir(): string {
+	return path.join(path.dirname(getWorktreesDir()), ".isolation-leases");
+}
+
+/**
+ * Immutable lease key: the derived slot, shared by the original and every
+ * `.retained-*` sibling. Mirrors `getTaskIsolationSlot` in `./worktree`, which
+ * imports this module, so the shape is restated instead of imported.
+ */
+const ISOLATION_SLOT_RE = /^t[0-9a-f]{9}$/;
+
+function isolationLeaseTarget(slot: string): string {
+	if (!ISOLATION_SLOT_RE.test(slot)) throw new Error(`invalid isolation slot "${slot}"`);
+	return path.join(isolationLeaseDir(), slot);
+}
+
+/** Raised when another process holds the slot lease; callers must preserve the sandbox. */
+export class IsolationLeaseBusyError extends Error {
+	constructor(slot: string) {
+		super(`another omp process holds the isolation lease for ${slot}`);
+		this.name = "IsolationLeaseBusyError";
+	}
+}
+
+/**
+ * Run `fn` while holding the slot's OS-backed lease.
+ *
+ * Reuses the repository's file-lock primitive, keyed by the immutable slot in a
+ * directory outside the sandbox, so a retention rename never breaks the inode
+ * a holder locked and a crash releases the lease with its process. The sidecar
+ * is never unlinked (that can split one lease across two inodes). Probes are
+ * deliberately absent: `isFileLockHeld` reports unsupported on some platforms,
+ * so callers attempt the real acquisition and treat contention as "preserve".
+ */
+export async function withIsolationLease<T>(slot: string, fn: () => Promise<T>): Promise<T> {
+	const target = isolationLeaseTarget(slot);
+	await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+	let handle: FileLockHandle;
+	try {
+		// One attempt: contention means another process owns the handover now.
+		handle = await acquireFileLock(target, { retries: 1 });
+	} catch {
+		throw new IsolationLeaseBusyError(slot);
+	}
+	try {
+		return await fn();
+	} finally {
+		handle.release();
+	}
+}
+
+/**
+ * Claim the retained sandbox for this process, atomically across processes.
+ *
+ * The owner marker is what `omp worktree clear` consults, so a cold/warm revive
+ * must refresh it: otherwise the revived run looks owner-less, and only the
+ * explicit release path may tear down a workspace a live session is writing. Read-check-write happens
+ * under the slot lease, so two simultaneous revives cannot both believe they
+ * own the sandbox; the loser refuses, and a marker naming another live process
+ * is never stolen. A dead owner (crash, previous boot) is reclaimed.
+ */
+export async function claimIsolationOwner(baseDir: string, id: string, slot: string): Promise<void> {
+	await withIsolationLease(slot, async () => {
+		const owner = await readIsolationOwner(baseDir);
+		if (owner && owner.pid !== process.pid && (await isProcessAliveWithToken(owner.pid, owner.startToken))) {
+			throw new Error(
+				`isolation workspace ${baseDir} is owned by live omp process ${owner.pid}; finish or release it there before reviving this agent`,
+			);
+		}
+		await writeIsolationOwner(baseDir, id);
+	});
 }

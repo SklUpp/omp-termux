@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { logger } from "@oh-my-pi/pi-utils";
+import { getWorktreesDir, logger } from "@oh-my-pi/pi-utils";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
 import { validateAgentAccountPools } from "../config/account-pools";
 import type { Model } from "@oh-my-pi/pi-ai";
@@ -16,7 +16,7 @@ import { formatModelRoleAlias } from "../config/model-roles";
 import type { Settings } from "../config/settings";
 import { MCPManager } from "../mcp/manager";
 import { initializeExtensions } from "../modes/runtime-init";
-import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
+import type { AgentReviver, PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
@@ -51,6 +51,9 @@ import { cfgTaskAgentAccountPools, cfgTaskMaxEffort } from "./settings";
 import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
 import { seanceIsolationOptions } from "./seance-policy";
 import type { AgentDefinition } from "./types";
+import { releaseIsolationWorkspace } from "./isolation-runner";
+import { claimIsolationOwner } from "./isolation-ownership";
+import { resolveIsolationWorkspace } from "./worktree";
 
 /**
  * Ambient context the reviver needs at revive time. The top-level session is
@@ -87,6 +90,17 @@ export function persistedAgentDefinition(displayName: string, init: PersistedSes
 		systemPrompt: init.systemPrompt.join("\n\n"),
 		source: "user",
 	};
+}
+
+/**
+ * The persisted prompt was rendered at spawn, before retention renamed the
+ * workspace. Rebind those old path occurrences to the workspace the descriptor
+ * now proves, so revived instructions and the session cwd describe the SAME
+ * directory instead of pointing the agent at a path that no longer exists.
+ */
+function rebindWorkspacePrompt(prompt: string[], staleWorkspace: string, workspaceDir: string): string[] {
+	if (staleWorkspace === workspaceDir) return prompt;
+	return prompt.map(block => block.split(staleWorkspace).join(workspaceDir));
 }
 
 /**
@@ -135,17 +149,32 @@ export function createPersistedSubagentReviverFactory(
 			if (!restoredSeance) return undefined;
 		}
 		const seanceOptions = restoredSeance ? seanceIsolationOptions(restoredSeance.cwd) : {};
-		// Isolated runs are never resumable: their worktree is merged + cleaned,
-		// and the parent was told messaging is impossible. A retained workspace
-		// (capture/persist failure) still exists on disk and would pass the cwd
-		// probe below, so gate on the stamped contract instead — otherwise a
-		// restart + peer message revives the agent outside isolation, in the
-		// parent cwd, contradicting the delivery notice.
-		if (peek.init.isolated) return undefined;
-		try {
-			await fs.stat(restoredSeance?.cwd ?? peek.cwd);
-		} catch {
-			return undefined;
+		// An isolated run revives only onto its retained workspace: the
+		// descriptor keeps the baseline a later release must capture against and
+		// the backend it must stop. Missing/broken state refuses with the reason
+		// instead of silently resurrecting the agent in the parent cwd.
+		const isolation = peek.init.isolated ? await resolveIsolationWorkspace(sessionFile, ref.id, peek.cwd) : undefined;
+		if (isolation && "refusal" in isolation) {
+			throw new Error(
+				`Cannot revive subagent "${ref.id}": ${isolation.refusal}. Its transcript remains readable at history://${ref.id}.`,
+			);
+		}
+		const isolationState = isolation && "state" in isolation ? isolation : undefined;
+		const isolatedState = isolationState?.state;
+		const systemPrompt =
+			isolatedState && isolationState
+				? rebindWorkspacePrompt(
+						peek.init.systemPrompt,
+						path.join(getWorktreesDir(), isolatedState.slot, isolatedState.mergedDir),
+						isolationState.workspaceDir,
+					)
+				: peek.init.systemPrompt;
+		if (!isolatedState) {
+			try {
+				await fs.stat(restoredSeance?.cwd ?? peek.cwd);
+			} catch {
+				return undefined;
+			}
 		}
 		// taskDepth drives real capability gating (task-spawn allowance, memory
 		// startup, …); derive it from the persisted parent chain rather than
@@ -158,7 +187,10 @@ export function createPersistedSubagentReviverFactory(
 			taskDepth++;
 			parentId = registry.get(parentId)?.parentId;
 		}
-		return async expectedRef => {
+		const revive: AgentReviver = async expectedRef => {
+			// Claim before opening the transcript: an unowned marker would let
+			// `worktree clear` reclaim a workspace this session is about to use.
+			if (isolationState) await claimIsolationOwner(isolationState.state.dir, ref.id, isolationState.state.slot);
 			// Re-open fresh on every revive: park closes the writer, so this takes
 			// the single-writer lock cleanly and restores the full message history.
 			const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
@@ -341,7 +373,8 @@ export function createPersistedSubagentReviverFactory(
 			let session: AgentSession;
 			try {
 				({ session } = await createAgentSession({
-					cwd: restoredSeance?.cwd ?? ctx.session.sessionManager.getCwd(),
+					// A revived isolated run keeps its workspace cwd; never the parent's.
+					cwd: isolationState?.workspaceDir ?? restoredSeance?.cwd ?? ctx.session.sessionManager.getCwd(),
 					costGate: ctx.session.costGate,
 					authStorage: ctx.authStorage,
 					// Revived agents join the root session tree, so their observability
@@ -400,7 +433,7 @@ export function createPersistedSubagentReviverFactory(
 					outputSchemaMode: init.outputSchemaMode,
 					restrictToolNames: restrictToolNames || undefined,
 					requireYieldTool: structured,
-					systemPrompt: () => [...init.systemPrompt],
+					systemPrompt: () => [...systemPrompt],
 					// Inherit current owner policy, never extension authority from a transcript.
 					extensionRoots: () => ctx.session.effectiveExtensionRoots,
 					preloadedPreparedExtensions: ctx.session.preparedExtensions,
@@ -473,7 +506,7 @@ export function createPersistedSubagentReviverFactory(
 			registry.syncSessionStatus(ref.id, session);
 			attachIrcWakeTurnMonitor(session, {
 				id: ref.id,
-				agent: persistedAgentDefinition(ref.displayName, init),
+				agent: persistedAgentDefinition(ref.displayName, { ...init, systemPrompt }),
 				completionProbe: isCompletionProbeEnabled(ctx.settings, taskDepth - 1),
 				eventBus: ctx.eventBus,
 				subagentEventBus: ctx.subagentEventBus,
@@ -487,5 +520,19 @@ export function createPersistedSubagentReviverFactory(
 			});
 			return session;
 		};
+		if (!isolatedState) return revive;
+		// The cold release owns exactly what the revived run owns: capture the
+		// delta against the persisted baseline and stop the recorded backend.
+		// `retain` (kill tombstone, shutdown) leaves both for a later release.
+		return Object.assign(revive, {
+			onRelease: async (opts?: { retain?: boolean }) => {
+				if (opts?.retain) return;
+				await releaseIsolationWorkspace(isolatedState, {
+					artifactsDir: path.dirname(sessionFile),
+					// Trusted independently of the descriptor: the ref's transcript.
+					expectedSessionFile: sessionFile,
+				});
+			},
+		});
 	};
 }

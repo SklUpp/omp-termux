@@ -14,6 +14,19 @@ Isolation: no changes captured.
 {{/if}}
 {{#list nestedPatchPaths prefix="- nested repository patch: `" suffix="`"}}{{this}}{{/list}}
 {{/when}}
+{{#when kind "==" "deferred"}}
+Isolation: changes are captured and held in the retained workspace. Not applied.
+{{#if agentId}}
+Send `/integrate` to `worktree://{{agentId}}` (via `write`) to apply the latest workspace changes to the parent checkout.
+{{/if}}
+{{#if branchName}}
+- branch: `{{branchName}}`
+{{/if}}
+{{#if rootPatchPath}}
+- patch: `{{rootPatchPath}}`
+{{/if}}
+{{#list nestedPatchPaths prefix="- nested repository patch: `" suffix="`"}}{{this}}{{/list}}
+{{/when}}
 {{#when kind "==" "capture-error"}}
 <system-notification>Isolation: {{error}}</system-notification>
 {{#if branchName}}
@@ -79,3 +92,6 @@ Nested repository patches (not applied):
 {{#list nestedPatchPaths prefix="- "}}{{this}}{{/list}}
 {{/if}}
 {{/when}}
+{{#if retainedDir}}
+Isolation workspace retained at `{{retainedDir}}`; revive and release the agent to capture its changes. `omp worktree clear` never deletes it.
+{{/if}}

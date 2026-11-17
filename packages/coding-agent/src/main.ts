@@ -43,7 +43,7 @@ import { formatKeyHint, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindi
 import type { SessionPickerOptions } from "@oh-my-pi/pi-tui/apps/session-picker";
 import { fetchBuild } from "./cli/build-service";
 import { applyStartupCwd } from "./cli/startup-cwd";
-import { getLatestRelease, isSourceCheckout, managedInstallName } from "./cli/update-cli";
+import { getLatestRelease, isAndroidUpdateHost, isSourceCheckout, managedInstallName } from "./cli/update-cli";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
@@ -275,6 +275,11 @@ function writeStartupWarning(warning: string): void {
 
 async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
 	if (!cfgStartupCheckUpdate.get(settings)) {
+		return;
+	}
+	// Android updates only through the port installer; `omp update` refuses, so
+	// a "run omp update" notification would be wrong advice.
+	if (isAndroidUpdateHost()) {
 		return;
 	}
 	try {

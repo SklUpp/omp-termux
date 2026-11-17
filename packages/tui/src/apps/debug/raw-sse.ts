@@ -483,17 +483,21 @@ export class RawSseViewerComponent implements Component {
 			return;
 		}
 
-		try {
-			this.#deps.copyToClipboard(payload);
-			const message = "Copied raw SSE stream";
-			this.#statusMessage = message;
-			this.#statusFailed = false;
-			this.#onStatus?.(message);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			this.#statusMessage = `Copy failed: ${message}`;
-			this.#statusFailed = true;
-		}
-		this.#onUpdate?.();
+		void Promise.resolve()
+			.then(() => this.#deps.copyToClipboard(payload))
+			.then(
+				() => {
+					const message = "Copied raw SSE stream";
+					this.#statusMessage = message;
+					this.#statusFailed = false;
+					this.#onStatus?.(message);
+				},
+				(error: unknown) => {
+					const message = error instanceof Error ? error.message : String(error);
+					this.#statusMessage = `Copy failed: ${message}`;
+					this.#statusFailed = true;
+				},
+			)
+			.finally(() => this.#onUpdate?.());
 	}
 }

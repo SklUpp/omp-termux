@@ -1,11 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { removeWithRetries, setAgentDir, setProjectDir, VERSION } from "@oh-my-pi/pi-utils";
 import { currentBuildHost } from "../../src/cli/build-service";
 import { fixedNpmRegistry } from "../../src/cli/npm-registry";
-import { getLatestRelease, runUpdateCommand } from "../../src/cli/update-cli";
+import {
+	androidReinstallInstructions,
+	getLatestRelease,
+	isAndroidUpdateHost,
+	runUpdateCommand,
+} from "../../src/cli/update-cli";
 import { cfgUpdateChannel } from "../../src/modes/settings";
 import { AgentStorage } from "../../src/session/agent-storage";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "../helpers/settings-test-state";
@@ -18,12 +23,18 @@ type FetchInit = RequestInit | BunFetchRequestInit;
 describe("runUpdateCommand version source", () => {
 	const dirs: string[] = [];
 	let settingsState: SettingsTestState | undefined;
+	const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+	const platformOverride = process.env.OMP_PLATFORM;
 
 	// `runUpdateCommand` initializes the global Settings singleton from the
 	// project and agent dirs; point both at a scratch dir so the host's config
 	// is never read, and drop the singleton afterwards so later files get a
 	// fresh `Settings.init()`.
 	beforeEach(async () => {
+		// `runUpdateCommand` refuses on the Android port; these cases exercise the
+		// desktop update path, so report a desktop host regardless of the runner.
+		if (platformDescriptor) Object.defineProperty(process, "platform", { ...platformDescriptor, value: "linux" });
+		delete process.env.OMP_PLATFORM;
 		settingsState = beginSettingsTest();
 		const scratch = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-update-settings-")));
 		dirs.push(scratch);
@@ -32,6 +43,9 @@ describe("runUpdateCommand version source", () => {
 	});
 
 	afterEach(async () => {
+		if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+		if (platformOverride === undefined) delete process.env.OMP_PLATFORM;
+		else process.env.OMP_PLATFORM = platformOverride;
 		AgentStorage.close();
 		restoreSettingsTestState(settingsState);
 		settingsState = undefined;
@@ -422,5 +436,55 @@ describe("getLatestRelease proxy errors", () => {
 		// Instead the user gets actionable guidance about supported proxy schemes.
 		expect(err?.message).toMatch(/SOCKS/i);
 		expect(err?.message).toMatch(/https?:\/\//i);
+	});
+});
+
+describe("Termux/Android updates", () => {
+	const savedOverride = process.env.OMP_PLATFORM;
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		if (savedOverride === undefined) delete process.env.OMP_PLATFORM;
+		else process.env.OMP_PLATFORM = savedOverride;
+		process.exitCode = 0;
+	});
+
+	afterAll(() => {
+		if (savedOverride === undefined) delete process.env.OMP_PLATFORM;
+		else process.env.OMP_PLATFORM = savedOverride;
+	});
+
+	it("detects the Android host from the runtime platform or OMP_PLATFORM", () => {
+		expect(isAndroidUpdateHost("android", undefined)).toBe(true);
+		expect(isAndroidUpdateHost("linux", "android")).toBe(true);
+		expect(isAndroidUpdateHost("linux", undefined)).toBe(false);
+		expect(isAndroidUpdateHost("darwin", "linux")).toBe(false);
+	});
+
+	it("refuses both check and install without querying upstream release metadata", async () => {
+		const errors: string[] = [];
+		const logs: string[] = [];
+		const fetchStub = vi.spyOn(globalThis, "fetch");
+		vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+			errors.push(args.join(" "));
+		});
+		vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+			logs.push(args.join(" "));
+		});
+		process.env.OMP_PLATFORM = "android";
+
+		for (const check of [true, false]) {
+			errors.length = 0;
+			logs.length = 0;
+			process.exitCode = 0;
+
+			await runUpdateCommand({ force: false, check });
+
+			expect(fetchStub).not.toHaveBeenCalled();
+			expect(errors.join("\n")).toContain(androidReinstallInstructions());
+			expect(errors.join("\n")).toContain("| sh -s -- -ex");
+			expect(logs.join("\n")).toContain("Current version:");
+			expect(process.exitCode).toBe(1);
+		}
 	});
 });

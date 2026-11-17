@@ -309,7 +309,11 @@ export interface SessionInitEntry extends SessionEntryBase {
 	advisor?: string;
 	/** Effective thresholds for a child with an explicit compaction override. */
 	compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
-	/** True when the subagent ran inside an isolation worktree: never revivable, transcript-only after park. Absent on older files. */
+	/**
+	 * True when the subagent ran inside an isolation worktree. Revival requires
+	 * the persisted isolation descriptor: the run resumes in the retained
+	 * workspace and its release captures the delta there. Absent on older files.
+	 */
 	isolated?: boolean;
 	/** Work-pool yield items of the last model call; revival restores them so the yield tool matches. Absent when none. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
