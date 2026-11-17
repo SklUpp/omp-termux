@@ -523,7 +523,8 @@ new_case missing-prereq
 limited=$CASE/bin
 mkdir -p "$limited"
 ln -s "$stub/uname" "$limited/uname"
-for c in sh pkg curl tar sed grep find mktemp dirname sha256sum; do
+ln -s "$stub/pkg" "$limited/pkg"
+for c in sh curl tar sed grep find mktemp dirname sha256sum; do
 	p=$(command -v "$c") || die "test lacks $c"
 	ln -s "$p" "$limited/$c"
 done
