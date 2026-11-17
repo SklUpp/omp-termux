@@ -1,8 +1,7 @@
 diff --git a/crates/pi-builtins/src/lib.rs b/crates/pi-builtins/src/lib.rs
-index ee13736..f29ce76 100644
 --- a/crates/pi-builtins/src/lib.rs
 +++ b/crates/pi-builtins/src/lib.rs
-@@ -343,7 +343,7 @@ pub use proc_snapshot::{ProcInfo, ProcessStatus};
+@@ -257,6 +257,6 @@ pub use proc_snapshot::{ProcInfo, ProcessStatus};
  /// implementation.
  #[cfg(all(
  	feature = "util.procs",
@@ -10,12 +9,10 @@ index ee13736..f29ce76 100644
 +	any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")
  ))]
  pub use proc_snapshot::sys as proc_sys;
- 
 diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/proc_snapshot.rs
-index 5ab3109..48f7cd2 100644
 --- a/crates/pi-builtins/src/proc_snapshot.rs
 +++ b/crates/pi-builtins/src/proc_snapshot.rs
-@@ -100,7 +100,7 @@ fn parse_procargs2(buffer: &[u8]) -> Vec<String> {
+@@ -116,7 +116,7 @@ fn parse_procargs2(buffer: &[u8]) -> Vec<String> {
  }
  
  /// Linux process primitives: procfs and pidfds.
@@ -24,7 +21,7 @@ index 5ab3109..48f7cd2 100644
  pub mod sys {
  	use std::{
  		fs,
-@@ -181,7 +181,7 @@ pub mod sys {
+@@ -197,7 +197,7 @@ pub mod sys {
  	}
  }
  
@@ -33,7 +30,7 @@ index 5ab3109..48f7cd2 100644
  mod proc_snapshot {
  	use std::{collections::HashMap, fs, os::fd::AsFd, time::Duration};
  
-@@ -1796,7 +1796,7 @@ mod proc_snapshot {
+@@ -1876,7 +1876,7 @@ mod proc_snapshot {
  	}
  }
  
@@ -42,16 +39,16 @@ index 5ab3109..48f7cd2 100644
  pub use proc_snapshot::{ProcInfo, threads_by_pid};
  
  /// The processes a signal must never reach: this one and its ancestors.
-@@ -1820,7 +1820,7 @@ pub use proc_snapshot::{ProcInfo, threads_by_pid};
+@@ -1900,7 +1900,7 @@ pub use proc_snapshot::{ProcInfo, threads_by_pid};
  ///
  /// Listing is unaffected: `pgrep` still reports ancestors and `ps` still shows
  /// them. Only signalling consults this.
 -#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 +#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
- pub(crate) struct HostProcesses {
+ pub struct HostProcesses {
  	/// This process and its ancestors, nearest first.
  	pub pids:  smallvec::SmallVec<[i32; 16]>,
-@@ -1833,7 +1833,7 @@ pub(crate) struct HostProcesses {
+@@ -1913,7 +1913,7 @@ pub struct HostProcesses {
  /// Keeping the walk over this rather than over [`ProcInfo`] lets the recycling
  /// cases — which are otherwise only reachable by winning a race against the OS —
  /// be tested with a synthetic tree.
@@ -60,16 +57,16 @@ index 5ab3109..48f7cd2 100644
  #[derive(Clone, Copy)]
  struct ChainNode {
  	ppid:  Option<i32>,
-@@ -1843,7 +1843,7 @@ struct ChainNode {
+@@ -1923,7 +1923,7 @@ struct ChainNode {
  	start: u64,
  }
  
 -#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 +#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
  impl HostProcesses {
- 	/// Walks the parent chain from the current process, taking one process-table
- 	/// snapshot.
-@@ -1914,7 +1914,7 @@ impl HostProcesses {
+ 	/// Whether signalling `target` would reach this process or one of its
+ 	/// ancestors.
+@@ -2009,7 +2009,7 @@ impl HostProcesses {
  	}
  }
  
@@ -79,10 +76,9 @@ index 5ab3109..48f7cd2 100644
  	use super::{HostProcesses, ProcInfo};
  
 diff --git a/crates/pi-builtins/src/ps.rs b/crates/pi-builtins/src/ps.rs
-index 956c7f7..5a74f2b 100644
 --- a/crates/pi-builtins/src/ps.rs
 +++ b/crates/pi-builtins/src/ps.rs
-@@ -1266,7 +1266,7 @@ fn format_ps_elapsed(duration: Duration) -> String {
+@@ -1274,7 +1274,7 @@ fn format_ps_elapsed(duration: Duration) -> String {
  	}
  }
  
@@ -92,7 +88,6 @@ index 956c7f7..5a74f2b 100644
  	let value = fs::read_to_string("/proc/meminfo")
  		.ok()?
 diff --git a/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs b/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
-index d28e8c0..c6f521f 100644
 --- a/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
 +++ b/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
 @@ -133,13 +133,18 @@ pub(super) fn resolve(
@@ -116,7 +111,6 @@ index d28e8c0..c6f521f 100644
  			0,
  			libc::NI_NUMERICHOST,
 diff --git a/crates/pi-builtins/src/rsync/tree/sys.rs b/crates/pi-builtins/src/rsync/tree/sys.rs
-index 08b8c00..6732262 100644
 --- a/crates/pi-builtins/src/rsync/tree/sys.rs
 +++ b/crates/pi-builtins/src/rsync/tree/sys.rs
 @@ -267,7 +267,20 @@ pub(crate) fn mknodat(
@@ -157,7 +151,6 @@ index 08b8c00..6732262 100644
  pub(crate) fn read_dir(fd: OwnedFd) -> io::Result<Vec<OsString>> {
  	let mut dir = rustix::fs::Dir::new(fd)?;
 diff --git a/crates/pi-builtins/src/sort.rs b/crates/pi-builtins/src/sort.rs
-index 5a45f57..cc18a77 100644
 --- a/crates/pi-builtins/src/sort.rs
 +++ b/crates/pi-builtins/src/sort.rs
 @@ -126,7 +126,7 @@ fn file_size_hint(fs: &BlockingFs, files: &[OsString]) -> Option<usize> {
@@ -265,26 +258,25 @@ index 5a45f57..cc18a77 100644
  		std::fs::create_dir_all(dir).unwrap();
  		for (name, contents) in files {
 diff --git a/crates/pi-natives/Cargo.toml b/crates/pi-natives/Cargo.toml
-index efed215..2e02031 100644
 --- a/crates/pi-natives/Cargo.toml
 +++ b/crates/pi-natives/Cargo.toml
-@@ -25,7 +25,6 @@ wayland-pipewire = ["dep:pipewire"]
+@@ -16,7 +16,6 @@ workspace = true
  [dependencies]
  anyhow.workspace = true
  async-trait.workspace = true
 -arboard.workspace = true
  base64.workspace = true
- clap.workspace = true
- heapless.workspace = true
-@@ -63,7 +62,6 @@ pi-iso.workspace = true
+ fontdue.workspace = true
+ grep-matcher.workspace = true
+@@ -50,7 +49,6 @@ pi-iso.workspace = true
  pi-predict.workspace = true
  pi-shell.workspace = true
  pi-vfs.workspace = true
 -pi-voice.workspace = true
+ ptts.workspace = true
  portable-pty.workspace = true
  png.workspace = true
- rayon.workspace = true
-@@ -79,6 +77,10 @@ xutf.workspace = true
+@@ -66,6 +64,10 @@ xutf.workspace = true
  zstd.workspace = true
  xxhash-rust.workspace = true
  
@@ -294,9 +286,8 @@ index efed215..2e02031 100644
 +
  [target.'cfg(target_os = "linux")'.dependencies]
  ashpd = { version = "=0.11.1", default-features = false, features = ["tokio"] }
- atspi = { version = "=0.30.0", features = ["tokio", "zbus"] }
+ atspi = { version = "=0.30.0", default-features = false, features = ["proxies", "tokio", "wrappers", "zbus"] }
 diff --git a/crates/pi-natives/src/audio.rs b/crates/pi-natives/src/audio.rs
-index 8377dcf..305c4ef 100644
 --- a/crates/pi-natives/src/audio.rs
 +++ b/crates/pi-natives/src/audio.rs
 @@ -4,6 +4,7 @@
@@ -422,7 +413,6 @@ index 8377dcf..305c4ef 100644
 +	}
 +}
 diff --git a/crates/pi-natives/src/clipboard.rs b/crates/pi-natives/src/clipboard.rs
-index 50d6dab..d09bc27 100644
 --- a/crates/pi-natives/src/clipboard.rs
 +++ b/crates/pi-natives/src/clipboard.rs
 @@ -5,9 +5,12 @@
@@ -560,7 +550,6 @@ index 50d6dab..d09bc27 100644
  	use super::dib_to_png;
  
 diff --git a/crates/pi-natives/src/crash_handler.rs b/crates/pi-natives/src/crash_handler.rs
-index 68fbb8f..b697718 100644
 --- a/crates/pi-natives/src/crash_handler.rs
 +++ b/crates/pi-natives/src/crash_handler.rs
 @@ -96,7 +96,7 @@ pub fn install() {
@@ -573,10 +562,9 @@ index 68fbb8f..b697718 100644
  			// Print the canonical line before doing anything allocation-prone.
  			// If this is genuine process-wide OOM, report formatting/path work may
 diff --git a/crates/pi-natives/src/desktop/ax.rs b/crates/pi-natives/src/desktop/ax.rs
-index e8a5476..9fb0e12 100644
 --- a/crates/pi-natives/src/desktop/ax.rs
 +++ b/crates/pi-natives/src/desktop/ax.rs
-@@ -21,6 +21,8 @@ pub enum AxHandle {
+@@ -24,6 +24,8 @@ pub enum AxHandle {
  	Uia(uiautomation::UIElement, Option<Box<[i32]>>),
  	#[cfg(target_os = "linux")]
  	AtSpi(atspi::ObjectRefOwned),
@@ -585,7 +573,7 @@ index e8a5476..9fb0e12 100644
  	#[cfg(test)]
  	Test(u64),
  	/// A test element without an identity, like a UIA element whose
-@@ -41,6 +43,8 @@ impl AxHandle {
+@@ -44,6 +46,8 @@ impl AxHandle {
  			Self::Uia(_, runtime_id) => runtime_id.is_some(),
  			#[cfg(target_os = "linux")]
  			Self::AtSpi(_) => true,
@@ -594,7 +582,7 @@ index e8a5476..9fb0e12 100644
  			#[cfg(test)]
  			Self::Test(_) => true,
  			#[cfg(test)]
-@@ -61,6 +65,8 @@ impl PartialEq for AxHandle {
+@@ -64,6 +68,8 @@ impl PartialEq for AxHandle {
  			(Self::Uia(_, a), Self::Uia(_, b)) => a == b,
  			#[cfg(target_os = "linux")]
  			(Self::AtSpi(a), Self::AtSpi(b)) => a == b,
@@ -603,7 +591,7 @@ index e8a5476..9fb0e12 100644
  			#[cfg(test)]
  			(Self::Test(a), Self::Test(b)) => a == b,
  			#[cfg(test)]
-@@ -82,6 +88,8 @@ impl Hash for AxHandle {
+@@ -85,6 +91,8 @@ impl Hash for AxHandle {
  			Self::Uia(_, runtime_id) => runtime_id.hash(state),
  			#[cfg(target_os = "linux")]
  			Self::AtSpi(object) => object.hash(state),
@@ -613,10 +601,9 @@ index e8a5476..9fb0e12 100644
  			Self::Test(id) => id.hash(state),
  			#[cfg(test)]
 diff --git a/crates/pi-natives/src/desktop/control.rs b/crates/pi-natives/src/desktop/control.rs
-index b59fa38..c7b03b7 100644
 --- a/crates/pi-natives/src/desktop/control.rs
 +++ b/crates/pi-natives/src/desktop/control.rs
-@@ -483,6 +483,8 @@ struct ControlLease {
+@@ -572,6 +572,8 @@ struct ControlLease {
  	_escape: Option<windows::EscapeMonitor>,
  	#[cfg(target_os = "linux")]
  	_escape: Option<linux::EscapeMonitor>,
@@ -625,7 +612,7 @@ index b59fa38..c7b03b7 100644
  	_kernel: KernelOwner,
  	running: AtomicBool,
  }
-@@ -544,6 +546,8 @@ impl ControlLease {
+@@ -637,6 +639,8 @@ impl ControlLease {
  			_escape: Some(escape),
  			#[cfg(target_os = "linux")]
  			_escape: escape,
@@ -635,7 +622,6 @@ index b59fa38..c7b03b7 100644
  			running: AtomicBool::new(false),
  		})
 diff --git a/crates/pi-natives/src/ipc/endpoint.rs b/crates/pi-natives/src/ipc/endpoint.rs
-index 2f9b06c..81a8446 100644
 --- a/crates/pi-natives/src/ipc/endpoint.rs
 +++ b/crates/pi-natives/src/ipc/endpoint.rs
 @@ -32,19 +32,80 @@ pub fn hash16(bytes: &[u8]) -> String {
@@ -853,7 +839,6 @@ index 2f9b06c..81a8446 100644
  
  	#[test]
 diff --git a/crates/pi-natives/src/ipc/mod.rs b/crates/pi-natives/src/ipc/mod.rs
-index afe6bc9..fc0f929 100644
 --- a/crates/pi-natives/src/ipc/mod.rs
 +++ b/crates/pi-natives/src/ipc/mod.rs
 @@ -46,6 +46,7 @@ const DEFAULT_MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
@@ -895,7 +880,6 @@ index afe6bc9..fc0f929 100644
  }
  
 diff --git a/crates/pi-natives/src/ipc/unix.rs b/crates/pi-natives/src/ipc/unix.rs
-index 332b982..3703f89 100644
 --- a/crates/pi-natives/src/ipc/unix.rs
 +++ b/crates/pi-natives/src/ipc/unix.rs
 @@ -276,7 +276,25 @@ fn prepare_parent(path: &Path) -> Result<(), IpcError> {
@@ -1220,7 +1204,6 @@ index 332b982..3703f89 100644
 +	}
 +}
 diff --git a/crates/pi-natives/src/lib.rs b/crates/pi-natives/src/lib.rs
-index 5fa706c..859efb7 100644
 --- a/crates/pi-natives/src/lib.rs
 +++ b/crates/pi-natives/src/lib.rs
 @@ -20,7 +20,7 @@
@@ -1230,10 +1213,9 @@ index 5fa706c..859efb7 100644
 -#![feature(alloc_error_hook)]
 +#![cfg_attr(not(target_os = "android"), feature(alloc_error_hook))]
  
- // Match the host feature set of terminfo's phf generator.
- #[cfg(unix)]
+ pub mod appearance;
+ pub mod applefm;
 diff --git a/crates/pi-natives/src/live.rs b/crates/pi-natives/src/live.rs
-index 9cbcd99..0fc449f 100644
 --- a/crates/pi-natives/src/live.rs
 +++ b/crates/pi-natives/src/live.rs
 @@ -5,117 +5,185 @@
@@ -1516,10 +1498,1816 @@ index 9cbcd99..0fc449f 100644
 +    fn drop(&mut self) {}
  }
 diff --git a/crates/pi-shell/src/process.rs b/crates/pi-shell/src/process.rs
-index 602a829..4693842 100644
---- a/crates/pi-shell/src/process.rs
+new file mode 100644
+--- /dev/null
 +++ b/crates/pi-shell/src/process.rs
-@@ -16,7 +16,7 @@ pub use pi_builtins::ProcessStatus;
+@@ -0,0 +1,1802 @@
++//! Cross-platform process tree management.
++
++use std::{
++	collections::{HashMap, HashSet},
++	time::Duration,
++};
++
++use anyhow::Result;
++use parking_lot::Mutex;
++/// Current state of a process reference.
++///
++/// Defined in `pi-builtins` alongside the process-table snapshots its process
++/// builtins read, and re-exported here so this module — and `pi-natives`
++/// through it — keeps one status type for both concerns.
++pub use pi_builtins::ProcessStatus;
++
++use crate::cancel::CancelToken;
++
++#[cfg(any(target_os = "linux", target_os = "android"))]
++mod platform {
++	use std::{
++		collections::HashSet,
++		fs,
++		os::fd::{AsFd, AsRawFd, OwnedFd},
++		sync::Arc,
++	};
++
++	use pi_builtins::proc_sys as sys;
++
++	use super::ProcessStatus;
++
++	/// Stable Linux process reference backed by a pidfd.
++	#[derive(Clone)]
++	pub struct Process {
++		pid:        i32,
++		pidfd:      Arc<OwnedFd>,
++		start_time: u64,
++	}
++
++	impl Process {
++		pub fn from_pid(pid: i32) -> Option<Self> {
++			if pid <= 0 {
++				return None;
++			}
++			let pidfd = Arc::new(sys::open_pidfd(pid)?);
++			let start_time = sys::start_time(pid)?;
++			Some(Self { pid, pidfd, start_time })
++		}
++
++		pub const fn pid(&self) -> i32 {
++			self.pid
++		}
++
++		pub fn children(&self) -> Vec<Self> {
++			if !self.live_identity() {
++				return Vec::new();
++			}
++
++			// `/proc/{pid}/task/{tid}/children` is per-task: a child fork()ed from
++			// a worker thread appears under that thread's `tid`, not the tgid.
++			// Walk every task subdir and union the lists, then re-validate
++			// parentage.
++			let task_dir = format!("/proc/{}/task", self.pid);
++			let Ok(entries) = fs::read_dir(&task_dir) else {
++				return Vec::new();
++			};
++
++			let mut seen: HashSet<i32> = HashSet::new();
++			let mut out = Vec::new();
++			let mut children_file_available = false;
++			for entry in entries.flatten() {
++				let name = entry.file_name();
++				let Some(tid_str) = name.to_str() else {
++					continue;
++				};
++				if tid_str.parse::<i32>().is_err() {
++					continue;
++				}
++				let children_path = format!("/proc/{}/task/{}/children", self.pid, tid_str);
++				let Ok(content) = fs::read_to_string(&children_path) else {
++					continue;
++				};
++				// The file is readable -> this kernel has CONFIG_PROC_CHILDREN.
++				children_file_available = true;
++				for part in content.split_whitespace() {
++					let Ok(child_pid) = part.parse::<i32>() else {
++						continue;
++					};
++					self.push_validated_child(child_pid, &mut seen, &mut out);
++				}
++			}
++
++			// Some Kata / microVM guest kernels are built without
++			// CONFIG_PROC_CHILDREN, so no `.../children` file exists and the
++			// walk above finds nothing — which would silently turn descendant
++			// signaling (cancellation cleanup) into a no-op inside such
++			// containers. Fall back to scanning `/proc` and grouping
++			// by parent pid, the same primitive the macOS path uses. Only taken
++			// when no `children` file was readable, so kernels that support it
++			// keep the cheap per-task fast path.
++			if !children_file_available {
++				for child_pid in sys::pids() {
++					self.push_validated_child(child_pid, &mut seen, &mut out);
++				}
++			}
++			out
++		}
++
++		/// Validate a candidate child pid — dedup, still running, and currently
++		/// parented to `self` — then push it onto `out`. Shared by the
++		/// `/proc/<pid>/task/<tid>/children` fast path and the `/proc`-scan
++		/// fallback for kernels without `CONFIG_PROC_CHILDREN`.
++		fn push_validated_child(&self, child_pid: i32, seen: &mut HashSet<i32>, out: &mut Vec<Self>) {
++			if child_pid == self.pid || !seen.insert(child_pid) {
++				return;
++			}
++			let Some(child) = Self::from_pid(child_pid) else {
++				return;
++			};
++			if child.status() == ProcessStatus::Running && sys::parent_pid(child.pid) == Some(self.pid)
++			{
++				out.push(child);
++			}
++		}
++
++		pub fn parent_pid(&self) -> Option<i32> {
++			if self.status() == ProcessStatus::Running {
++				sys::parent_pid(self.pid)
++			} else {
++				None
++			}
++		}
++
++		pub fn args(&self) -> Vec<String> {
++			if !self.live_identity() {
++				return Vec::new();
++			}
++
++			let Some(args) = sys::cmdline(self.pid) else {
++				return Vec::new();
++			};
++			// Re-validate after the read: PID reuse between identity check and
++			// read would otherwise leak an impostor's command line to callers.
++			if !self.live_identity() {
++				return Vec::new();
++			}
++			args
++		}
++
++		pub fn kill(&self, signal: i32) -> bool {
++			sys::pidfd_send_signal(self.pidfd.as_fd(), signal)
++		}
++
++		pub fn group_id(&self) -> Option<i32> {
++			if self.status() != ProcessStatus::Running {
++				return None;
++			}
++
++			// SAFETY: `self.pid` names the process currently referenced by
++			// `self.pidfd` unless it exits concurrently. If it exits, `getpgid`
++			// reports failure rather than dereferencing caller-owned memory.
++			let pgid = unsafe { libc::getpgid(self.pid) };
++			if pgid > 0 { Some(pgid) } else { None }
++		}
++
++		pub fn status(&self) -> ProcessStatus {
++			loop {
++				let mut pollfd =
++					libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
++				// SAFETY: `pollfd` points to one initialized `pollfd` element, and
++				// the pidfd remains open for the duration of the call. Timeout
++				// zero makes this a non-blocking readiness probe.
++				let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
++				if ready < 0 {
++					// Retry on EINTR; for any other transient poll error treat the
++					// pidfd as still running. The pidfd is still owned and the
++					// kernel has not reported the process gone — a spurious
++					// `Exited` here makes every downstream signal/kill fall
++					// through silently.
++					if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
++						continue;
++					}
++					return ProcessStatus::Running;
++				}
++				if ready == 0 {
++					return ProcessStatus::Running;
++				}
++				if (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
++					!= 0
++				{
++					return ProcessStatus::Exited;
++				}
++				return ProcessStatus::Running;
++			}
++		}
++
++		/// Resolves once the process exits: its pidfd becomes readable then.
++		pub async fn exited(&self) -> std::io::Result<()> {
++			let pidfd = tokio::io::unix::AsyncFd::with_interest(
++				self.pidfd.try_clone()?,
++				tokio::io::Interest::READABLE,
++			)?;
++			let _ready = pidfd.readable().await?;
++			Ok(())
++		}
++
++		/// Walk the descendant tree in post-order (leaves first), de-duplicating
++		/// by PID so concurrent reparenting cannot trap us in a cycle.
++		pub fn descendants(&self) -> Vec<Self> {
++			let mut out = Vec::new();
++			let mut visited = HashSet::new();
++			visited.insert(self.pid);
++			self.descendants_into(&mut out, &mut visited);
++			out
++		}
++
++		fn descendants_into(&self, out: &mut Vec<Self>, visited: &mut HashSet<i32>) {
++			for child in self.children() {
++				if visited.insert(child.pid) {
++					child.descendants_into(out, visited);
++					out.push(child);
++				}
++			}
++		}
++
++		fn live_identity(&self) -> bool {
++			self.status() == ProcessStatus::Running
++				&& sys::start_time(self.pid) == Some(self.start_time)
++		}
++	}
++
++	/// Find processes whose `/proc/{pid}/exe` symlink resolves to exactly
++	/// `target`.
++	pub fn find_by_path(target: &str) -> Vec<Process> {
++		sys::pids()
++			.filter(|pid| {
++				fs::read_link(format!("/proc/{pid}/exe"))
++					.is_ok_and(|resolved| resolved.as_os_str() == target)
++			})
++			.filter_map(Process::from_pid)
++			.collect()
++	}
++}
++
++#[cfg(target_os = "macos")]
++mod platform {
++	use std::{
++		collections::{HashMap, HashSet},
++		ptr,
++	};
++
++	use pi_builtins::proc_sys as sys;
++
++	use super::ProcessStatus;
++
++	/// macOS does not expose pidfds; identity is pinned via the kernel-reported
++	/// process start time so a recycled PID does not silently impersonate the
++	/// original target.
++	#[derive(Clone)]
++	pub struct Process {
++		pid:          i32,
++		start_tvsec:  u64,
++		start_tvusec: u64,
++	}
++
++	impl Process {
++		pub fn from_pid(pid: i32) -> Option<Self> {
++			if pid <= 0 {
++				return None;
++			}
++			let info = sys::bsdinfo(pid)?;
++			if i32::try_from(info.pbi_pid).ok()? != pid {
++				return None;
++			}
++			Some(Self { pid, start_tvsec: info.pbi_start_tvsec, start_tvusec: info.pbi_start_tvusec })
++		}
++
++		pub const fn pid(&self) -> i32 {
++			self.pid
++		}
++
++		pub fn children(&self) -> Vec<Self> {
++			if self.live_bsdinfo().is_none() {
++				return Vec::new();
++			}
++			// `proc_listchildpids` (the obvious choice) is broken on recent macOS
++			// kernels when queried for the *calling* process — it returns one byte
++			// of padding regardless of how many children the process actually
++			// has, so a process can never list its own descendants. Confirmed
++			// on darwin 25.4 from C, Rust, and Bun callers via
++			// `proc_listchildpids(getpid(), …)`, while `ps -P` and `pgrep -P`
++			// still see the same children. Walk the whole pid table via
++			// `proc_listallpids` and filter on `pbi_ppid` instead; this is the
++			// same approach we already use for `find_by_path` and that the
++			// Windows implementation uses via Toolhelp snapshots.
++			let tree = build_process_tree();
++			Self::children_from_tree(self.pid, &tree)
++		}
++
++		pub fn parent_pid(&self) -> Option<i32> {
++			let info = self.live_bsdinfo()?;
++			i32::try_from(info.pbi_ppid).ok().filter(|ppid| *ppid > 0)
++		}
++
++		pub fn args(&self) -> Vec<String> {
++			if self.live_bsdinfo().is_none() {
++				return Vec::new();
++			}
++			sys::args(self.pid)
++		}
++
++		pub fn kill(&self, signal: i32) -> bool {
++			// Re-validate identity right before signaling. There is no atomic
++			// "kill iff start_time matches" primitive on macOS, so a vanishingly
++			// small window remains between this check and the syscall — but
++			// matching against the recorded `(pid, start_tvsec, start_tvusec)`
++			// triple eliminates the PID-reuse race in every practical case.
++			if self.live_bsdinfo().is_none() {
++				return false;
++			}
++			// SAFETY: `kill` takes integer identifiers by value and does not
++			// access caller-owned memory.
++			unsafe { libc::kill(self.pid, signal) == 0 }
++		}
++
++		pub fn group_id(&self) -> Option<i32> {
++			let info = self.live_bsdinfo()?;
++			i32::try_from(info.pbi_pgid).ok().filter(|pgid| *pgid > 0)
++		}
++
++		/// Walk the descendant tree in post-order (leaves first), de-duplicating
++		/// by PID so concurrent reparenting cannot trap us in a cycle.
++		pub fn descendants(&self) -> Vec<Self> {
++			// One process-table snapshot per walk — building it inside the
++			// recursion would re-scan every pid for every visited node,
++			// producing an `O(N · D)` kernel call pattern. Mirrors the Windows
++			// implementation.
++			let tree = build_process_tree();
++			let mut out = Vec::new();
++			let mut visited = HashSet::new();
++			visited.insert(self.pid);
++			Self::collect_descendants_from_tree(self.pid, &tree, &mut visited, &mut out);
++			out
++		}
++
++		fn children_from_tree(parent: i32, tree: &HashMap<i32, Vec<i32>>) -> Vec<Self> {
++			let Some(child_pids) = tree.get(&parent) else {
++				return Vec::new();
++			};
++			child_pids
++				.iter()
++				.copied()
++				.filter_map(Self::from_pid)
++				.collect()
++		}
++
++		fn collect_descendants_from_tree(
++			parent: i32,
++			tree: &HashMap<i32, Vec<i32>>,
++			visited: &mut HashSet<i32>,
++			out: &mut Vec<Self>,
++		) {
++			let Some(child_pids) = tree.get(&parent) else {
++				return;
++			};
++			for &child_pid in child_pids {
++				if !visited.insert(child_pid) {
++					continue;
++				}
++				let Some(child) = Self::from_pid(child_pid) else {
++					continue;
++				};
++				// Post-order: grandchildren first, so leaf processes get signalled
++				// before their parents during tree termination.
++				Self::collect_descendants_from_tree(child_pid, tree, visited, out);
++				out.push(child);
++			}
++		}
++
++		pub fn status(&self) -> ProcessStatus {
++			if self.live_bsdinfo().is_some() {
++				ProcessStatus::Running
++			} else {
++				ProcessStatus::Exited
++			}
++		}
++
++		/// Resolves once the process exits, through a kqueue `NOTE_EXIT`
++		/// filter.
++		pub async fn exited(&self) -> std::io::Result<()> {
++			use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
++
++			// SAFETY: `kqueue` takes no arguments; a negative result is an error.
++			let kq = unsafe { libc::kqueue() };
++			if kq < 0 {
++				return Err(std::io::Error::last_os_error());
++			}
++			// SAFETY: `kq` is a fresh descriptor nothing else owns.
++			let kq = unsafe { OwnedFd::from_raw_fd(kq) };
++			// Scoped so the raw record (its `udata` is a `*mut c_void`) is gone
++			// before the await below; holding it would make this future `!Send`.
++			let registered = {
++				let change = libc::kevent {
++					ident:  self.pid as libc::uintptr_t,
++					filter: libc::EVFILT_PROC,
++					flags:  libc::EV_ADD | libc::EV_ONESHOT,
++					fflags: libc::NOTE_EXIT,
++					data:   0,
++					udata:  ptr::null_mut(),
++				};
++				// SAFETY: `change` is one initialized change record; with no event
++				// buffer the call only registers it and the null timeout is unused.
++				unsafe {
++					libc::kevent(kq.as_raw_fd(), &raw const change, 1, ptr::null_mut(), 0, ptr::null())
++				}
++			};
++			if registered < 0 {
++				let err = std::io::Error::last_os_error();
++				// No such process: it is already gone.
++				return (err.raw_os_error() == Some(libc::ESRCH)).ok_or(err);
++			}
++			// The pid may have been reused before the filter was registered, in
++			// which case it watches another process; confirm identity after.
++			if self.status() != ProcessStatus::Running {
++				return Ok(());
++			}
++			let kq = tokio::io::unix::AsyncFd::with_interest(kq, tokio::io::Interest::READABLE)?;
++			let _ready = kq.readable().await?;
++			Ok(())
++		}
++
++		/// Returns the current `proc_bsdinfo` only if it still describes the same
++		/// process this reference was opened on — i.e. the start time has not
++		/// changed.
++		fn live_bsdinfo(&self) -> Option<libc::proc_bsdinfo> {
++			let info = sys::bsdinfo(self.pid)?;
++			if info.pbi_start_tvsec == self.start_tvsec && info.pbi_start_tvusec == self.start_tvusec {
++				Some(info)
++			} else {
++				None
++			}
++		}
++	}
++
++	/// Build a `ppid -> [pids]` map from a one-shot scan of `proc_listallpids`.
++	///
++	/// Used as the foundation of `Process::children` and `Process::descendants`
++	/// on macOS where `proc_listchildpids` returns no children for self-queries.
++	pub(super) fn build_process_tree() -> HashMap<i32, Vec<i32>> {
++		let pids = sys::pids();
++		let mut tree: HashMap<i32, Vec<i32>> = HashMap::with_capacity(pids.len() / 2);
++		for pid in pids {
++			let Some(info) = sys::bsdinfo(pid) else {
++				continue;
++			};
++			let Ok(ppid) = i32::try_from(info.pbi_ppid) else {
++				continue;
++			};
++			if ppid <= 0 {
++				continue;
++			}
++			tree.entry(ppid).or_default().push(pid);
++		}
++		tree
++	}
++
++	/// Find processes whose libproc-reported executable path equals `target`.
++	pub fn find_by_path(target: &str) -> Vec<Process> {
++		let mut path = [0u8; sys::PATH_CAPACITY];
++		sys::pids()
++			.into_iter()
++			.filter(|pid| *pid > 0 && sys::executable_path(*pid, &mut path) == Some(target.as_bytes()))
++			.filter_map(Process::from_pid)
++			.collect()
++	}
++}
++#[cfg(target_os = "windows")]
++mod platform {
++	use std::{
++		collections::{HashMap, HashSet},
++		ffi::OsStr,
++		os::windows::{ffi::OsStrExt, io::OwnedHandle},
++		sync::Arc,
++	};
++
++	use pi_builtins::proc_sys as sys;
++	use smallvec::SmallVec;
++
++	use super::ProcessStatus;
++
++	const PROCESS_REFERENCE_ACCESS: u32 =
++		sys::PROCESS_TERMINATE | sys::PROCESS_QUERY_LIMITED_INFORMATION | sys::SYNCHRONIZE;
++
++	#[derive(Clone)]
++	/// Stable Windows process reference backed by an owned process handle plus
++	/// the kernel-reported creation time, which pins identity even if the PID is
++	/// recycled while we hold the handle.
++	pub struct Process {
++		pid:           i32,
++		handle:        Arc<OwnedHandle>,
++		creation_time: u64,
++	}
++
++	impl Process {
++		pub fn from_pid(pid: i32) -> Option<Self> {
++			if pid <= 0 {
++				return None;
++			}
++			let handle =
++				Arc::new(sys::open_process(u32::try_from(pid).ok()?, PROCESS_REFERENCE_ACCESS)?);
++			let creation_time = sys::process_times(&handle)?.0;
++			Some(Self { pid, handle, creation_time })
++		}
++
++		pub const fn pid(&self) -> i32 {
++			self.pid
++		}
++
++		pub fn parent_pid(&self) -> Option<i32> {
++			sys::parent_pid(&self.handle)
++		}
++
++		/// Read through the pinned handle, so it is always this process's
++		/// command line even after the pid is reused.
++		pub fn args(&self) -> Vec<String> {
++			sys::command_line(&self.handle)
++				.map_or_default(|command_line| sys::split_command_line(&command_line))
++		}
++
++		pub fn children(&self) -> Vec<Self> {
++			let tree = build_process_tree();
++			self.children_from_tree(&tree)
++		}
++
++		/// Walk the entire descendant tree using a single Toolhelp snapshot.
++		///
++		/// `children()` recursing per-node would re-snapshot the whole process
++		/// table for every visited descendant, making tree termination
++		/// `O(N · D)` snapshots. One snapshot per termination wave is enough.
++		pub fn descendants(&self) -> Vec<Self> {
++			let tree = build_process_tree();
++			let Ok(root) = u32::try_from(self.pid) else {
++				return Vec::new();
++			};
++			let mut visited: HashSet<u32> = HashSet::new();
++			visited.insert(root);
++			let mut out = Vec::new();
++			self.collect_descendants_from_tree(&tree, &mut visited, &mut out);
++			out
++		}
++
++		/// The running process `child_pid`, when it really is a child of
++		/// `self`. Windows never rewrites the parent id recorded for a process
++		/// whose parent exited, so such an orphan is listed as a child of
++		/// whichever process reuses that pid. A real child cannot have been
++		/// created before its parent; an orphan older than `self` can.
++		fn child(&self, child_pid: u32) -> Option<Self> {
++			let child = Self::from_pid(i32::try_from(child_pid).ok()?)?;
++			(child.creation_time >= self.creation_time && child.status() == ProcessStatus::Running)
++				.then_some(child)
++		}
++
++		pub(super) fn children_from_tree(
++			&self,
++			tree: &HashMap<u32, SmallVec<[u32; 4]>>,
++		) -> Vec<Self> {
++			let Ok(pid_u32) = u32::try_from(self.pid) else {
++				return Vec::new();
++			};
++			tree
++				.get(&pid_u32)
++				.into_iter()
++				.flatten()
++				.filter_map(|&child_pid| self.child(child_pid))
++				.collect()
++		}
++
++		fn collect_descendants_from_tree(
++			&self,
++			tree: &HashMap<u32, SmallVec<[u32; 4]>>,
++			visited: &mut HashSet<u32>,
++			out: &mut Vec<Self>,
++		) {
++			let Some(children) = u32::try_from(self.pid).ok().and_then(|pid| tree.get(&pid)) else {
++				return;
++			};
++			for &child_pid in children {
++				if !visited.insert(child_pid) {
++					continue;
++				}
++				let Some(child) = self.child(child_pid) else {
++					continue;
++				};
++				// Post-order: collect grandchildren first so leaves are signalled
++				// before their parents during tree termination.
++				child.collect_descendants_from_tree(tree, visited, out);
++				out.push(child);
++			}
++		}
++
++		/// The handle pins the original kernel process object even after the
++		/// pid is recycled, so this cannot hit a different process.
++		pub fn kill(&self, _signal: i32) -> bool {
++			sys::terminate(&self.handle)
++		}
++
++		pub const fn group_id() -> Option<i32> {
++			None
++		}
++
++		pub fn status(&self) -> ProcessStatus {
++			if sys::has_exited(&self.handle) {
++				ProcessStatus::Exited
++			} else {
++				ProcessStatus::Running
++			}
++		}
++
++		/// Resolves once the process exits, through a thread-pool wait on the
++		/// process handle, so no thread is parked per waiter.
++		pub async fn exited(&self) -> std::io::Result<()> {
++			sys::exited(Arc::clone(&self.handle)).await
++		}
++	}
++
++	/// Build a map of `parent_pid` -> [`child_pids`] for all processes.
++	fn build_process_tree() -> HashMap<u32, SmallVec<[u32; 4]>> {
++		let mut tree: HashMap<u32, SmallVec<[u32; 4]>> = HashMap::new();
++		for entry in sys::processes() {
++			tree.entry(entry.ppid).or_default().push(entry.pid);
++		}
++		tree
++	}
++
++	/// Find processes whose `QueryFullProcessImageNameW` result equals `target`.
++	pub fn find_by_path(target: &str) -> Vec<Process> {
++		let target: Vec<u16> = OsStr::new(target).encode_wide().collect();
++		let mut path = vec![0u16; 32_768];
++		sys::processes()
++			.filter(|entry| {
++				sys::open_process(entry.pid, sys::PROCESS_QUERY_LIMITED_INFORMATION)
++					.is_some_and(|handle| sys::image_path(&handle, &mut path) == Some(&target[..]))
++			})
++			.filter_map(|entry| Process::from_pid(i32::try_from(entry.pid).ok()?))
++			.collect()
++	}
++}
++
++/// Stable process reference.
++#[derive(Clone)]
++pub struct Process {
++	inner: platform::Process,
++}
++
++impl Process {
++	/// Open a stable process reference from a PID.
++	pub fn from_pid(pid: i32) -> Option<Self> {
++		platform::Process::from_pid(pid).map(Self::from_inner)
++	}
++
++	/// Open stable process references whose executable path matches exactly.
++	pub fn from_path(path: String) -> Vec<Self> {
++		platform::find_by_path(&path)
++			.into_iter()
++			.map(Self::from_inner)
++			.collect()
++	}
++
++	/// Operating-system process identifier for this process reference.
++	#[must_use]
++	pub const fn pid(&self) -> i32 {
++		self.inner.pid()
++	}
++
++	/// Parent process id for this process, when available.
++	#[must_use]
++	pub fn ppid(&self) -> Option<i32> {
++		self.inner.parent_pid()
++	}
++
++	/// Launch arguments for this process.
++	#[must_use]
++	pub fn args(&self) -> Vec<String> {
++		self.inner.args()
++	}
++
++	/// Send `signal` to this process only, through its pinned identity, so it
++	/// never reaches a process that reused the pid after this one was reaped.
++	/// On Windows the process is terminated whatever `signal` is.
++	pub fn signal(&self, signal: i32) -> bool {
++		self.inner.kill(signal)
++	}
++
++	/// Send `signal` to this process and its descendants, children first.
++	///
++	/// On Linux and macOS the signal is forwarded as-is. On Windows there is no
++	/// signal abstraction, so the `signal` argument is ignored and the entire
++	/// tree is hard-killed via `TerminateProcess`. Defaults to the POSIX
++	/// hard-kill signal.
++	#[must_use]
++	pub fn kill_tree(&self, signal: Option<i32>) -> u32 {
++		self.signal_tree(signal.unwrap_or(KILL_SIGNAL))
++	}
++
++	/// Process group id for this process, when supported by the platform.
++	#[cfg(target_os = "windows")]
++	#[must_use]
++	pub const fn group_id(&self) -> Option<i32> {
++		platform::Process::group_id()
++	}
++
++	#[cfg(not(target_os = "windows"))]
++	#[must_use]
++	pub fn group_id(&self) -> Option<i32> {
++		self.inner.group_id()
++	}
++
++	/// Direct children of this process as stable process references.
++	pub fn children(&self) -> Vec<Self> {
++		self
++			.inner
++			.children()
++			.into_iter()
++			.map(Self::from_inner)
++			.collect()
++	}
++
++	/// Current status of this process reference.
++	#[must_use]
++	pub fn status(&self) -> ProcessStatus {
++		self.inner.status()
++	}
++
++	/// Gracefully terminate this process and its descendants.
++	///
++	/// Sends `TERM_SIGNAL` to the optional process group, every live descendant,
++	/// and the root, then optionally waits up to `graceful_ms` for the tree to
++	/// exit before escalating to `KILL_SIGNAL`. Pass `graceful_ms < 0` to skip
++	/// the wait entirely (the polite signal is still emitted). Returns `true`
++	/// when the tree has exited by the end of the hard wave's wait window.
++	pub async fn terminate_tree(
++		&self,
++		group: bool,
++		graceful_ms: i32,
++		timeout_ms: u32,
++		ct: CancelToken,
++	) -> Result<bool> {
++		self
++			.terminate_tree_impl(group, graceful_ms, timeout_ms, ct)
++			.await
++	}
++
++	/// Wait until this process exits, optionally bounded by `timeout`.
++	pub async fn wait_for_exit(&self, timeout: Option<Duration>, ct: CancelToken) -> Result<bool> {
++		wait_for_exit(self, &[], timeout, ct).await
++	}
++}
++
++impl Process {
++	const fn from_inner(inner: platform::Process) -> Self {
++		Self { inner }
++	}
++
++	/// Walk the live descendant tree from scratch. Cheap and idempotent — call
++	/// it again before each signal wave so grandchildren spawned during a grace
++	/// period are not missed.
++	fn live_descendants(&self) -> Vec<Self> {
++		self
++			.inner
++			.descendants()
++			.into_iter()
++			.map(Self::from_inner)
++			.collect()
++	}
++
++	fn signal_tree(&self, signal: i32) -> u32 {
++		self.signal_tree_excluding(signal, &host_protected_pids())
++	}
++
++	/// Signal this process and its live descendants (children first), skipping
++	/// any pid in `protected`.
++	///
++	/// `protected` shields the harness itself: a run-cancellation sweep must
++	/// never hard-kill the host. On Windows the
++	/// descendant tree is derived from raw `th32ParentProcessID` values that
++	/// outlive their recorded parent, so a freshly spawned child whose recycled
++	/// pid matches the harness's stale parent pid makes the harness enumerate
++	/// as a false descendant; `TerminateProcess`-ing it drops the whole session
++	/// with no cleanup and no `session_exit` record (#7452, related #4605).
++	fn signal_tree_excluding(&self, signal: i32, protected: &HashSet<i32>) -> u32 {
++		let descendants = self.signalable_descendants(protected);
++		let mut signaled = 0u32;
++		// If self leads its own process group, also signal the group — this
++		// catches grandchildren reparented to init when their immediate parent
++		// died inside the descendant walk.
++		if let Some(pgid) = self.group_id()
++			&& pgid == self.inner.pid()
++		{
++			let _ = kill_process_group(pgid, signal);
++		}
++		for child in &descendants {
++			if child.inner.kill(signal) {
++				signaled += 1;
++			}
++		}
++		if !protected.contains(&self.pid()) && self.inner.kill(signal) {
++			signaled += 1;
++		}
++		signaled
++	}
++
++	/// Live descendants with every protected subtree pruned, not just the exact
++	/// protected pids.
++	///
++	/// The flattened descendant list can contain a protected node (the harness,
++	/// on a Windows PID-reuse false-descendant) *together with* that node's real
++	/// children, which were collected by recursing through it. Skipping only the
++	/// exact protected pid would still terminate those unrelated worker/tool
++	/// subprocesses, so drop every node whose recorded parent chain — within the
++	/// enumerated set — passes through a protected pid (#7452 review).
++	fn signalable_descendants(&self, protected: &HashSet<i32>) -> Vec<Self> {
++		let descendants = self.live_descendants();
++		let parents: HashMap<i32, i32> = descendants
++			.iter()
++			.filter_map(|descendant| descendant.ppid().map(|parent| (descendant.pid(), parent)))
++			.collect();
++		descendants
++			.into_iter()
++			.filter(|descendant| !pid_in_protected_subtree(descendant.pid(), protected, &parents))
++			.collect()
++	}
++
++	async fn terminate_tree_impl(
++		&self,
++		group: bool,
++		graceful_ms: i32,
++		timeout_ms: u32,
++		ct: CancelToken,
++	) -> Result<bool> {
++		if self.status() != ProcessStatus::Running {
++			return Ok(true);
++		}
++
++		let process_group = if group { self.group_id() } else { None };
++		let protected = host_protected_pids();
++
++		// Polite wave: SIGTERM the group, every live descendant, then the root.
++		if let Some(pgid) = process_group {
++			let _ = kill_process_group(pgid, TERM_SIGNAL);
++		}
++		let mut descendants = self.signalable_descendants(&protected);
++		for child in &descendants {
++			let _ = child.inner.kill(TERM_SIGNAL);
++		}
++		if !protected.contains(&self.pid()) {
++			let _ = self.inner.kill(TERM_SIGNAL);
++		}
++
++		// Optional grace wait. A negative `graceful_ms` skips the wait entirely
++		// (we still emit the polite signal so cleanup handlers can run before
++		// KILL).
++		if graceful_ms >= 0 {
++			let exited = wait_for_exit(
++				self,
++				&descendants,
++				Some(Duration::from_millis(graceful_ms as u64)),
++				ct.clone(),
++			)
++			.await?;
++			if exited {
++				return Ok(true);
++			}
++		}
++
++		// Hard wave. Re-walk the tree so any grandchild spawned during the grace
++		// period — or any process re-parented to the root — is signalled too.
++		if let Some(pgid) = process_group {
++			let _ = kill_process_group(pgid, KILL_SIGNAL);
++		}
++		descendants = self.signalable_descendants(&protected);
++		for child in &descendants {
++			let _ = child.inner.kill(KILL_SIGNAL);
++		}
++		if !protected.contains(&self.pid()) {
++			let _ = self.inner.kill(KILL_SIGNAL);
++		}
++
++		wait_for_exit(self, &descendants, Some(Duration::from_millis(u64::from(timeout_ms))), ct)
++			.await
++	}
++}
++
++/// The harness pid — the one process a run-cancellation sweep must never
++/// signal.
++///
++/// On Unix the descendant walk is identity-pinned (pidfd / start-time), so the
++/// host can never appear as a false descendant and this set is a harmless
++/// no-op safety net. On Windows the descendant tree is derived from raw
++/// `th32ParentProcessID` values that survive their recorded parent's death: a
++/// freshly spawned child whose recycled pid matches the harness's stale parent
++/// pid makes the harness enumerate as a false descendant, so cancelling a
++/// timed-out bash run would `TerminateProcess` the host with no cleanup and no
++/// `session_exit` record (#7452, related #4605).
++///
++/// Do not walk the host's numeric parent chain here. On Windows the host's
++/// recorded parent pid can itself have been recycled onto the cancellation
++/// target; treating that raw pid as protected would spare the hung command and
++/// prune all of its descendants from cleanup.
++fn host_protected_pids() -> HashSet<i32> {
++	i32::try_from(std::process::id()).into_iter().collect()
++}
++
++/// True when `pid` is itself protected or descends — within the enumerated
++/// `parents` map (pid -> recorded parent pid) — from a protected pid. Used to
++/// prune a whole protected subtree from a cancellation sweep so a false
++/// descendant of the harness cannot drag the harness's real children into the
++/// kill set (#7452).
++fn pid_in_protected_subtree(
++	pid: i32,
++	protected: &HashSet<i32>,
++	parents: &HashMap<i32, i32>,
++) -> bool {
++	let mut current = pid;
++	// Bound the walk against a corrupted or cyclic parent chain.
++	for _ in 0..256 {
++		if protected.contains(&current) {
++			return true;
++		}
++		match parents.get(&current) {
++			Some(&parent) if parent != current => current = parent,
++			_ => return false,
++		}
++	}
++	false
++}
++
++async fn wait_for_exit(
++	root: &Process,
++	descendants: &[Process],
++	timeout: Option<Duration>,
++	ct: CancelToken,
++) -> Result<bool> {
++	ct.heartbeat()?;
++	if root.status() != ProcessStatus::Running
++		&& descendants
++			.iter()
++			.all(|process| process.status() != ProcessStatus::Running)
++	{
++		return Ok(true);
++	}
++
++	// A lone process is awaited through the OS exit notification. Polling woke
++	// every waiter 20 times a second, and IPC workers wait on their parent for
++	// their whole life. Trees still poll: their membership changes.
++	if descendants.is_empty()
++		&& let Some(result) = wait_for_root_exit(root, timeout, &ct).await
++	{
++		return result;
++	}
++
++	let poll_interval = Duration::from_millis(50);
++	let mut elapsed = Duration::ZERO;
++	while timeout.is_none_or(|limit| elapsed < limit) {
++		let sleep_for =
++			timeout.map_or(poll_interval, |limit| limit.saturating_sub(elapsed).min(poll_interval));
++		if sleep_for.is_zero() {
++			break;
++		}
++		ct.heartbeat()?;
++		tokio::time::sleep(sleep_for).await;
++		elapsed += sleep_for;
++
++		if root.status() != ProcessStatus::Running
++			&& descendants
++				.iter()
++				.all(|process| process.status() != ProcessStatus::Running)
++		{
++			return Ok(true);
++		}
++	}
++
++	Ok(false)
++}
++
++/// Waits for `root` to exit through the platform's exit notification:
++/// `Ok(true)` once it exited, `Ok(false)` when `timeout` elapsed first.
++/// `None` when no notification could be set up, so the caller polls instead.
++async fn wait_for_root_exit(
++	root: &Process,
++	timeout: Option<Duration>,
++	ct: &CancelToken,
++) -> Option<Result<bool>> {
++	let exited = root.inner.exited();
++	let bounded = async {
++		match timeout {
++			Some(limit) => tokio::time::timeout(limit, exited).await.ok(),
++			None => Some(exited.await),
++		}
++	};
++	tokio::select! {
++		outcome = bounded => match outcome {
++			None => Some(Ok(false)),
++			Some(Ok(())) => Some(Ok(true)),
++			Some(Err(_)) => None,
++		},
++		reason = ct.wait() => Some(Err(anyhow::Error::msg(format!("Aborted: {reason:?}")))),
++	}
++}
++
++/// Send `signal` to the process group `pgid`.
++/// Returns false when process groups are unsupported on the platform.
++#[allow(clippy::missing_const_for_fn, reason = "Dispatches to platform-specific implementation")]
++#[must_use]
++pub fn kill_process_group(pgid: i32, signal: i32) -> bool {
++	// Defense in depth: refuse to deliver a signal to the harness's own
++	// process group. Doing so terminates the harness along with the targets.
++	// `SpawnRegistry` only ever records pgids brush created for this run (never
++	// the harness pgid); this catches any future caller that bypasses it.
++	if pgid <= 0 || is_self_process_group(pgid) {
++		return false;
++	}
++	platform_kill_process_group(pgid, signal)
++}
++
++#[cfg(unix)]
++fn platform_kill_process_group(pgid: i32, signal: i32) -> bool {
++	// SAFETY: `kill` takes integer identifiers by value and does not access
++	// caller-owned memory. A negative PID is the POSIX process-group form.
++	unsafe { libc::kill(-pgid, signal) == 0 }
++}
++
++/// Process groups are not exposed on Windows.
++#[cfg(not(unix))]
++const fn platform_kill_process_group(_pgid: i32, _signal: i32) -> bool {
++	false
++}
++
++#[cfg(unix)]
++fn is_self_process_group(pgid: i32) -> bool {
++	// SAFETY: `getpgid(0)` queries the calling process's pgid and does not
++	// access caller-owned memory. A return value <= 0 is treated as "unknown",
++	// which fails open so the actual signal call decides.
++	let self_pgid = unsafe { libc::getpgid(0) };
++	self_pgid > 0 && self_pgid == pgid
++}
++
++#[cfg(not(unix))]
++const fn is_self_process_group(_pgid: i32) -> bool {
++	false
++}
++
++/// POSIX `SIGTERM` / Windows polite termination sentinel.
++pub const TERM_SIGNAL: i32 = 15;
++
++/// POSIX `SIGKILL` / Windows hard-termination sentinel.
++pub const KILL_SIGNAL: i32 = 9;
++
++/// A collection of process groups and process trees scheduled for
++/// termination together.
++///
++/// Built incrementally from job records or PTY metadata, then signalled
++/// in escalating waves (typically `TERM_SIGNAL` followed by
++/// `KILL_SIGNAL` after a grace period). Process-group calls are no-ops
++/// on platforms that do not expose process groups.
++#[derive(Default)]
++pub struct TerminationTargets {
++	pgids:     Vec<i32>,
++	processes: Vec<Process>,
++	seen_pids: HashSet<i32>,
++}
++
++impl TerminationTargets {
++	/// Create an empty target set.
++	#[must_use]
++	pub fn new() -> Self {
++		Self::default()
++	}
++
++	/// Record a process group id. Duplicates are ignored.
++	pub fn add_pgid(&mut self, pgid: i32) {
++		if pgid > 0 && !self.pgids.contains(&pgid) {
++			self.pgids.push(pgid);
++		}
++	}
++
++	/// Record a pid. Duplicates are ignored. If the pid is alive, opens
++	/// a stable [`Process`] reference so the descendant tree can be
++	/// killed even if the original pid is reused later.
++	///
++	/// Prefer [`add_process`](Self::add_process) when the caller already holds a
++	/// [`Process`] captured at spawn time: opening by pid here loses the
++	/// original identity if the pid was recycled between the child exiting
++	/// and this call.
++	pub fn add_pid(&mut self, pid: i32) {
++		if self.seen_pids.insert(pid)
++			&& let Some(process) = Process::from_pid(pid)
++		{
++			self.processes.push(process);
++		}
++	}
++
++	/// Record a pre-pinned [`Process`] handle. Duplicates (by pid) are ignored.
++	///
++	/// This is the correct entry point when the caller captured the handle at
++	/// spawn time — the handle already pins OS-level identity, so no `from_pid`
++	/// re-open (and its PID-reuse race) is needed at cancellation time.
++	pub fn add_process(&mut self, process: Process) {
++		if self.seen_pids.insert(process.pid()) {
++			self.processes.push(process);
++		}
++	}
++
++	/// True when no targets have been recorded.
++	#[must_use]
++	pub const fn is_empty(&self) -> bool {
++		self.pgids.is_empty() && self.processes.is_empty()
++	}
++
++	/// Send `signal` to every recorded target. Failures are swallowed:
++	/// targets routinely exit between collection and signalling, and
++	/// the caller's policy is "best effort".
++	pub fn signal(&self, signal: i32) {
++		for &pgid in &self.pgids {
++			let _ = kill_process_group(pgid, signal);
++		}
++		for process in &self.processes {
++			let _ = process.signal_tree(signal);
++		}
++	}
++}
++
++/// A single external child reported by the shell's spawn-observer hook.
++///
++/// `process` is captured *at spawn time* so its OS-level identity is pinned
++/// before the pid can be recycled. On Windows an open process handle keeps
++/// the pid reserved for the lifetime of the reference; on Linux the pidfd
++/// pins identity; on macOS the recorded `(pid, start_time)` triple detects
++/// impersonation. Storing only the raw pid and re-opening at cancellation
++/// time — as previous versions did — leaked kills onto unrelated processes
++/// that happened to acquire the recycled pid between the child exiting and
++/// the run being cancelled (issue #4605).
++#[derive(Clone)]
++struct SpawnedProcess {
++	process: Option<Process>,
++	pgid:    Option<i32>,
++}
++
++/// Per-run record of the OS processes a single shell command launched,
++/// captured at spawn time via brush's `SpawnObserver` hook.
++///
++/// Replaces the old process-global "new descendants since a baseline" diff,
++/// which could not distinguish the children of concurrent runs sharing one
++/// host process: a run that cancelled would signal *any* descendant spawned
++/// after its baseline, including another run's children. Ownership is now
++/// explicit — only processes this run actually spawned are ever signalled.
++#[derive(Default)]
++struct RegistryState {
++	spawned:       Vec<SpawnedProcess>,
++	/// The next `spawned.len()` at which `record` runs a sweep. Bounds sweep
++	/// frequency when the live set stabilizes above the initial threshold:
++	/// without this watermark, every subsequent `record` would find
++	/// `len >= PRUNE_THRESHOLD` true and sweep on every spawn (O(n²) in a
++	/// large-fan-out run like `for i in {1..1000}; do sleep 60 & done`). With
++	/// it, the next sweep only fires once the vec has grown by another
++	/// `PRUNE_THRESHOLD` entries since the previous sweep — restoring true
++	/// amortized O(1) per spawn regardless of how many entries survive each
++	/// sweep.
++	next_sweep_at: usize,
++}
++
++#[derive(Default)]
++pub struct SpawnRegistry {
++	state: Mutex<RegistryState>,
++}
++
++impl SpawnRegistry {
++	/// Amortized-cost threshold for opportunistic pruning of exited entries.
++	///
++	/// A shell run that spawns many short-lived external commands (e.g. a bash
++	/// loop invoking a binary per iteration) would otherwise retain one owned
++	/// process handle per spawn — a pidfd on Linux, a `HANDLE` on Windows — for
++	/// the lifetime of the run, exhausting per-process FD/handle limits.
++	///
++	/// Each sweep costs `O(N)` (one non-blocking status probe per entry, plus
++	/// a Toolhelp descendant walk on Windows for exited roots). The next sweep
++	/// is scheduled `PRUNE_THRESHOLD` further records away — via the
++	/// `next_sweep_at` watermark — so a run that keeps many concurrent
++	/// long-lived children (`for i in {1..1000}; do sleep 60 & done`) does not
++	/// sweep on every spawn just because the vec is already above threshold.
++	/// Amortized cost per spawn stays `O(1)` regardless of the live-set size.
++	const PRUNE_THRESHOLD: usize = 64;
++
++	/// Create an empty registry.
++	#[must_use]
++	pub fn new() -> Self {
++		Self::default()
++	}
++
++	/// Record a freshly spawned child. Called from the spawn-observer hook.
++	///
++	/// The `Process` handle MUST be opened by the caller *immediately* after
++	/// the child's pid becomes visible, so identity is pinned before any race
++	/// with pid recycling can start. When the pin fails (child already exited
++	/// before we could `Process::from_pid`) the entry becomes a no-op at
++	/// termination time — there is nothing left to signal.
++	///
++	/// Exited entries are swept opportunistically once the recorded vec
++	/// crosses the next-sweep watermark, so long-running loops of short
++	/// external commands cannot exhaust the process' FD/handle limit by
++	/// retaining one owned handle per historical spawn.
++	pub fn record(&self, pgid: Option<i32>, process: Option<Process>) {
++		let mut state = self.state.lock();
++		state.spawned.push(SpawnedProcess { process, pgid });
++		if state.spawned.len() >= state.next_sweep_at.max(Self::PRUNE_THRESHOLD) {
++			prune_exited(&mut state.spawned);
++			// Schedule the next sweep `PRUNE_THRESHOLD` further records away.
++			// Comparing against the post-sweep live-set size (not the pre-sweep
++			// length) bounds the sweep frequency when many entries survive:
++			// each sweep costs O(N) but now runs at most once per
++			// `PRUNE_THRESHOLD` records, so amortized per-record cost is O(1)
++			// even if the live set stays large.
++			state.next_sweep_at = state.spawned.len() + Self::PRUNE_THRESHOLD;
++		}
++	}
++
++	/// Pids of recorded processes that are still alive, in spawn order.
++	///
++	/// Liveness is probed through each entry's pinned [`Process`] (pidfd on
++	/// Linux, start-time identity on macOS, open handle on Windows), so a
++	/// recycled pid never reports as one of this run's children. Entries whose
++	/// pin failed at spawn time are skipped — they already exited. The
++	/// recorded set is not mutated; pruning stays with `record`/`build_targets`.
++	#[must_use]
++	pub fn live_pids(&self) -> Vec<i32> {
++		let state = self.state.lock();
++		state
++			.spawned
++			.iter()
++			.filter_map(|entry| entry.process.as_ref())
++			.filter(|process| process.status() == ProcessStatus::Running)
++			.map(Process::pid)
++			.collect()
++	}
++
++	/// Build the kill set from the processes recorded so far. Re-read on every
++	/// signal wave so a child spawned during a grace window — between the
++	/// cancel firing and the next wave — is still reaped.
++	///
++	/// A recorded process contributes only while alive; a recorded pgid
++	/// contributes only while the group still has members, so once the run's
++	/// whole tree exits the targets are empty and the wave loop can stop early.
++	///
++	/// Pruning also runs here so a cancellation cycle sees a compact target
++	/// set even when the record-time threshold hasn't fired yet.
++	#[must_use]
++	pub fn build_targets(&self) -> TerminationTargets {
++		let mut targets = TerminationTargets::new();
++		let spawned = {
++			let mut state = self.state.lock();
++			prune_exited(&mut state.spawned);
++			// Reset the watermark to the current live-set size + threshold;
++			// leaving a stale pre-sweep value would misgate the next
++			// record-time sweep.
++			state.next_sweep_at = state.spawned.len() + Self::PRUNE_THRESHOLD;
++			state.spawned.clone()
++		};
++		for entry in spawned {
++			if let Some(process) = entry.process {
++				targets.add_process(process);
++			}
++			// If the observer failed to pin a handle at spawn time (the child
++			// exited before `Process::from_pid` could open it), the child is
++			// already gone — signalling anything for that pid would either
++			// no-op or, worse, race a recycled pid onto an unrelated process.
++			// Drop the entry entirely rather than reintroduce the pid-reuse
++			// window this whole change exists to close (#4605).
++			if let Some(pgid) = entry.pgid
++				&& pgid > 0
++				&& process_group_alive(pgid)
++			{
++				targets.add_pgid(pgid);
++			}
++		}
++		targets
++	}
++}
++
++/// Drop registry entries whose pinned process, process group, and — on
++/// Windows — descendant tree are all gone. With nothing still-live the entry
++/// contributes nothing to the next termination wave and only pins an owned OS
++/// handle for no reason.
++///
++/// The platform split matters because Windows has no process groups. On Unix
++/// a child reparented onto init keeps its pgid, so a live pgid still catches
++/// grandchildren whose immediate parent exited. On Windows there is no
++/// reparenting and no pgid, so we probe the descendant tree directly through
++/// the still-open pinned handle — dropping that handle would release the pid
++/// slot, letting a recycled pid make future Toolhelp walks unsafe (issue
++/// #4605) and orphaning any leftover child from the next cancellation wave.
++fn prune_exited(spawned: &mut Vec<SpawnedProcess>) {
++	spawned.retain(|entry| {
++		if let Some(process) = &entry.process {
++			if process.status() == ProcessStatus::Running {
++				return true;
++			}
++			// Windows-only: root exited but the pinned handle still keeps its
++			// pid reserved, so `live_descendants` walks the *original* subtree
++			// via Toolhelp. If any child is still running we must keep the
++			// entry — closing the handle would both release the pid (racing
++			// pid reuse) and strand the surviving child.
++			#[cfg(target_os = "windows")]
++			if !process.live_descendants().is_empty() {
++				return true;
++			}
++		}
++		entry
++			.pgid
++			.is_some_and(|pgid| pgid > 0 && process_group_alive(pgid))
++	});
++}
++
++/// True when process group `pgid` still has at least one member. `kill(2)`
++/// with signal 0 performs permission/existence checks without delivering a
++/// signal; `EPERM` means the group exists but is not ours to signal, which
++/// still counts as alive.
++#[must_use]
++#[allow(
++	clippy::missing_const_for_fn,
++	reason = "calls non-const platform_process_group_alive on unix"
++)]
++fn process_group_alive(pgid: i32) -> bool {
++	if pgid <= 0 {
++		return false;
++	}
++	platform_process_group_alive(pgid)
++}
++
++#[cfg(unix)]
++fn platform_process_group_alive(pgid: i32) -> bool {
++	// SAFETY: `kill` takes integer identifiers by value and does not access
++	// caller-owned memory. A negative pid targets the process group; signal 0
++	// only runs the existence/permission checks.
++	let ret = unsafe { libc::kill(-pgid, 0) };
++	ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
++}
++
++#[cfg(not(unix))]
++const fn platform_process_group_alive(_pgid: i32) -> bool {
++	false
++}
++
++#[cfg(test)]
++mod tests {
++	use super::*;
++
++	/// The harness pid must be the only protected pid. Including its recorded
++	/// parent would be unsafe on Windows: that stale numeric pid can have been
++	/// recycled onto the timed-out command, causing cancellation to spare the
++	/// hung target and its whole subtree.
++	#[test]
++	fn host_protected_pids_includes_self() {
++		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
++		assert_eq!(
++			host_protected_pids(),
++			HashSet::from([self_pid]),
++			"only the harness pid may be protected from cancellation sweeps",
++		);
++	}
++
++	/// Regression test for #7452: a cancellation sweep must never signal the
++	/// protected host pid, even when it is enumerated as the sweep root. On
++	/// Windows a recycled pid can make the harness surface as
++	/// a false descendant of a just-spawned child; `TerminateProcess`-ing it
++	/// killed the whole session with no `session_exit` record. The observable
++	/// defense — provable cross-platform — is that `signal_tree_excluding`
++	/// leaves a protected pid untouched.
++	#[cfg(unix)]
++	#[test]
++	fn signal_tree_spares_protected_pids() {
++		use std::{process::Command, thread, time::Duration};
++
++		let mut child = Command::new("sleep")
++			.arg("30")
++			.spawn()
++			.expect("spawn sleep");
++		let child_pid = i32::try_from(child.id()).expect("child pid fits in i32");
++		let root = Process::from_pid(child_pid).expect("pin child");
++
++		// Treat the child's pid as protected (standing in for the harness/an
++		// ancestor). The sweep must refuse to signal it.
++		let protected: HashSet<i32> = HashSet::from([child_pid]);
++		let signaled = root.signal_tree_excluding(KILL_SIGNAL, &protected);
++		assert_eq!(signaled, 0, "a protected root must never be signalled");
++
++		// The protected process is still alive after the sweep.
++		thread::sleep(Duration::from_millis(50));
++		assert_eq!(
++			root.status(),
++			ProcessStatus::Running,
++			"a protected pid must survive a cancellation sweep",
++		);
++
++		// With no protection the same sweep reaps it — proves the skip is what
++		// spared it, not a dead target.
++		let reaped = root.signal_tree_excluding(KILL_SIGNAL, &HashSet::new());
++		assert!(reaped >= 1, "an unprotected root must be signalled");
++		let _ = child.wait();
++	}
++
++	/// Regression test for the #7453 review: pruning a protected node must drop
++	/// its whole subtree, not just the exact protected pid. A Windows PID-reuse
++	/// false-descendant collects the harness together with the harness's real
++	/// children (LSP servers, worker/tool subprocesses); skipping only the host
++	/// pid would still terminate those. `pid_in_protected_subtree` walks the
++	/// enumerated parent map so any node under a protected pid is excluded.
++	#[test]
++	fn protected_subtree_is_pruned_not_just_the_pid() {
++		// root(1) -> host(2, protected) -> worker(3); root(1) -> real_child(4).
++		let parents: HashMap<i32, i32> = HashMap::from([(2, 1), (3, 2), (4, 1)]);
++		let protected: HashSet<i32> = HashSet::from([2]);
++
++		assert!(
++			pid_in_protected_subtree(2, &protected, &parents),
++			"the protected node itself must be excluded",
++		);
++		assert!(
++			pid_in_protected_subtree(3, &protected, &parents),
++			"a child collected through the protected node must be excluded too",
++		);
++		assert!(
++			!pid_in_protected_subtree(4, &protected, &parents),
++			"a real child of the sweep root must still be signalled",
++		);
++		assert!(
++			!pid_in_protected_subtree(1, &protected, &parents),
++			"the sweep root must not be pruned",
++		);
++	}
++
++	/// Windows keeps the parent pid an orphan recorded, so after its parent
++	/// exits the orphan is listed under whichever later process reuses that
++	/// pid. The walk must not adopt it: an older process cannot be the child of
++	/// a newer one, and a cancellation sweep would otherwise terminate an
++	/// unrelated program.
++	#[cfg(windows)]
++	#[test]
++	fn descendant_walk_skips_processes_older_than_their_listed_parent() {
++		use std::{process::Command, thread, time::Duration};
++
++		let spawn = || {
++			Command::new("ping")
++				.args(["-n", "30", "127.0.0.1"])
++				.stdout(std::process::Stdio::null())
++				.spawn()
++				.expect("spawn sleeper")
++		};
++		let mut older = spawn();
++		// Creation times have coarse granularity; keep the two apart.
++		thread::sleep(Duration::from_millis(50));
++		let mut newer = spawn();
++		let (older_pid, newer_pid) = (older.id(), newer.id());
++		let pin = |pid: u32| platform::Process::from_pid(i32::try_from(pid).unwrap()).unwrap();
++
++		// A snapshot in which the older process names the newer one as its
++		// parent, as it would after its own parent exited and the pid was reused.
++		let tree = HashMap::from([(newer_pid, smallvec::SmallVec::from_slice(&[older_pid]))]);
++		assert!(
++			pin(newer_pid).children_from_tree(&tree).is_empty(),
++			"an older process is not a child"
++		);
++
++		// The same entry is accepted when the listed child is newer.
++		let tree = HashMap::from([(older_pid, smallvec::SmallVec::from_slice(&[newer_pid]))]);
++		let children = pin(older_pid).children_from_tree(&tree);
++		assert_eq!(
++			children
++				.iter()
++				.map(platform::Process::pid)
++				.collect::<Vec<_>>(),
++			[i32::try_from(newer_pid).unwrap()]
++		);
++
++		let _ = older.kill();
++		let _ = newer.kill();
++		let _ = older.wait();
++		let _ = newer.wait();
++	}
++
++	/// `kill_process_group` is the last line of defense: even if a future
++	/// caller manages to feed the harness's own pgid into the signal path,
++	/// this wrapper must refuse to deliver the signal.
++	#[cfg(unix)]
++	#[test]
++	fn kill_process_group_refuses_self_pgroup() {
++		// SAFETY: `getpgid(0)` queries the calling process and does not touch
++		// caller-owned memory.
++		let self_pgid = unsafe { libc::getpgid(0) };
++		assert!(self_pgid > 0, "getpgid(0) failed");
++		assert!(
++			!kill_process_group(self_pgid, TERM_SIGNAL),
++			"kill_process_group must refuse the harness pgid; otherwise the test process would have \
++			 been SIGTERMed",
++		);
++		assert!(
++			!kill_process_group(0, TERM_SIGNAL),
++			"kill_process_group must reject non-positive pgids",
++		);
++	}
++
++	/// Regression test for the macOS `proc_listchildpids` brokenness: on
++	/// darwin 25.4+ the kernel returns no entries when a process queries its
++	/// own children via that API, so `Process::descendants` produced an empty
++	/// list and termination cleanup silently became a no-op. The replacement
++	/// path scans `proc_listallpids` and groups by `pbi_ppid`, which actually
++	/// works. Linux has always worked via `/proc`.
++	#[cfg(unix)]
++	#[test]
++	fn descendants_includes_freshly_spawned_child() {
++		use std::{process::Command, thread, time::Duration};
++
++		let mut child = Command::new("sleep")
++			.arg("10")
++			.spawn()
++			.expect("spawn sleep");
++		let child_pid = i32::try_from(child.id()).expect("child pid fits in i32");
++
++		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
++		let harness = Process::from_pid(self_pid).expect("harness Process ref");
++
++		// Allow a few polling iterations so the kernel's process-table query
++		// settles on a loaded host. proc_listallpids reflects newly forked pids
++		// within milliseconds in practice; 1s is a comfortable upper bound.
++		let mut found = false;
++		for _ in 0..40 {
++			if harness
++				.live_descendants()
++				.iter()
++				.any(|descendant| descendant.pid() == child_pid)
++			{
++				found = true;
++				break;
++			}
++			thread::sleep(Duration::from_millis(25));
++		}
++
++		let _ = child.kill();
++		let _ = child.wait();
++
++		assert!(
++			found,
++			"freshly spawned child pid {child_pid} must appear in `live_descendants` so the \
++			 cancellation cleanup can reach it; this regressed on macOS when the walk relied on the \
++			 broken `proc_listchildpids`",
++		);
++	}
++
++	/// Regression test for issue #4605: `SpawnRegistry` MUST pin a stable
++	/// [`Process`] reference at spawn time rather than defer re-opening the
++	/// pid until termination.
++	///
++	/// Before the fix, `SpawnRegistry` stored only the raw pid; `build_targets`
++	/// called `Process::from_pid` at cancellation time. On Windows pids recycle
++	/// aggressively, so a bash-spawned `pwsh.exe` that had already exited could
++	/// see its pid reassigned to an unrelated PowerShell session (e.g. the
++	/// user's other Cursor terminal). `Process::from_pid` at cancel time would
++	/// happily open that unrelated process, and `signal_tree` would then
++	/// enumerate — and `TerminateProcess` — the entire foreign subtree.
++	///
++	/// This test cannot literally trigger Windows pid recycling from a
++	/// cross-platform Rust test, but it can prove the observable defense: a
++	/// recorded process reference survives the original pid's death (so no
++	/// "look it up again" step exists to be raced), and the registry never
++	/// consults `Process::from_pid` when a handle was pinned at record time.
++	#[cfg(unix)]
++	#[test]
++	fn spawn_registry_pins_identity_at_record_time() {
++		use std::{process::Command, thread, time::Duration};
++
++		// Phase 1: while the child is alive, the pinned handle carries identity
++		// forward into `build_targets` without any `Process::from_pid` re-open
++		// step existing to be raced against pid reuse.
++		let mut long = Command::new("sleep")
++			.arg("30")
++			.spawn()
++			.expect("spawn sleep");
++		let long_pid = i32::try_from(long.id()).expect("child pid fits in i32");
++
++		let registry = SpawnRegistry::new();
++		let pinned = Process::from_pid(long_pid).expect("pin child at record time");
++		registry.record(None, Some(pinned));
++
++		let live_targets = registry.build_targets();
++		assert!(
++			!live_targets.is_empty(),
++			"a still-live pinned child must appear in the target set — otherwise the cancellation \
++			 cleanup would silently miss it"
++		);
++		let live_pids: Vec<i32> = live_targets.processes.iter().map(Process::pid).collect();
++		assert_eq!(
++			live_pids,
++			vec![long_pid],
++			"target set must come from the pinned handle recorded at spawn time, not a re-lookup by \
++			 pid (which would race pid reuse — issue #4605)"
++		);
++
++		let _ = long.kill();
++		let _ = long.wait();
++
++		// Phase 2: once the child exits, the registry MUST drop the entry
++		// rather than reintroduce a `Process::from_pid` re-open at kill time.
++		// Poll until pruning sees the pidfd as Exited (kernel-visible within
++		// milliseconds in practice).
++		let mut empty_after_exit = false;
++		for _ in 0..40 {
++			if registry.build_targets().is_empty() {
++				empty_after_exit = true;
++				break;
++			}
++			thread::sleep(Duration::from_millis(25));
++		}
++		assert!(
++			empty_after_exit,
++			"once the pinned child exits the registry must drop it — re-opening by pid at \
++			 termination time is exactly the pid-reuse race #4605 closes"
++		);
++	}
++
++	/// `TerminationTargets::add_process` must accept a pre-pinned handle
++	/// without going through `Process::from_pid`. This is the API contract
++	/// `SpawnRegistry` relies on to avoid the PID-reuse race.
++	#[cfg(unix)]
++	#[test]
++	fn add_process_bypasses_from_pid_lookup() {
++		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
++		let pinned = Process::from_pid(self_pid).expect("pin self");
++
++		let mut targets = TerminationTargets::new();
++		targets.add_process(pinned.clone());
++		assert!(!targets.is_empty(), "add_process must record the pinned handle");
++
++		// Adding the same pid again through either entry point must dedupe:
++		// otherwise every wave in `terminate_run` would re-signal the same
++		// tree N times.
++		targets.add_process(pinned);
++		targets.add_pid(self_pid);
++		assert_eq!(targets.processes.len(), 1, "duplicate pids must be deduped");
++	}
++
++	/// Regression test for the review on PR #4606: a long-running shell
++	/// command that spawns many short-lived external processes must not
++	/// retain one owned handle per historical spawn — that would exhaust
++	/// per-process FD/handle limits (pidfd on Linux, `HANDLE` on Windows).
++	/// The registry MUST prune dead entries once the recorded vec crosses
++	/// the sweep threshold.
++	#[cfg(unix)]
++	#[test]
++	fn spawn_registry_prunes_exited_entries() {
++		use std::{thread, time::Duration};
++
++		let registry = SpawnRegistry::new();
++
++		// Fabricate many recorded-then-exited children by pinning ourselves,
++		// pushing the entry, then immediately treating it as "dead" from the
++		// registry's perspective. To simulate the exit without actually
++		// killing the harness, use `Process::from_pid(1)` for a pid that
++		// (on Linux) is init and never exits — but wrap the recording in a
++		// pattern that guarantees `status()` returns Exited for the pruner:
++		// spawn a tiny child, pin it, wait for exit, then record.
++		for _ in 0..(SpawnRegistry::PRUNE_THRESHOLD * 2) {
++			let mut child = std::process::Command::new("true")
++				.spawn()
++				.expect("spawn true");
++			let pid = i32::try_from(child.id()).expect("child pid fits in i32");
++			let pinned = Process::from_pid(pid);
++			let _ = child.wait();
++			// Give the kernel a moment to mark the pidfd readable so `status()`
++			// reports Exited when the pruner probes.
++			for _ in 0..20 {
++				if pinned
++					.as_ref()
++					.is_some_and(|process| process.status() == ProcessStatus::Exited)
++				{
++					break;
++				}
++				thread::sleep(Duration::from_millis(5));
++			}
++			registry.record(None, pinned);
++		}
++
++		let retained = registry.state.lock().spawned.len();
++		assert!(
++			retained < SpawnRegistry::PRUNE_THRESHOLD,
++			"pruning must bound retained entries below the sweep threshold once the pinned processes \
++			 have exited; got {retained} retained (threshold {})",
++			SpawnRegistry::PRUNE_THRESHOLD
++		);
++
++		// build_targets sees no live handles → empty target set, matching the
++		// contract that fully-exited registries stop the wave loop early.
++		let targets = registry.build_targets();
++		assert!(targets.is_empty(), "registry of only-dead entries must produce an empty target set");
++	}
++
++	/// Regression test for the third review on PR #4606: once the recorded
++	/// vec crosses `PRUNE_THRESHOLD`, subsequent `record` calls must NOT
++	/// sweep on every spawn. Without the `next_sweep_at` watermark, a large
++	/// fan-out run whose live children exceed the threshold turned every
++	/// spawn into an O(N) status probe of the whole retained set.
++	///
++	/// The check reasons about the observable side effect: after N records
++	/// past threshold with entries that CANNOT be pruned (all still live),
++	/// the retained size grows monotonically by exactly N — no sweep runs
++	/// have modified the vec in between. The direct signal of "did a sweep
++	/// happen" is a stable pinned handle count across records.
++	#[cfg(unix)]
++	#[test]
++	fn spawn_registry_watermark_bounds_sweep_frequency() {
++		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
++		let registry = SpawnRegistry::new();
++
++		// Fill past threshold with entries that are permanently alive
++		// (pinning ourselves) so the pruner has nothing to remove.
++		let fill = SpawnRegistry::PRUNE_THRESHOLD + 10;
++		for _ in 0..fill {
++			registry.record(None, Process::from_pid(self_pid));
++		}
++		let after_fill = registry.state.lock().spawned.len();
++		assert_eq!(after_fill, fill, "live-only entries must not be pruned during warm-up");
++		let watermark_after_fill = registry.state.lock().next_sweep_at;
++
++		// Every additional record with a live entry must land in the vec
++		// verbatim and — critically — NOT re-enter `prune_exited` until the
++		// vec crosses the freshly scheduled watermark. If the guard were
++		// still `len >= PRUNE_THRESHOLD` (pre-fix), a sweep would fire on
++		// every one of these records.
++		let extra = 20;
++		for _ in 0..extra {
++			registry.record(None, Process::from_pid(self_pid));
++		}
++		let after_extra = registry.state.lock().spawned.len();
++		assert_eq!(
++			after_extra,
++			after_fill + extra,
++			"records with live entries must accumulate without triggering per-spawn sweeps"
++		);
++		assert_eq!(
++			registry.state.lock().next_sweep_at,
++			watermark_after_fill,
++			"watermark must not advance while the vec stays below it — otherwise a sweep ran"
++		);
++	}
++
++	/// `wait_for_exit` on a lone process resolves when it exits, reports a
++	/// timeout as `false`, and surfaces cancellation as an abort error.
++	#[tokio::test(flavor = "multi_thread")]
++	async fn wait_for_exit_resolves_times_out_and_aborts() {
++		use std::process::Command;
++
++		#[cfg(unix)]
++		let mut child = Command::new("sleep")
++			.arg("30")
++			.spawn()
++			.expect("spawn sleep");
++		#[cfg(windows)]
++		let mut child = Command::new("ping")
++			.args(["-n", "30", "127.0.0.1"])
++			.stdout(std::process::Stdio::null())
++			.spawn()
++			.expect("spawn sleeper");
++		let process = Process::from_pid(i32::try_from(child.id()).unwrap()).expect("pin child");
++
++		let waited = process
++			.wait_for_exit(Some(Duration::from_millis(100)), CancelToken::default())
++			.await
++			.expect("bounded wait");
++		assert!(!waited, "a running process times out");
++
++		let aborted = process
++			.wait_for_exit(None, CancelToken::new(Some(100)))
++			.await
++			.expect_err("an expired token aborts the wait");
++		assert_eq!(aborted.to_string(), "Aborted: Timeout");
++
++		let waiter = {
++			let process = process.clone();
++			tokio::spawn(async move {
++				process
++					.wait_for_exit(Some(Duration::from_secs(20)), CancelToken::default())
++					.await
++			})
++		};
++		tokio::time::sleep(Duration::from_millis(50)).await;
++		child.kill().expect("kill child");
++		let exited = tokio::time::timeout(Duration::from_secs(5), waiter)
++			.await
++			.expect("the wait ends promptly after exit")
++			.expect("waiter task")
++			.expect("wait result");
++		assert!(exited, "exit resolves the wait");
++		let _ = child.wait();
++	}
++}
+diff --git a/crates/pi-shell/src/proctree.rs b/crates/pi-shell/src/proctree.rs
+--- a/crates/pi-shell/src/proctree.rs
++++ b/crates/pi-shell/src/proctree.rs
+@@ -15,7 +15,7 @@ pub use pi_builtins::ProcessStatus;
  
  use crate::cancel::CancelToken;
  
@@ -1529,7 +3317,6 @@ index 602a829..4693842 100644
  	use std::{
  		collections::HashSet,
 diff --git a/crates/pi-vfs/src/fs.rs b/crates/pi-vfs/src/fs.rs
-index a378045..f11e5e6 100644
 --- a/crates/pi-vfs/src/fs.rs
 +++ b/crates/pi-vfs/src/fs.rs
 @@ -510,8 +510,21 @@ fn may_access(path: &Path, mode: libc::c_int) -> bool {
@@ -1556,11 +3343,10 @@ index a378045..f11e5e6 100644
  
  /// Reads a whole host file. Under a cancellable scope the read goes through
 diff --git a/packages/coding-agent/src/cli/update-cli.ts b/packages/coding-agent/src/cli/update-cli.ts
-index 8fbee0c..2b612f5 100644
 --- a/packages/coding-agent/src/cli/update-cli.ts
 +++ b/packages/coding-agent/src/cli/update-cli.ts
-@@ -2275,6 +2275,54 @@ async function runManagedUpdate(
- 	}
+@@ -2305,6 +2305,54 @@ async function runManagedUpdate(
+ 	return { kind: "installed", version: installed };
  }
  
 +/**
@@ -1614,32 +3400,31 @@ index 8fbee0c..2b612f5 100644
  /**
   * Run the update command.
   *
-@@ -2288,6 +2336,10 @@ export async function runUpdateCommand(opts: {
- 	check: boolean;
- 	channel?: UpdateChannel;
- }): Promise<void> {
+@@ -2317,6 +2365,10 @@ async function runManagedUpdate(
+  * fails, or when another update holds the install lock.
+  */
+ export async function runUpdateCommand(opts: UpdateOptions): Promise<UpdateOutcome> {
 +	if (isAndroidUpdateHost()) {
 +		runAndroidUpdate();
-+		return;
++		return { kind: "unsupported", reason: androidReinstallInstructions() };
 +	}
  	const ompPath = resolveOmpPath();
  	const manager = ompPath ? await managedInstallName(ompPath) : undefined;
  	if (manager) {
 diff --git a/packages/coding-agent/src/main.ts b/packages/coding-agent/src/main.ts
-index 7cef76c..d3d65de 100644
 --- a/packages/coding-agent/src/main.ts
 +++ b/packages/coding-agent/src/main.ts
-@@ -43,7 +43,7 @@ import { formatKeyHint, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindi
- import type { SessionPickerOptions } from "@oh-my-pi/pi-tui/apps/session-picker";
- import { fetchBuild } from "./cli/build-service";
+@@ -45,7 +45,7 @@ import { fetchBuild } from "./cli/build-service";
  import { applyStartupCwd } from "./cli/startup-cwd";
--import { getLatestRelease, isSourceCheckout, managedInstallName } from "./cli/update-cli";
-+import { getLatestRelease, isAndroidUpdateHost, isSourceCheckout, managedInstallName } from "./cli/update-cli";
+ import { runAutoUpdate } from "./cli/auto-update";
+ import { managedInstallName } from "./cli/managed-install";
+-import { getLatestRelease, isSourceCheckout } from "./cli/update-cli";
++import { getLatestRelease, isAndroidUpdateHost, isSourceCheckout } from "./cli/update-cli";
  import { findConfigFile } from "./config";
+ import { cfgNoJudge, cfgNoSpotlight, cfgOffline } from "./config/auxiliary-model-policy";
  import { ModelRegistry } from "./config/model-registry";
- import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
-@@ -277,6 +277,11 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
- 	if (!cfgStartupCheckUpdate.get(settings)) {
+@@ -279,6 +279,11 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
+ 	if (!cfgStartupCheckUpdate.get(settings) && !cfgUpdateAuto.get(settings)) {
  		return;
  	}
 +	// Android updates only through the port installer; `omp update` refuses, so
@@ -1651,10 +3436,9 @@ index 7cef76c..d3d65de 100644
  		// Checkouts update through git and a manager (Tern) updates its omp itself:
  		// "run omp update" would be wrong advice for both.
 diff --git a/packages/coding-agent/src/modes/controllers/command-controller.ts b/packages/coding-agent/src/modes/controllers/command-controller.ts
-index a45781a..ba6c9ef 100644
 --- a/packages/coding-agent/src/modes/controllers/command-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/command-controller.ts
-@@ -457,12 +457,15 @@ export class CommandController {
+@@ -460,12 +460,15 @@ export class CommandController {
  				this.ctx.showError("Advisor has no history yet.");
  				return;
  			}
@@ -1676,18 +3460,17 @@ index a45781a..ba6c9ef 100644
  	}
  
 diff --git a/packages/coding-agent/src/modes/controllers/event-controller.ts b/packages/coding-agent/src/modes/controllers/event-controller.ts
-index 07445ca..b17ef24 100644
 --- a/packages/coding-agent/src/modes/controllers/event-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/event-controller.ts
-@@ -63,6 +63,7 @@ import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
+@@ -58,6 +58,7 @@ import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
  import { writeDeviceDispatch } from "../../tools/resolve";
  import { SpeechEnhancer } from "../../tts/speech-enhancer";
  import { vocalizer } from "../../tts/vocalizer";
 +import { sendAndroidNotification } from "../../utils/android-helpers";
  import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
- import { type RunStatus, setRunStatus } from "../../utils/run-status";
- import { setTerminalTitleState } from "../../utils/title-generator";
-@@ -2974,6 +2975,11 @@ export class EventController {
+ import { type RunFlowStatus, setRunStatus } from "../../utils/run-status";
+ import {
+@@ -2970,6 +2971,11 @@ export class EventController {
  			type: "error",
  			actions: "focus",
  		});
@@ -1699,7 +3482,7 @@ index 07445ca..b17ef24 100644
  	}
  
  	sendCompletionNotification(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
-@@ -2999,5 +3005,8 @@ export class EventController {
+@@ -2995,5 +3001,8 @@ export class EventController {
  			type: "completion",
  			actions: "focus",
  		});
@@ -1709,10 +3492,9 @@ index 07445ca..b17ef24 100644
  	}
  }
 diff --git a/packages/coding-agent/src/modes/controllers/input-controller.ts b/packages/coding-agent/src/modes/controllers/input-controller.ts
-index 2eb6bc5..1bf5ad9 100644
 --- a/packages/coding-agent/src/modes/controllers/input-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/input-controller.ts
-@@ -3006,14 +3006,14 @@ export class InputController {
+@@ -3120,14 +3120,14 @@ export class InputController {
  			this.ctx.showStatus("Nothing to copy");
  			return;
  		}
@@ -1735,7 +3517,7 @@ index 2eb6bc5..1bf5ad9 100644
  	}
  
  	/** Copy current prompt text to system clipboard. */
-@@ -3023,14 +3023,12 @@ export class InputController {
+@@ -3137,14 +3137,12 @@ export class InputController {
  			this.ctx.showStatus("Nothing to copy");
  			return;
  		}
@@ -1757,10 +3539,9 @@ index 2eb6bc5..1bf5ad9 100644
  
  	cycleThinkingLevel(): void {
 diff --git a/packages/coding-agent/src/modes/controllers/selector-controller.ts b/packages/coding-agent/src/modes/controllers/selector-controller.ts
-index e222839..f882290 100644
 --- a/packages/coding-agent/src/modes/controllers/selector-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/selector-controller.ts
-@@ -1468,8 +1468,10 @@ export class SelectorController {
+@@ -1553,8 +1553,10 @@ export class SelectorController {
  					this.ctx.showStatus("Nothing to copy in that item");
  					return;
  				}
@@ -1774,10 +3555,9 @@ index e222839..f882290 100644
  			onOpen: (href, label) => {
  				done();
 diff --git a/packages/coding-agent/src/modes/controllers/todo-command-controller.ts b/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
-index dab0c5a..f1c9639 100644
 --- a/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
-@@ -213,12 +213,10 @@ export class TodoCommandController {
+@@ -212,12 +212,10 @@ export class TodoCommandController {
  			this.ctx.showWarning("No todos to copy.");
  			return;
  		}
@@ -1795,7 +3575,6 @@ index dab0c5a..f1c9639 100644
  
  	#resolveTodoPath(rest: string): string {
 diff --git a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
-index b55af8d..c1ab16e 100644
 --- a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
 +++ b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
 @@ -577,50 +577,52 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
@@ -1809,7 +3588,7 @@ index b55af8d..c1ab16e 100644
 -				return;
 -			}
 -			if (arg === "code") {
--				const block = extractLastCodeBlock(runtime.ctx.session.messages);
+-				const block = extractLastCodeBlock(runtime.ctx.viewSession.messages);
 -				if (!block) {
 -					runtime.ctx.showStatus("No code block to copy.");
 -					clearSubmittedText(runtime);
@@ -1825,12 +3604,12 @@ index b55af8d..c1ab16e 100644
 -				return;
 -			}
 -			if (arg === "cmd" || arg === "command") {
--				const lastCommand = extractLastCommand(runtime.ctx.session.messages);
+-				const lastCommand = extractLastCommand(runtime.ctx.viewSession.messages);
 -				if (!lastCommand) {
 -					runtime.ctx.showStatus("No command to copy.");
 -					clearSubmittedText(runtime);
 +				if (arg === "code") {
-+					const block = extractLastCodeBlock(runtime.ctx.session.messages);
++					const block = extractLastCodeBlock(runtime.ctx.viewSession.messages);
 +					if (!block) {
 +						runtime.ctx.showStatus("No code block to copy.");
 +						return;
@@ -1845,12 +3624,12 @@ index b55af8d..c1ab16e 100644
 -				return;
 -			}
 -			if (arg === "link" || arg === "url") {
--				const link = extractLastLink(runtime.ctx.session.messages);
+-				const link = extractLastLink(runtime.ctx.viewSession.messages);
 -				if (!link) {
 -					runtime.ctx.showStatus("No link to copy.");
 -					clearSubmittedText(runtime);
 +				if (arg === "cmd" || arg === "command") {
-+					const lastCommand = extractLastCommand(runtime.ctx.session.messages);
++					const lastCommand = extractLastCommand(runtime.ctx.viewSession.messages);
 +					if (!lastCommand) {
 +						runtime.ctx.showStatus("No command to copy.");
 +						return;
@@ -1864,7 +3643,7 @@ index b55af8d..c1ab16e 100644
 -				await copyToClipboard(link.href);
 -				runtime.ctx.showStatus("Copied link to clipboard");
 +				if (arg === "link" || arg === "url") {
-+					const link = extractLastLink(runtime.ctx.session.messages);
++					const link = extractLastLink(runtime.ctx.viewSession.messages);
 +					if (!link) {
 +						runtime.ctx.showStatus("No link to copy.");
 +						return;
@@ -1888,20 +3667,19 @@ index b55af8d..c1ab16e 100644
  	},
  	{
 diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src/task/index.ts
-index 88cd09b..98f8661 100644
 --- a/packages/coding-agent/src/task/index.ts
 +++ b/packages/coding-agent/src/task/index.ts
-@@ -390,6 +390,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
- 	}
- 	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task, taskFile: params.taskFile };
+@@ -357,6 +357,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
+ 	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task };
+ 	if (params.steps !== undefined) item.steps = params.steps;
  	if ("solutionSpace" in params) item.solutionSpace = params.solutionSpace;
 +	if ("repoRoot" in params) item.repoRoot = params.repoRoot;
  	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
  	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
  	if ("tools" in params) item.tools = params.tools;
-@@ -462,6 +463,11 @@ function spawnParamsFor(params: TaskParams, item: ResolvedTaskItem, defaultAgent
- 	if (item.taskFile !== undefined) spawn.taskFile = item.taskFile;
- 	if (item.taskFileSha256 !== undefined) spawn.taskFileSha256 = item.taskFileSha256;
+@@ -381,6 +382,11 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
+ 	if (item.task !== undefined) spawn.task = item.task;
+ 	if (item.steps !== undefined) spawn.steps = item.steps;
  	if (item.solutionSpace !== undefined) spawn.solutionSpace = item.solutionSpace;
 +	if (item.repoRoot !== undefined) {
 +		spawn.repoRoot = item.repoRoot;
@@ -1911,7 +3689,7 @@ index 88cd09b..98f8661 100644
  	if (params.context !== undefined) spawn.context = params.context;
  	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
  	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
-@@ -1087,7 +1093,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1010,7 +1016,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  			...spawnModelFields(params),
  			...this.#resultParams(params),
  			...this.#effortParams(params),
@@ -1920,7 +3698,7 @@ index 88cd09b..98f8661 100644
  			blockedAgent: this.#blockedAgent,
  			enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
  			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
-@@ -1955,7 +1961,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1885,7 +1891,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  				...(onArtifactsRetained ? { onArtifactsRetained } : {}),
  				invokedAt: launchTiming?.invokedAt,
  				acquiredAt: launchTiming?.acquiredAt,
@@ -1930,10 +3708,9 @@ index 88cd09b..98f8661 100644
  				enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
  				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/coding-agent/src/task/isolation-runner.ts
-index 806cb6a..45486bf 100644
 --- a/packages/coding-agent/src/task/isolation-runner.ts
 +++ b/packages/coding-agent/src/task/isolation-runner.ts
-@@ -142,8 +142,8 @@ export interface IsolationContext {
+@@ -145,8 +145,8 @@ export interface IsolationContext {
   * the error as a task-tool failure. Each spawn captures its own baseline from
   * its isolation copy (see {@link captureIsolationBaseline}).
   */
@@ -1945,10 +3722,9 @@ index 806cb6a..45486bf 100644
  
  /** Fingerprint of a captured delta, used to skip re-committing an unchanged workspace on release. */
 diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/coding-agent/src/task/structured-subagent.ts
-index e2d024e..c8c8cb9 100644
 --- a/packages/coding-agent/src/task/structured-subagent.ts
 +++ b/packages/coding-agent/src/task/structured-subagent.ts
-@@ -110,6 +110,7 @@ export interface StructuredSubagentIsolationControls {
+@@ -113,6 +113,7 @@ export interface StructuredSubagentIsolationControls {
  	requested?: boolean;
  	merge?: "patch" | "branch";
  	apply?: boolean;
@@ -1956,7 +3732,7 @@ index e2d024e..c8c8cb9 100644
  }
  
  /** Identity and presentation metadata supplied by the calling surface. */
-@@ -226,6 +227,7 @@ export interface EffectiveSubagentPolicy {
+@@ -224,6 +225,7 @@ export interface EffectiveSubagentPolicy {
  	schema: StructuredSubagentSchemaResolution;
  	planMode: boolean;
  	isIsolated: boolean;
@@ -1964,7 +3740,7 @@ index e2d024e..c8c8cb9 100644
  	mergeMode: "patch" | "branch";
  	applyChanges: boolean;
  	enableLsp: boolean;
-@@ -311,7 +313,10 @@ function assertPlanControlsAllowed(request: StructuredSubagentRequest, planMode:
+@@ -322,7 +324,10 @@ function assertPlanControlsAllowed(request: StructuredSubagentRequest, planMode:
  	const isolation = request.isolation;
  	if (
  		isolation &&
@@ -1976,7 +3752,7 @@ index e2d024e..c8c8cb9 100644
  	) {
  		throw new StructuredSubagentError(
  			"preflight",
-@@ -620,6 +625,7 @@ export async function resolveEffectiveSubagentPolicy(
+@@ -629,6 +634,7 @@ export async function resolveEffectiveSubagentPolicy(
  		schema,
  		planMode,
  		isIsolated,
@@ -1984,7 +3760,7 @@ index e2d024e..c8c8cb9 100644
  		mergeMode: request.isolation?.merge ?? cfgTaskIsolationMerge.get(request.session.settings),
  		applyChanges:
  			request.isolation?.apply ??
-@@ -1011,7 +1017,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
+@@ -1022,7 +1028,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
  		let isolationContext: IsolationContext | null = null;
  		if (policy.isIsolated) {
  			try {
@@ -1994,10 +3770,9 @@ index e2d024e..c8c8cb9 100644
  				const message = error instanceof Error ? error.message : String(error);
  				throw new StructuredSubagentError(
 diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src/task/types.ts
-index f896685..0ceddc2 100644
 --- a/packages/coding-agent/src/task/types.ts
 +++ b/packages/coding-agent/src/task/types.ts
-@@ -77,6 +77,7 @@ export const taskItemSchema = type({
+@@ -67,6 +67,7 @@ export const taskItemSchema = type({
  	agent: "string = 'task'",
  	task: "string",
  	solutionSpace: "string",
@@ -2005,7 +3780,7 @@ index f896685..0ceddc2 100644
  	"outputSchema?": outputSchemaInputSchema,
  	"schemaMode?": '"permissive" | "strict"',
  	"tools?": "string[]",
-@@ -88,6 +89,7 @@ const taskItemSchemaIsolated = type({
+@@ -77,6 +78,7 @@ const taskItemSchemaIsolated = type({
  	agent: "string = 'task'",
  	task: "string",
  	solutionSpace: "string",
@@ -2013,7 +3788,7 @@ index f896685..0ceddc2 100644
  	"outputSchema?": outputSchemaInputSchema,
  	"schemaMode?": '"permissive" | "strict"',
  	"tools?": "string[]",
-@@ -101,6 +103,7 @@ export const taskSchema = type({
+@@ -89,6 +91,7 @@ export const taskSchema = type({
  	agent: "string = 'task'",
  	task: "string",
  	solutionSpace: "string",
@@ -2021,7 +3796,7 @@ index f896685..0ceddc2 100644
  	"outputSchema?": outputSchemaInputSchema,
  	"schemaMode?": '"permissive" | "strict"',
  	"tools?": "string[]",
-@@ -113,6 +116,7 @@ const taskSchemaNoIsolation = type({
+@@ -100,6 +103,7 @@ const taskSchemaNoIsolation = type({
  	agent: "string = 'task'",
  	task: "string",
  	solutionSpace: "string",
@@ -2030,10 +3805,9 @@ index f896685..0ceddc2 100644
  	"schemaMode?": '"permissive" | "strict"',
  	"tools?": "string[]",
 diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/src/task/worktree.ts
-index c15b573..34fa981 100644
 --- a/packages/coding-agent/src/task/worktree.ts
 +++ b/packages/coding-agent/src/task/worktree.ts
-@@ -47,18 +47,35 @@ export interface WorktreeBaseline {
+@@ -48,18 +48,35 @@ export interface WorktreeBaseline {
  	nested: Array<{ relativePath: string; baseline: RepoBaseline }>;
  }
  
@@ -2073,7 +3847,7 @@ index c15b573..34fa981 100644
  
  	throw new Error("Git repository not found for isolated task execution.");
  }
-@@ -649,8 +666,9 @@ export async function ensureIsolation(
+@@ -633,8 +650,9 @@ export async function ensureIsolation(
  	baseCwd: string,
  	id: string,
  	preferred?: IsoBackendKind,
@@ -2082,16 +3856,15 @@ index c15b573..34fa981 100644
 -	const repoRoot = await getRepoRoot(baseCwd);
 +	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
  	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
- 	const baseDir = getWorktreeDir(getTaskIsolationSegment(repoRoot, id));
+ 	const baseDir = taskIsolationBaseDir(repoRoot, id);
  	const mergedDir = path.join(baseDir, TASK_ISOLATION_MOUNT_DIR);
 diff --git a/packages/coding-agent/src/tools/ask.ts b/packages/coding-agent/src/tools/ask.ts
-index 8897536..210fe86 100644
 --- a/packages/coding-agent/src/tools/ask.ts
 +++ b/packages/coding-agent/src/tools/ask.ts
-@@ -44,6 +44,12 @@ import { sessionLocalProtocolOptions } from "../internal-urls/context";
- import { cfgAskNotify, askTimeoutMs } from "../modes/settings";
+@@ -49,6 +49,12 @@ import askResultTemplate from "../prompts/tools/ask-result.md" with { type: "tex
  import { renderAttachmentSourceNotice } from "../session/attachment-source-notice";
  import { cfgSpeechEnabled } from "../tts/settings";
+ import { vocalizer } from "../tts/vocalizer";
 +import {
 +	type AndroidOutcome,
 +	clearAndroidNotification,
@@ -2099,9 +3872,9 @@ index 8897536..210fe86 100644
 +	sendAndroidNotification,
 +} from "../utils/android-helpers";
  import { describeAttachedImagesForTextModel, shouldDescribeImagesForTextModel } from "../utils/image-vision-fallback";
- 
- // =============================================================================
-@@ -589,8 +595,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+ import type { ToolSession } from ".";
+ import { ToolAbortError } from "./tool-errors";
+@@ -378,8 +384,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
  		return (session.canPromptUser ?? session.hasUI) || session.advertiseHeadlessAsk ? new AskTool(session) : null;
  	}
  
@@ -2116,7 +3889,7 @@ index 8897536..210fe86 100644
  		if (!this.session.hasUI) return;
  		const method = cfgAskNotify.get(this.session.settings);
  		if (method === "off") return;
-@@ -601,6 +611,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+@@ -390,6 +400,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
  			urgency: "normal",
  			actions: "focus",
  		});
@@ -2126,497 +3899,120 @@ index 8897536..210fe86 100644
 +		return { id, posted: sendAndroidNotification("omp", "Waiting for input", { id }) };
  	}
  
- 	/**
-@@ -656,6 +670,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
- 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
- 		context?: AgentToolContext,
- 	): Promise<AgentToolResult<AskToolDetails>> {
-+		// Android ask card, cleared as soon as the dialog resolves (see below).
-+		let askAndroidCard: { id: string; posted: Promise<AndroidOutcome> } | undefined;
- 		// Headless fallback
- 		if (!context?.hasUI || !context.ui) {
- 			// A headless fork (`/tan`) keeps `ask` advertised only to share the parent's
-@@ -769,15 +785,22 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
- 		const dialogSignal = signal ? AbortSignal.any([signal, userSteering.signal]) : userSteering.signal;
- 		const abortError = (): ToolAbortError =>
- 			new ToolAbortError(userSteering.signal.aborted ? "Ask interrupted by message" : "Ask input was cancelled");
-+		async function clearAndroidAskCard(): Promise<void> {
-+			const card = askAndroidCard;
-+			if (!card) return;
-+			askAndroidCard = undefined;
-+			// Serialize behind the post: the two Termux:API commands are separate
-+			// processes, so a removal that races an in-flight post leaves the card
-+			// behind. A suppressed or failed post has no card to remove.
-+			if (!(await card.posted).ok) return;
-+			await clearAndroidNotification(card.id).catch(() => {});
-+		}
- 		const cancelAsk = (): never => {
- 			if (userSteering.signal.aborted) throw abortError();
- 			context.abort();
+ 	async #answerImageBlocks(
+@@ -481,51 +495,67 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
  			throw new ToolAbortError("Ask tool was cancelled by the user");
  		};
  
 -		// Send notification if waiting and not suppressed
 -		this.#sendAskNotification();
 -
- 		if (params.questions.length === 0) {
- 			return {
- 				content: [{ type: "text" as const, text: "Error: questions must not be empty" }],
-@@ -785,232 +808,240 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
- 			};
- 		}
- 
--		// Speak the question(s) aloud before surfacing them. Ask vocalizes in every
+-		// Speak the questions aloud before surfacing them. Ask vocalizes in every
 -		// mode — it's the assistant addressing the user — gated only by speech.enabled
 -		// (the vocalizer re-checks the setting and no-ops when disabled).
 -		if (cfgSpeechEnabled.get(this.session.settings)) {
--			vocalizer.speak(params.questions.map(q => q.question).join("\n"));
--		}
+-			vocalizer.speak(named.map(field => questions.get(field) ?? field.name).join("\n"));
 +		// Notify only after validation, so no card is posted for a request that
 +		// returns an error without ever waiting for input.
-+		askAndroidCard = this.#sendAskNotification();
++		const askAndroidCard = this.#sendAskNotification();
++
++		async function clearAndroidAskCard(
++			card: { id: string; posted: Promise<AndroidOutcome> } | undefined,
++		): Promise<void> {
++			if (!card) return;
++			// Serialize behind the post: the two Termux:API commands are separate
++			// processes, so a removal that races an in-flight post leaves the card
++			// behind. A suppressed or failed post has no card to remove.
++			if (!(await card.posted).ok) return;
++			await clearAndroidNotification(card.id).catch(() => {});
+ 		}
  
--		const richAskDialog = extensionUi.askDialog;
--		if (richAskDialog) {
--			try {
--				const showRichDialog = () =>
--					richAskDialog(
--						params.questions.map(q => ({
--							id: q.id,
--							question: q.question,
--							...(q.header?.trim() ? { header: q.header } : {}),
--							options: q.options.map(option => ({
--								label: option.label,
--								...(option.description?.trim() ? { description: option.description.trim() } : {}),
--								...(option.preview?.trim() ? { preview: option.preview } : {}),
-+		try {
-+			// Speak the question(s) aloud before surfacing them. Ask vocalizes in every
+-		let answered: { data: HtmlFormData; notes?: OptionNote[]; timedOut?: boolean } | undefined;
+ 		try {
+-			if (extensionUi.formDialog) {
+-				const formDialog = extensionUi.formDialog.bind(extensionUi);
+-				answered = await untilAborted(dialogSignal, () =>
+-					formDialog(params.html, { timeout, signal: dialogSignal, acceptImages: true }),
+-				);
+-			} else {
+-				answered = await askFieldByField(extensionUi, form, timeout, dialogSignal);
++			// Speak the questions aloud before surfacing them. Ask vocalizes in every
 +			// mode — it's the assistant addressing the user — gated only by speech.enabled
 +			// (the vocalizer re-checks the setting and no-ops when disabled).
 +			if (cfgSpeechEnabled.get(this.session.settings)) {
-+				vocalizer.speak(params.questions.map(q => q.question).join("\n"));
-+			}
-+
-+			const richAskDialog = extensionUi.askDialog;
-+			if (richAskDialog) {
-+				try {
-+					const showRichDialog = () =>
-+						richAskDialog(
-+							params.questions.map(q => ({
-+								id: q.id,
-+								question: q.question,
-+								...(q.header?.trim() ? { header: q.header } : {}),
-+								options: q.options.map(option => ({
-+									label: option.label,
-+									...(option.description?.trim() ? { description: option.description.trim() } : {}),
-+									...(option.preview?.trim() ? { preview: option.preview } : {}),
-+								})),
-+								...(q.multi !== undefined ? { multi: q.multi } : {}),
-+								...(q.recommended !== undefined ? { recommended: q.recommended } : {}),
- 							})),
--							...(q.multi !== undefined ? { multi: q.multi } : {}),
--							...(q.recommended !== undefined ? { recommended: q.recommended } : {}),
--						})),
--						{ timeout: timeout ?? undefined, signal: dialogSignal, acceptImages: true },
--					);
--				const richResult = await untilAborted(dialogSignal, showRichDialog);
--				if (!richResult) return cancelAsk();
--				if (richResult.kind === "chat") {
--					const questionText = params.questions.map(q => q.question).join("\n");
--					return {
--						content: [
--							{
--								type: "text" as const,
--								text: `User chose to chat about this instead of answering.\n\nQuestions asked:\n${questionText}`,
--							},
--						],
--						details: { chatRedirect: true, questions: params.questions.map(q => q.question) },
--					};
--				}
--				if (richResult.results.length !== params.questions.length) {
--					throw new Error("Ask dialog returned a result count that does not match the requested questions");
--				}
--				const results: QuestionResult[] = [];
--				// Each prompt numbers markers from 1; shift them so `[Image #N]` indexes all result images.
--				const answerImages: ImageContent[] = [];
--				for (let index = 0; index < params.questions.length; index++) {
--					const question = params.questions[index];
--					const result = richResult.results[index];
--					if (!question || !result || result.id !== question.id) {
--						throw new Error("Ask dialog returned results that do not match the requested question order");
-+							{ timeout: timeout ?? undefined, signal: dialogSignal, acceptImages: true },
-+						);
-+					const richResult = await untilAborted(dialogSignal, showRichDialog());
-+					if (!richResult) return cancelAsk();
-+					if (richResult.kind === "chat") {
-+						const questionText = params.questions.map(q => q.question).join("\n");
-+						return {
-+							content: [
-+								{
-+									type: "text" as const,
-+									text: `User chose to chat about this instead of answering.\n\nQuestions asked:\n${questionText}`,
-+								},
-+							],
-+							details: { chatRedirect: true, questions: params.questions.map(q => q.question) },
-+						};
- 					}
--					const customOffset = answerImages.length;
--					if (result.customInputImages) answerImages.push(...result.customInputImages);
--					const noteOffset = answerImages.length;
--					if (result.noteImages) answerImages.push(...result.noteImages);
--					results.push({
--						id: question.id,
--						question: question.question,
--						options: question.options.map(option => option.label),
--						multi: question.multi ?? false,
--						selectedOptions: result.selectedOptions,
--						customInput:
--							result.customInput === undefined
--								? undefined
--								: shiftImageMarkers(result.customInput, customOffset, result.customInputImages?.length ?? 0),
--						note:
--							result.note === undefined
--								? undefined
--								: shiftImageMarkers(result.note, noteOffset, result.noteImages?.length ?? 0),
--						noteOption: result.noteOption,
--						timedOut: result.timedOut,
--					});
--				}
--				if (params.questions.length === 1) {
--					const result = results[0];
--					// An empty multi-select submission is a valid "select none"
--					// answer (#8265 review); only a truly empty single-select
--					// result counts as cancellation.
--					if (
--						!result ||
--						(!result.timedOut &&
--							!result.multi &&
--							result.selectedOptions.length === 0 &&
--							result.customInput === undefined)
--					)
--						cancelAsk();
--					const details: AskToolDetails = {
--						question: result.question,
--						options: result.options,
--						multi: result.multi,
--						selectedOptions: result.selectedOptions,
--						customInput: result.customInput,
--						note: result.note,
--						noteOption: result.noteOption,
--						timedOut: result.timedOut,
--					};
--					const responseText = formatSingleQuestionResponse(result);
-+					if (richResult.results.length !== params.questions.length) {
-+						throw new Error("Ask dialog returned a result count that does not match the requested questions");
-+					}
-+					const results: QuestionResult[] = [];
-+					// Each prompt numbers markers from 1; shift them so `[Image #N]` indexes all result images.
-+					const answerImages: ImageContent[] = [];
-+					for (let index = 0; index < params.questions.length; index++) {
-+						const question = params.questions[index];
-+						const result = richResult.results[index];
-+						if (!question || !result || result.id !== question.id) {
-+							throw new Error("Ask dialog returned results that do not match the requested question order");
-+						}
-+						const customOffset = answerImages.length;
-+						if (result.customInputImages) answerImages.push(...result.customInputImages);
-+						const noteOffset = answerImages.length;
-+						if (result.noteImages) answerImages.push(...result.noteImages);
-+						results.push({
-+							id: question.id,
-+							question: question.question,
-+							options: question.options.map(option => option.label),
-+							multi: question.multi ?? false,
-+							selectedOptions: result.selectedOptions,
-+							customInput:
-+								result.customInput === undefined
-+									? undefined
-+									: shiftImageMarkers(result.customInput, customOffset, result.customInputImages?.length ?? 0),
-+							note:
-+								result.note === undefined
-+									? undefined
-+									: shiftImageMarkers(result.note, noteOffset, result.noteImages?.length ?? 0),
-+							noteOption: result.noteOption,
-+							timedOut: result.timedOut,
-+						});
-+					}
-+					if (params.questions.length === 1) {
-+						const result = results[0];
-+						// An empty multi-select submission is a valid "select none"
-+						// answer (#8265 review); only a truly empty single-select
-+						// result counts as cancellation.
-+						if (
-+							!result ||
-+							(!result.timedOut &&
-+								!result.multi &&
-+								result.selectedOptions.length === 0 &&
-+								result.customInput === undefined)
-+						)
-+							cancelAsk();
-+						const details: AskToolDetails = {
-+							question: result.question,
-+							options: result.options,
-+							multi: result.multi,
-+							selectedOptions: result.selectedOptions,
-+							customInput: result.customInput,
-+							note: result.note,
-+							noteOption: result.noteOption,
-+							timedOut: result.timedOut,
-+						};
-+						const responseText = formatSingleQuestionResponse(result);
-+						const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
-+						return { content: [{ type: "text" as const, text: responseText }, ...imageBlocks], details };
-+					}
-+					const details: AskToolDetails = { results };
-+					const responseText = `User answers:\n${results.map(formatQuestionResult).join("\n")}`;
- 					const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
- 					return { content: [{ type: "text" as const, text: responseText }, ...imageBlocks], details };
-+				} catch (error) {
-+					if (error instanceof Error && error.name === "AbortError") throw abortError();
-+					throw error;
- 				}
--				const details: AskToolDetails = { results };
--				const responseText = `User answers:\n${results.map(formatQuestionResult).join("\n")}`;
--				const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
--				return { content: [{ type: "text" as const, text: responseText }, ...imageBlocks], details };
--			} catch (error) {
--				if (error instanceof Error && error.name === "AbortError") throw abortError();
--				throw error;
++				vocalizer.speak(named.map(field => questions.get(field) ?? field.name).join("\n"));
  			}
+-		} catch (error) {
+-			if (error instanceof Error && error.name === "AbortError") throw abortError();
+-			throw error;
 -		}
- 
--		const askQuestion = async (
--			q: AskParams["questions"][number],
--			options?: { previous?: QuestionResult; navigation?: NavigationControls },
--		) => {
--			const questionOptions = q.options.map(option => ({
--				label: option.label,
--				...(option.description?.trim() ? { description: option.description.trim() } : {}),
--			}));
--			const optionLabels = questionOptions.map(getAskOptionLabel);
--			try {
--				const { selectedOptions, customInput, note, navigation, cancelled, timedOut } = await askSingleQuestion(
--					ui,
--					q.question,
--					questionOptions,
--					q.multi ?? false,
--					{
--						recommended: q.recommended,
--						timeout: timeout ?? undefined,
--						signal: dialogSignal,
--						initialSelection: options?.previous,
--						navigation: options?.navigation,
--					},
--				);
--				return { optionLabels, selectedOptions, customInput, note, navigation, cancelled, timedOut };
--			} catch (error) {
--				if (error instanceof Error && error.name === "AbortError") throw abortError();
--				throw error;
--			}
--		};
+-		if (!answered) return cancelAsk();
 -
--		if (params.questions.length === 1) {
--			const [q] = params.questions;
--			const { optionLabels, selectedOptions, customInput, note, cancelled, timedOut } = await askQuestion(q);
--
--			if (!timedOut && (cancelled || (selectedOptions.length === 0 && customInput === undefined))) cancelAsk();
--			const details: AskToolDetails = {
--				question: q.question,
--				options: optionLabels,
--				multi: q.multi ?? false,
--				selectedOptions,
--				customInput,
--				note,
--				timedOut: timedOut || undefined,
-+			const askQuestion = async (
-+				q: AskParams["questions"][number],
-+				options?: { previous?: QuestionResult; navigation?: NavigationControls },
-+			) => {
-+				const questionOptions = q.options.map(option => ({
-+					label: option.label,
-+					...(option.description?.trim() ? { description: option.description.trim() } : {}),
-+				}));
-+				const optionLabels = questionOptions.map(getAskOptionLabel);
-+				try {
-+					const { selectedOptions, customInput, note, navigation, cancelled, timedOut } = await askSingleQuestion(
-+						ui,
-+						q.question,
-+						questionOptions,
-+						q.multi ?? false,
-+						{
-+							recommended: q.recommended,
-+							timeout: timeout ?? undefined,
-+							signal: dialogSignal,
-+							initialSelection: options?.previous,
-+							navigation: options?.navigation,
-+						},
+-		const notes = answered.notes?.length ? answered.notes : undefined;
+-		// Each note numbers its markers from 1; shift them so `[Image #N]` indexes all result images.
+-		const answerImages: ImageContent[] = [];
+-		const resultNotes: OptionNote[] = [];
+-		for (const { images, ...note } of notes ?? []) {
+-			resultNotes.push({ ...note, text: shiftImageMarkers(note.text, answerImages.length, images?.length ?? 0) });
+-			if (images) answerImages.push(...images);
++
++			let answered: { data: HtmlFormData; notes?: OptionNote[]; timedOut?: boolean } | undefined;
++			try {
++				if (extensionUi.formDialog) {
++					const formDialog = extensionUi.formDialog.bind(extensionUi);
++					answered = await untilAborted(dialogSignal, () =>
++						formDialog(params.html, { timeout, signal: dialogSignal, acceptImages: true }),
 +					);
-+					return { optionLabels, selectedOptions, customInput, note, navigation, cancelled, timedOut };
-+				} catch (error) {
-+					if (error instanceof Error && error.name === "AbortError") throw abortError();
-+					throw error;
++				} else {
++					answered = await askFieldByField(extensionUi, form, timeout, dialogSignal);
 +				}
- 			};
- 
--			const responseText = formatSingleQuestionResponse({
--				selectedOptions,
--				customInput,
--				note,
--				timedOut: timedOut || undefined,
--				multi: q.multi ?? false,
--			});
--
--			return { content: [{ type: "text" as const, text: responseText }], details };
--		}
-+			if (params.questions.length === 1) {
-+				const [q] = params.questions;
-+				const { optionLabels, selectedOptions, customInput, note, cancelled, timedOut } = await askQuestion(q);
-+
-+				if (!timedOut && (cancelled || (selectedOptions.length === 0 && customInput === undefined))) cancelAsk();
-+				const details: AskToolDetails = {
-+					question: q.question,
-+					options: optionLabels,
-+					multi: q.multi ?? false,
-+					selectedOptions,
-+					customInput,
-+					note,
-+					timedOut: timedOut || undefined,
-+				};
- 
--		const resultsByIndex: Array<QuestionResult | undefined> = Array.from({ length: params.questions.length });
--		let questionIndex = 0;
--		while (questionIndex < params.questions.length) {
--			const q = params.questions[questionIndex];
--			if (!q) throw new Error("Ask question index exceeded the requested question list");
--			const previous = resultsByIndex[questionIndex];
--			const navigation: NavigationControls = {
--				allowBack: questionIndex > 0,
--				allowForward: true,
--				progressText: `${questionIndex + 1}/${params.questions.length}`,
--			};
--			const {
--				optionLabels,
--				selectedOptions,
--				customInput,
--				note,
--				navigation: navAction,
--				cancelled,
--				timedOut,
--			} = await askQuestion(q, { previous, navigation });
--
--			if (cancelled && !timedOut) cancelAsk();
--
--			resultsByIndex[questionIndex] = {
--				id: q.id,
--				question: q.question,
--				options: optionLabels,
--				multi: q.multi ?? false,
--				selectedOptions,
--				customInput,
--				note,
--				timedOut: timedOut || undefined,
--			};
-+				const responseText = formatSingleQuestionResponse({
-+					selectedOptions,
-+					customInput,
-+					note,
-+					timedOut: timedOut || undefined,
-+					multi: q.multi ?? false,
-+				});
- 
--			if (navAction === "back") {
--				questionIndex = Math.max(0, questionIndex - 1);
--				continue;
-+				return { content: [{ type: "text" as const, text: responseText }], details };
- 			}
- 
--			questionIndex += 1;
--		}
-+			const resultsByIndex: Array<QuestionResult | undefined> = Array.from({ length: params.questions.length });
-+			let questionIndex = 0;
-+			while (questionIndex < params.questions.length) {
-+				const q = params.questions[questionIndex];
-+				if (!q) throw new Error("Ask question index exceeded the requested question list");
-+				const previous = resultsByIndex[questionIndex];
-+				const navigation: NavigationControls = {
-+					allowBack: questionIndex > 0,
-+					allowForward: true,
-+					progressText: `${questionIndex + 1}/${params.questions.length}`,
-+				};
-+				const {
-+					optionLabels,
-+					selectedOptions,
-+					customInput,
-+					note,
-+					navigation: navAction,
-+					cancelled,
-+					timedOut,
-+				} = await askQuestion(q, { previous, navigation });
-+
-+				if (cancelled && !timedOut) cancelAsk();
-+
-+				resultsByIndex[questionIndex] = {
-+					id: q.id,
-+					question: q.question,
-+					options: optionLabels,
-+					multi: q.multi ?? false,
-+					selectedOptions,
-+					customInput,
-+					note,
-+					timedOut: timedOut || undefined,
-+				};
- 
--		const results = params.questions.map((q, index) => {
--			const result = resultsByIndex[index];
--			if (result) return result;
--			return {
--				id: q.id,
--				question: q.question,
--				options: q.options.map(o => o.label),
--				multi: q.multi ?? false,
--				selectedOptions: [],
--			};
--		});
-+				if (navAction === "back") {
-+					questionIndex = Math.max(0, questionIndex - 1);
-+					continue;
-+				}
-+
-+				questionIndex += 1;
++			} catch (error) {
++				if (error instanceof Error && error.name === "AbortError") throw abortError();
++				throw error;
 +			}
++			if (!answered) return cancelAsk();
 +
-+			const results = params.questions.map((q, index) => {
-+				const result = resultsByIndex[index];
-+				if (result) return result;
-+				return {
-+					id: q.id,
-+					question: q.question,
-+					options: q.options.map(o => o.label),
-+					multi: q.multi ?? false,
-+					selectedOptions: [],
-+				};
++			const notes = answered.notes?.length ? answered.notes : undefined;
++			// Each note numbers its markers from 1; shift them so `[Image #N]` indexes all result images.
++			const answerImages: ImageContent[] = [];
++			const resultNotes: OptionNote[] = [];
++			for (const { images, ...note } of notes ?? []) {
++				resultNotes.push({ ...note, text: shiftImageMarkers(note.text, answerImages.length, images?.length ?? 0) });
++				if (images) answerImages.push(...images);
++			}
++			const details: AskToolDetails = {
++				answers: formAnswers(form, answered.data),
++				...(notes ? { notes: resultNotes } : {}),
++				...(answered.timedOut ? { timedOut: true } : {}),
++			};
++			const text = prompt.render(askResultTemplate, {
++				timedOut: answered.timedOut,
++				json: JSON.stringify(answered.data, null, 2),
++				notes: notes && resultNotes.map(note => ({ ...note, text: note.text.replace(/\s+/g, " ").trim() })),
 +			});
- 
--		const details: AskToolDetails = { results };
--		const responseLines = results.map(formatQuestionResult);
--		const responseText = `User answers:\n${responseLines.join("\n")}`;
-+			const details: AskToolDetails = { results };
-+			const responseLines = results.map(formatQuestionResult);
-+			const responseText = `User answers:\n${responseLines.join("\n")}`;
- 
--		return { content: [{ type: "text" as const, text: responseText }], details };
-+			return { content: [{ type: "text" as const, text: responseText }], details };
++			const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
++			return { content: [{ type: "text", text }, ...imageBlocks], details };
 +		} finally {
-+			await clearAndroidAskCard();
-+		}
++			await clearAndroidAskCard(askAndroidCard);
+ 		}
+-		const details: AskToolDetails = {
+-			answers: formAnswers(form, answered.data),
+-			...(notes ? { notes: resultNotes } : {}),
+-			...(answered.timedOut ? { timedOut: true } : {}),
+-		};
+-		const text = prompt.render(askResultTemplate, {
+-			timedOut: answered.timedOut,
+-			json: JSON.stringify(answered.data, null, 2),
+-			notes: notes && resultNotes.map(note => ({ ...note, text: note.text.replace(/\s+/g, " ").trim() })),
+-		});
+-		const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
+-		return { content: [{ type: "text", text }, ...imageBlocks], details };
  	}
  }
- 
 diff --git a/packages/coding-agent/src/tools/browser/launch.ts b/packages/coding-agent/src/tools/browser/launch.ts
-index 95a0fda..ff56451 100644
 --- a/packages/coding-agent/src/tools/browser/launch.ts
 +++ b/packages/coding-agent/src/tools/browser/launch.ts
-@@ -316,8 +316,11 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
+@@ -342,8 +342,11 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
   * link clicks (#8673). Chrome for Testing uses a dedicated bundle id
   * (`com.google.chrome.for.testing`) that is never a user's default handler;
   * system Chrome is used on macOS only when Chrome for Testing cannot be
@@ -2630,7 +4026,7 @@ index 95a0fda..ff56451 100644
   * cached under ~/.omp/puppeteer (getPuppeteerDir). Returns undefined when
   * platform detection fails (puppeteer default resolution takes over).
   * Exported so real-browser tests can probe launchability and skip on hosts
-@@ -326,7 +329,31 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
+@@ -352,7 +355,31 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
  let chromiumExecutablePromise: Promise<string | undefined> | undefined;
  export async function ensureChromiumExecutable(): Promise<string | undefined> {
  	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -2663,7 +4059,7 @@ index 95a0fda..ff56451 100644
  	// macOS: never route a background daemon through the user's GUI Chrome
  	// bundle; prefer the isolated Chrome for Testing binary instead (#8673).
  	const preferManagedChromium = process.platform === "darwin";
-@@ -451,14 +478,16 @@ function isExecutableFile(p: string): boolean {
+@@ -494,14 +521,16 @@ function isExecutableFile(p: string): boolean {
  async function isChromiumExecutable(p: string): Promise<boolean> {
  	if (!isExecutableFile(p)) return false;
  	// The version probe below launches the candidate. It exists to reject
@@ -2688,7 +4084,7 @@ index 95a0fda..ff56451 100644
  	try {
  		const probeTimeoutMs = 3000;
  		const proc = Bun.spawn([p, "--version"], {
-@@ -539,6 +568,25 @@ function systemChromiumCandidates(
+@@ -582,6 +611,25 @@ function systemChromiumCandidates(
  			);
  			break;
  		}
@@ -2716,7 +4112,6 @@ index 95a0fda..ff56451 100644
  			const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
 diff --git a/packages/coding-agent/src/utils/android-helpers.ts b/packages/coding-agent/src/utils/android-helpers.ts
 new file mode 100644
-index 0000000..db76062
 --- /dev/null
 +++ b/packages/coding-agent/src/utils/android-helpers.ts
 @@ -0,0 +1,172 @@
@@ -2893,10 +4288,9 @@ index 0000000..db76062
 +	return { ok: false, error: "OOM adjust not available or denied" };
 +}
 diff --git a/packages/coding-agent/src/utils/clipboard.ts b/packages/coding-agent/src/utils/clipboard.ts
-index 02c7e0a..3254658 100644
 --- a/packages/coding-agent/src/utils/clipboard.ts
 +++ b/packages/coding-agent/src/utils/clipboard.ts
-@@ -124,10 +124,24 @@ let macClipboardWrite = Promise.resolve();
+@@ -126,10 +126,24 @@ let macClipboardWrite = Promise.resolve();
   * The OSC 52 goes through `writeTerminalSequence`, so it cannot tear a TUI
   * frame; from a worker thread it is skipped and only the native copy runs.
   *
@@ -2922,7 +4316,7 @@ index 02c7e0a..3254658 100644
  
  	// Keep pbcopy, document-header writes, and native fallbacks in invocation order.
  	let releaseWrite: (() => void) | undefined;
-@@ -144,9 +158,13 @@ export async function copyToClipboard(text: string): Promise<void> {
+@@ -146,9 +160,13 @@ export async function copyToClipboard(text: string): Promise<void> {
  		if (process.env.TERMUX_VERSION) {
  			try {
  				await spawnCapture(["termux-clipboard-set"], { input: text, timeoutMs: 5000 });
@@ -2938,7 +4332,7 @@ index 02c7e0a..3254658 100644
  			}
  		}
  		// macOS: prefer `pbcopy` over the in-process AppKit write, mirroring the
-@@ -172,15 +190,21 @@ export async function copyToClipboard(text: string): Promise<void> {
+@@ -174,15 +192,21 @@ export async function copyToClipboard(text: string): Promise<void> {
  					timeoutMs: 5000,
  					env: { ...process.env, LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" },
  				});
@@ -2965,7 +4359,6 @@ index 02c7e0a..3254658 100644
  	}
 diff --git a/packages/coding-agent/test/android-helpers.test.ts b/packages/coding-agent/test/android-helpers.test.ts
 new file mode 100644
-index 0000000..143a092
 --- /dev/null
 +++ b/packages/coding-agent/test/android-helpers.test.ts
 @@ -0,0 +1,147 @@
@@ -3117,7 +4510,6 @@ index 0000000..143a092
 +	});
 +});
 diff --git a/packages/coding-agent/test/cli/update-cli.test.ts b/packages/coding-agent/test/cli/update-cli.test.ts
-index 9e9ccc2..9e70342 100644
 --- a/packages/coding-agent/test/cli/update-cli.test.ts
 +++ b/packages/coding-agent/test/cli/update-cli.test.ts
 @@ -1,11 +1,16 @@
@@ -3127,7 +4519,7 @@ index 9e9ccc2..9e70342 100644
  import * as os from "node:os";
  import * as path from "node:path";
  import { removeWithRetries, setAgentDir, setProjectDir, VERSION } from "@oh-my-pi/pi-utils";
- import { currentBuildHost } from "../../src/cli/build-service";
+ import { currentBuildHost, OMP_BUILD } from "../../src/cli/build-service";
  import { fixedNpmRegistry } from "../../src/cli/npm-registry";
 -import { getLatestRelease, runUpdateCommand } from "../../src/cli/update-cli";
 +import {
@@ -3168,7 +4560,7 @@ index 9e9ccc2..9e70342 100644
  		AgentStorage.close();
  		restoreSettingsTestState(settingsState);
  		settingsState = undefined;
-@@ -424,3 +438,53 @@ describe("getLatestRelease proxy errors", () => {
+@@ -426,3 +440,53 @@ describe("getLatestRelease proxy errors", () => {
  		expect(err?.message).toMatch(/https?:\/\//i);
  	});
  });
@@ -3223,7 +4615,6 @@ index 9e9ccc2..9e70342 100644
 +	});
 +});
 diff --git a/packages/coding-agent/test/fixtures/browser-executable-probe.ts b/packages/coding-agent/test/fixtures/browser-executable-probe.ts
-index 497d309..f215916 100644
 --- a/packages/coding-agent/test/fixtures/browser-executable-probe.ts
 +++ b/packages/coding-agent/test/fixtures/browser-executable-probe.ts
 @@ -9,7 +9,7 @@ import {
@@ -3236,7 +4627,6 @@ index 497d309..f215916 100644
  	spyOn(os, "platform").mockReturnValue(platform);
  } else if (platform) {
 diff --git a/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts b/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
-index 98ca39a..a2dc6d1 100644
 --- a/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
 +++ b/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
 @@ -7,19 +7,37 @@ import { copyToClipboard } from "@oh-my-pi/pi-coding-agent/utils/clipboard";
@@ -3282,7 +4672,6 @@ index 98ca39a..a2dc6d1 100644
 +}
 diff --git a/packages/coding-agent/test/generator-android.test.ts b/packages/coding-agent/test/generator-android.test.ts
 new file mode 100644
-index 0000000..390c4b5
 --- /dev/null
 +++ b/packages/coding-agent/test/generator-android.test.ts
 @@ -0,0 +1,145 @@
@@ -3431,26 +4820,8 @@ index 0000000..390c4b5
 +		}
 +	});
 +});
-diff --git a/packages/coding-agent/test/interactive-click-focus.test.ts b/packages/coding-agent/test/interactive-click-focus.test.ts
-index 5a55fc7..3ad6cc9 100644
---- a/packages/coding-agent/test/interactive-click-focus.test.ts
-+++ b/packages/coding-agent/test/interactive-click-focus.test.ts
-@@ -862,7 +862,11 @@ describe("inline click-to-focus geometry", () => {
- 		await term.waitForRender(() => screen().some(row => row.includes("Extension links")));
- 		// A link handler's `ctx.ui.custom(…, { overlay: true })` draws over the browser and takes the keys.
- 		const keys: string[] = [];
--		const panel = { render: () => ["Handler panel"], invalidate() {}, handleInput: (data: string) => keys.push(data) };
-+		const panel = {
-+			render: () => ["Handler panel"],
-+			invalidate() {},
-+			handleInput: (data: string) => keys.push(data),
-+		};
- 		const handle = mode.ui.showOverlay(panel, { anchor: "center", width: 30 });
- 		expect(mode.ui.getFocused()).toBe(panel);
- 
 diff --git a/packages/coding-agent/test/repo-root-isolation.test.ts b/packages/coding-agent/test/repo-root-isolation.test.ts
 new file mode 100644
-index 0000000..c71b3bd
 --- /dev/null
 +++ b/packages/coding-agent/test/repo-root-isolation.test.ts
 @@ -0,0 +1,36 @@
@@ -3491,10 +4862,9 @@ index 0000000..c71b3bd
 +	});
 +});
 diff --git a/packages/coding-agent/test/slash-commands/copy.test.ts b/packages/coding-agent/test/slash-commands/copy.test.ts
-index 0946a6e..2976d99 100644
 --- a/packages/coding-agent/test/slash-commands/copy.test.ts
 +++ b/packages/coding-agent/test/slash-commands/copy.test.ts
-@@ -97,6 +97,17 @@ describe("/copy slash command", () => {
+@@ -110,6 +110,17 @@ describe("/copy slash command", () => {
  		expect(harness.showStatus).toHaveBeenCalledWith("No link to copy.");
  	});
  
@@ -3514,7 +4884,6 @@ index 0946a6e..2976d99 100644
  		const harness = createRuntimeHarness([assistantText("answer")]);
 diff --git a/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
 new file mode 100644
-index 0000000..79bda86
 --- /dev/null
 +++ b/packages/coding-agent/test/termux-notifications.test.ts
 @@ -0,0 +1,495 @@
@@ -4015,7 +5384,6 @@ index 0000000..79bda86
 +});
 diff --git a/packages/coding-agent/test/tools/browser-android-chromium.test.ts b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
 new file mode 100644
-index 0000000..7720ed1
 --- /dev/null
 +++ b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
 @@ -0,0 +1,151 @@
@@ -4171,7 +5539,6 @@ index 0000000..7720ed1
 +	});
 +});
 diff --git a/packages/coding-agent/test/utils/clipboard-osc52.test.ts b/packages/coding-agent/test/utils/clipboard-osc52.test.ts
-index 32b5f21..b4fdc3a 100644
 --- a/packages/coding-agent/test/utils/clipboard-osc52.test.ts
 +++ b/packages/coding-agent/test/utils/clipboard-osc52.test.ts
 @@ -56,6 +56,7 @@ describe("copyToClipboard OSC 52 routing", () => {
@@ -4208,7 +5575,6 @@ index 32b5f21..b4fdc3a 100644
 +	});
  });
 diff --git a/packages/coding-agent/test/utils/clipboard.test.ts b/packages/coding-agent/test/utils/clipboard.test.ts
-index 00a84ff..4a171f8 100644
 --- a/packages/coding-agent/test/utils/clipboard.test.ts
 +++ b/packages/coding-agent/test/utils/clipboard.test.ts
 @@ -1,5 +1,6 @@
@@ -4218,7 +5584,7 @@ index 00a84ff..4a171f8 100644
  	isClipboardTerminalLocal,
  	readImageFromClipboard,
  	readMacFileUrlsFromClipboard,
-@@ -59,6 +60,17 @@ function restorePlatform(): void {
+@@ -60,6 +61,17 @@ function restorePlatform(): void {
  	if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
  }
  
@@ -4236,7 +5602,7 @@ index 00a84ff..4a171f8 100644
  const ENV_KEYS = ["WSL_DISTRO_NAME", "WSL_INTEROP", "DISPLAY", "WAYLAND_DISPLAY", "TERMUX_VERSION"] as const;
  let savedEnv: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
  
-@@ -77,6 +89,7 @@ afterEach(() => {
+@@ -78,6 +90,7 @@ afterEach(() => {
  		else process.env[key] = prior;
  	}
  	restorePlatform();
@@ -4244,7 +5610,7 @@ index 00a84ff..4a171f8 100644
  	vi.restoreAllMocks();
  });
  
-@@ -243,6 +256,101 @@ describe("readImageFromClipboard dispatch", () => {
+@@ -244,6 +257,101 @@ describe("readImageFromClipboard dispatch", () => {
  	});
  });
  
@@ -4347,36 +5713,35 @@ index 00a84ff..4a171f8 100644
  	it("returns an empty list on non-darwin platforms without spawning osascript", async () => {
  		setPlatform("linux");
 diff --git a/packages/natives/native/index.js b/packages/natives/native/index.js
-index 74a474f..e265a88 100644
 --- a/packages/natives/native/index.js
 +++ b/packages/natives/native/index.js
 @@ -23,8 +23,12 @@ import { adaptDesktopSession } from "./desktop-adapter.js";
  const nativeBindings = loadNative();
  // --- generated native exports (do not edit) ---
  // classes
--export const AudioCapture = nativeBindings.AudioCapture;
--export const AudioPlayback = nativeBindings.AudioPlayback;
+-export const AudioCapture = nativeBindings.AudioCapture ?? missingNativeClass("AudioCapture");
+-export const AudioPlayback = nativeBindings.AudioPlayback ?? missingNativeClass("AudioPlayback");
 +export const AudioCapture = process.platform === "android"
 +	? (() => { const v = nativeBindings.AudioCapture; if (v !== undefined) return v; const err = function err() { throw new Error("Native AudioCapture is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
-+	: (nativeBindings.AudioCapture);
++	: (nativeBindings.AudioCapture ?? missingNativeClass("AudioCapture"));
 +export const AudioPlayback = process.platform === "android"
 +	? (() => { const v = nativeBindings.AudioPlayback; if (v !== undefined) return v; const err = function err() { throw new Error("Native AudioPlayback is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
-+	: (nativeBindings.AudioPlayback);
++	: (nativeBindings.AudioPlayback ?? missingNativeClass("AudioPlayback"));
  export const DesktopSession = adaptDesktopSession(nativeBindings.DesktopSession);
- export const DiffStream = nativeBindings.DiffStream;
- export const EditSession = nativeBindings.EditSession;
-@@ -34,7 +38,9 @@ export const HighlightStream = nativeBindings.HighlightStream;
- export const IpcConnection = nativeBindings.IpcConnection;
- export const IpcServer = nativeBindings.IpcServer;
- export const LineMatcher = nativeBindings.LineMatcher;
--export const LiveWebRtcPeer = nativeBindings.LiveWebRtcPeer;
+ export const DiffStream = nativeBindings.DiffStream ?? missingNativeClass("DiffStream");
+ export const DirectoryWatcher = nativeBindings.DirectoryWatcher ?? missingNativeClass("DirectoryWatcher");
+@@ -35,7 +39,9 @@ export const HighlightStream = nativeBindings.HighlightStream ?? missingNativeCl
+ export const IpcConnection = nativeBindings.IpcConnection ?? missingNativeClass("IpcConnection");
+ export const IpcServer = nativeBindings.IpcServer ?? missingNativeClass("IpcServer");
+ export const LineMatcher = nativeBindings.LineMatcher ?? missingNativeClass("LineMatcher");
+-export const LiveWebRtcPeer = nativeBindings.LiveWebRtcPeer ?? missingNativeClass("LiveWebRtcPeer");
 +export const LiveWebRtcPeer = process.platform === "android"
 +	? (() => { const v = nativeBindings.LiveWebRtcPeer; if (v !== undefined) return v; const err = function err() { throw new Error("Native LiveWebRtcPeer is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
-+	: (nativeBindings.LiveWebRtcPeer);
- export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
- export const MacOSFrontApp = nativeBindings.MacOSFrontApp;
- export const NativeOAuthCallback = nativeBindings.NativeOAuthCallback;
-@@ -62,7 +68,9 @@ export const astGrep = nativeBindings.astGrep ?? missingNativeExport("astGrep");
++	: (nativeBindings.LiveWebRtcPeer ?? missingNativeClass("LiveWebRtcPeer"));
+ export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver ?? missingNativeClass("MacAppearanceObserver");
+ export const MacOSFrontApp = nativeBindings.MacOSFrontApp ?? missingNativeClass("MacOSFrontApp");
+ export const NativeOAuthCallback = nativeBindings.NativeOAuthCallback ?? missingNativeClass("NativeOAuthCallback");
+@@ -66,7 +72,9 @@ export const astGrep = nativeBindings.astGrep ?? missingNativeExport("astGrep");
  export const astMatch = nativeBindings.astMatch ?? missingNativeExport("astMatch");
  export const blockRangeAt = nativeBindings.blockRangeAt ?? missingNativeExport("blockRangeAt");
  export const closeDesktopEventTaps = nativeBindings.closeDesktopEventTaps ?? missingNativeExport("closeDesktopEventTaps");
@@ -4387,7 +5752,7 @@ index 74a474f..e265a88 100644
  export const cosineSimilarityPairs = nativeBindings.cosineSimilarityPairs ?? missingNativeExport("cosineSimilarityPairs");
  export const countTokens = nativeBindings.countTokens ?? missingNativeExport("countTokens");
  export const decodeSixelToPng = nativeBindings.decodeSixelToPng ?? missingNativeExport("decodeSixelToPng");
-@@ -131,7 +139,9 @@ export const parseKey = nativeBindings.parseKey ?? missingNativeExport("parseKey
+@@ -136,7 +144,9 @@ export const parseKey = nativeBindings.parseKey ?? missingNativeExport("parseKey
  export const parseKittySequence = nativeBindings.parseKittySequence ?? missingNativeExport("parseKittySequence");
  export const pdfToMarkdown = nativeBindings.pdfToMarkdown ?? missingNativeExport("pdfToMarkdown");
  export const rasterizeSvg = nativeBindings.rasterizeSvg ?? missingNativeExport("rasterizeSvg");
@@ -4399,7 +5764,6 @@ index 74a474f..e265a88 100644
  export const renderMermaidAscii = nativeBindings.renderMermaidAscii ?? missingNativeExport("renderMermaidAscii");
  export const renderSnapcompactPng = nativeBindings.renderSnapcompactPng ?? missingNativeExport("renderSnapcompactPng");
 diff --git a/packages/natives/native/loader-state.js b/packages/natives/native/loader-state.js
-index 1c1e959..c664b66 100644
 --- a/packages/natives/native/loader-state.js
 +++ b/packages/natives/native/loader-state.js
 @@ -38,6 +38,7 @@ const SUPPORTED_PLATFORMS = [
@@ -4411,7 +5775,6 @@ index 1c1e959..c664b66 100644
  
  /**
 diff --git a/packages/natives/scripts/gen-enums.ts b/packages/natives/scripts/gen-enums.ts
-index 75dcd5d..ccb5d0f 100644
 --- a/packages/natives/scripts/gen-enums.ts
 +++ b/packages/natives/scripts/gen-enums.ts
 @@ -16,9 +16,7 @@
@@ -4434,7 +5797,7 @@ index 75dcd5d..ccb5d0f 100644
  	const classes = collectMatches(dts, CLASS_RE);
  	const functions = collectMatches(dts, FUNCTION_RE);
  	const enums = collectEnums(dts);
-@@ -92,24 +90,44 @@ function buildGeneratedBlock(dts: string): string {
+@@ -92,6 +90,18 @@ function buildGeneratedBlock(dts: string): string {
  	}
  
  	const lines: string[] = [];
@@ -4453,8 +5816,10 @@ index 75dcd5d..ccb5d0f 100644
  	if (classes.length > 0) {
  		lines.push("// classes");
  		for (const name of classes) {
- 			const binding =
- 				name === "DesktopSession" ? `adaptDesktopSession(nativeBindings.${name})` : `nativeBindings.${name}`;
+@@ -104,19 +114,27 @@ function buildGeneratedBlock(dts: string): string {
+ 				name === "DesktopSession"
+ 					? `adaptDesktopSession(nativeBindings.${name})`
+ 					: `nativeBindings.${name} ?? missingNativeClass("${name}")`;
 -			lines.push(`export const ${name} = ${binding};`);
 +			if (androidUnsupported.has(name)) {
 +				lines.push(
@@ -4485,7 +5850,7 @@ index 75dcd5d..ccb5d0f 100644
  		}
  	}
  	if (enums.length > 0) {
-@@ -123,7 +141,10 @@ function buildGeneratedBlock(dts: string): string {
+@@ -130,7 +148,10 @@ function buildGeneratedBlock(dts: string): string {
  	return `${MARKER_START}\n${lines.join("\n")}\n${MARKER_END}`;
  }
  
@@ -4498,7 +5863,6 @@ index 75dcd5d..ccb5d0f 100644
  	const existing = await Bun.file(jsPath).text();
  	const generatedBlock = buildGeneratedBlock(dts);
 diff --git a/packages/natives/test/ipc.test.ts b/packages/natives/test/ipc.test.ts
-index c569d44..ded5c37 100644
 --- a/packages/natives/test/ipc.test.ts
 +++ b/packages/natives/test/ipc.test.ts
 @@ -223,7 +223,15 @@ describe("native IPC", () => {
@@ -4571,7 +5935,6 @@ index c569d44..ded5c37 100644
  		// Small frames coalesce until the end of the task while large ones may
  		// be written immediately; a 4 MiB frame also overflows the socket
 diff --git a/packages/tui/src/active-terminal.ts b/packages/tui/src/active-terminal.ts
-index 6ef0e4c..9501254 100644
 --- a/packages/tui/src/active-terminal.ts
 +++ b/packages/tui/src/active-terminal.ts
 @@ -67,14 +67,22 @@ export function writeThroughActiveTerminal(data: string): boolean {
@@ -4601,7 +5964,6 @@ index 6ef0e4c..9501254 100644
  	}
  }
 diff --git a/packages/tui/src/apps/debug/log-viewer.ts b/packages/tui/src/apps/debug/log-viewer.ts
-index 04e7361..f3d058c 100644
 --- a/packages/tui/src/apps/debug/log-viewer.ts
 +++ b/packages/tui/src/apps/debug/log-viewer.ts
 @@ -1205,15 +1205,19 @@ export class DebugLogViewerComponent implements Component {
@@ -4635,7 +5997,6 @@ index 04e7361..f3d058c 100644
  	}
  }
 diff --git a/packages/tui/src/apps/debug/raw-sse.ts b/packages/tui/src/apps/debug/raw-sse.ts
-index 14e294a..982c574 100644
 --- a/packages/tui/src/apps/debug/raw-sse.ts
 +++ b/packages/tui/src/apps/debug/raw-sse.ts
 @@ -483,17 +483,21 @@ export class RawSseViewerComponent implements Component {
@@ -4673,10 +6034,9 @@ index 14e294a..982c574 100644
  	}
  }
 diff --git a/packages/tui/src/tools/task.ts b/packages/tui/src/tools/task.ts
-index 4e4258e..22df315 100644
 --- a/packages/tui/src/tools/task.ts
 +++ b/packages/tui/src/tools/task.ts
-@@ -2261,6 +2261,8 @@ export interface TaskItem {
+@@ -2275,6 +2275,8 @@ export interface TaskItem {
  	tools?: string[];
  	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
  	isolated?: boolean;
@@ -4685,7 +6045,7 @@ index 4e4258e..22df315 100644
  }
  
  /**
-@@ -2298,6 +2300,8 @@ export interface TaskParams {
+@@ -2310,6 +2312,8 @@ export interface TaskParams {
  	context?: string;
  	/** Run in an isolated worktree (flat form; per-item in batch form). */
  	isolated?: boolean;
@@ -4694,17 +6054,3 @@ index 4e4258e..22df315 100644
  }
  
  /**
-diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
-index 612a355..71989db 100644
---- a/packages/tui/src/tui.ts
-+++ b/packages/tui/src/tui.ts
-@@ -1328,7 +1328,8 @@ export class TUI extends Container {
- 					this.overlayStack.splice(index, 1);
- 					// Overlays opened over this one return focus to where it would have.
- 					for (const other of this.overlayStack) {
--						if (other.preFocus && isOverlayFocusTarget(component, other.preFocus)) other.preFocus = entry.preFocus;
-+						if (other.preFocus && isOverlayFocusTarget(component, other.preFocus))
-+							other.preFocus = entry.preFocus;
- 					}
- 					// Restore focus if this overlay or one of its owned targets had focus
- 					if (isOverlayFocusTarget(component, this.#focusedComponent)) {

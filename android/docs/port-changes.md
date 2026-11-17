@@ -51,8 +51,8 @@ Patch `01` also carries two formatter-only hunks
 keeps the upstream formatter check green. A separate patch fights the queue on
 every regen.
 
-Current port target: upstream oh-my-pi **18.16.0**, commit
-`83de60ad992d12e572ec3ed6fe2dd9e160cdc4a2`. `android/versions.env` pins
+Current port target: upstream oh-my-pi **18.22.0**, commit
+`a344c4b31a12ca27fc7c426ebf91b2de302f4bca`. `android/versions.env` pins
 Android Bun 1.4.4. The release workflow verifies its SHA-256.
 
 ## Transformation catalog (current)
