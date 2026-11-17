@@ -510,8 +510,21 @@ fn may_access(path: &Path, mode: libc::c_int) -> bool {
 	let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
 		return false;
 	};
+	// bionic rejects every nonzero faccessat flag with EINVAL, so its flags=0
+	// path checks real IDs. That matches the effective-ID contract only when
+	// real and effective IDs agree (the normal Termux case); fail closed
+	// otherwise — release is best-effort and stays blocked instead.
+	// SAFETY: the get*id calls take no arguments and never fail.
+	#[cfg(target_os = "android")]
+	if unsafe { libc::getuid() != libc::geteuid() || libc::getgid() != libc::getegid() } {
+		return false;
+	}
+	#[cfg(target_os = "android")]
+	const ACCESS_FLAGS: libc::c_int = 0;
+	#[cfg(not(target_os = "android"))]
+	const ACCESS_FLAGS: libc::c_int = libc::AT_EACCESS;
 	// SAFETY: `path` is a NUL-terminated string alive for the call.
-	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, libc::AT_EACCESS) == 0 }
+	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, ACCESS_FLAGS) == 0 }
 }
 
 /// Reads a whole host file. Under a cancellable scope the read goes through
