@@ -8,7 +8,8 @@ This document covers execution/process/terminal primitives in `@oh-my-pi/pi-nati
 - `crates/pi-shell/src/shell.rs`
 - `crates/pi-shell/src/cancel.rs`
 - `crates/pi-shell/src/windows.rs` (Windows-only PATH enrichment)
-- `crates/pi-shell/src/process.rs`
+- `crates/pi-shell/src/process/` (module: `mod.rs`, `host.rs`, `signals.rs`, `timer.rs`, `pending_fs.rs`)
+- `crates/pi-shell/src/proctree.rs` (process-tree tracking; formerly `process.rs`)
 - `crates/pi-natives/src/pty.rs`
 - `crates/pi-natives/src/ps.rs`
 - `crates/pi-natives/src/keys.rs`

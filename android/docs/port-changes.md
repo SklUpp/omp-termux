@@ -123,11 +123,15 @@ The stub target is a normal `function`, not an arrow. Thus `new AudioCapture()`
 reaches the trap and throws the Android message. It does not throw a generic
 "not a constructor" error.
 
-### 5. process.rs (pi-shell) — enable platform module on Android
+### 5. proctree.rs (pi-shell) — enable platform module on Android
 
-The patch widens the Linux `mod platform` gate to
-`#[cfg(any(target_os = "linux", target_os = "android"))]`. The macOS/Windows
-blocks do not change.
+Upstream 18.22.0 split the old `pi-shell/src/process.rs` into the
+`pi-shell/src/process/` module directory plus `pi-shell/src/proctree.rs`, which
+is where the Linux `mod platform` block now lives. The patch widens that gate
+to `#[cfg(any(target_os = "linux", target_os = "android"))]`. The
+macOS/Windows blocks do not change. The old `process.rs` must not come back: it
+would shadow `process/` and fail with E0761, and
+`android/scripts/verify-overlay.py` rejects it.
 
 ### 6. pi-builtins — proc_snapshot.rs + ps.rs
 

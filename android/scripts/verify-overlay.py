@@ -46,7 +46,7 @@ checks = {
     "crates/pi-natives/src/lib.rs": "#![cfg_attr(not(target_os = \"android\"), feature(alloc_error_hook))]",
     "crates/pi-natives/src/crash_handler.rs": "#[cfg(not(target_os = \"android\"))]",
     "crates/pi-natives/src/clipboard.rs": '#[cfg(target_os = "android")]',
-    "crates/pi-shell/src/process.rs": '#[cfg(any(target_os = "linux", target_os = "android"))]',
+    "crates/pi-shell/src/proctree.rs": '#[cfg(any(target_os = "linux", target_os = "android"))]',
     "crates/pi-builtins/src/proc_snapshot.rs": '#[cfg(any(target_os = "linux", target_os = "android"))]',
     "crates/pi-builtins/src/ps.rs": '#[cfg(any(target_os = "linux", target_os = "android"))]\nfn ps_total_memory_bytes',
     "crates/pi-builtins/src/sort.rs": '#[cfg(any(target_os = "linux", target_os = "android"))]\nfn linux_cgroup_memory_headroom',
@@ -64,6 +64,14 @@ for path, needle in checks.items():
             continue
         raise SystemExit(f"overlay verification failed: required file missing: {path}")
     require(path, needle)
+
+# Upstream 18.22.0 split the old `pi-shell/src/process.rs` into `process/mod.rs`
+# plus `proctree.rs`. A surviving `process.rs` shadows the module directory and
+# fails with E0761, so its absence is part of the overlay contract.
+if (ROOT / "crates/pi-shell/src/process.rs").exists():
+    raise SystemExit(
+        "overlay verification failed: stale crates/pi-shell/src/process.rs shadows process/ (E0761)"
+    )
 
 browser_path = ROOT / "packages/coding-agent/src/tools/browser/launch.ts"
 if not browser_path.is_file():
@@ -95,7 +103,7 @@ if "newAndroidAskNotificationId" not in read_required(
     "packages/coding-agent/src/utils/android-helpers.ts"
 ):
     raise SystemExit("overlay verification failed: per-process Android notification id missing")
-if "await clearAndroidAskCard();" not in read_required("packages/coding-agent/src/tools/ask.ts"):
+if "await clearAndroidAskCard(askAndroidCard);" not in read_required("packages/coding-agent/src/tools/ask.ts"):
     raise SystemExit("overlay verification failed: ask notification cleanup missing")
 
 sort_source = read_required("crates/pi-builtins/src/sort.rs")
@@ -144,12 +152,20 @@ clipboard_rs = read_required("crates/pi-natives/src/clipboard.rs")
 if '#[cfg(all(test, not(target_os = "android")))]\nmod tests {' not in clipboard_rs:
     raise SystemExit("overlay verification failed: Android cargo test would import the cfg-gated dib_to_png")
 
-for path in ("crates/pi-builtins/src/proc_match.rs", "crates/pi-natives/src/held_files/mod.rs"):
-    text = read_required(path)
-    if 'target_os = "android"' in text:
-        raise SystemExit(
-            f"overlay verification failed: {path} must not enable pidfd/OFD without a device proof"
-        )
+# The pidfd/OFD watching path has no Android device proof. Upstream widens some
+# signal-table cfgs to Android, so the guard pins the actual kernel-watch code
+# instead of rejecting every "android" literal: pidfd watching stays Linux-only
+# and the OFD lock probe stays a non-Android target.
+proc_match = read_required("crates/pi-builtins/src/proc_match.rs")
+if '#[cfg(target_os = "linux")]\nasync fn wait_for_watchable_exits(' not in proc_match:
+    raise SystemExit(
+        "overlay verification failed: pidfd watching must stay Linux-only (no Android device proof)"
+    )
+held_files = read_required("crates/pi-natives/src/held_files/mod.rs")
+if re.search(r'#\[cfg\([^\]]*target_os = "android"', held_files):
+    raise SystemExit(
+        "overlay verification failed: held_files must keep the OFD lock probe off Android (no device proof)"
+    )
 if "relocated endpoint is stable across processes" not in read_required(
     "packages/natives/test/ipc.test.ts"
 ):

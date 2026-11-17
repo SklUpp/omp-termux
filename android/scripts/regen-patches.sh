@@ -72,7 +72,7 @@ termux_files = [
     "crates/pi-natives/src/ipc/unix.rs",
     "crates/pi-natives/src/lib.rs",
     "crates/pi-natives/src/live.rs",
-    "crates/pi-shell/src/process.rs",
+    "crates/pi-shell/src/proctree.rs",
     "packages/coding-agent/src/cli.ts",
     "packages/coding-agent/src/cli/startup-cwd.ts",
     "packages/coding-agent/src/cli/update-cli.ts",
@@ -116,7 +116,6 @@ termux_files = [
     "packages/natives/scripts/gen-enums.ts",
     "packages/natives/test/ipc.test.ts",
     "packages/natives/native/loader-state.js",
-    "packages/utils/src/android-system.ts",
     "packages/utils/src/index.ts",
     "packages/utils/src/procmgr.ts",
     "packages/utils/src/temp.ts"
