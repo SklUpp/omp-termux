@@ -227,6 +227,8 @@ diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-age
  					await fs.rm(target.path, { recursive: true, force: true });
  					parentsToPrune.add(target.parentRepo);
  				}
+-			} else {
+-				if (target.kind === "task-isolation") {
 +			} else if (target.kind === "task-isolation") {
 +				// Lease keyed by the IMMUTABLE slot: the original sandbox and every
 +				// `.retained-*` sibling share it, so a rename cannot orphan a held
@@ -243,7 +245,8 @@ diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-age
 +					// Descriptor-bearing sandboxes are never garbage: release is the
 +					// only path that captures their delta and branch commits first.
 +					if (await isolationStateExists(target.path)) return false;
-+					await stopRetainedMount(target.path);
+ 					await stopRetainedMount(target.path);
+-					await releaseOvnfsCheckout(target.path);
 +					await fs.rm(target.path, { recursive: true, force: true });
 +					return true;
 +				};
@@ -253,17 +256,15 @@ diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-age
 +				} catch (error) {
 +					if (error instanceof IsolationLeaseBusyError) removed = false;
 +					else throw error;
-+				}
+ 				}
 +				if (!removed) {
 +					keptLive = [...keptLive, target];
 +					continue;
 +				}
 +				if (target.parentRepo) parentsToPrune.add(target.parentRepo);
- 			} else {
--				if (target.kind === "task-isolation") {
- 					await stopRetainedMount(target.path);
- 					await releaseOvnfsCheckout(target.path);
--				}
++			} else {
++				await stopRetainedMount(target.path);
++				await releaseOvnfsCheckout(target.path);
  				await fs.rm(target.path, { recursive: true, force: true });
  				if (target.parentRepo) parentsToPrune.add(target.parentRepo);
  			}
@@ -1143,7 +1144,7 @@ diff --git a/packages/coding-agent/src/task/deferred-integration.ts b/packages/c
 new file mode 100644
 --- /dev/null
 +++ b/packages/coding-agent/src/task/deferred-integration.ts
-@@ -0,0 +1,704 @@
+@@ -0,0 +1,706 @@
 +/**
 + * Explicit handoff for deferred isolated runs.
 + *
@@ -1527,10 +1528,12 @@ new file mode 100644
 +
 +	const branchFields =
 +		mergeMode === "branch"
-+			? await commitToBranch(handle.mergedDir, current.baseline, id, description, undefined, capture.delta).then(commit => ({
-+					...(commit?.branchName === undefined ? {} : { branchName: commit.branchName }),
-+					...(commit?.baseSha === undefined ? {} : { branchBaseSha: commit.baseSha }),
-+				}))
++			? await commitToBranch(handle.mergedDir, current.baseline, id, description, undefined, capture.delta).then(
++					commit => ({
++						...(commit?.branchName === undefined ? {} : { branchName: commit.branchName }),
++						...(commit?.baseSha === undefined ? {} : { branchBaseSha: commit.baseSha }),
++					}),
++				)
 +			: {};
 +	const result = integrationResult({
 +		id,
@@ -1899,16 +1902,19 @@ diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/
  		} catch (error) {
  			logger.warn("Subagent lifecycle resource cleanup failed", { id: args.id, error: String(error) });
  		}
-@@ -3882,7 +3894,7 @@ export async function finalizeSubagentLifecycle(args: {
+@@ -3882,7 +3894,10 @@ export async function finalizeSubagentLifecycle(args: {
  		if (ref && ownsRef) {
  			if (shutdownDispose) {
  				try {
 -					await AgentLifecycleManager.global().release(args.id, ref, { dispose: shutdownDispose });
-+					await AgentLifecycleManager.global().release(args.id, ref, { dispose: shutdownDispose, retainWorkspace: true });
++					await AgentLifecycleManager.global().release(args.id, ref, {
++						dispose: shutdownDispose,
++						retainWorkspace: true,
++					});
  				} catch (error) {
  					logger.warn("runSubagent: failed to release session during manager shutdown", {
  						id: args.id,
-@@ -4470,6 +4482,28 @@ export async function replayRevivedAgentStart(session: AgentSession): Promise<vo
+@@ -4470,6 +4485,28 @@ export async function replayRevivedAgentStart(session: AgentSession): Promise<vo
  function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
  	return async expectedAgentRef => {
  		const { id } = capture.spec.prompt;
@@ -1937,7 +1943,7 @@ diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/
  		const reopened = await SessionManager.open(capture.sessionFile, undefined, undefined, {
  			suppressBreadcrumb: true,
  			throwIfMissing: true,
-@@ -4515,6 +4549,9 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
+@@ -4515,6 +4552,9 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
  					expectedAgentRef,
  					mcpFollower,
  				);
@@ -1947,7 +1953,7 @@ diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/
  				({ session: revived } = await createAgentSession({
  					...options,
  					...(sessionLocalModel
-@@ -5240,6 +5277,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
+@@ -5240,6 +5280,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
  			}
  			sessionOpenedAt = performance.now();
  			await refreshSubagentIrcRoot(sessionSpec.prompt, sessionManager, sessionFile);
@@ -1955,7 +1961,7 @@ diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/
  
  			const hasExistingModelRole = sessionManager.getLastModelChangeRole() !== undefined;
  			// Subscribe before the builder mints proxies so a manager change during
-@@ -5409,9 +5447,8 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
+@@ -5409,9 +5450,8 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
  				outputSchema,
  				outputSchemaMode: options.outputSchemaMode,
  				restrictToolNames: restrictToolNames || undefined,
@@ -2002,15 +2008,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
  	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
  	if ("tools" in params) item.tools = params.tools;
-@@ -367,6 +369,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
- 	return [item];
- }
- 
-+
- /**
-  * Per-spawn params handed to the executor path: top-level call fields with the
-  * item's identity substituted in. Each spawn's `agent` resolves here —
-@@ -382,11 +385,6 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
+@@ -382,11 +384,6 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
  	if (item.task !== undefined) spawn.task = item.task;
  	if (item.steps !== undefined) spawn.steps = item.steps;
  	if (item.solutionSpace !== undefined) spawn.solutionSpace = item.solutionSpace;
@@ -2022,7 +2020,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  	if (params.context !== undefined) spawn.context = params.context;
  	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
  	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
-@@ -865,6 +863,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -865,6 +862,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  			sessionAgents,
  			isolationEnabled: !planMode && isolationEnabled,
  			applyIsolatedChanges: cfgTaskIsolationApply.get(this.session.settings),
@@ -2030,7 +2028,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  			disabledAgents,
  			batchEnabled: this.#isBatchEnabled(),
  			effortEnabled: cfgTaskEnableEffort.get(this.session.settings),
-@@ -1016,7 +1015,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1016,7 +1014,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  			...spawnModelFields(params),
  			...this.#resultParams(params),
  			...this.#effortParams(params),
@@ -2039,7 +2037,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  			blockedAgent: this.#blockedAgent,
  			enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
  			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
-@@ -1103,7 +1102,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1103,7 +1101,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  				try {
  					return { policy: await this.#resolveSpawnPreflight(spawn) };
  				} catch (error) {
@@ -2050,7 +2048,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  				}
  			}),
  		);
-@@ -1505,11 +1506,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1505,11 +1505,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  		// its widget has no tool tap to read.
  		let spawnRun: SpawnRun | undefined = run;
  		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
@@ -2066,7 +2064,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  			const isolated = spawnParams.isolated === true;
  			const ref = aborted ? AgentRegistry.global().get(agentId) : undefined;
  			return `\n\n${prompt.render(taskFollowUpTemplate, {
-@@ -1517,7 +1517,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1517,7 +1516,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  				aborted,
  				isolated,
  				ircEnabled,
@@ -2076,7 +2074,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  				transcriptAvailable: aborted ? await hasResolvableTranscript(agentId) : true,
  			})}`;
  		};
-@@ -1891,7 +1892,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1891,7 +1891,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  				...(onArtifactsRetained ? { onArtifactsRetained } : {}),
  				invokedAt: launchTiming?.invokedAt,
  				acquiredAt: launchTiming?.acquiredAt,
