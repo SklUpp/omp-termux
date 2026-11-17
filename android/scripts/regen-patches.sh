@@ -11,6 +11,19 @@ PIN_FILE="$REPO_ROOT/android/UPSTREAM_COMMIT"
 
 cd "$REPO_ROOT"
 
+# STALE. This script copies whole files from the working tree over a clean
+# upstream checkout and writes `02-autolearn.patch`. That layout is obsolete:
+# the queue is `01-termux.patch` + `02-isolated-revive.patch`, and whole-file
+# copies would revert upstream refactors the port now merges by hand (3-way
+# merge per file, then `git diff` per layer). Running it over a drifted
+# upstream destroys the queue silently, so it refuses unless forced.
+if [[ "${OMP_REGEN_LEGACY:-0}" != "1" ]]; then
+	echo "error: regen-patches.sh is stale and would overwrite the current queue." >&2
+	echo "Port the queue by per-file merge instead (see android/docs/port-changes.md)." >&2
+	echo "Set OMP_REGEN_LEGACY=1 to run the legacy whole-file copy anyway." >&2
+	exit 1
+fi
+
 if [[ ! -f "$PIN_FILE" ]]; then
 	echo "error: missing recorded upstream commit: $PIN_FILE" >&2
 	exit 1

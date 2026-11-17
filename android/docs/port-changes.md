@@ -42,8 +42,13 @@ There is **one** delivery mechanism: the sequential raw Git patch queue.
 `git apply --check`, then applies patches in manifest order. It also accepts a
 tree that already has the patches.
 
-When upstream changes, the queue is regenerated from clean upstream-derived
-source. The sync workflow applies it in CI. Release workflows apply it again,
+When upstream changes, the queue is ported by per-file three-way merge against
+the new upstream tip: merge upstream into the patched tree, resolve each
+conflict by keeping the upstream refactor and re-expressing the Android delta,
+then emit `git diff <upstream> <layer1>` and `git diff <layer1> <layer2>`.
+`android/scripts/regen-patches.sh` is the older whole-file-copy generator and
+now refuses to run without `OMP_REGEN_LEGACY=1`; do not use it. The sync
+workflow applies the queue in CI. Release workflows apply it again,
 idempotently, after they check out the immutable release tag.
 
 Patch `01` also carries two formatter-only hunks
