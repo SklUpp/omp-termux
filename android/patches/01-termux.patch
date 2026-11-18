@@ -1497,6 +1497,363 @@ diff --git a/crates/pi-natives/src/live.rs b/crates/pi-natives/src/live.rs
 -	}
 +    fn drop(&mut self) {}
  }
+diff --git a/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs b/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs
+--- a/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs
++++ b/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs
+@@ -83,8 +83,8 @@ const fn ri(
+ 	ResInfo { res, name, kind, unit, opt, descr }
+ }
+ 
+-/// zsh's `resinfo[]` on Linux, indexed by `RLIMIT_*` number.
+-#[cfg(target_os = "linux")]
++/// zsh's `resinfo[]` on Linux and Android, indexed by `RLIMIT_*` number.
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ const RESINFO: &[ResInfo] = &[
+ 	ri(Rlimit::Cpu, "cputime", Kind::Time, 1, b't', "cpu time (seconds)"),
+ 	ri(Rlimit::Fsize, "filesize", Kind::Memory, 512, b'f', "file size (blocks)"),
+@@ -101,12 +101,13 @@ const RESINFO: &[ResInfo] = &[
+ 	ri(Rlimit::Msgqueue, "msgqueue", Kind::Number, 1, b'q', "bytes in POSIX msg queues"),
+ 	ri(Rlimit::Nice, "nice", Kind::Number, 1, b'e', "max nice"),
+ 	ri(Rlimit::Rtprio, "rt_priority", Kind::Number, 1, b'r', "max rt priority"),
++	#[cfg(target_os = "linux")]
+ 	ri(Rlimit::Rttime, "rt_time", Kind::Micro, 1, b'N', "rt cpu time (microseconds)"),
+ ];
+ 
+ /// zsh's `resinfo[]` on macOS (and the BSD layout it shares), indexed by
+ /// `RLIMIT_*` number; `RLIMIT_RSS` is `RLIMIT_AS` there.
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ const RESINFO: &[ResInfo] = &[
+ 	ri(Rlimit::Cpu, "cputime", Kind::Time, 1, b't', "cpu time (seconds)"),
+ 	ri(Rlimit::Fsize, "filesize", Kind::Memory, 512, b'f', "file size (blocks)"),
+diff --git a/crates/pi-shell/src/bin/obash/fault.rs b/crates/pi-shell/src/bin/obash/fault.rs
+--- a/crates/pi-shell/src/bin/obash/fault.rs
++++ b/crates/pi-shell/src/bin/obash/fault.rs
+@@ -1029,7 +1029,7 @@ mod os {
+ 	/// on failure. Linux re-executes `/proc/self/exe`, so a binary replaced
+ 	/// on disk meanwhile does not take over.
+ 	pub fn exec(args: &[OsString]) -> io::Error {
+-		let exe = if cfg!(target_os = "linux") {
++		let exe = if cfg!(any(target_os = "linux", target_os = "android")) {
+ 			PathBuf::from("/proc/self/exe")
+ 		} else {
+ 			match std::env::current_exe() {
+diff --git a/crates/pi-shell/src/process/host.rs b/crates/pi-shell/src/process/host.rs
+--- a/crates/pi-shell/src/process/host.rs
++++ b/crates/pi-shell/src/process/host.rs
+@@ -576,9 +576,9 @@ pub fn ignored_on_entry() -> crate::bash::SigSet {
+ pub fn inherited_fds(embedded: bool) -> Vec<(i32, Box<dyn File>)> {
+ 	use std::os::fd::FromRawFd;
+ 
+-	#[cfg(target_os = "linux")]
++	#[cfg(any(target_os = "linux", target_os = "android"))]
+ 	let mut fds = open_fds();
+-	#[cfg(not(target_os = "linux"))]
++	#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ 	let mut fds: Vec<i32> = {
+ 		let Ok(entries) = std::fs::read_dir("/dev/fd") else {
+ 			return Vec::new();
+@@ -621,7 +621,7 @@ pub fn inherited_fds(embedded: bool) -> Vec<(i32, Box<dyn File>)> {
+ 
+ /// Enumerate inherited descriptor candidates without libc's 32 KiB
+ /// directory buffer, which otherwise faults in unused startup pages.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn open_fds() -> Vec<i32> {
+ 	use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+ 
+@@ -671,7 +671,7 @@ fn open_fds() -> Vec<i32> {
+ 	fds
+ }
+ 
+-#[cfg(all(test, target_os = "linux"))]
++#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+ #[test]
+ fn open_fds_spans_directory_batches() {
+ 	use std::os::fd::AsRawFd;
+diff --git a/crates/pi-shell/src/process/signals.rs b/crates/pi-shell/src/process/signals.rs
+--- a/crates/pi-shell/src/process/signals.rs
++++ b/crates/pi-shell/src/process/signals.rs
+@@ -38,15 +38,15 @@ mod unix {
+ 		forgotten: Vec<i32>,
+ 	}
+ 
+-	/// Read Linux's disposition bitmap in one query, falling back to
+-	/// sigaction when procfs is unavailable or its status format changes.
+-	#[cfg(target_os = "linux")]
++	/// Read `/proc/self/status`'s disposition bitmap in one query, falling
++	/// back to sigaction when procfs is unavailable or its format changes.
++	#[cfg(any(target_os = "linux", target_os = "android"))]
+ 	fn ignored_from_proc() -> Option<SigSet> {
+ 		let file = std::fs::File::open("/proc/self/status").ok()?;
+ 		ignored_from_status(io::BufReader::new(file))
+ 	}
+ 
+-	#[cfg(target_os = "linux")]
++	#[cfg(any(target_os = "linux", target_os = "android"))]
+ 	fn ignored_from_status(mut input: impl io::BufRead) -> Option<SigSet> {
+ 		let mut line = Vec::new();
+ 		while input.read_until(b'\n', &mut line).ok()? != 0 {
+@@ -68,7 +68,7 @@ mod unix {
+ 		None
+ 	}
+ 
+-	#[cfg(all(test, target_os = "linux"))]
++	#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+ 	mod tests {
+ 		use super::*;
+ 
+@@ -109,7 +109,7 @@ mod unix {
+ 	impl Signals {
+ 		/// Signals ignored when the process started (inherited dispositions).
+ 		pub fn ignored() -> SigSet {
+-			#[cfg(target_os = "linux")]
++			#[cfg(any(target_os = "linux", target_os = "android"))]
+ 			if let Some(ignored) = ignored_from_proc() {
+ 				return ignored;
+ 			}
+diff --git a/crates/pi-shell/src/sys/proc.rs b/crates/pi-shell/src/sys/proc.rs
+--- a/crates/pi-shell/src/sys/proc.rs
++++ b/crates/pi-shell/src/sys/proc.rs
+@@ -124,7 +124,7 @@ pub fn signal_pinned(p: &ProcInfo, sig: Signal) -> io::Result<bool> {
+ /// The command name may itself contain spaces and parentheses, so it ends at
+ /// the *last* `)`.
+ #[cfg_attr(
+-	not(target_os = "linux"),
++	not(any(target_os = "linux", target_os = "android")),
+ 	allow(dead_code, reason = "Linux-only outside tests; the parser is tested everywhere")
+ )]
+ fn split_stat(line: &[u8]) -> Option<(&[u8], impl Iterator<Item = &[u8]>)> {
+@@ -142,7 +142,7 @@ fn split_stat(line: &[u8]) -> Option<(&[u8], impl Iterator<Item = &[u8]>)> {
+ 
+ /// Parse a Linux `/proc/<pid>/stat` line.
+ #[cfg_attr(
+-	not(target_os = "linux"),
++	not(any(target_os = "linux", target_os = "android")),
+ 	allow(dead_code, reason = "Linux-only outside tests; the parser is tested everywhere")
+ )]
+ fn parse_stat(pid: i32, line: &[u8]) -> Option<ProcInfo> {
+@@ -169,7 +169,7 @@ fn parse_stat(pid: i32, line: &[u8]) -> Option<ProcInfo> {
+ 	})
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod sys {
+ 	use std::{
+ 		fs,
+diff --git a/crates/pi-shell/src/sys/ready.rs b/crates/pi-shell/src/sys/ready.rs
+--- a/crates/pi-shell/src/sys/ready.rs
++++ b/crates/pi-shell/src/sys/ready.rs
+@@ -41,11 +41,11 @@ pub const WRITE: i16 = libc::POLLOUT;
+ 
+ /// Bytes a write may carry after [`now`] reported `WRITE` without risking a
+ /// wait: `PIPE_BUF` (POSIX: a pipe that polls writable takes this much).
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub const WRITE_CHUNK: usize = libc::PIPE_BUF;
+ /// Bytes a write may carry after [`now`] reported `WRITE` without risking a
+ /// wait: `PIPE_BUF` of `<sys/syslimits.h>`.
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ pub const WRITE_CHUNK: usize = 512;
+ 
+ /// Whether `fd` is ready for `events` right now (also when it hung up or
+diff --git a/crates/pi-shell/src/sys/rlimit.rs b/crates/pi-shell/src/sys/rlimit.rs
+--- a/crates/pi-shell/src/sys/rlimit.rs
++++ b/crates/pi-shell/src/sys/rlimit.rs
+@@ -31,15 +31,15 @@ pub(crate) const fn resource(r: Rlimit) -> Option<Resource> {
+ 		Rlimit::Nproc => libc::RLIMIT_NPROC,
+ 		Rlimit::Nofile => libc::RLIMIT_NOFILE,
+ 		Rlimit::Vmem => libc::RLIMIT_AS,
+-		#[cfg(target_os = "linux")]
++		#[cfg(any(target_os = "linux", target_os = "android"))]
+ 		Rlimit::Locks => libc::RLIMIT_LOCKS,
+-		#[cfg(target_os = "linux")]
++		#[cfg(any(target_os = "linux", target_os = "android"))]
+ 		Rlimit::Sigpending => libc::RLIMIT_SIGPENDING,
+-		#[cfg(target_os = "linux")]
++		#[cfg(any(target_os = "linux", target_os = "android"))]
+ 		Rlimit::Msgqueue => libc::RLIMIT_MSGQUEUE,
+-		#[cfg(target_os = "linux")]
++		#[cfg(any(target_os = "linux", target_os = "android"))]
+ 		Rlimit::Nice => libc::RLIMIT_NICE,
+-		#[cfg(target_os = "linux")]
++		#[cfg(any(target_os = "linux", target_os = "android"))]
+ 		Rlimit::Rtprio => libc::RLIMIT_RTPRIO,
+ 		#[cfg(target_os = "linux")]
+ 		Rlimit::Rttime => libc::RLIMIT_RTTIME,
+@@ -120,12 +120,14 @@ mod tests {
+ 		for r in [Rlimit::Npts, Rlimit::Kqueues, Rlimit::Sbsize, Rlimit::Threads, Rlimit::Swap] {
+ 			assert!(!mapped.contains(&r), "{r:?} is FreeBSD-only");
+ 		}
+-		let linux_only = [Rlimit::Locks, Rlimit::Rtprio, Rlimit::Rttime];
++		let android_limits = [Rlimit::Locks, Rlimit::Rtprio];
+ 		assert!(
+-			linux_only
++			android_limits
+ 				.iter()
+-				.all(|r| mapped.contains(r) == cfg!(target_os = "linux"))
++				.all(|r| mapped.contains(r) == cfg!(any(target_os = "linux", target_os = "android")))
+ 		);
++		// bionic's `sys/resource.h` has no `RLIMIT_RTTIME`.
++		assert_eq!(mapped.contains(&Rlimit::Rttime), cfg!(target_os = "linux"));
+ 		assert_eq!(get(Rlimit::Swap).unwrap_err().kind(), io::ErrorKind::Unsupported);
+ 	}
+ 
+diff --git a/crates/pi-shell/src/sys/socket.rs b/crates/pi-shell/src/sys/socket.rs
+--- a/crates/pi-shell/src/sys/socket.rs
++++ b/crates/pi-shell/src/sys/socket.rs
+@@ -378,6 +378,11 @@ fn lookup(host: &str, family: IpFamily) -> io::Result<Vec<IpAddr>> {
+ fn reverse(addr: IpAddr) -> Option<BString> {
+ 	let (ss, len) = to_c(&SockAddr::Inet(SocketAddr::new(addr, 0)));
+ 	let mut host = [0 as libc::c_char; 1025];
++	// bionic takes `size_t` lengths where glibc takes `socklen_t`.
++	#[cfg(target_os = "android")]
++	let host_len = host.len();
++	#[cfg(not(target_os = "android"))]
++	let host_len = host.len() as libc::socklen_t;
+ 	// SAFETY: a valid address of `len` bytes and a host buffer of its
+ 	// stated size; no service buffer.
+ 	let rc = unsafe {
+@@ -385,7 +390,7 @@ fn reverse(addr: IpAddr) -> Option<BString> {
+ 			(&raw const ss).cast(),
+ 			len,
+ 			host.as_mut_ptr(),
+-			host.len() as libc::socklen_t,
++			host_len,
+ 			std::ptr::null_mut(),
+ 			0,
+ 			libc::NI_NAMEREQD,
+diff --git a/crates/pi-shell/src/sys/spawn/unix.rs b/crates/pi-shell/src/sys/spawn/unix.rs
+--- a/crates/pi-shell/src/sys/spawn/unix.rs
++++ b/crates/pi-shell/src/sys/spawn/unix.rs
+@@ -70,9 +70,9 @@ use crate::{
+ };
+ 
+ /// Include Linux realtime signal 64; macOS has only signals 1 through 31.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ const NSIG: usize = 65;
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ const NSIG: usize = 32;
+ 
+ /// Waiter and escalation threads only wait and signal.
+diff --git a/crates/pi-shell/src/sys/tty.rs b/crates/pi-shell/src/sys/tty.rs
+--- a/crates/pi-shell/src/sys/tty.rs
++++ b/crates/pi-shell/src/sys/tty.rs
+@@ -51,7 +51,7 @@ mod unix {
+ 		(TermFlag::Inlcr, Field::I, libc::INLCR),
+ 		(TermFlag::Igncr, Field::I, libc::IGNCR),
+ 		(TermFlag::Icrnl, Field::I, libc::ICRNL),
+-		#[cfg(target_os = "linux")]
++		#[cfg(any(target_os = "linux", target_os = "android"))]
+ 		(TermFlag::Iuclc, Field::I, libc::IUCLC),
+ 		(TermFlag::Ixon, Field::I, libc::IXON),
+ 		(TermFlag::Ixany, Field::I, libc::IXANY),
+@@ -59,7 +59,7 @@ mod unix {
+ 		(TermFlag::Imaxbel, Field::I, libc::IMAXBEL),
+ 		(TermFlag::Iutf8, Field::I, IUTF8),
+ 		(TermFlag::Opost, Field::O, libc::OPOST),
+-		#[cfg(target_os = "linux")]
++		#[cfg(any(target_os = "linux", target_os = "android"))]
+ 		(TermFlag::Olcuc, Field::O, libc::OLCUC),
+ 		(TermFlag::Onlcr, Field::O, libc::ONLCR),
+ 		(TermFlag::Ocrnl, Field::O, libc::OCRNL),
+@@ -74,7 +74,7 @@ mod unix {
+ 		(TermFlag::Crtscts, Field::C, libc::CRTSCTS),
+ 		(TermFlag::Isig, Field::L, libc::ISIG),
+ 		(TermFlag::Icanon, Field::L, libc::ICANON),
+-		#[cfg(target_os = "linux")]
++		#[cfg(any(target_os = "linux", target_os = "android"))]
+ 		(TermFlag::Xcase, Field::L, libc::XCASE),
+ 		(TermFlag::Echo, Field::L, libc::ECHO),
+ 		(TermFlag::Echoe, Field::L, libc::ECHOE),
+@@ -92,9 +92,9 @@ mod unix {
+ 	];
+ 
+ 	/// `IUTF8` (not in every libc target module).
+-	#[cfg(target_os = "linux")]
++	#[cfg(any(target_os = "linux", target_os = "android"))]
+ 	const IUTF8: libc::tcflag_t = 0o040000;
+-	#[cfg(not(target_os = "linux"))]
++	#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ 	const IUTF8: libc::tcflag_t = libc::IUTF8;
+ 
+ 	/// The platform's `c_cc` index for each [`CtlChar`] it has.
+@@ -109,26 +109,26 @@ mod unix {
+ 		(CtlChar::Start, libc::VSTART),
+ 		(CtlChar::Stop, libc::VSTOP),
+ 		(CtlChar::Susp, libc::VSUSP),
+-		#[cfg(not(target_os = "linux"))]
++		#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ 		(CtlChar::Dsusp, libc::VDSUSP),
+ 		(CtlChar::Lnext, libc::VLNEXT),
+ 		(CtlChar::Werase, libc::VWERASE),
+ 		(CtlChar::Reprint, libc::VREPRINT),
+ 		(CtlChar::Discard, libc::VDISCARD),
+-		#[cfg(not(target_os = "linux"))]
++		#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ 		(CtlChar::Status, libc::VSTATUS),
+-		#[cfg(target_os = "linux")]
++		#[cfg(any(target_os = "linux", target_os = "android"))]
+ 		(CtlChar::Swtc, libc::VSWTC),
+ 	];
+ 
+ 	/// `_POSIX_VDISABLE`.
+-	#[cfg(target_os = "linux")]
++	#[cfg(any(target_os = "linux", target_os = "android"))]
+ 	const VDISABLE: libc::cc_t = 0;
+-	#[cfg(not(target_os = "linux"))]
++	#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ 	const VDISABLE: libc::cc_t = 0xff;
+ 
+ 	/// Linux encodes speeds as `B…` codes; `(code, baud)`.
+-	#[cfg(target_os = "linux")]
++	#[cfg(any(target_os = "linux", target_os = "android"))]
+ 	const SPEEDS: &[(libc::speed_t, u32)] = &[
+ 		(libc::B0, 0),
+ 		(libc::B50, 50),
+@@ -163,22 +163,22 @@ mod unix {
+ 		(libc::B4000000, 4_000_000),
+ 	];
+ 
+-	#[cfg(target_os = "linux")]
++	#[cfg(any(target_os = "linux", target_os = "android"))]
+ 	fn baud(code: libc::speed_t) -> u32 {
+ 		SPEEDS.iter().find(|s| s.0 == code).map_or(0, |s| s.1)
+ 	}
+ 
+-	#[cfg(target_os = "linux")]
++	#[cfg(any(target_os = "linux", target_os = "android"))]
+ 	fn code(baud: u32) -> Option<libc::speed_t> {
+ 		SPEEDS.iter().find(|s| s.1 == baud).map(|s| s.0)
+ 	}
+ 
+-	#[cfg(not(target_os = "linux"))]
++	#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ 	fn baud(code: libc::speed_t) -> u32 {
+ 		u32::try_from(code).unwrap_or(u32::MAX)
+ 	}
+ 
+-	#[cfg(not(target_os = "linux"))]
++	#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ 	fn code(baud: u32) -> libc::speed_t {
+ 		libc::speed_t::from(baud)
+ 	}
+@@ -266,9 +266,9 @@ mod unix {
+ 		os.c_cc[libc::VMIN] = t.min;
+ 		os.c_cc[libc::VTIME] = t.time;
+ 		// An unknown speed keeps the encoding's.
+-		#[cfg(target_os = "linux")]
++		#[cfg(any(target_os = "linux", target_os = "android"))]
+ 		let (ispeed, ospeed) = (code(t.ispeed), code(t.ospeed));
+-		#[cfg(not(target_os = "linux"))]
++		#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ 		let (ispeed, ospeed) = (Some(code(t.ispeed)), Some(code(t.ospeed)));
+ 		if let Some(i) = ispeed {
+ 			// SAFETY: `os` is a valid termios.
 diff --git a/crates/pi-shell/src/proctree.rs b/crates/pi-shell/src/proctree.rs
 --- a/crates/pi-shell/src/proctree.rs
 +++ b/crates/pi-shell/src/proctree.rs
