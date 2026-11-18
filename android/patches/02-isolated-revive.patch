@@ -1177,7 +1177,7 @@ new file mode 100644
 +import type { NestedRepoPatch, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 +import { logger } from "@oh-my-pi/pi-utils";
 +import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-+import { AgentRegistry, type AgentRef } from "../registry/agent-registry";
++import { AgentRegistry, type AgentRef, type AgentRegistryApi } from "../registry/agent-registry";
 +import { ensurePersistedRoster, sessionFileBelongsToRoot } from "../registry/persisted-agents";
 +import { SessionManager } from "../session/session-manager";
 +import {
@@ -1210,7 +1210,7 @@ new file mode 100644
 +}
 +
 +export interface DeferredIntegrationRequest {
-+	registry: AgentRegistry;
++	registry: AgentRegistryApi;
 +	/** Agent sending the signal; must be the target's parent session. */
 +	senderId: string;
 +	target: string;
