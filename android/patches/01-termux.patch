@@ -1,4 +1,5 @@
 diff --git a/crates/pi-builtins/src/lib.rs b/crates/pi-builtins/src/lib.rs
+index 3e52d51..0461b12 100644
 --- a/crates/pi-builtins/src/lib.rs
 +++ b/crates/pi-builtins/src/lib.rs
 @@ -257,6 +257,6 @@ pub use proc_snapshot::{ProcInfo, ProcessStatus};
@@ -10,6 +11,7 @@ diff --git a/crates/pi-builtins/src/lib.rs b/crates/pi-builtins/src/lib.rs
  ))]
  pub use proc_snapshot::sys as proc_sys;
 diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/proc_snapshot.rs
+index 144dd2a..94dbcc5 100644
 --- a/crates/pi-builtins/src/proc_snapshot.rs
 +++ b/crates/pi-builtins/src/proc_snapshot.rs
 @@ -116,7 +116,7 @@ fn parse_procargs2(buffer: &[u8]) -> Vec<String> {
@@ -21,7 +23,61 @@ diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/pr
  pub mod sys {
  	use std::{
  		fs,
-@@ -197,7 +197,7 @@ pub mod sys {
+@@ -133,9 +133,53 @@ pub mod sys {
+ 			.filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+ 	}
+ 
++	/// Whether this process may issue `pidfd_open` at all.
++	///
++	/// Android answers unknown syscalls with `SECCOMP_RET_TRAP`, so a raw
++	/// `pidfd_open` on a release that does not admit it (everything before
++	/// API 31) kills the caller with SIGSYS instead of returning an error.
++	/// The level comes from bionic itself; that symbol only exists from
++	/// API 29, and a device without it is older than that.
++	#[cfg(target_os = "android")]
++	pub fn pidfd_open_supported() -> bool {
++		use std::{
++			ffi::{c_char, c_void},
++			sync::LazyLock,
++		};
++
++		unsafe extern "C" {
++			fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
++		}
++
++		static LEVEL: LazyLock<Option<libc::c_int>> = LazyLock::new(|| {
++			// SAFETY: RTLD_DEFAULT searches the loaded objects for the
++			// NUL-terminated name; a miss returns null.
++			let symbol =
++				unsafe { dlsym(libc::RTLD_DEFAULT, c"android_get_device_api_level".as_ptr()) };
++			if symbol.is_null() {
++				return None;
++			}
++			// SAFETY: bionic declares the symbol as `int (void)`.
++			let level: unsafe extern "C" fn() -> libc::c_int = unsafe { std::mem::transmute(symbol) };
++			// SAFETY: the signature matches the resolved symbol.
++			Some(unsafe { level() })
++		});
++		LEVEL.is_some_and(|level| level >= 31)
++	}
++
++	/// Linux has the syscall since 5.3; the macOS and Windows modules never
++	/// compile this one.
++	#[cfg(not(target_os = "android"))]
++	pub const fn pidfd_open_supported() -> bool {
++		true
++	}
++
+ 	/// Opens a pidfd on whichever process holds `pid` now; callers pin identity
+ 	/// by re-checking [`start_time`] after the open.
+ 	pub fn open_pidfd(pid: i32) -> Option<OwnedFd> {
++		if !pidfd_open_supported() {
++			return None;
++		}
+ 		// SAFETY: pidfd_open takes scalar arguments and returns a new owned fd.
+ 		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+ 		(fd >= 0).then(|| {
+@@ -197,7 +241,7 @@ pub mod sys {
  	}
  }
  
@@ -30,7 +86,7 @@ diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/pr
  mod proc_snapshot {
  	use std::{collections::HashMap, fs, os::fd::AsFd, time::Duration};
  
-@@ -1876,7 +1876,7 @@ mod proc_snapshot {
+@@ -1876,7 +1920,7 @@ mod proc_snapshot {
  	}
  }
  
@@ -39,7 +95,7 @@ diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/pr
  pub use proc_snapshot::{ProcInfo, threads_by_pid};
  
  /// The processes a signal must never reach: this one and its ancestors.
-@@ -1900,7 +1900,7 @@ pub use proc_snapshot::{ProcInfo, threads_by_pid};
+@@ -1900,7 +1944,7 @@ pub use proc_snapshot::{ProcInfo, threads_by_pid};
  ///
  /// Listing is unaffected: `pgrep` still reports ancestors and `ps` still shows
  /// them. Only signalling consults this.
@@ -48,7 +104,7 @@ diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/pr
  pub struct HostProcesses {
  	/// This process and its ancestors, nearest first.
  	pub pids:  smallvec::SmallVec<[i32; 16]>,
-@@ -1913,7 +1913,7 @@ pub struct HostProcesses {
+@@ -1913,7 +1957,7 @@ pub struct HostProcesses {
  /// Keeping the walk over this rather than over [`ProcInfo`] lets the recycling
  /// cases — which are otherwise only reachable by winning a race against the OS —
  /// be tested with a synthetic tree.
@@ -57,7 +113,7 @@ diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/pr
  #[derive(Clone, Copy)]
  struct ChainNode {
  	ppid:  Option<i32>,
-@@ -1923,7 +1923,7 @@ struct ChainNode {
+@@ -1923,7 +1967,7 @@ struct ChainNode {
  	start: u64,
  }
  
@@ -66,7 +122,7 @@ diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/pr
  impl HostProcesses {
  	/// Whether signalling `target` would reach this process or one of its
  	/// ancestors.
-@@ -2009,7 +2009,7 @@ impl HostProcesses {
+@@ -2009,7 +2053,7 @@ impl HostProcesses {
  	}
  }
  
@@ -76,6 +132,7 @@ diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/pr
  	use super::{HostProcesses, ProcInfo};
  
 diff --git a/crates/pi-builtins/src/ps.rs b/crates/pi-builtins/src/ps.rs
+index 7f1249e..8a8a0c1 100644
 --- a/crates/pi-builtins/src/ps.rs
 +++ b/crates/pi-builtins/src/ps.rs
 @@ -1274,7 +1274,7 @@ fn format_ps_elapsed(duration: Duration) -> String {
@@ -88,6 +145,7 @@ diff --git a/crates/pi-builtins/src/ps.rs b/crates/pi-builtins/src/ps.rs
  	let value = fs::read_to_string("/proc/meminfo")
  		.ok()?
 diff --git a/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs b/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
+index d28e8c0..c6f521f 100644
 --- a/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
 +++ b/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
 @@ -133,13 +133,18 @@ pub(super) fn resolve(
@@ -111,6 +169,7 @@ diff --git a/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs b/crates/pi
  			0,
  			libc::NI_NUMERICHOST,
 diff --git a/crates/pi-builtins/src/rsync/tree/sys.rs b/crates/pi-builtins/src/rsync/tree/sys.rs
+index 4b40488..9e8052b 100644
 --- a/crates/pi-builtins/src/rsync/tree/sys.rs
 +++ b/crates/pi-builtins/src/rsync/tree/sys.rs
 @@ -267,7 +267,20 @@ pub(crate) fn mknodat(
@@ -151,6 +210,7 @@ diff --git a/crates/pi-builtins/src/rsync/tree/sys.rs b/crates/pi-builtins/src/r
  pub(crate) fn read_dir(fd: OwnedFd) -> io::Result<Vec<OsString>> {
  	let mut dir = rustix::fs::Dir::new(fd)?;
 diff --git a/crates/pi-builtins/src/sort.rs b/crates/pi-builtins/src/sort.rs
+index d5c0442..f9a040e 100644
 --- a/crates/pi-builtins/src/sort.rs
 +++ b/crates/pi-builtins/src/sort.rs
 @@ -126,7 +126,7 @@ fn file_size_hint(fs: &BlockingFs, files: &[OsString]) -> Option<usize> {
@@ -258,6 +318,7 @@ diff --git a/crates/pi-builtins/src/sort.rs b/crates/pi-builtins/src/sort.rs
  		std::fs::create_dir_all(dir).unwrap();
  		for (name, contents) in files {
 diff --git a/crates/pi-natives/Cargo.toml b/crates/pi-natives/Cargo.toml
+index 4b0f073..336010a 100644
 --- a/crates/pi-natives/Cargo.toml
 +++ b/crates/pi-natives/Cargo.toml
 @@ -16,7 +16,6 @@ workspace = true
@@ -288,6 +349,7 @@ diff --git a/crates/pi-natives/Cargo.toml b/crates/pi-natives/Cargo.toml
  ashpd = { version = "=0.11.1", default-features = false, features = ["tokio"] }
  atspi = { version = "=0.30.0", default-features = false, features = ["proxies", "tokio", "wrappers", "zbus"] }
 diff --git a/crates/pi-natives/src/audio.rs b/crates/pi-natives/src/audio.rs
+index 8377dcf..305c4ef 100644
 --- a/crates/pi-natives/src/audio.rs
 +++ b/crates/pi-natives/src/audio.rs
 @@ -4,6 +4,7 @@
@@ -413,6 +475,7 @@ diff --git a/crates/pi-natives/src/audio.rs b/crates/pi-natives/src/audio.rs
 +	}
 +}
 diff --git a/crates/pi-natives/src/clipboard.rs b/crates/pi-natives/src/clipboard.rs
+index 50d6dab..d09bc27 100644
 --- a/crates/pi-natives/src/clipboard.rs
 +++ b/crates/pi-natives/src/clipboard.rs
 @@ -5,9 +5,12 @@
@@ -550,6 +613,7 @@ diff --git a/crates/pi-natives/src/clipboard.rs b/crates/pi-natives/src/clipboar
  	use super::dib_to_png;
  
 diff --git a/crates/pi-natives/src/crash_handler.rs b/crates/pi-natives/src/crash_handler.rs
+index 68fbb8f..b697718 100644
 --- a/crates/pi-natives/src/crash_handler.rs
 +++ b/crates/pi-natives/src/crash_handler.rs
 @@ -96,7 +96,7 @@ pub fn install() {
@@ -562,6 +626,7 @@ diff --git a/crates/pi-natives/src/crash_handler.rs b/crates/pi-natives/src/cras
  			// Print the canonical line before doing anything allocation-prone.
  			// If this is genuine process-wide OOM, report formatting/path work may
 diff --git a/crates/pi-natives/src/desktop/ax.rs b/crates/pi-natives/src/desktop/ax.rs
+index 6f668c8..1bc21af 100644
 --- a/crates/pi-natives/src/desktop/ax.rs
 +++ b/crates/pi-natives/src/desktop/ax.rs
 @@ -24,6 +24,8 @@ pub enum AxHandle {
@@ -601,18 +666,30 @@ diff --git a/crates/pi-natives/src/desktop/ax.rs b/crates/pi-natives/src/desktop
  			Self::Test(id) => id.hash(state),
  			#[cfg(test)]
 diff --git a/crates/pi-natives/src/desktop/control.rs b/crates/pi-natives/src/desktop/control.rs
+index 0051c8a..3847e9f 100644
 --- a/crates/pi-natives/src/desktop/control.rs
 +++ b/crates/pi-natives/src/desktop/control.rs
-@@ -572,6 +572,8 @@ struct ControlLease {
+@@ -561,6 +561,10 @@ type EscapeMonitor = macos::EscapeMonitor;
+ type EscapeMonitor = linux::EscapeMonitor;
+ #[cfg(windows)]
+ type EscapeMonitor = windows::EscapeMonitor;
++/// Android has no desktop input surface, so there is nothing to monitor and the
++/// takeover path never arms one (`escape_monitor` answers `None`).
++#[cfg(target_os = "android")]
++type EscapeMonitor = ();
+ 
+ /// The kernel owner lives on its own thread: Windows mutex release must happen
+ /// on the same thread that acquired it, even when the session is disposed from
+@@ -572,6 +576,8 @@ struct ControlLease {
  	_escape: Option<windows::EscapeMonitor>,
  	#[cfg(target_os = "linux")]
  	_escape: Option<linux::EscapeMonitor>,
 +	#[cfg(target_os = "android")]
-+	_escape: Option<()>,
++	_escape: Option<EscapeMonitor>,
  	_kernel: KernelOwner,
  	running: AtomicBool,
  }
-@@ -637,6 +639,8 @@ impl ControlLease {
+@@ -637,6 +643,8 @@ impl ControlLease {
  			_escape: Some(escape),
  			#[cfg(target_os = "linux")]
  			_escape: escape,
@@ -621,7 +698,21 @@ diff --git a/crates/pi-natives/src/desktop/control.rs b/crates/pi-natives/src/de
  			_kernel: kernel,
  			running: AtomicBool::new(false),
  		})
+@@ -662,6 +670,12 @@ impl ControlLease {
+ 	fn escape_monitor(source: &CancellationSource) -> CoreResult<Option<EscapeMonitor>> {
+ 		linux::EscapeMonitor::start(EmergencyStop(Arc::downgrade(&source.0)))
+ 	}
++
++	/// No desktop input surface on Android, so a takeover arms no monitor.
++	#[cfg(target_os = "android")]
++	fn escape_monitor(_source: &CancellationSource) -> CoreResult<Option<EscapeMonitor>> {
++		Ok(None)
++	}
+ }
+ 
+ struct KernelOwner {
 diff --git a/crates/pi-natives/src/ipc/endpoint.rs b/crates/pi-natives/src/ipc/endpoint.rs
+index 2f9b06c..81a8446 100644
 --- a/crates/pi-natives/src/ipc/endpoint.rs
 +++ b/crates/pi-natives/src/ipc/endpoint.rs
 @@ -32,19 +32,80 @@ pub fn hash16(bytes: &[u8]) -> String {
@@ -839,6 +930,7 @@ diff --git a/crates/pi-natives/src/ipc/endpoint.rs b/crates/pi-natives/src/ipc/e
  
  	#[test]
 diff --git a/crates/pi-natives/src/ipc/mod.rs b/crates/pi-natives/src/ipc/mod.rs
+index afe6bc9..fc0f929 100644
 --- a/crates/pi-natives/src/ipc/mod.rs
 +++ b/crates/pi-natives/src/ipc/mod.rs
 @@ -46,6 +46,7 @@ const DEFAULT_MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
@@ -880,6 +972,7 @@ diff --git a/crates/pi-natives/src/ipc/mod.rs b/crates/pi-natives/src/ipc/mod.rs
  }
  
 diff --git a/crates/pi-natives/src/ipc/unix.rs b/crates/pi-natives/src/ipc/unix.rs
+index 332b982..3703f89 100644
 --- a/crates/pi-natives/src/ipc/unix.rs
 +++ b/crates/pi-natives/src/ipc/unix.rs
 @@ -276,7 +276,25 @@ fn prepare_parent(path: &Path) -> Result<(), IpcError> {
@@ -1204,6 +1297,7 @@ diff --git a/crates/pi-natives/src/ipc/unix.rs b/crates/pi-natives/src/ipc/unix.
 +	}
 +}
 diff --git a/crates/pi-natives/src/lib.rs b/crates/pi-natives/src/lib.rs
+index 5f9846b..228e127 100644
 --- a/crates/pi-natives/src/lib.rs
 +++ b/crates/pi-natives/src/lib.rs
 @@ -20,7 +20,7 @@
@@ -1216,6 +1310,7 @@ diff --git a/crates/pi-natives/src/lib.rs b/crates/pi-natives/src/lib.rs
  pub mod appearance;
  pub mod applefm;
 diff --git a/crates/pi-natives/src/live.rs b/crates/pi-natives/src/live.rs
+index 9cbcd99..0fc449f 100644
 --- a/crates/pi-natives/src/live.rs
 +++ b/crates/pi-natives/src/live.rs
 @@ -5,117 +5,185 @@
@@ -1498,8 +1593,18 @@ diff --git a/crates/pi-natives/src/live.rs b/crates/pi-natives/src/live.rs
 +    fn drop(&mut self) {}
  }
 diff --git a/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs b/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs
+index aab7845..96929b2 100644
 --- a/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs
 +++ b/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs
+@@ -53,7 +53,7 @@ enum Kind {
+ 	/// `ZLIMTYPE_MICROSECONDS` (Linux's `RLIMIT_RTTIME`).
+ 	#[cfg_attr(
+ 		not(target_os = "linux"),
+-		allow(dead_code, reason = "RLIMIT_RTTIME exists only on Linux")
++		allow(dead_code, reason = "only the Linux resinfo table maps RLIMIT_RTTIME")
+ 	)]
+ 	Micro,
+ }
 @@ -83,8 +83,8 @@ const fn ri(
  	ResInfo { res, name, kind, unit, opt, descr }
  }
@@ -1527,6 +1632,7 @@ diff --git a/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs b/crates/pi
  	ri(Rlimit::Cpu, "cputime", Kind::Time, 1, b't', "cpu time (seconds)"),
  	ri(Rlimit::Fsize, "filesize", Kind::Memory, 512, b'f', "file size (blocks)"),
 diff --git a/crates/pi-shell/src/bin/obash/fault.rs b/crates/pi-shell/src/bin/obash/fault.rs
+index 8450318..013d2a8 100644
 --- a/crates/pi-shell/src/bin/obash/fault.rs
 +++ b/crates/pi-shell/src/bin/obash/fault.rs
 @@ -1029,7 +1029,7 @@ mod os {
@@ -1539,6 +1645,7 @@ diff --git a/crates/pi-shell/src/bin/obash/fault.rs b/crates/pi-shell/src/bin/ob
  		} else {
  			match std::env::current_exe() {
 diff --git a/crates/pi-shell/src/process/host.rs b/crates/pi-shell/src/process/host.rs
+index e09adda..3ca832f 100644
 --- a/crates/pi-shell/src/process/host.rs
 +++ b/crates/pi-shell/src/process/host.rs
 @@ -576,9 +576,9 @@ pub fn ignored_on_entry() -> crate::bash::SigSet {
@@ -1572,6 +1679,7 @@ diff --git a/crates/pi-shell/src/process/host.rs b/crates/pi-shell/src/process/h
  fn open_fds_spans_directory_batches() {
  	use std::os::fd::AsRawFd;
 diff --git a/crates/pi-shell/src/process/signals.rs b/crates/pi-shell/src/process/signals.rs
+index 200294c..cf09fb0 100644
 --- a/crates/pi-shell/src/process/signals.rs
 +++ b/crates/pi-shell/src/process/signals.rs
 @@ -38,15 +38,15 @@ mod unix {
@@ -1612,7 +1720,21 @@ diff --git a/crates/pi-shell/src/process/signals.rs b/crates/pi-shell/src/proces
  			if let Some(ignored) = ignored_from_proc() {
  				return ignored;
  			}
+diff --git a/crates/pi-shell/src/proctree.rs b/crates/pi-shell/src/proctree.rs
+index ffcb9c5..79724ad 100644
+--- a/crates/pi-shell/src/proctree.rs
++++ b/crates/pi-shell/src/proctree.rs
+@@ -15,7 +15,7 @@ pub use pi_builtins::ProcessStatus;
+ 
+ use crate::cancel::CancelToken;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod platform {
+ 	use std::{
+ 		collections::HashSet,
 diff --git a/crates/pi-shell/src/sys/proc.rs b/crates/pi-shell/src/sys/proc.rs
+index 4a49af4..f2b4ad9 100644
 --- a/crates/pi-shell/src/sys/proc.rs
 +++ b/crates/pi-shell/src/sys/proc.rs
 @@ -124,7 +124,7 @@ pub fn signal_pinned(p: &ProcInfo, sig: Signal) -> io::Result<bool> {
@@ -1642,7 +1764,41 @@ diff --git a/crates/pi-shell/src/sys/proc.rs b/crates/pi-shell/src/sys/proc.rs
  mod sys {
  	use std::{
  		fs,
+@@ -236,13 +236,26 @@ mod sys {
+ 		Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+ 	}
+ 
++	/// Whether this process may call `pidfd_open`. The API-level query lives
++	/// with the syscall itself, in `pi_builtins::proc_sys`, so the policy has
++	/// one definition: Android traps the call with SIGSYS before API 31.
++	fn pidfd_supported() -> bool {
++		pi_builtins::proc_sys::pidfd_open_supported()
++	}
++
+ 	pub fn signal_pinned(p: &ProcInfo, sig: i32) -> io::Result<bool> {
+-		let pidfd = match pidfd_open(p.pid) {
+-			Ok(fd) => Some(fd),
+-			Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
+-			// Kernels before 5.3: fall back to a start-time recheck.
+-			Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => None,
+-			Err(e) => return Err(e),
++		let pidfd = if pidfd_supported() {
++			match pidfd_open(p.pid) {
++				Ok(fd) => Some(fd),
++				Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
++				// Kernels before 5.3: fall back to a start-time recheck.
++				Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => None,
++				Err(e) => return Err(e),
++			}
++		} else {
++			// Android before 12: kill(2) after the start-time recheck, the
++			// same window the pre-pidfd fallback accepts.
++			None
+ 		};
+ 		// With the pidfd open the pid cannot be reused for another process
+ 		// while we check that it still names the scanned one.
 diff --git a/crates/pi-shell/src/sys/ready.rs b/crates/pi-shell/src/sys/ready.rs
+index 02743e8..0db7ef0 100644
 --- a/crates/pi-shell/src/sys/ready.rs
 +++ b/crates/pi-shell/src/sys/ready.rs
 @@ -41,11 +41,11 @@ pub const WRITE: i16 = libc::POLLOUT;
@@ -1660,9 +1816,10 @@ diff --git a/crates/pi-shell/src/sys/ready.rs b/crates/pi-shell/src/sys/ready.rs
  
  /// Whether `fd` is ready for `events` right now (also when it hung up or
 diff --git a/crates/pi-shell/src/sys/rlimit.rs b/crates/pi-shell/src/sys/rlimit.rs
+index f8a28ae..f558bf9 100644
 --- a/crates/pi-shell/src/sys/rlimit.rs
 +++ b/crates/pi-shell/src/sys/rlimit.rs
-@@ -31,15 +31,15 @@ pub(crate) const fn resource(r: Rlimit) -> Option<Resource> {
+@@ -31,18 +31,23 @@ pub(crate) const fn resource(r: Rlimit) -> Option<Resource> {
  		Rlimit::Nproc => libc::RLIMIT_NPROC,
  		Rlimit::Nofile => libc::RLIMIT_NOFILE,
  		Rlimit::Vmem => libc::RLIMIT_AS,
@@ -1683,7 +1840,15 @@ diff --git a/crates/pi-shell/src/sys/rlimit.rs b/crates/pi-shell/src/sys/rlimit.
  		Rlimit::Rtprio => libc::RLIMIT_RTPRIO,
  		#[cfg(target_os = "linux")]
  		Rlimit::Rttime => libc::RLIMIT_RTTIME,
-@@ -120,12 +120,14 @@ mod tests {
++		// bionic exposes `RLIMIT_RTTIME` (15) through `linux/resource.h`, but
++		// the `libc` crate declares no Android constant for it, and the engine
++		// maps only the resources it can name.
++		#[cfg(target_os = "android")]
++		Rlimit::Rttime => return None,
+ 		_ => return None,
+ 	})
+ }
+@@ -120,12 +125,15 @@ mod tests {
  		for r in [Rlimit::Npts, Rlimit::Kqueues, Rlimit::Sbsize, Rlimit::Threads, Rlimit::Swap] {
  			assert!(!mapped.contains(&r), "{r:?} is FreeBSD-only");
  		}
@@ -1696,12 +1861,14 @@ diff --git a/crates/pi-shell/src/sys/rlimit.rs b/crates/pi-shell/src/sys/rlimit.
 -				.all(|r| mapped.contains(r) == cfg!(target_os = "linux"))
 +				.all(|r| mapped.contains(r) == cfg!(any(target_os = "linux", target_os = "android")))
  		);
-+		// bionic's `sys/resource.h` has no `RLIMIT_RTTIME`.
++		// bionic exposes `RLIMIT_RTTIME` (15) through `linux/resource.h`, but the
++		// `libc` crate has no Android constant, so only the Linux table maps it.
 +		assert_eq!(mapped.contains(&Rlimit::Rttime), cfg!(target_os = "linux"));
  		assert_eq!(get(Rlimit::Swap).unwrap_err().kind(), io::ErrorKind::Unsupported);
  	}
  
 diff --git a/crates/pi-shell/src/sys/socket.rs b/crates/pi-shell/src/sys/socket.rs
+index c351de7..5eb1c79 100644
 --- a/crates/pi-shell/src/sys/socket.rs
 +++ b/crates/pi-shell/src/sys/socket.rs
 @@ -378,6 +378,11 @@ fn lookup(host: &str, family: IpFamily) -> io::Result<Vec<IpAddr>> {
@@ -1726,6 +1893,7 @@ diff --git a/crates/pi-shell/src/sys/socket.rs b/crates/pi-shell/src/sys/socket.
  			0,
  			libc::NI_NAMEREQD,
 diff --git a/crates/pi-shell/src/sys/spawn/unix.rs b/crates/pi-shell/src/sys/spawn/unix.rs
+index eafd841..440b163 100644
 --- a/crates/pi-shell/src/sys/spawn/unix.rs
 +++ b/crates/pi-shell/src/sys/spawn/unix.rs
 @@ -70,9 +70,9 @@ use crate::{
@@ -1741,6 +1909,7 @@ diff --git a/crates/pi-shell/src/sys/spawn/unix.rs b/crates/pi-shell/src/sys/spa
  
  /// Waiter and escalation threads only wait and signal.
 diff --git a/crates/pi-shell/src/sys/tty.rs b/crates/pi-shell/src/sys/tty.rs
+index c588279..f30de2c 100644
 --- a/crates/pi-shell/src/sys/tty.rs
 +++ b/crates/pi-shell/src/sys/tty.rs
 @@ -51,7 +51,7 @@ mod unix {
@@ -1854,19 +2023,8 @@ diff --git a/crates/pi-shell/src/sys/tty.rs b/crates/pi-shell/src/sys/tty.rs
  		let (ispeed, ospeed) = (Some(code(t.ispeed)), Some(code(t.ospeed)));
  		if let Some(i) = ispeed {
  			// SAFETY: `os` is a valid termios.
-diff --git a/crates/pi-shell/src/proctree.rs b/crates/pi-shell/src/proctree.rs
---- a/crates/pi-shell/src/proctree.rs
-+++ b/crates/pi-shell/src/proctree.rs
-@@ -15,7 +15,7 @@ pub use pi_builtins::ProcessStatus;
- 
- use crate::cancel::CancelToken;
- 
--#[cfg(target_os = "linux")]
-+#[cfg(any(target_os = "linux", target_os = "android"))]
- mod platform {
- 	use std::{
- 		collections::HashSet,
 diff --git a/crates/pi-vfs/src/fs.rs b/crates/pi-vfs/src/fs.rs
+index a378045..f11e5e6 100644
 --- a/crates/pi-vfs/src/fs.rs
 +++ b/crates/pi-vfs/src/fs.rs
 @@ -510,8 +510,21 @@ fn may_access(path: &Path, mode: libc::c_int) -> bool {
@@ -1893,6 +2051,7 @@ diff --git a/crates/pi-vfs/src/fs.rs b/crates/pi-vfs/src/fs.rs
  
  /// Reads a whole host file. Under a cancellable scope the read goes through
 diff --git a/packages/coding-agent/src/cli/update-cli.ts b/packages/coding-agent/src/cli/update-cli.ts
+index ed12d3f..cb9889d 100644
 --- a/packages/coding-agent/src/cli/update-cli.ts
 +++ b/packages/coding-agent/src/cli/update-cli.ts
 @@ -2305,6 +2305,54 @@ async function runManagedUpdate(
@@ -1962,6 +2121,7 @@ diff --git a/packages/coding-agent/src/cli/update-cli.ts b/packages/coding-agent
  	const manager = ompPath ? await managedInstallName(ompPath) : undefined;
  	if (manager) {
 diff --git a/packages/coding-agent/src/main.ts b/packages/coding-agent/src/main.ts
+index eb3870f..3d91766 100644
 --- a/packages/coding-agent/src/main.ts
 +++ b/packages/coding-agent/src/main.ts
 @@ -45,7 +45,7 @@ import { fetchBuild } from "./cli/build-service";
@@ -1986,6 +2146,7 @@ diff --git a/packages/coding-agent/src/main.ts b/packages/coding-agent/src/main.
  		// Checkouts update through git and a manager (Tern) updates its omp itself:
  		// "run omp update" would be wrong advice for both.
 diff --git a/packages/coding-agent/src/modes/controllers/command-controller.ts b/packages/coding-agent/src/modes/controllers/command-controller.ts
+index 0e58ed2..74bb8d3 100644
 --- a/packages/coding-agent/src/modes/controllers/command-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/command-controller.ts
 @@ -460,12 +460,15 @@ export class CommandController {
@@ -2010,6 +2171,7 @@ diff --git a/packages/coding-agent/src/modes/controllers/command-controller.ts b
  	}
  
 diff --git a/packages/coding-agent/src/modes/controllers/event-controller.ts b/packages/coding-agent/src/modes/controllers/event-controller.ts
+index f61cbbc..4e7e2ec 100644
 --- a/packages/coding-agent/src/modes/controllers/event-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/event-controller.ts
 @@ -58,6 +58,7 @@ import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
@@ -2042,6 +2204,7 @@ diff --git a/packages/coding-agent/src/modes/controllers/event-controller.ts b/p
  	}
  }
 diff --git a/packages/coding-agent/src/modes/controllers/input-controller.ts b/packages/coding-agent/src/modes/controllers/input-controller.ts
+index c04354e..adeb3b0 100644
 --- a/packages/coding-agent/src/modes/controllers/input-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/input-controller.ts
 @@ -3120,14 +3120,14 @@ export class InputController {
@@ -2089,6 +2252,7 @@ diff --git a/packages/coding-agent/src/modes/controllers/input-controller.ts b/p
  
  	cycleThinkingLevel(): void {
 diff --git a/packages/coding-agent/src/modes/controllers/selector-controller.ts b/packages/coding-agent/src/modes/controllers/selector-controller.ts
+index 1478cb2..cc03da5 100644
 --- a/packages/coding-agent/src/modes/controllers/selector-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/selector-controller.ts
 @@ -1553,8 +1553,10 @@ export class SelectorController {
@@ -2105,6 +2269,7 @@ diff --git a/packages/coding-agent/src/modes/controllers/selector-controller.ts 
  			onOpen: (href, label) => {
  				done();
 diff --git a/packages/coding-agent/src/modes/controllers/todo-command-controller.ts b/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
+index 9417117..eba5a58 100644
 --- a/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
 @@ -212,12 +212,10 @@ export class TodoCommandController {
@@ -2125,6 +2290,7 @@ diff --git a/packages/coding-agent/src/modes/controllers/todo-command-controller
  
  	#resolveTodoPath(rest: string): string {
 diff --git a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
+index 0b03496..52560ef 100644
 --- a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
 +++ b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
 @@ -577,50 +577,52 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
@@ -2217,6 +2383,7 @@ diff --git a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts b
  	},
  	{
 diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src/task/index.ts
+index 72c0a28..674cbe1 100644
 --- a/packages/coding-agent/src/task/index.ts
 +++ b/packages/coding-agent/src/task/index.ts
 @@ -357,6 +357,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
@@ -2258,6 +2425,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  				enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
  				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/coding-agent/src/task/isolation-runner.ts
+index 5e2abde..9bf7f6c 100644
 --- a/packages/coding-agent/src/task/isolation-runner.ts
 +++ b/packages/coding-agent/src/task/isolation-runner.ts
 @@ -145,8 +145,8 @@ export interface IsolationContext {
@@ -2272,6 +2440,7 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  
  /** Fingerprint of a captured delta, used to skip re-committing an unchanged workspace on release. */
 diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/coding-agent/src/task/structured-subagent.ts
+index ee49a81..5fafdfc 100644
 --- a/packages/coding-agent/src/task/structured-subagent.ts
 +++ b/packages/coding-agent/src/task/structured-subagent.ts
 @@ -113,6 +113,7 @@ export interface StructuredSubagentIsolationControls {
@@ -2320,6 +2489,7 @@ diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/co
  				const message = error instanceof Error ? error.message : String(error);
  				throw new StructuredSubagentError(
 diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src/task/types.ts
+index 9dad59b..90ede01 100644
 --- a/packages/coding-agent/src/task/types.ts
 +++ b/packages/coding-agent/src/task/types.ts
 @@ -67,6 +67,7 @@ export const taskItemSchema = type({
@@ -2355,6 +2525,7 @@ diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src
  	"schemaMode?": '"permissive" | "strict"',
  	"tools?": "string[]",
 diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/src/task/worktree.ts
+index 0b6f155..d1eecb0 100644
 --- a/packages/coding-agent/src/task/worktree.ts
 +++ b/packages/coding-agent/src/task/worktree.ts
 @@ -48,18 +48,35 @@ export interface WorktreeBaseline {
@@ -2409,6 +2580,7 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
  	const baseDir = taskIsolationBaseDir(repoRoot, id);
  	const mergedDir = path.join(baseDir, TASK_ISOLATION_MOUNT_DIR);
 diff --git a/packages/coding-agent/src/tools/ask.ts b/packages/coding-agent/src/tools/ask.ts
+index d9b7bcd..4ad0fd4 100644
 --- a/packages/coding-agent/src/tools/ask.ts
 +++ b/packages/coding-agent/src/tools/ask.ts
 @@ -49,6 +49,12 @@ import askResultTemplate from "../prompts/tools/ask-result.md" with { type: "tex
@@ -2560,6 +2732,7 @@ diff --git a/packages/coding-agent/src/tools/ask.ts b/packages/coding-agent/src/
  	}
  }
 diff --git a/packages/coding-agent/src/tools/browser/launch.ts b/packages/coding-agent/src/tools/browser/launch.ts
+index ed7c496..1a923d9 100644
 --- a/packages/coding-agent/src/tools/browser/launch.ts
 +++ b/packages/coding-agent/src/tools/browser/launch.ts
 @@ -342,8 +342,11 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
@@ -2660,8 +2833,9 @@ diff --git a/packages/coding-agent/src/tools/browser/launch.ts b/packages/coding
  		case "win32": {
  			const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
  			const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
-diff --git a/packages/coding-agent/src/utils/android-helpers.ts b/packages/coding-agent/src/utils/android-helpers.ts
+diff --git b/packages/coding-agent/src/utils/android-helpers.ts b/packages/coding-agent/src/utils/android-helpers.ts
 new file mode 100644
+index 0000000..db76062
 --- /dev/null
 +++ b/packages/coding-agent/src/utils/android-helpers.ts
 @@ -0,0 +1,172 @@
@@ -2838,6 +3012,7 @@ new file mode 100644
 +	return { ok: false, error: "OOM adjust not available or denied" };
 +}
 diff --git a/packages/coding-agent/src/utils/clipboard.ts b/packages/coding-agent/src/utils/clipboard.ts
+index d47389e..edd4268 100644
 --- a/packages/coding-agent/src/utils/clipboard.ts
 +++ b/packages/coding-agent/src/utils/clipboard.ts
 @@ -126,10 +126,24 @@ let macClipboardWrite = Promise.resolve();
@@ -2907,8 +3082,9 @@ diff --git a/packages/coding-agent/src/utils/clipboard.ts b/packages/coding-agen
  	} finally {
  		releaseWrite?.();
  	}
-diff --git a/packages/coding-agent/test/android-helpers.test.ts b/packages/coding-agent/test/android-helpers.test.ts
+diff --git b/packages/coding-agent/test/android-helpers.test.ts b/packages/coding-agent/test/android-helpers.test.ts
 new file mode 100644
+index 0000000..143a092
 --- /dev/null
 +++ b/packages/coding-agent/test/android-helpers.test.ts
 @@ -0,0 +1,147 @@
@@ -3060,6 +3236,7 @@ new file mode 100644
 +	});
 +});
 diff --git a/packages/coding-agent/test/cli/update-cli.test.ts b/packages/coding-agent/test/cli/update-cli.test.ts
+index 8985a0b..a1e4fd1 100644
 --- a/packages/coding-agent/test/cli/update-cli.test.ts
 +++ b/packages/coding-agent/test/cli/update-cli.test.ts
 @@ -1,11 +1,16 @@
@@ -3165,6 +3342,7 @@ diff --git a/packages/coding-agent/test/cli/update-cli.test.ts b/packages/coding
 +	});
 +});
 diff --git a/packages/coding-agent/test/fixtures/browser-executable-probe.ts b/packages/coding-agent/test/fixtures/browser-executable-probe.ts
+index 497d309..f215916 100644
 --- a/packages/coding-agent/test/fixtures/browser-executable-probe.ts
 +++ b/packages/coding-agent/test/fixtures/browser-executable-probe.ts
 @@ -9,7 +9,7 @@ import {
@@ -3177,6 +3355,7 @@ diff --git a/packages/coding-agent/test/fixtures/browser-executable-probe.ts b/p
  	spyOn(os, "platform").mockReturnValue(platform);
  } else if (platform) {
 diff --git a/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts b/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
+index 98ca39a..a2dc6d1 100644
 --- a/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
 +++ b/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
 @@ -7,19 +7,37 @@ import { copyToClipboard } from "@oh-my-pi/pi-coding-agent/utils/clipboard";
@@ -3220,8 +3399,9 @@ diff --git a/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts b/pack
 +		error: error instanceof Error ? error.message : String(error),
 +	});
 +}
-diff --git a/packages/coding-agent/test/generator-android.test.ts b/packages/coding-agent/test/generator-android.test.ts
+diff --git b/packages/coding-agent/test/generator-android.test.ts b/packages/coding-agent/test/generator-android.test.ts
 new file mode 100644
+index 0000000..b27275e
 --- /dev/null
 +++ b/packages/coding-agent/test/generator-android.test.ts
 @@ -0,0 +1,209 @@
@@ -3434,8 +3614,9 @@ new file mode 100644
 +		}
 +	});
 +});
-diff --git a/packages/coding-agent/test/repo-root-isolation.test.ts b/packages/coding-agent/test/repo-root-isolation.test.ts
+diff --git b/packages/coding-agent/test/repo-root-isolation.test.ts b/packages/coding-agent/test/repo-root-isolation.test.ts
 new file mode 100644
+index 0000000..c71b3bd
 --- /dev/null
 +++ b/packages/coding-agent/test/repo-root-isolation.test.ts
 @@ -0,0 +1,36 @@
@@ -3476,6 +3657,7 @@ new file mode 100644
 +	});
 +});
 diff --git a/packages/coding-agent/test/slash-commands/copy.test.ts b/packages/coding-agent/test/slash-commands/copy.test.ts
+index a4b6d2e..702fb78 100644
 --- a/packages/coding-agent/test/slash-commands/copy.test.ts
 +++ b/packages/coding-agent/test/slash-commands/copy.test.ts
 @@ -110,6 +110,17 @@ describe("/copy slash command", () => {
@@ -3496,8 +3678,9 @@ diff --git a/packages/coding-agent/test/slash-commands/copy.test.ts b/packages/c
  	it("keeps bare /copy on the picker", async () => {
  		const copySpy = spyOn(clipboard, "copyToClipboard").mockResolvedValue(undefined);
  		const harness = createRuntimeHarness([assistantText("answer")]);
-diff --git a/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
+diff --git b/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
 new file mode 100644
+index 0000000..782dbf0
 --- /dev/null
 +++ b/packages/coding-agent/test/termux-notifications.test.ts
 @@ -0,0 +1,500 @@
@@ -4001,8 +4184,9 @@ new file mode 100644
 +		expect(calls).toEqual([["termux-notification-remove", statusId]]);
 +	});
 +});
-diff --git a/packages/coding-agent/test/tools/browser-android-chromium.test.ts b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
+diff --git b/packages/coding-agent/test/tools/browser-android-chromium.test.ts b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
 new file mode 100644
+index 0000000..7720ed1
 --- /dev/null
 +++ b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
 @@ -0,0 +1,151 @@
@@ -4158,6 +4342,7 @@ new file mode 100644
 +	});
 +});
 diff --git a/packages/coding-agent/test/utils/clipboard-osc52.test.ts b/packages/coding-agent/test/utils/clipboard-osc52.test.ts
+index 32b5f21..b4fdc3a 100644
 --- a/packages/coding-agent/test/utils/clipboard-osc52.test.ts
 +++ b/packages/coding-agent/test/utils/clipboard-osc52.test.ts
 @@ -56,6 +56,7 @@ describe("copyToClipboard OSC 52 routing", () => {
@@ -4194,6 +4379,7 @@ diff --git a/packages/coding-agent/test/utils/clipboard-osc52.test.ts b/packages
 +	});
  });
 diff --git a/packages/coding-agent/test/utils/clipboard.test.ts b/packages/coding-agent/test/utils/clipboard.test.ts
+index 581c2bf..4a835ca 100644
 --- a/packages/coding-agent/test/utils/clipboard.test.ts
 +++ b/packages/coding-agent/test/utils/clipboard.test.ts
 @@ -1,5 +1,6 @@
@@ -4332,6 +4518,7 @@ diff --git a/packages/coding-agent/test/utils/clipboard.test.ts b/packages/codin
  	it("returns an empty list on non-darwin platforms without spawning osascript", async () => {
  		setPlatform("linux");
 diff --git a/packages/natives/native/index.js b/packages/natives/native/index.js
+index 8838638..ba3f139 100644
 --- a/packages/natives/native/index.js
 +++ b/packages/natives/native/index.js
 @@ -23,8 +23,12 @@ import { adaptDesktopSession } from "./desktop-adapter.js";
@@ -4383,6 +4570,7 @@ diff --git a/packages/natives/native/index.js b/packages/natives/native/index.js
  export const renderMermaidAscii = nativeBindings.renderMermaidAscii ?? missingNativeExport("renderMermaidAscii");
  export const renderSnapcompactPng = nativeBindings.renderSnapcompactPng ?? missingNativeExport("renderSnapcompactPng");
 diff --git a/packages/natives/native/loader-state.js b/packages/natives/native/loader-state.js
+index d2290bd..8dfba40 100644
 --- a/packages/natives/native/loader-state.js
 +++ b/packages/natives/native/loader-state.js
 @@ -38,6 +38,7 @@ const SUPPORTED_PLATFORMS = [
@@ -4394,6 +4582,7 @@ diff --git a/packages/natives/native/loader-state.js b/packages/natives/native/l
  
  /**
 diff --git a/packages/natives/scripts/gen-enums.ts b/packages/natives/scripts/gen-enums.ts
+index bb1750b..9b6af51 100644
 --- a/packages/natives/scripts/gen-enums.ts
 +++ b/packages/natives/scripts/gen-enums.ts
 @@ -16,9 +16,7 @@
@@ -4482,6 +4671,7 @@ diff --git a/packages/natives/scripts/gen-enums.ts b/packages/natives/scripts/ge
  	const existing = await Bun.file(jsPath).text();
  	const generatedBlock = buildGeneratedBlock(dts);
 diff --git a/packages/natives/test/ipc.test.ts b/packages/natives/test/ipc.test.ts
+index a1919c5..ff2696d 100644
 --- a/packages/natives/test/ipc.test.ts
 +++ b/packages/natives/test/ipc.test.ts
 @@ -223,7 +223,15 @@ describe("native IPC", () => {
@@ -4554,6 +4744,7 @@ diff --git a/packages/natives/test/ipc.test.ts b/packages/natives/test/ipc.test.
  		// Small frames coalesce until the end of the task while large ones may
  		// be written immediately; a 4 MiB frame also overflows the socket
 diff --git a/packages/tui/src/active-terminal.ts b/packages/tui/src/active-terminal.ts
+index 6ef0e4c..9501254 100644
 --- a/packages/tui/src/active-terminal.ts
 +++ b/packages/tui/src/active-terminal.ts
 @@ -67,14 +67,22 @@ export function writeThroughActiveTerminal(data: string): boolean {
@@ -4583,6 +4774,7 @@ diff --git a/packages/tui/src/active-terminal.ts b/packages/tui/src/active-termi
  	}
  }
 diff --git a/packages/tui/src/apps/debug/log-viewer.ts b/packages/tui/src/apps/debug/log-viewer.ts
+index 04e7361..f3d058c 100644
 --- a/packages/tui/src/apps/debug/log-viewer.ts
 +++ b/packages/tui/src/apps/debug/log-viewer.ts
 @@ -1205,15 +1205,19 @@ export class DebugLogViewerComponent implements Component {
@@ -4616,6 +4808,7 @@ diff --git a/packages/tui/src/apps/debug/log-viewer.ts b/packages/tui/src/apps/d
  	}
  }
 diff --git a/packages/tui/src/apps/debug/raw-sse.ts b/packages/tui/src/apps/debug/raw-sse.ts
+index 14e294a..982c574 100644
 --- a/packages/tui/src/apps/debug/raw-sse.ts
 +++ b/packages/tui/src/apps/debug/raw-sse.ts
 @@ -483,17 +483,21 @@ export class RawSseViewerComponent implements Component {
@@ -4653,6 +4846,7 @@ diff --git a/packages/tui/src/apps/debug/raw-sse.ts b/packages/tui/src/apps/debu
  	}
  }
 diff --git a/packages/tui/src/tools/task.ts b/packages/tui/src/tools/task.ts
+index 32c5716..50a714c 100644
 --- a/packages/tui/src/tools/task.ts
 +++ b/packages/tui/src/tools/task.ts
 @@ -2275,6 +2275,8 @@ export interface TaskItem {
