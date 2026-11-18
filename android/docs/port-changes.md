@@ -60,6 +60,39 @@ Current port target: upstream oh-my-pi **18.22.0**, commit
 `a344c4b31a12ca27fc7c426ebf91b2de302f4bca`. `android/versions.env` pins
 Android Bun 1.4.4. The release workflow verifies its SHA-256.
 
+## Queue scope inventory
+
+Measured against the pin, so the split between "port" and "fork feature" stays
+auditable on every refresh:
+
+| layer | files | added | removed | new files |
+|---|---|---|---|---|
+| `01-termux.patch` | 55 | 2468 | 321 | 6 |
+| `02-isolated-revive.patch` | 40 | 4856 | 233 | 7 |
+
+- Port work in patch `01`: 36 files. bionic gaps, dropped native backends,
+  Termux:API surfaces, Android platform gating, IPC relocation, installer and
+  overlay scripts.
+- Fork feature in patch `01`: 7 files (`repoRoot` plumbing, see the section
+  below). Upstream has only the internal resolver and baseline field.
+- Adaptation in patch `01`: 12 files, the async-clipboard contract ripple.
+- Patch `02` is entirely fork feature work: retained workspaces, cold revive,
+  deferred integration, `worktree://`, slot leases. Upstream already has
+  subagent isolation (`task/isolation-runner.ts`, `task/worktree.ts`,
+  `cleanupIsolation`); `02` replaces its run-end teardown and inverts two
+  upstream invariants on purpose: isolated runs stay resumable, and
+  `task/persisted-revive.ts` no longer refuses isolated transcripts.
+
+Two changes ride in the queue without being port work or documented features.
+Treat them as known deviations, not as intended behaviour:
+
+- `internal-urls/agent-protocol.ts` drops the `enableIrc === false` /
+  `isIrcEnabled(settings, taskDepth)` gate, so `agent://` writes no longer
+  require IRC.
+- `task/index.ts` replaces the `("isolated" in params ? … : {})` probe with
+  `params.isolated === true`, so an explicit `isolated: false` no longer
+  reaches the policy or the plan-mode control guard.
+
 ## Transformation catalog (current)
 
 The Android overlay (patch `01`) transforms these files.
