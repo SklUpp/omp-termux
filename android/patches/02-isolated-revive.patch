@@ -6660,7 +6660,7 @@ diff --git a/packages/coding-agent/test/task/workpool.test.ts b/packages/coding-
 diff --git a/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
 --- a/packages/coding-agent/test/termux-notifications.test.ts
 +++ b/packages/coding-agent/test/termux-notifications.test.ts
-@@ -117,26 +117,25 @@ function makeAskSession(overrides: Partial<ToolSession> = {}): ToolSession {
+@@ -114,26 +114,25 @@ function makeAskSession(overrides: Partial<ToolSession> = {}): ToolSession {
  }
  
  function answeredAskDialog() {
@@ -6694,7 +6694,7 @@ diff --git a/packages/coding-agent/test/termux-notifications.test.ts b/packages/
  			editor: async () => undefined,
  			timeoutStartsOnPresentation: false,
  		},
-@@ -144,7 +143,9 @@ function plainAskContext(select: () => Promise<string | undefined>) {
+@@ -141,7 +140,9 @@ function plainAskContext(select: () => Promise<string | undefined>) {
  	} as never;
  }
  

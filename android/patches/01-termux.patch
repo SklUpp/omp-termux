@@ -3143,7 +3143,7 @@ diff --git a/packages/coding-agent/test/termux-notifications.test.ts b/packages/
 new file mode 100644
 --- /dev/null
 +++ b/packages/coding-agent/test/termux-notifications.test.ts
-@@ -0,0 +1,495 @@
+@@ -0,0 +1,500 @@
 +/**
 + * Termux notification wiring: the existing `completion.notify` / `error.notify` /
 + * `ask.notify` gates and the global `PI_NOTIFICATIONS` suppression decide whether
@@ -3242,11 +3242,8 @@ new file mode 100644
 +	});
 +}
 +
-+function makeAgentEndEvent(
-+	messages: AssistantMessage[],
-+	isTerminal = true,
-+): Extract<AgentSessionEvent, { type: "agent_end" }> {
-+	return { type: "agent_end", messages, isTerminal } as Extract<AgentSessionEvent, { type: "agent_end" }>;
++function makeAgentEndEvent(messages: AssistantMessage[]): Extract<AgentSessionEvent, { type: "agent_end" }> {
++	return { type: "agent_end", messages };
 +}
 +
 +function makeAskSession(overrides: Partial<ToolSession> = {}): ToolSession {
@@ -3393,14 +3390,22 @@ new file mode 100644
 +		expect(calls).toHaveLength(0);
 +	});
 +
-+	it("stays silent for normal completions and non-terminal scheduling pauses", () => {
++	it("stays silent for normal completions and scheduling pauses", async () => {
 +		const calls = captureAndroidSpawns();
 +		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 +		cfgErrorNotify.override(settings, "on");
 +		const controller = new EventController(makeContext());
 +
 +		controller.sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
-+		controller.sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("error")], false));
++		// A model loop that stops while the run continues emits `agent_pause`,
++		// never an `agent_end`; an errored pause is still a scheduling pause, so
++		// nothing settled and no error card may fire.
++		await controller.handleEvent({
++			type: "agent_pause",
++			messages: [makeAssistantMessage("error")],
++			yielded: false,
++			awaiting: false,
++		});
 +
 +		expect(calls).toHaveLength(0);
 +	});
