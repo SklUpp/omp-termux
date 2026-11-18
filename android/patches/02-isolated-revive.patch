@@ -2000,27 +2000,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  		batchEnabled: options.batchEnabled,
  		effortEnabled: options.effortEnabled,
  		perCallModelEnabled: options.perCallModelEnabled,
-@@ -357,7 +360,6 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
- 	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task };
- 	if (params.steps !== undefined) item.steps = params.steps;
- 	if ("solutionSpace" in params) item.solutionSpace = params.solutionSpace;
--	if ("repoRoot" in params) item.repoRoot = params.repoRoot;
- 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
- 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
- 	if ("tools" in params) item.tools = params.tools;
-@@ -382,11 +384,6 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
- 	if (item.task !== undefined) spawn.task = item.task;
- 	if (item.steps !== undefined) spawn.steps = item.steps;
- 	if (item.solutionSpace !== undefined) spawn.solutionSpace = item.solutionSpace;
--	if (item.repoRoot !== undefined) {
--		spawn.repoRoot = item.repoRoot;
--	} else if (params.repoRoot !== undefined) {
--		spawn.repoRoot = params.repoRoot;
--	}
- 	if (params.context !== undefined) spawn.context = params.context;
- 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
- 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
-@@ -865,6 +862,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -865,6 +868,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  			sessionAgents,
  			isolationEnabled: !planMode && isolationEnabled,
  			applyIsolatedChanges: cfgTaskIsolationApply.get(this.session.settings),
@@ -2028,16 +2008,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  			disabledAgents,
  			batchEnabled: this.#isBatchEnabled(),
  			effortEnabled: cfgTaskEnableEffort.get(this.session.settings),
-@@ -1016,7 +1014,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
- 			...spawnModelFields(params),
- 			...this.#resultParams(params),
- 			...this.#effortParams(params),
--			...(params.isolated === true ? { isolation: { requested: true, repoRoot: params.repoRoot } } : {}),
-+			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
- 			blockedAgent: this.#blockedAgent,
- 			enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
- 			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
-@@ -1103,7 +1101,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1103,7 +1107,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  				try {
  					return { policy: await this.#resolveSpawnPreflight(spawn) };
  				} catch (error) {
@@ -2048,7 +2019,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  				}
  			}),
  		);
-@@ -1505,11 +1505,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1505,11 +1511,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  		// its widget has no tool tap to read.
  		let spawnRun: SpawnRun | undefined = run;
  		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
@@ -2064,7 +2035,7 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  			const isolated = spawnParams.isolated === true;
  			const ref = aborted ? AgentRegistry.global().get(agentId) : undefined;
  			return `\n\n${prompt.render(taskFollowUpTemplate, {
-@@ -1517,7 +1516,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1517,7 +1522,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  				aborted,
  				isolated,
  				ircEnabled,
@@ -2074,15 +2045,6 @@ diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src
  				transcriptAvailable: aborted ? await hasResolvableTranscript(agentId) : true,
  			})}`;
  		};
-@@ -1891,7 +1891,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
- 				...(onArtifactsRetained ? { onArtifactsRetained } : {}),
- 				invokedAt: launchTiming?.invokedAt,
- 				acquiredAt: launchTiming?.acquiredAt,
--				...(params.isolated === true ? { isolation: { requested: true, repoRoot: params.repoRoot } } : {}),
-+				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
- 				blockedAgent: this.#blockedAgent,
- 				enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
- 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 diff --git a/packages/coding-agent/src/task/isolation-ownership.ts b/packages/coding-agent/src/task/isolation-ownership.ts
 --- a/packages/coding-agent/src/task/isolation-ownership.ts
 +++ b/packages/coding-agent/src/task/isolation-ownership.ts
@@ -2318,17 +2280,6 @@ diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/codin
  }
  
  /**
-@@ -145,8 +162,8 @@ export interface IsolationContext {
-  * the error as a task-tool failure. Each spawn captures its own baseline from
-  * its isolation copy (see {@link captureIsolationBaseline}).
-  */
--export async function prepareIsolationContext(cwd: string, explicitRepoRoot?: string): Promise<IsolationContext> {
--	return { repoRoot: await getRepoRoot(cwd, explicitRepoRoot) };
-+export async function prepareIsolationContext(cwd: string): Promise<IsolationContext> {
-+	return { repoRoot: await getRepoRoot(cwd) };
- }
- 
- /** Fingerprint of a captured delta, used to skip re-committing an unchanged workspace on release. */
 @@ -198,6 +215,15 @@ export interface IsolatedRunOptions {
  	agentId: string;
  	/** Merge mode driving how changes are captured ("branch" commits, "patch" diffs). */
@@ -3069,19 +3020,16 @@ diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/co
  	cfgTaskIsolationEnabled,
  	cfgTaskIsolationMerge,
  	cfgTaskMaxRecursionDepth,
-@@ -113,7 +114,6 @@ export interface StructuredSubagentIsolationControls {
+@@ -113,6 +114,7 @@ export interface StructuredSubagentIsolationControls {
  	requested?: boolean;
  	merge?: "patch" | "branch";
  	apply?: boolean;
--	repoRoot?: string;
++	/** Git root the isolated workspace is copied from; relative to the session cwd. */
+ 	repoRoot?: string;
  }
  
- /** Identity and presentation metadata supplied by the calling surface. */
-@@ -225,9 +225,13 @@ export interface EffectiveSubagentPolicy {
- 	schema: StructuredSubagentSchemaResolution;
- 	planMode: boolean;
- 	isIsolated: boolean;
--	repoRoot?: string;
+@@ -228,6 +230,11 @@ export interface EffectiveSubagentPolicy {
+ 	repoRoot?: string;
  	mergeMode: "patch" | "branch";
  	applyChanges: boolean;
 +	/** Keep a successful run's changes in its workspace until the parent sends `/integrate`. */
@@ -3092,19 +3040,7 @@ diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/co
  	enableLsp: boolean;
  	enableIrc: boolean;
  	/** Caller `effort` hint to apply; dropped when the agent's level comes from the user's `^model:level` tag. */
-@@ -324,10 +328,7 @@ function assertPlanControlsAllowed(request: StructuredSubagentRequest, planMode:
- 	const isolation = request.isolation;
- 	if (
- 		isolation &&
--		(Object.hasOwn(isolation, "requested") ||
--			Object.hasOwn(isolation, "apply") ||
--			Object.hasOwn(isolation, "merge") ||
--			(isolation.requested === true && Object.hasOwn(isolation, "repoRoot")))
-+		(Object.hasOwn(isolation, "requested") || Object.hasOwn(isolation, "apply") || Object.hasOwn(isolation, "merge"))
- 	) {
- 		throw new StructuredSubagentError(
- 			"preflight",
-@@ -618,6 +619,24 @@ export async function resolveEffectiveSubagentPolicy(
+@@ -618,6 +625,24 @@ export async function resolveEffectiveSubagentPolicy(
  			"Subagent isolated execution requires task.isolation.enabled; it is currently false.",
  		);
  	}
@@ -3129,11 +3065,9 @@ diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/co
  	return {
  		discovery,
  		agentName,
-@@ -634,11 +653,10 @@ export async function resolveEffectiveSubagentPolicy(
- 		schema,
- 		planMode,
+@@ -636,9 +661,9 @@ export async function resolveEffectiveSubagentPolicy(
  		isIsolated,
--		repoRoot: isIsolated ? request.isolation?.repoRoot : undefined,
+ 		repoRoot: isIsolated ? request.isolation?.repoRoot : undefined,
  		mergeMode: request.isolation?.merge ?? cfgTaskIsolationMerge.get(request.session.settings),
 -		applyChanges:
 -			request.isolation?.apply ??
@@ -3144,7 +3078,7 @@ diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/co
  		enableLsp:
  			!planMode &&
  			(request.enableLsp ?? ((request.session.enableLsp ?? true) && cfgTaskEnableLsp.get(request.session.settings))),
-@@ -945,6 +963,23 @@ function describeCapturedChanges(result: SingleResult): string {
+@@ -945,6 +970,23 @@ function describeCapturedChanges(result: SingleResult): string {
  	});
  }
  
@@ -3168,16 +3102,7 @@ diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/co
  function attachStructuredOutputMetadata(result: SingleResult, schema: StructuredSubagentSchemaResolution): void {
  	if (schema.source === "none") {
  		delete result.structuredOutput;
-@@ -1028,7 +1063,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
- 		let isolationContext: IsolationContext | null = null;
- 		if (policy.isIsolated) {
- 			try {
--				isolationContext = await prepareIsolationContext(request.session.cwd, policy.repoRoot);
-+				isolationContext = await prepareIsolationContext(request.session.cwd);
- 			} catch (error) {
- 				const message = error instanceof Error ? error.message : String(error);
- 				throw new StructuredSubagentError(
-@@ -1060,6 +1095,9 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
+@@ -1060,6 +1102,9 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
  					openWorkspace: openIsolatedWorkspace(request.session.settings),
  					agentId: id,
  					mergeMode: policy.mergeMode,
@@ -3187,7 +3112,7 @@ diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/co
  					artifactsDir: lease.artifactsDir,
  					description: trimToUndefined(request.identity?.label),
  					buildCommitMessage: makeIsolationCommitMessage(request.session),
-@@ -1082,6 +1120,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
+@@ -1082,6 +1127,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
  			policy.isIsolated &&
  			isolationContext &&
  			policy.applyChanges &&
@@ -3195,7 +3120,7 @@ diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/co
  			result.exitCode === 0 &&
  			!result.error &&
  			!result.aborted
-@@ -1121,6 +1160,16 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
+@@ -1121,6 +1167,16 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
  			});
  		} else if (policy.isIsolated && isolationContext && !policy.applyChanges) {
  			mergeSummary = describeCapturedChanges(result);
@@ -3212,7 +3137,7 @@ diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/co
  		}
  
  		completedSuccessfully = result.exitCode === 0 && !result.error && !result.aborted;
-@@ -1147,7 +1196,8 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
+@@ -1147,7 +1203,8 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
  			request.detached === true ||
  			retainSalvagedArtifact ||
  			(request.retainArtifacts && (completedSuccessfully || hasValidStructuredOutput)) ||
@@ -3332,47 +3257,7 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
  import { mapWithConcurrencyLimit } from "./parallel";
  import type { cfgIsolationBackend } from "./settings";
  
-@@ -48,35 +57,18 @@ export interface WorktreeBaseline {
- 	nested: Array<{ relativePath: string; baseline: RepoBaseline }>;
- }
- 
--export async function getRepoRoot(cwd: string, explicitRepoRoot?: string): Promise<string> {
--	const targetPath = explicitRepoRoot ? path.resolve(cwd, explicitRepoRoot) : cwd;
-+export async function getRepoRoot(cwd: string): Promise<string> {
- 	// Pure-jj check runs first so a jj workspace nested under an unrelated
- 	// outer Git checkout is rejected at its own root rather than silently
- 	// mutating the surrounding Git tree behind jj's back.
--	if (vcs.isPureJj(targetPath)) {
-+	if (vcs.isPureJj(cwd)) {
- 		throw new Error(
- 			"Isolated task execution requires a Git checkout, but this workspace is pure Jujutsu (`.jj/` without a colocated `.git/`). Run `jj git init --colocate` to add a Git checkout, or set `task.isolation.enabled: false` to disable task isolation.",
- 		);
- 	}
- 
--	const repoInfo = vcs.git(targetPath)?.info();
--	const resolvedRoot = repoInfo?.repoRoot;
--	if (resolvedRoot) {
--		if (explicitRepoRoot) {
--			const canonicalTarget = path.resolve(targetPath);
--			const canonicalResolved = path.resolve(resolvedRoot);
--			if (canonicalTarget !== canonicalResolved && !canonicalTarget.startsWith(canonicalResolved + path.sep)) {
--				throw new Error(
--					`Explicit repoRoot '${explicitRepoRoot}' does not match resolved git repository '${resolvedRoot}'.`,
--				);
--			}
--		}
--		return resolvedRoot;
--	}
--
--	if (explicitRepoRoot) {
--		throw new Error(`Explicit repoRoot '${explicitRepoRoot}' is not a valid Git repository.`);
--	}
-+	const repoRoot = vcs.git(cwd)?.info().repoRoot;
-+	if (repoRoot) return repoRoot;
- 
- 	throw new Error("Git repository not found for isolated task execution.");
- }
-@@ -250,7 +242,10 @@ async function captureRepoBaseline(repoRoot: string, budgetBytes: number): Promi
+@@ -250,7 +259,10 @@ async function captureRepoBaseline(repoRoot: string, budgetBytes: number): Promi
  		// The renderer's cap and the budget are UTF-8 bytes; a render that
  		// succeeded is at most `budgetBytes` of them, so the remainder is never
  		// negative.
@@ -3384,7 +3269,7 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
  	} catch (error) {
  		if (vcs.isVcsError(error) && error.code === "OutputTooLarge") {
  			throw new IsolationBaselineTooLargeError(repoRoot, undefined, budgetBytes);
-@@ -597,15 +592,34 @@ function errorMessage(err: unknown): string {
+@@ -597,15 +609,34 @@ function errorMessage(err: unknown): string {
  	return err instanceof Error ? err.message : String(err);
  }
  
@@ -3422,14 +3307,9 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
  }
  
  /**
-@@ -650,55 +664,86 @@ export async function ensureIsolation(
- 	baseCwd: string,
- 	id: string,
- 	preferred?: IsoBackendKind,
--	explicitRepoRoot?: string,
+@@ -654,51 +685,83 @@ export async function ensureIsolation(
  ): Promise<IsolationHandle> {
--	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
-+	const repoRoot = await getRepoRoot(baseCwd);
+ 	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
  	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
 -	const baseDir = taskIsolationBaseDir(repoRoot, id);
 +	const slot = getTaskIsolationSlot(repoRoot, id);
@@ -3491,8 +3371,7 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
 +				throw new Error(
 +					`isolation workspace ${baseDir} is owned by a live omp process; finish or release it there before spawning this agent again`,
 +				);
- 			}
--			fallbackReason ??= message;
++			}
 +			const resolution = await natives.isoResolve(preferred ?? null);
 +			const candidates = resolution.candidates.length > 0 ? resolution.candidates : [resolution.kind];
 +			let fallbackReason = resolution.reason ?? null;
@@ -3531,7 +3410,8 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
 +					}
 +					fallbackReason ??= message;
 +				}
-+			}
+ 			}
+-			fallbackReason ??= message;
 +
 +			throw new Error(fallbackReason ?? "No isolation backend is available.");
 +		});
@@ -3551,7 +3431,7 @@ diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/
  /**
   * Tear down a handle returned by {@link ensureIsolation}. When native teardown fails for a mount or
   * subvolume backend, the workspace is kept with a retained-backend sidecar (recursive `rm` would
-@@ -731,6 +776,633 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
+@@ -731,6 +794,633 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
  	await fs.rm(baseDir, { recursive: true, force: true });
  }
  
@@ -4594,7 +4474,7 @@ diff --git a/packages/coding-agent/test/task/deferred-integration.test.ts b/pack
 new file mode 100644
 --- /dev/null
 +++ b/packages/coding-agent/test/task/deferred-integration.test.ts
-@@ -0,0 +1,552 @@
+@@ -0,0 +1,556 @@
 +import { afterEach, describe, expect, it, vi } from "bun:test";
 +import * as fs from "node:fs/promises";
 +import * as os from "node:os";
@@ -4786,6 +4666,10 @@ new file mode 100644
 +			hasRootChanges: options.hasRootChanges ?? false,
 +			nestedPatches: options.nestedPatches ?? [],
 +			nestedPatchPaths: [],
++		},
++		delta: {
++			rootPatch: "diff --git a/work.txt b/work.txt",
++			nestedPatches: [],
 +		},
 +		fingerprint: 1,
 +	};
@@ -6769,6 +6653,54 @@ diff --git a/packages/coding-agent/test/task/workpool.test.ts b/packages/coding-
  } satisfies EffectiveSubagentPolicy;
  
  const managers = new Set<AsyncJobManager>();
+diff --git a/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
+--- a/packages/coding-agent/test/termux-notifications.test.ts
++++ b/packages/coding-agent/test/termux-notifications.test.ts
+@@ -117,26 +117,25 @@ function makeAskSession(overrides: Partial<ToolSession> = {}): ToolSession {
+ }
+ 
+ function answeredAskDialog() {
+-	return vi.fn().mockResolvedValue({
+-		kind: "submit",
+-		results: [{ id: "q1", question: "Proceed?", selectedOptions: ["Yes"] }],
+-	});
++	return vi.fn().mockResolvedValue({ data: { answer: "Yes" } });
+ }
+ 
++/** Rich surface: the form dialog submits the control values it collected. */
+ function askContext(dialog: ReturnType<typeof answeredAskDialog>) {
+ 	return {
+ 		hasUI: true,
+-		ui: { askDialog: dialog },
++		ui: { formDialog: dialog },
+ 		abort: vi.fn(),
+ 	} as never;
+ }
+ 
+-/** Non-rich UI surface: `askDialog` is absent, like an RPC host without set_ask_dialog. */
+-function plainAskContext(select: () => Promise<string | undefined>) {
++/** Non-rich UI surface: `formDialog` is absent, so the tool walks the form field by field. */
++function plainAskContext(answer: () => Promise<string | undefined>) {
+ 	return {
+ 		hasUI: true,
+ 		ui: {
+-			select,
++			input: answer,
++			select: answer,
+ 			editor: async () => undefined,
+ 			timeoutStartsOnPresentation: false,
+ 		},
+@@ -144,7 +143,9 @@ function plainAskContext(select: () => Promise<string | undefined>) {
+ 	} as never;
+ }
+ 
+-const ASK_PARAMS = { questions: [{ id: "q1", question: "Proceed?", options: [{ label: "Yes" }] }] };
++/** One named text control: the form contract both the dialog and the fallback walk. */
++const ASK_HTML = '<form><label for="answer">Proceed?</label><input id="answer" name="answer" type="text" /></form>';
++const ASK_PARAMS = { html: ASK_HTML };
+ 
+ describe("Termux notifications: completion", () => {
+ 	it("posts one Android notification when completion.notify is on", () => {
 diff --git a/packages/tui/src/overlays/agent-hub-types.ts b/packages/tui/src/overlays/agent-hub-types.ts
 --- a/packages/tui/src/overlays/agent-hub-types.ts
 +++ b/packages/tui/src/overlays/agent-hub-types.ts
@@ -6784,25 +6716,7 @@ diff --git a/packages/tui/src/overlays/agent-hub-types.ts b/packages/tui/src/ove
 diff --git a/packages/tui/src/tools/task.ts b/packages/tui/src/tools/task.ts
 --- a/packages/tui/src/tools/task.ts
 +++ b/packages/tui/src/tools/task.ts
-@@ -2275,8 +2275,6 @@ export interface TaskItem {
- 	tools?: string[];
- 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
- 	isolated?: boolean;
--	/** Optional explicit git repository root for task isolation. */
--	repoRoot?: string;
- }
- 
- /**
-@@ -2312,8 +2310,6 @@ export interface TaskParams {
- 	context?: string;
- 	/** Run in an isolated worktree (flat form; per-item in batch form). */
- 	isolated?: boolean;
--	/** Explicit repository root (flat form or batch context override). */
--	repoRoot?: string;
- }
- 
- /**
-@@ -2538,9 +2534,10 @@ export interface SingleResult {
+@@ -2538,9 +2538,10 @@ export interface SingleResult {
  	/** Output path for the task result */
  	outputPath?: string;
  	/**
