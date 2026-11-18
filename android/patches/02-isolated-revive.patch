@@ -3150,50 +3150,19 @@ diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/co
 diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src/task/types.ts
 --- a/packages/coding-agent/src/task/types.ts
 +++ b/packages/coding-agent/src/task/types.ts
-@@ -67,7 +67,6 @@ export const taskItemSchema = type({
- 	agent: "string = 'task'",
- 	task: "string",
- 	solutionSpace: "string",
--	"repoRoot?": "string",
- 	"outputSchema?": outputSchemaInputSchema,
- 	"schemaMode?": '"permissive" | "strict"',
- 	"tools?": "string[]",
-@@ -78,7 +77,6 @@ const taskItemSchemaIsolated = type({
- 	agent: "string = 'task'",
- 	task: "string",
- 	solutionSpace: "string",
--	"repoRoot?": "string",
- 	"outputSchema?": outputSchemaInputSchema,
- 	"schemaMode?": '"permissive" | "strict"',
- 	"tools?": "string[]",
-@@ -91,7 +89,6 @@ export const taskSchema = type({
- 	agent: "string = 'task'",
- 	task: "string",
- 	solutionSpace: "string",
--	"repoRoot?": "string",
- 	"outputSchema?": outputSchemaInputSchema,
- 	"schemaMode?": '"permissive" | "strict"',
- 	"tools?": "string[]",
-@@ -103,7 +100,6 @@ const taskSchemaNoIsolation = type({
- 	agent: "string = 'task'",
- 	task: "string",
- 	solutionSpace: "string",
--	"repoRoot?": "string",
- 	"outputSchema?": outputSchemaInputSchema,
- 	"schemaMode?": '"permissive" | "strict"',
- 	"tools?": "string[]",
-@@ -165,6 +161,10 @@ function createTaskSchema(options: {
+@@ -165,6 +165,11 @@ function createTaskSchema(options: {
  }): BaseType {
  	const agent = taskAgentSchemaRule(options.defaultAgent);
  	const taskFields = options.steps ? { steps: "string[]" } : { task: "string" };
-+	// Accepted even without isolation (it is simply unused there), matching the
-+	// static schemas; dropping it here erased the explicit root whenever a
-+	// non-default option (task.file, structured, …) selected this builder.
++	// Declared by every return, isolated or not (unused without isolation), to
++	// match the static schemas above: `"+": "delete"` drops any field the shape
++	// omits, so omitting it here erased an explicit root whenever a non-default
++	// option (task.file, structured, …) selected this builder.
 +	const repoRootField = { "repoRoot?": "string" };
  	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
  	const schemaFields = options.structured
  		? { "outputSchema?": outputSchemaInputSchema, "schemaMode?": '"permissive" | "strict"' }
-@@ -181,6 +181,7 @@ function createTaskSchema(options: {
+@@ -181,6 +186,7 @@ function createTaskSchema(options: {
  				"name?": "string",
  				agent,
  				...taskFields,
@@ -3201,7 +3170,7 @@ diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src
  				solutionSpace: "string",
  				...effortField,
  				...schemaFields,
-@@ -201,6 +202,7 @@ function createTaskSchema(options: {
+@@ -201,6 +207,7 @@ function createTaskSchema(options: {
  			"name?": "string",
  			agent,
  			...taskFields,
@@ -3209,7 +3178,7 @@ diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src
  			solutionSpace: "string",
  			...effortField,
  			...schemaFields,
-@@ -221,6 +223,7 @@ function createTaskSchema(options: {
+@@ -221,6 +228,7 @@ function createTaskSchema(options: {
  			"name?": "string",
  			agent,
  			...taskFields,
@@ -3217,7 +3186,7 @@ diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src
  			solutionSpace: "string",
  			...effortField,
  			...schemaFields,
-@@ -234,6 +237,7 @@ function createTaskSchema(options: {
+@@ -234,6 +242,7 @@ function createTaskSchema(options: {
  		"name?": "string",
  		agent,
  		...taskFields,
@@ -6595,7 +6564,7 @@ diff --git a/packages/coding-agent/test/task/result-summary.test.ts b/packages/c
 diff --git a/packages/coding-agent/test/task/task-schema.test.ts b/packages/coding-agent/test/task/task-schema.test.ts
 --- a/packages/coding-agent/test/task/task-schema.test.ts
 +++ b/packages/coding-agent/test/task/task-schema.test.ts
-@@ -58,6 +58,30 @@ describe("task schema (single-spawn)", () => {
+@@ -58,6 +58,65 @@ describe("task schema (single-spawn)", () => {
  		}
  	});
  
@@ -6620,6 +6589,41 @@ diff --git a/packages/coding-agent/test/task/task-schema.test.ts b/packages/codi
 +			if (parsed instanceof type.errors) throw new Error(parsed.summary);
 +			const parsedItem = batchEnabled ? (parsed as { tasks: unknown[] }).tasks[0] : parsed;
 +			expect(parsedItem).toMatchObject({ repoRoot: "/repo/override" });
++		}
++	});
++
++	it.each([false, true])("declares repoRoot in the static and builder task schemas (batch=%s)", batchEnabled => {
++		// `structured: true` (the default) publishes this wire shape to the model
++		// and the exported `taskSchema` parses directly, so the static schemas and
++		// `createTaskSchema` must agree: a static shape that hid repoRoot while the
++		// builder declared it left the documented parameter unadvertised, and the
++		// `"+": "delete"` path silently stripped it from a direct parse.
++		for (const isolationEnabled of [false, true]) {
++			// Default options select a static schema; `effortEnabled` forces the builder.
++			for (const builder of [false, true]) {
++				const schema = getTaskSchema({
++					batchEnabled,
++					isolationEnabled,
++					...(builder ? { effortEnabled: true } : {}),
++				});
++				const wire = schema.toJsonSchema();
++				const properties = isRecord(wire.properties) ? wire.properties : undefined;
++				const tasks = properties && isRecord(properties.tasks) ? properties.tasks : undefined;
++				const itemWire = batchEnabled && tasks ? tasks.items : wire;
++				if (!isRecord(itemWire) || !isRecord(itemWire.properties)) {
++					throw new Error("Expected an object schema for the task input");
++				}
++				expect(itemWire.properties.repoRoot).toEqual({ type: "string" });
++				const item = {
++					task: "Re-root the spawn",
++					solutionSpace: "one defined change",
++					repoRoot: "/repo/override",
++				};
++				const parsed = schema(batchEnabled ? { context: "shared context", tasks: [item] } : item);
++				if (parsed instanceof type.errors) throw new Error(parsed.summary);
++				const batchItems = batchEnabled && isRecord(parsed) ? parsed.tasks : undefined;
++				expect(Array.isArray(batchItems) ? batchItems[0] : parsed).toMatchObject({ repoRoot: "/repo/override" });
++			}
 +		}
 +	});
 +
