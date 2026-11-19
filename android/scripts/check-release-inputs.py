@@ -113,6 +113,20 @@ def main():
     manifest_entries = read_manifest(manifest_path)
     if not manifest_entries:
         sys.exit(f"error: no patches listed in {manifest_name}")
+    # The pin has one authoritative source; the tracked copy must never drift
+    # from it, or two queues silently build against different upstreams.
+    pin_path = root / "android" / "UPSTREAM_COMMIT"
+    tracked_path = root / "android" / "UPSTREAM_TRACKED"
+    if pin_path.is_file() and tracked_path.is_file():
+        pin = pin_path.read_text(encoding="utf-8").strip()
+        tracked = tracked_path.read_text(encoding="utf-8").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", pin):
+            sys.exit(f"error: UPSTREAM_COMMIT is not a full commit sha: {pin!r}")
+        if pin != tracked:
+            sys.exit(
+                "error: UPSTREAM_COMMIT and UPSTREAM_TRACKED disagree "
+                f"({pin} != {tracked}); the patches are generated against UPSTREAM_COMMIT"
+            )
     if len(manifest_entries) != len(set(manifest_entries)):
         sys.exit(f"error: duplicate patch entries in {manifest_name}")
     if profile == "extended":
