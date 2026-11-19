@@ -81,6 +81,23 @@ fi
 printf '01-one.patch\n' > "$root/repo/android/patches/MANIFEST.standard"
 pass 'standard profile rejects 9x feature patch entries'
 
+cat > "$root/repo/android/patches/05-extra.patch" <<'PATCH'
+diff --git a/three.txt b/three.txt
+new file mode 100644
+index 0000000..f2e9d4a
+--- /dev/null
++++ b/three.txt
+@@ -0,0 +1 @@
++three
+PATCH
+printf '01-one.patch\n05-extra.patch\n' > "$root/repo/android/patches/MANIFEST.standard"
+if (cd "$root/repo" && OMP_PATCH_PROFILE=standard bash android/scripts/apply-patches.sh >/dev/null 2>&1); then
+	fail 'standard profile accepted a patch absent from MANIFEST'
+fi
+printf '01-one.patch\n' > "$root/repo/android/patches/MANIFEST.standard"
+pass 'standard profile rejects entries absent from MANIFEST'
+rm -f "$root/repo/android/patches/05-extra.patch"
+
 # check-release-inputs.py profile/tag validation in a minimal release root.
 release="$root/release"
 mkdir -p "$release/android/scripts" "$release/android/patches" "$release/packages/natives/native"
@@ -117,6 +134,11 @@ printf '01-one.patch\n90-feature.patch\n' > "$release/android/patches/MANIFEST.s
 check standard v18.16.0-termux fail
 printf '01-one.patch\n' > "$release/android/patches/MANIFEST.standard"
 pass 'release-input rejects 9x feature patches in standard manifest'
+
+: > "$release/android/patches/MANIFEST.standard"
+check standard v18.16.0-termux fail
+printf '01-one.patch\n' > "$release/android/patches/MANIFEST.standard"
+pass 'release-input rejects an empty standard manifest'
 
 check_no_variant() { # profile tag expected
 	local profile=$1 tag=$2 want=$3

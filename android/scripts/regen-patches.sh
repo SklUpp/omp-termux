@@ -52,8 +52,11 @@ tar -C "$tmp/a" -cf - . | tar -C "$tmp/b" -xf -
 for name in "${port_patches[@]}"; do
 	git -C "$tmp/b" apply --whitespace=nowarn "$PATCH_DIR/$name"
 done
-# The feature patch must still apply on the regenerated port result.
-git -C "$tmp/b" apply --check --whitespace=nowarn "$PATCH_DIR/$feature_patch"
+# The feature patch is outside this generator. A stale 9x patch is a warning,
+# not an abort: the standard slices are still valid and the file stays as is.
+if ! git -C "$tmp/b" apply --check --whitespace=nowarn "$PATCH_DIR/$feature_patch"; then
+	echo "warning: $feature_patch does not apply to the regenerated port result; leaving it untouched" >&2
+fi
 
 gen() { # name pathspec...
 	local name=$1
@@ -63,8 +66,7 @@ gen() { # name pathspec...
 		echo "error: generated $name is empty; pathspec no longer matches the port" >&2
 		exit 1
 	fi
-	cp "$tmp/out/$name" "$PATCH_DIR/$name"
-	echo "Generated $name ($(grep -c '^diff --git' "$PATCH_DIR/$name") files)"
+	echo "Staged $name ($(grep -c '^diff --git' "$tmp/out/$name") files)"
 }
 
 gen 01-bionic-rust.patch \
@@ -106,7 +108,22 @@ gen 04-repo-root.patch \
 	packages/tui/src/tools/task.ts \
 	packages/coding-agent/test/repo-root-isolation.test.ts
 
-cat > "$PATCH_DIR/MANIFEST" <<'EOF'
+# Completeness gate: the staged slices must reproduce the port tree exactly.
+# A file dropped from every pathspec (rename, new path, typo) changes the tree
+# and fails here before anything is written.
+verify="$tmp/verify"
+mkdir -p "$verify"
+tar -C "$tmp/a" -cf - . | tar -C "$verify" -xf -
+for name in "${port_patches[@]}"; do
+	git -C "$verify" apply --whitespace=nowarn "$tmp/out/$name"
+done
+if ! git diff --no-index --quiet "$verify" "$tmp/b"; then
+	echo "error: regenerated slices do not reproduce the port result; nothing written" >&2
+	git diff --no-index --stat "$verify" "$tmp/b" >&2 || true
+	exit 1
+fi
+
+cat > "$tmp/out/MANIFEST" <<'EOF'
 # Active patch order: clean upstream -> 01..04 port slices -> 9x fork features
 # Entries whose base name starts with 9 are fork features and are excluded
 # from MANIFEST.standard.
@@ -118,7 +135,7 @@ cat > "$PATCH_DIR/MANIFEST" <<'EOF'
 90-isolation-retained.patch
 EOF
 
-cat > "$PATCH_DIR/MANIFEST.standard" <<'EOF'
+cat > "$tmp/out/MANIFEST.standard" <<'EOF'
 # Standard patch order: clean upstream -> 01..04 port slices
 # Must not list 9x fork feature patches; extended queue is MANIFEST.
 # This manifest is validated by android/scripts/apply-patches.sh
@@ -127,6 +144,11 @@ cat > "$PATCH_DIR/MANIFEST.standard" <<'EOF'
 03-termux-api.patch
 04-repo-root.patch
 EOF
+
+# Publish last: generation and verification failures leave the queue intact.
+for name in "${port_patches[@]}" MANIFEST MANIFEST.standard; do
+	mv "$tmp/out/$name" "$PATCH_DIR/$name"
+done
 
 echo "Manifests updated; $feature_patch left untouched."
 echo "All port slices regenerated successfully."

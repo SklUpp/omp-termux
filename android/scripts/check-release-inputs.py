@@ -111,6 +111,8 @@ def main():
         ]
 
     manifest_entries = read_manifest(manifest_path)
+    if not manifest_entries:
+        sys.exit(f"error: no patches listed in {manifest_name}")
     if len(manifest_entries) != len(set(manifest_entries)):
         sys.exit(f"error: duplicate patch entries in {manifest_name}")
     if profile == "extended":
