@@ -1,4 +1,7 @@
-# Standard patch order: clean upstream -> 01-termux
-# Extended queue is MANIFEST (01-termux -> 02-isolated-revive).
+# Standard patch order: clean upstream -> 01..04 port slices
+# Must not list 9x fork feature patches; extended queue is MANIFEST.
 # This manifest is validated by android/scripts/apply-patches.sh
-01-termux.patch
+01-bionic-rust.patch
+02-native-ipc.patch
+03-termux-api.patch
+04-repo-root.patch

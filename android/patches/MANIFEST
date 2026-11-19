@@ -1,4 +1,9 @@
-# Active patch order: clean upstream -> 01-termux -> 02-isolated-revive
+# Active patch order: clean upstream -> 01..04 port slices -> 9x fork features
+# Entries whose base name starts with 9 are fork features and are excluded
+# from MANIFEST.standard.
 # This manifest is validated by android/scripts/apply-patches.sh
-01-termux.patch
-02-isolated-revive.patch
+01-bionic-rust.patch
+02-native-ipc.patch
+03-termux-api.patch
+04-repo-root.patch
+90-isolation-retained.patch

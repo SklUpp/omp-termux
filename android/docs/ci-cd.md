@@ -34,8 +34,8 @@ Manifest fields:
 1. `sync-upstream.yml` tracks `main` in `can1357/oh-my-pi`.
 2. `port-patches.yml` applies the sequential raw Git patch queue.
 3. CI validates the patch queue, the release inputs, and the frozen lockfile.
-4. `release-tree` builds two variants independently: standard (`01`) and
-   extended (`01+02`). Standard publishes `mod`. Each variant creates its
+4. `release-tree` builds two variants independently: standard (`01`..`04`) and
+   extended (`01`..`04`+`90`). Standard publishes `mod`. Each variant creates its
    immutable tag (`v<ver>-termux[-ex]`) and dispatches `android-release.yml`.
    A failed extended build does not block the standard build.
 5. `android-release.yml` runs repository checks, Android overlay checks, the

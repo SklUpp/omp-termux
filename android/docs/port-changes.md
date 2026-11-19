@@ -38,23 +38,19 @@ There is **one** delivery mechanism: the sequential raw Git patch queue.
 
 `android/scripts/apply-patches.sh` selects `OMP_PATCH_PROFILE=standard` or
 `extended` (default `extended`). It validates the matching manifest
-(`MANIFEST.standard` = 01 only, `MANIFEST` = 01+02). It checks each patch with
-`git apply --check`, then applies patches in manifest order. It also accepts a
-tree that already has the patches.
+(`MANIFEST.standard` = 01..04, `MANIFEST` = 01..04+90). It checks each patch
+with `git apply --check`, then applies patches in manifest order. It also
+accepts a tree that already has the patches.
 
 When upstream changes, the queue is ported by per-file three-way merge against
 the new upstream tip: merge upstream into the patched tree, resolve each
 conflict by keeping the upstream refactor and re-expressing the Android delta,
-then emit `git diff <upstream> <layer1>` and `git diff <layer1> <layer2>`.
-`android/scripts/regen-patches.sh` is the older whole-file-copy generator and
-now refuses to run without `OMP_REGEN_LEGACY=1`; do not use it. The sync
-workflow applies the queue in CI. Release workflows apply it again,
-idempotently, after they check out the immutable release tag.
-
-Patch `01` also carries two formatter-only hunks
-(`test/interactive-click-focus.test.ts` and `packages/tui/src/tui.ts`). This
-keeps the upstream formatter check green. A separate patch fights the queue on
-every regen.
+then regenerate the four port slices independently by pathspec from the same
+clean pin. `android/scripts/regen-patches.sh` rebuilds those slices against
+`android/UPSTREAM_COMMIT` and leaves `90-isolation-retained.patch` untouched
+because its hunks are written against the port result. The sync workflow
+applies the queue in CI. Release workflows apply it again, idempotently, after
+they check out the immutable release tag.
 
 Current port target: upstream oh-my-pi **18.22.0**, commit
 `a344c4b31a12ca27fc7c426ebf91b2de302f4bca`. `android/versions.env` pins
@@ -67,19 +63,21 @@ auditable on every refresh:
 
 | layer | files | added | removed | new files |
 |---|---|---|---|---|
-| `01-termux.patch` | 55 | 2468 | 321 | 6 |
-| `02-isolated-revive.patch` | 40 | 4856 | 233 | 7 |
+| `01-bionic-rust.patch` | 26 | 508 | 178 | 0 |
+| `02-native-ipc.patch` | 7 | 549 | 38 | 0 |
+| `03-termux-api.patch` | 25 | 1745 | 157 | 5 |
+| `04-repo-root.patch` | 7 | 85 | 11 | 1 |
+| `90-isolation-retained.patch` | 40 | 5147 | 236 | 7 |
 
-- Port work in patch `01`: 36 files. bionic gaps, dropped native backends,
-  Termux:API surfaces, Android platform gating, IPC relocation, installer and
-  overlay scripts.
-- Fork feature in patch `01`: 7 files (`repoRoot` plumbing, see the section
+- Port work in slices `01`..`03`: 58 files. bionic gaps, dropped native
+  backends, IPC relocation, Termux:API surfaces, Android platform gating,
+  clipboard and browser adaptations, installer and overlay scripts.
+- Fork feature in slice `04`: 7 files (`repoRoot` plumbing, see the section
   below). Upstream has only the internal resolver and baseline field.
-- Adaptation in patch `01`: 12 files, the async-clipboard contract ripple.
-- Patch `02` is entirely fork feature work: retained workspaces, cold revive,
+- Patch `90` is entirely fork feature work: retained workspaces, cold revive,
   deferred integration, `worktree://`, slot leases. Upstream already has
   subagent isolation (`task/isolation-runner.ts`, `task/worktree.ts`,
-  `cleanupIsolation`); `02` replaces its run-end teardown and inverts two
+  `cleanupIsolation`); `90` replaces its run-end teardown and inverts two
   upstream invariants on purpose: isolated runs stay resumable, and
   `task/persisted-revive.ts` no longer refuses isolated transcripts.
 
@@ -95,7 +93,7 @@ Treat them as known deviations, not as intended behaviour:
 
 ## Transformation catalog (current)
 
-The Android overlay (patch `01`) transforms these files.
+The Android port slices (`01`..`03`) transform these files.
 
 ### 1. Cargo.toml — gate arboard + pi-voice off Android
 
@@ -245,10 +243,10 @@ Bionic declares the `getnameinfo` host length as `size_t`. Thus Android passes
 `buf.len()` as `usize`. Other Unix targets keep `socklen_t`. Address, length
 and behavior do not change.
 
-## Fork feature: task isolation workspace lifecycle (patch `02`)
+## Fork feature: task isolation workspace lifecycle (patch `90`)
 
 This feature is not Android-gated. The port carries it in the same queue
-(`02-isolated-revive.patch`), so releases from this fork keep it.
+(`90-isolation-retained.patch`), so releases from this fork keep it.
 
 Task-isolation workspaces now outlive a run. Spawn writes
 `.omp-isolation-state.json` beside the owner marker. It records the id, parent
@@ -313,12 +311,12 @@ foreign owner. It prints the artifact directory. When capture or the commit
 fails, it leaves the sandbox intact. Thus you can finalize or discard a cold
 workspace deliberately, without `kill` (which retains).
 
-`repoRoot` selects a different repository to isolate. Patch `01` adds it to the
-task schemas. Patch `02` preserves it in every branch of the dynamic
+`repoRoot` selects a different repository to isolate. Patch `04` adds it to the
+task schemas. Patch `90` preserves it in every branch of the dynamic
 `task.file` schema. `isolated` alone always uses the current cwd's repository.
 `repoRoot` alone enables nothing.
 
-## Fork feature: deferred integration (patch `02`)
+## Fork feature: deferred integration (patch `90`)
 
 `task.isolation.deferIntegration` (default `false`) is the explicit-consent
 variant of `task.isolation.apply`. It is shown only while

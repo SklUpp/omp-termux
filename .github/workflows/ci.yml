@@ -11,7 +11,7 @@ on:
   workflow_call:
     inputs:
       patch-profile:
-        description: "Patch profile (standard excludes patch 02)"
+        description: "Patch profile (standard excludes 9x fork features)"
         required: false
         type: string
         default: extended
@@ -123,7 +123,7 @@ jobs:
         run: cargo test --profile local -p pi-builtins --lib 'sort::'
       # Required, not optional coverage: these exercise the retained-workspace
       # lifecycle, dynamic-schema repoRoot, resume-hint, and explicit cold
-      # release contracts added by patch 02, so a missing/renamed file must fail the job instead of
+      # release contracts added by patch 90, so a missing/renamed file must fail the job instead of
       # silently greening the overlay check.
       - name: Run isolation lifecycle tests
         if: env.OMP_PATCH_PROFILE == 'extended'
@@ -142,7 +142,7 @@ jobs:
   # requires the workflow file there. Runs only when ci.yml is manually
   # dispatched on the refresh branch; preflights reuse this file's own
   # quality-check/android-overlay-check jobs (never re-enter ci.yml), build the
-  # extended (01+02) profile and upload a release-identical bundle. No tags or
+  # extended (01..04+90) profile and upload a release-identical bundle. No tags or
   # releases are created and nothing is published.
   profile-compat:
     name: Patch profile compatibility (${{ matrix.profile }})
@@ -176,10 +176,10 @@ jobs:
           set -euo pipefail
           if [ "$OMP_PATCH_PROFILE" = standard ]; then
             test ! -e packages/coding-agent/test/task/isolation-retained.test.ts
-            ! git apply --reverse --check --whitespace=nowarn android/patches/02-isolated-revive.patch 2>/dev/null
+            ! git apply --reverse --check --whitespace=nowarn android/patches/90-isolation-retained.patch 2>/dev/null
           else
             test -s packages/coding-agent/test/task/isolation-retained.test.ts
-            git apply --reverse --check --whitespace=nowarn android/patches/02-isolated-revive.patch
+            git apply --reverse --check --whitespace=nowarn android/patches/90-isolation-retained.patch
           fi
           echo "profile ${OMP_PATCH_PROFILE} tree matches its manifest"
 

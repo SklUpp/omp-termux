@@ -128,7 +128,7 @@ If stdin is a terminal, the installer asks each question unless the choice is al
 Flags, environment variables, and a pinned `OMP_VERSION` can select a choice.
 The choices are extended release and Chromium. Both default to no. Without a terminal, the installer does not ask questions.
 
-The standard release contains `01-termux.patch`. The extended release also contains `02-isolated-revive.patch`.
+The standard release contains the four port slices (`01-bionic-rust.patch` through `04-repo-root.patch`). The extended release also contains `90-isolation-retained.patch`.
 Use `-ex` or `--extended` to select the extended release. Use `--standard` to select the standard release.
 Use `--browser` to install Chromium. Use `--no-browser` to skip Chromium.
 `OMP_EXTENDED=0|1` and `OMP_INSTALL_BROWSER=0|1` set the same choices. Flags take priority over these variables.
@@ -155,10 +155,10 @@ exit with an error and show reinstall instructions.
 Reinstall with the installer used for this device. Keep the release profile:
 
 ```sh
-# standard (default: applies only 01-termux.patch)
+# standard (default: applies only the 01..04 port slices)
 curl -fsSL https://raw.githubusercontent.com/SklUpp/omp-termux/main/install.sh | sh
 
-# extended (adds 02-isolated-revive.patch)
+# extended (adds 90-isolation-retained.patch)
 curl -fsSL https://raw.githubusercontent.com/SklUpp/omp-termux/main/install.sh | sh -s -- -ex
 ```
 

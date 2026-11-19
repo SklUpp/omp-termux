@@ -27,7 +27,7 @@ index 0000000..5626abf
 @@ -0,0 +1 @@
 +one
 PATCH
-cat > "$root/repo/android/patches/02-isolated-revive.patch" <<'PATCH'
+cat > "$root/repo/android/patches/90-feature.patch" <<'PATCH'
 diff --git a/two.txt b/two.txt
 new file mode 100644
 index 0000000..7d51b31
@@ -36,7 +36,7 @@ index 0000000..7d51b31
 @@ -0,0 +1 @@
 +two
 PATCH
-printf '01-one.patch\n02-isolated-revive.patch\n' > "$root/repo/android/patches/MANIFEST"
+printf '01-one.patch\n90-feature.patch\n' > "$root/repo/android/patches/MANIFEST"
 printf '01-one.patch\n' > "$root/repo/android/patches/MANIFEST.standard"
 git -C "$root/repo" add base.txt android
 git -C "$root/repo" commit -qm base
@@ -52,8 +52,8 @@ reset_repo() {
 
 apply extended
 [ -f "$root/repo/one.txt" ] || fail 'extended did not apply 01'
-[ -f "$root/repo/two.txt" ] || fail 'extended did not apply 02'
-pass 'extended profile applies 01+02'
+[ -f "$root/repo/two.txt" ] || fail 'extended did not apply 90'
+pass 'extended profile applies 01+90'
 
 if apply standard; then fail 'standard accepted an already-extended tree'; fi
 pass 'standard rejects already-extended tree'
@@ -61,7 +61,7 @@ pass 'standard rejects already-extended tree'
 reset_repo
 apply standard
 [ -f "$root/repo/one.txt" ] || fail 'standard did not apply 01'
-[ -e "$root/repo/two.txt" ] && fail 'standard applied 02'
+[ -e "$root/repo/two.txt" ] && fail 'standard applied 90'
 pass 'standard profile applies 01 only'
 
 apply standard
@@ -74,12 +74,12 @@ if (cd "$root/repo" && OMP_PATCH_PROFILE=bogus bash android/scripts/apply-patche
 fi
 pass 'invalid profile rejected'
 
-printf '02-isolated-revive.patch\n' > "$root/repo/android/patches/MANIFEST.standard"
+printf '90-feature.patch\n' > "$root/repo/android/patches/MANIFEST.standard"
 if (cd "$root/repo" && OMP_PATCH_PROFILE=standard bash android/scripts/apply-patches.sh >/dev/null 2>&1); then
-	fail 'standard profile accepted 02'
+	fail 'standard profile accepted a 9x feature patch'
 fi
 printf '01-one.patch\n' > "$root/repo/android/patches/MANIFEST.standard"
-pass 'standard profile rejects patch 02'
+pass 'standard profile rejects 9x feature patch entries'
 
 # check-release-inputs.py profile/tag validation in a minimal release root.
 release="$root/release"
@@ -92,8 +92,8 @@ printf 'BUN_VERSION=1\nBUN_ARCHIVE_NAME=x\nBUN_SHA256=y\n' > "$release/android/v
 : > "$release/android/scripts/build-termux.sh"
 : > "$release/packages/natives/native/loader-state.js"
 cp "$root/repo/android/patches/01-one.patch" "$release/android/patches/"
-cp "$root/repo/android/patches/02-isolated-revive.patch" "$release/android/patches/"
-printf '01-one.patch\n02-isolated-revive.patch\n' > "$release/android/patches/MANIFEST"
+cp "$root/repo/android/patches/90-feature.patch" "$release/android/patches/"
+printf '01-one.patch\n90-feature.patch\n' > "$release/android/patches/MANIFEST"
 printf '01-one.patch\n' > "$release/android/patches/MANIFEST.standard"
 
 check() { # profile tag expected
@@ -112,6 +112,11 @@ check extended v18.16.0-termux-ex pass
 check extended v18.16.0-termux-ex-r0123456789ab pass
 check standard v18.16.0-termux-ex fail
 check extended v18.16.0-termux fail
+
+printf '01-one.patch\n90-feature.patch\n' > "$release/android/patches/MANIFEST.standard"
+check standard v18.16.0-termux fail
+printf '01-one.patch\n' > "$release/android/patches/MANIFEST.standard"
+pass 'release-input rejects 9x feature patches in standard manifest'
 
 check_no_variant() { # profile tag expected
 	local profile=$1 tag=$2 want=$3

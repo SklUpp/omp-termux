@@ -49,15 +49,26 @@ jobs:
           probe_dir=$(mktemp -d)
           git archive "$upstream_tip" | tar -x -C "$probe_dir"
           git -C "$probe_dir" init -q
-          if ! git -C "$probe_dir" apply --check --whitespace=nowarn "$GITHUB_WORKSPACE/android/patches/01-termux.patch" 2>/dev/null; then
+          port_ok=true
+          while IFS= read -r name || [[ -n "$name" ]]; do
+            [[ -z "$name" || "$name" == \#* ]] && continue
+            if ! git -C "$probe_dir" apply --check --whitespace=nowarn "$GITHUB_WORKSPACE/android/patches/$name" 2>/dev/null; then
+              port_ok=false
+              break
+            fi
+            git -C "$probe_dir" apply --whitespace=nowarn "$GITHUB_WORKSPACE/android/patches/$name"
+          done < "$GITHUB_WORKSPACE/android/patches/MANIFEST.standard"
+          if [[ "$port_ok" != true ]]; then
             rm -rf "$probe_dir"
-            echo "::warning::Standard patch 01 does not apply cleanly onto upstream tip $upstream_tip; skipping automatic update"
+            echo "::warning::Standard patch queue does not apply cleanly onto upstream tip $upstream_tip; skipping automatic update"
             exit 0
           fi
-          git -C "$probe_dir" apply --whitespace=nowarn "$GITHUB_WORKSPACE/android/patches/01-termux.patch"
-          if ! git -C "$probe_dir" apply --check --whitespace=nowarn "$GITHUB_WORKSPACE/android/patches/02-isolated-revive.patch" 2>/dev/null; then
-            echo "::warning::Extended patch 02 does not apply onto upstream tip $upstream_tip; standard release can proceed, extended will be skipped"
-          fi
+          while IFS= read -r name || [[ -n "$name" ]]; do
+            [[ -z "$name" || "$name" == \#* || "$name" != 9* ]] && continue
+            if ! git -C "$probe_dir" apply --check --whitespace=nowarn "$GITHUB_WORKSPACE/android/patches/$name" 2>/dev/null; then
+              echo "::warning::Extended patch $name does not apply onto upstream tip $upstream_tip; standard release can proceed, extended will be skipped"
+            fi
+          done < "$GITHUB_WORKSPACE/android/patches/MANIFEST"
           rm -rf "$probe_dir"
 
           git config user.name github-actions[bot]

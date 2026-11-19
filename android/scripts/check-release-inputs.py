@@ -102,11 +102,15 @@ def main():
     active_patches = sorted(
         p.name for p in manifest_path.parent.glob("[0-9][0-9]-*.patch")
     )
-    manifest_entries = [
-        line.strip()
-        for line in manifest_path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+
+    def read_manifest(path):
+        return [
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+    manifest_entries = read_manifest(manifest_path)
     if len(manifest_entries) != len(set(manifest_entries)):
         sys.exit(f"error: duplicate patch entries in {manifest_name}")
     if profile == "extended":
@@ -119,8 +123,21 @@ def main():
         missing = [entry for entry in manifest_entries if entry not in active_patches]
         if missing:
             sys.exit(f"error: standard manifest references missing patches: {missing}")
-        if "02-isolated-revive.patch" in manifest_entries:
-            sys.exit("error: standard manifest must not include 02-isolated-revive.patch")
+        feature_patches = [entry for entry in manifest_entries if entry.startswith("9")]
+        if feature_patches:
+            sys.exit(
+                "error: standard manifest must not include fork feature patches: "
+                f"{feature_patches}"
+            )
+        full_manifest = read_manifest(manifest_path.parent / "MANIFEST")
+        position = 0
+        for entry in manifest_entries:
+            try:
+                position = full_manifest.index(entry, position) + 1
+            except ValueError:
+                sys.exit(
+                    f"error: standard patch {entry} is missing from MANIFEST or out of order"
+                )
         for marker in (
             "packages/coding-agent/test/cli/worktree-release-isolation.test.ts",
             "packages/coding-agent/test/fixtures/isolation-lease-child.ts",

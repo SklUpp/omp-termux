@@ -52,11 +52,35 @@ if (( ${#manifest_patches[@]} == 0 )); then
 	echo "error: no patches listed in $manifest" >&2
 	exit 1
 fi
+# Fork feature patches use a 9x name and never belong in the standard queue.
+# Every standard entry must also appear in MANIFEST, in the same order.
+feature_patches=()
 if [[ "$profile" == standard ]]; then
+	full_manifest=()
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		[[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+		full_manifest+=("$line")
+	done < "$PATCHES_DIR/MANIFEST"
+	seen=0
 	for name in "${manifest_patches[@]}"; do
-		if [[ "$name" == "02-isolated-revive.patch" ]]; then
-			echo "error: standard profile must not include 02-isolated-revive.patch" >&2
+		if [[ "$name" == 9* ]]; then
+			echo "error: standard profile must not include fork feature patch: $name" >&2
 			exit 1
+		fi
+		while (( seen < ${#full_manifest[@]} )) && [[ "${full_manifest[$seen]}" != "$name" ]]; do
+			seen=$((seen + 1))
+		done
+		if (( seen >= ${#full_manifest[@]} )); then
+			echo "error: standard patch $name is missing from MANIFEST or out of order" >&2
+			exit 1
+		fi
+		seen=$((seen + 1))
+	done
+	for name in "${full_manifest[@]}"; do
+		if [[ "$name" == 9* ]]; then
+			feature_patches+=("$PATCHES_DIR/$name")
 		fi
 	done
 fi
@@ -90,9 +114,8 @@ if compgen -G "$PATCHES_DIR"/*.patch.disabled > /dev/null; then
 	exit 1
 fi
 
-# Standard must not silently accept a tree that already contains extended
-# changes. Patch 02 is generated on top of 01, so reversing it is a reliable
-# applied-tree probe without touching the working tree.
+# Extended-only marker files are a cheap early rejection; the reverse probe
+# below is the authoritative check.
 if [[ "$profile" == standard ]]; then
 	for marker in \
 		packages/coding-agent/test/cli/worktree-release-isolation.test.ts \
@@ -104,14 +127,19 @@ if [[ "$profile" == standard ]]; then
 		fi
 	done
 fi
-if [[ "$profile" == standard && -f "$PATCHES_DIR/02-isolated-revive.patch" ]]; then
+# Standard must not silently accept a tree that already contains extended
+# changes. Feature patches are generated on top of the port slices, so a
+# successful reverse check proves the tree already carries that feature.
+if (( ${#feature_patches[@]} > 0 )); then
 	probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/android-profile.XXXXXX")
 	tar -C "$ROOT_DIR" --exclude=.git -cf - . | tar -C "$probe_dir" -xf -
-	if git -C "$probe_dir" apply --reverse --check --whitespace=nowarn "$PATCHES_DIR/02-isolated-revive.patch" >/dev/null 2>&1; then
-		rm -R "$probe_dir"
-		echo "error: extended patch 02 is already applied; standard profile requires a clean or standard tree" >&2
-		exit 1
-	fi
+	for patch in "${feature_patches[@]}"; do
+		if git -C "$probe_dir" apply --reverse --check --whitespace=nowarn "$patch" >/dev/null 2>&1; then
+			rm -R "$probe_dir"
+			echo "error: fork feature patch $(basename "$patch") is already applied; standard profile requires a clean or standard tree" >&2
+			exit 1
+		fi
+	done
 	rm -R "$probe_dir"
 fi
 
