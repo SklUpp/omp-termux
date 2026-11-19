@@ -44,6 +44,12 @@ import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { cfgAskNotify, askTimeoutMs } from "../modes/settings";
 import { renderAttachmentSourceNotice } from "../session/attachment-source-notice";
 import { cfgSpeechEnabled } from "../tts/settings";
+import {
+	type AndroidOutcome,
+	clearAndroidNotification,
+	newAndroidAskNotificationId,
+	sendAndroidNotification,
+} from "../utils/android-helpers";
 import { describeAttachedImagesForTextModel, shouldDescribeImagesForTextModel } from "../utils/image-vision-fallback";
 
 // =============================================================================
@@ -589,8 +595,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		return (session.canPromptUser ?? session.hasUI) || session.advertiseHeadlessAsk ? new AskTool(session) : null;
 	}
 
-	/** Send terminal notification when ask tool is waiting for input */
-	#sendAskNotification(): void {
+	/**
+	 * Notify that the ask dialog is waiting for input: the terminal notification
+	 * plus, on Android, a system card. The caller keeps the card's post promise
+	 * so the removal can be serialized behind it.
+	 */
+	#sendAskNotification(): { id: string; posted: Promise<AndroidOutcome> } | undefined {
 		if (!this.session.hasUI) return;
 		const method = cfgAskNotify.get(this.session.settings);
 		if (method === "off") return;
@@ -601,6 +611,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			urgency: "normal",
 			actions: "focus",
 		});
+		// A per-prompt id: removing it must not erase a completion/error card
+		// posted under the process status id while the dialog was pending.
+		const id = newAndroidAskNotificationId();
+		return { id, posted: sendAndroidNotification("omp", "Waiting for input", { id }) };
 	}
 
 	/**
@@ -656,6 +670,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<AskToolDetails>> {
+		// Android ask card, cleared as soon as the dialog resolves (see below).
+		let askAndroidCard: { id: string; posted: Promise<AndroidOutcome> } | undefined;
 		// Headless fallback
 		if (!context?.hasUI || !context.ui) {
 			// A headless fork (`/tan`) keeps `ask` advertised only to share the parent's
@@ -769,14 +785,21 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		const dialogSignal = signal ? AbortSignal.any([signal, userSteering.signal]) : userSteering.signal;
 		const abortError = (): ToolAbortError =>
 			new ToolAbortError(userSteering.signal.aborted ? "Ask interrupted by message" : "Ask input was cancelled");
+		async function clearAndroidAskCard(): Promise<void> {
+			const card = askAndroidCard;
+			if (!card) return;
+			askAndroidCard = undefined;
+			// Serialize behind the post: the two Termux:API commands are separate
+			// processes, so a removal that races an in-flight post leaves the card
+			// behind. A suppressed or failed post has no card to remove.
+			if (!(await card.posted).ok) return;
+			await clearAndroidNotification(card.id).catch(() => {});
+		}
 		const cancelAsk = (): never => {
 			if (userSteering.signal.aborted) throw abortError();
 			context.abort();
 			throw new ToolAbortError("Ask tool was cancelled by the user");
 		};
-
-		// Send notification if waiting and not suppressed
-		this.#sendAskNotification();
 
 		if (params.questions.length === 0) {
 			return {
@@ -785,232 +808,240 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			};
 		}
 
-		// Speak the question(s) aloud before surfacing them. Ask vocalizes in every
-		// mode — it's the assistant addressing the user — gated only by speech.enabled
-		// (the vocalizer re-checks the setting and no-ops when disabled).
-		if (cfgSpeechEnabled.get(this.session.settings)) {
-			vocalizer.speak(params.questions.map(q => q.question).join("\n"));
-		}
+		// Notify only after validation, so no card is posted for a request that
+		// returns an error without ever waiting for input.
+		askAndroidCard = this.#sendAskNotification();
 
-		const richAskDialog = extensionUi.askDialog;
-		if (richAskDialog) {
-			try {
-				const showRichDialog = () =>
-					richAskDialog(
-						params.questions.map(q => ({
-							id: q.id,
-							question: q.question,
-							...(q.header?.trim() ? { header: q.header } : {}),
-							options: q.options.map(option => ({
-								label: option.label,
-								...(option.description?.trim() ? { description: option.description.trim() } : {}),
-								...(option.preview?.trim() ? { preview: option.preview } : {}),
+		try {
+			// Speak the question(s) aloud before surfacing them. Ask vocalizes in every
+			// mode — it's the assistant addressing the user — gated only by speech.enabled
+			// (the vocalizer re-checks the setting and no-ops when disabled).
+			if (cfgSpeechEnabled.get(this.session.settings)) {
+				vocalizer.speak(params.questions.map(q => q.question).join("\n"));
+			}
+
+			const richAskDialog = extensionUi.askDialog;
+			if (richAskDialog) {
+				try {
+					const showRichDialog = () =>
+						richAskDialog(
+							params.questions.map(q => ({
+								id: q.id,
+								question: q.question,
+								...(q.header?.trim() ? { header: q.header } : {}),
+								options: q.options.map(option => ({
+									label: option.label,
+									...(option.description?.trim() ? { description: option.description.trim() } : {}),
+									...(option.preview?.trim() ? { preview: option.preview } : {}),
+								})),
+								...(q.multi !== undefined ? { multi: q.multi } : {}),
+								...(q.recommended !== undefined ? { recommended: q.recommended } : {}),
 							})),
-							...(q.multi !== undefined ? { multi: q.multi } : {}),
-							...(q.recommended !== undefined ? { recommended: q.recommended } : {}),
-						})),
-						{ timeout: timeout ?? undefined, signal: dialogSignal, acceptImages: true },
-					);
-				const richResult = await untilAborted(dialogSignal, showRichDialog);
-				if (!richResult) return cancelAsk();
-				if (richResult.kind === "chat") {
-					const questionText = params.questions.map(q => q.question).join("\n");
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `User chose to chat about this instead of answering.\n\nQuestions asked:\n${questionText}`,
-							},
-						],
-						details: { chatRedirect: true, questions: params.questions.map(q => q.question) },
-					};
-				}
-				if (richResult.results.length !== params.questions.length) {
-					throw new Error("Ask dialog returned a result count that does not match the requested questions");
-				}
-				const results: QuestionResult[] = [];
-				// Each prompt numbers markers from 1; shift them so `[Image #N]` indexes all result images.
-				const answerImages: ImageContent[] = [];
-				for (let index = 0; index < params.questions.length; index++) {
-					const question = params.questions[index];
-					const result = richResult.results[index];
-					if (!question || !result || result.id !== question.id) {
-						throw new Error("Ask dialog returned results that do not match the requested question order");
+							{ timeout: timeout ?? undefined, signal: dialogSignal, acceptImages: true },
+						);
+					const richResult = await untilAborted(dialogSignal, showRichDialog());
+					if (!richResult) return cancelAsk();
+					if (richResult.kind === "chat") {
+						const questionText = params.questions.map(q => q.question).join("\n");
+						return {
+							content: [
+								{
+									type: "text" as const,
+									text: `User chose to chat about this instead of answering.\n\nQuestions asked:\n${questionText}`,
+								},
+							],
+							details: { chatRedirect: true, questions: params.questions.map(q => q.question) },
+						};
 					}
-					const customOffset = answerImages.length;
-					if (result.customInputImages) answerImages.push(...result.customInputImages);
-					const noteOffset = answerImages.length;
-					if (result.noteImages) answerImages.push(...result.noteImages);
-					results.push({
-						id: question.id,
-						question: question.question,
-						options: question.options.map(option => option.label),
-						multi: question.multi ?? false,
-						selectedOptions: result.selectedOptions,
-						customInput:
-							result.customInput === undefined
-								? undefined
-								: shiftImageMarkers(result.customInput, customOffset, result.customInputImages?.length ?? 0),
-						note:
-							result.note === undefined
-								? undefined
-								: shiftImageMarkers(result.note, noteOffset, result.noteImages?.length ?? 0),
-						noteOption: result.noteOption,
-						timedOut: result.timedOut,
-					});
-				}
-				if (params.questions.length === 1) {
-					const result = results[0];
-					// An empty multi-select submission is a valid "select none"
-					// answer (#8265 review); only a truly empty single-select
-					// result counts as cancellation.
-					if (
-						!result ||
-						(!result.timedOut &&
-							!result.multi &&
-							result.selectedOptions.length === 0 &&
-							result.customInput === undefined)
-					)
-						cancelAsk();
-					const details: AskToolDetails = {
-						question: result.question,
-						options: result.options,
-						multi: result.multi,
-						selectedOptions: result.selectedOptions,
-						customInput: result.customInput,
-						note: result.note,
-						noteOption: result.noteOption,
-						timedOut: result.timedOut,
-					};
-					const responseText = formatSingleQuestionResponse(result);
+					if (richResult.results.length !== params.questions.length) {
+						throw new Error("Ask dialog returned a result count that does not match the requested questions");
+					}
+					const results: QuestionResult[] = [];
+					// Each prompt numbers markers from 1; shift them so `[Image #N]` indexes all result images.
+					const answerImages: ImageContent[] = [];
+					for (let index = 0; index < params.questions.length; index++) {
+						const question = params.questions[index];
+						const result = richResult.results[index];
+						if (!question || !result || result.id !== question.id) {
+							throw new Error("Ask dialog returned results that do not match the requested question order");
+						}
+						const customOffset = answerImages.length;
+						if (result.customInputImages) answerImages.push(...result.customInputImages);
+						const noteOffset = answerImages.length;
+						if (result.noteImages) answerImages.push(...result.noteImages);
+						results.push({
+							id: question.id,
+							question: question.question,
+							options: question.options.map(option => option.label),
+							multi: question.multi ?? false,
+							selectedOptions: result.selectedOptions,
+							customInput:
+								result.customInput === undefined
+									? undefined
+									: shiftImageMarkers(result.customInput, customOffset, result.customInputImages?.length ?? 0),
+							note:
+								result.note === undefined
+									? undefined
+									: shiftImageMarkers(result.note, noteOffset, result.noteImages?.length ?? 0),
+							noteOption: result.noteOption,
+							timedOut: result.timedOut,
+						});
+					}
+					if (params.questions.length === 1) {
+						const result = results[0];
+						// An empty multi-select submission is a valid "select none"
+						// answer (#8265 review); only a truly empty single-select
+						// result counts as cancellation.
+						if (
+							!result ||
+							(!result.timedOut &&
+								!result.multi &&
+								result.selectedOptions.length === 0 &&
+								result.customInput === undefined)
+						)
+							cancelAsk();
+						const details: AskToolDetails = {
+							question: result.question,
+							options: result.options,
+							multi: result.multi,
+							selectedOptions: result.selectedOptions,
+							customInput: result.customInput,
+							note: result.note,
+							noteOption: result.noteOption,
+							timedOut: result.timedOut,
+						};
+						const responseText = formatSingleQuestionResponse(result);
+						const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
+						return { content: [{ type: "text" as const, text: responseText }, ...imageBlocks], details };
+					}
+					const details: AskToolDetails = { results };
+					const responseText = `User answers:\n${results.map(formatQuestionResult).join("\n")}`;
 					const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
 					return { content: [{ type: "text" as const, text: responseText }, ...imageBlocks], details };
+				} catch (error) {
+					if (error instanceof Error && error.name === "AbortError") throw abortError();
+					throw error;
 				}
-				const details: AskToolDetails = { results };
-				const responseText = `User answers:\n${results.map(formatQuestionResult).join("\n")}`;
-				const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
-				return { content: [{ type: "text" as const, text: responseText }, ...imageBlocks], details };
-			} catch (error) {
-				if (error instanceof Error && error.name === "AbortError") throw abortError();
-				throw error;
 			}
-		}
 
-		const askQuestion = async (
-			q: AskParams["questions"][number],
-			options?: { previous?: QuestionResult; navigation?: NavigationControls },
-		) => {
-			const questionOptions = q.options.map(option => ({
-				label: option.label,
-				...(option.description?.trim() ? { description: option.description.trim() } : {}),
-			}));
-			const optionLabels = questionOptions.map(getAskOptionLabel);
-			try {
-				const { selectedOptions, customInput, note, navigation, cancelled, timedOut } = await askSingleQuestion(
-					ui,
-					q.question,
-					questionOptions,
-					q.multi ?? false,
-					{
-						recommended: q.recommended,
-						timeout: timeout ?? undefined,
-						signal: dialogSignal,
-						initialSelection: options?.previous,
-						navigation: options?.navigation,
-					},
-				);
-				return { optionLabels, selectedOptions, customInput, note, navigation, cancelled, timedOut };
-			} catch (error) {
-				if (error instanceof Error && error.name === "AbortError") throw abortError();
-				throw error;
-			}
-		};
-
-		if (params.questions.length === 1) {
-			const [q] = params.questions;
-			const { optionLabels, selectedOptions, customInput, note, cancelled, timedOut } = await askQuestion(q);
-
-			if (!timedOut && (cancelled || (selectedOptions.length === 0 && customInput === undefined))) cancelAsk();
-			const details: AskToolDetails = {
-				question: q.question,
-				options: optionLabels,
-				multi: q.multi ?? false,
-				selectedOptions,
-				customInput,
-				note,
-				timedOut: timedOut || undefined,
+			const askQuestion = async (
+				q: AskParams["questions"][number],
+				options?: { previous?: QuestionResult; navigation?: NavigationControls },
+			) => {
+				const questionOptions = q.options.map(option => ({
+					label: option.label,
+					...(option.description?.trim() ? { description: option.description.trim() } : {}),
+				}));
+				const optionLabels = questionOptions.map(getAskOptionLabel);
+				try {
+					const { selectedOptions, customInput, note, navigation, cancelled, timedOut } = await askSingleQuestion(
+						ui,
+						q.question,
+						questionOptions,
+						q.multi ?? false,
+						{
+							recommended: q.recommended,
+							timeout: timeout ?? undefined,
+							signal: dialogSignal,
+							initialSelection: options?.previous,
+							navigation: options?.navigation,
+						},
+					);
+					return { optionLabels, selectedOptions, customInput, note, navigation, cancelled, timedOut };
+				} catch (error) {
+					if (error instanceof Error && error.name === "AbortError") throw abortError();
+					throw error;
+				}
 			};
 
-			const responseText = formatSingleQuestionResponse({
-				selectedOptions,
-				customInput,
-				note,
-				timedOut: timedOut || undefined,
-				multi: q.multi ?? false,
+			if (params.questions.length === 1) {
+				const [q] = params.questions;
+				const { optionLabels, selectedOptions, customInput, note, cancelled, timedOut } = await askQuestion(q);
+
+				if (!timedOut && (cancelled || (selectedOptions.length === 0 && customInput === undefined))) cancelAsk();
+				const details: AskToolDetails = {
+					question: q.question,
+					options: optionLabels,
+					multi: q.multi ?? false,
+					selectedOptions,
+					customInput,
+					note,
+					timedOut: timedOut || undefined,
+				};
+
+				const responseText = formatSingleQuestionResponse({
+					selectedOptions,
+					customInput,
+					note,
+					timedOut: timedOut || undefined,
+					multi: q.multi ?? false,
+				});
+
+				return { content: [{ type: "text" as const, text: responseText }], details };
+			}
+
+			const resultsByIndex: Array<QuestionResult | undefined> = Array.from({ length: params.questions.length });
+			let questionIndex = 0;
+			while (questionIndex < params.questions.length) {
+				const q = params.questions[questionIndex];
+				if (!q) throw new Error("Ask question index exceeded the requested question list");
+				const previous = resultsByIndex[questionIndex];
+				const navigation: NavigationControls = {
+					allowBack: questionIndex > 0,
+					allowForward: true,
+					progressText: `${questionIndex + 1}/${params.questions.length}`,
+				};
+				const {
+					optionLabels,
+					selectedOptions,
+					customInput,
+					note,
+					navigation: navAction,
+					cancelled,
+					timedOut,
+				} = await askQuestion(q, { previous, navigation });
+
+				if (cancelled && !timedOut) cancelAsk();
+
+				resultsByIndex[questionIndex] = {
+					id: q.id,
+					question: q.question,
+					options: optionLabels,
+					multi: q.multi ?? false,
+					selectedOptions,
+					customInput,
+					note,
+					timedOut: timedOut || undefined,
+				};
+
+				if (navAction === "back") {
+					questionIndex = Math.max(0, questionIndex - 1);
+					continue;
+				}
+
+				questionIndex += 1;
+			}
+
+			const results = params.questions.map((q, index) => {
+				const result = resultsByIndex[index];
+				if (result) return result;
+				return {
+					id: q.id,
+					question: q.question,
+					options: q.options.map(o => o.label),
+					multi: q.multi ?? false,
+					selectedOptions: [],
+				};
 			});
 
+			const details: AskToolDetails = { results };
+			const responseLines = results.map(formatQuestionResult);
+			const responseText = `User answers:\n${responseLines.join("\n")}`;
+
 			return { content: [{ type: "text" as const, text: responseText }], details };
+		} finally {
+			await clearAndroidAskCard();
 		}
-
-		const resultsByIndex: Array<QuestionResult | undefined> = Array.from({ length: params.questions.length });
-		let questionIndex = 0;
-		while (questionIndex < params.questions.length) {
-			const q = params.questions[questionIndex];
-			if (!q) throw new Error("Ask question index exceeded the requested question list");
-			const previous = resultsByIndex[questionIndex];
-			const navigation: NavigationControls = {
-				allowBack: questionIndex > 0,
-				allowForward: true,
-				progressText: `${questionIndex + 1}/${params.questions.length}`,
-			};
-			const {
-				optionLabels,
-				selectedOptions,
-				customInput,
-				note,
-				navigation: navAction,
-				cancelled,
-				timedOut,
-			} = await askQuestion(q, { previous, navigation });
-
-			if (cancelled && !timedOut) cancelAsk();
-
-			resultsByIndex[questionIndex] = {
-				id: q.id,
-				question: q.question,
-				options: optionLabels,
-				multi: q.multi ?? false,
-				selectedOptions,
-				customInput,
-				note,
-				timedOut: timedOut || undefined,
-			};
-
-			if (navAction === "back") {
-				questionIndex = Math.max(0, questionIndex - 1);
-				continue;
-			}
-
-			questionIndex += 1;
-		}
-
-		const results = params.questions.map((q, index) => {
-			const result = resultsByIndex[index];
-			if (result) return result;
-			return {
-				id: q.id,
-				question: q.question,
-				options: q.options.map(o => o.label),
-				multi: q.multi ?? false,
-				selectedOptions: [],
-			};
-		});
-
-		const details: AskToolDetails = { results };
-		const responseLines = results.map(formatQuestionResult);
-		const responseText = `User answers:\n${responseLines.join("\n")}`;
-
-		return { content: [{ type: "text" as const, text: responseText }], details };
 	}
 }
 

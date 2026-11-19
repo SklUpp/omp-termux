@@ -68,9 +68,10 @@ export function formatTaskResultSummary(
 	const error = result.exitCode !== 0 && !result.aborted && result.output.trim().length > 0 ? result.error : undefined;
 	const outputCharCount = result.outputMeta?.charCount ?? output.length;
 	// A stopped agent stays messageable; tell the parent so it can resume via
-	// irc instead of redoing the work. Isolated runs are parked without a
-	// reviver (their worktree is gone), so they must not read as resumable.
-	const resumable = result.aborted && !result.isolated && isResumable(AgentRegistry.global().get(result.id));
+	// irc instead of redoing the work. Isolation no longer parks the agent
+	// without a reviver: retained workspaces revive through the persisted
+	// factory, so an isolated abort is as resumable as any other.
+	const resumable = result.aborted && isResumable(AgentRegistry.global().get(result.id));
 	const render = (truncated: boolean): string =>
 		prompt.render(taskSummaryTemplate, {
 			agentName: result.agent,

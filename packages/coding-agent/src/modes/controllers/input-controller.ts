@@ -3006,14 +3006,14 @@ export class InputController {
 			this.ctx.showStatus("Nothing to copy");
 			return;
 		}
-		try {
-			copyToClipboard(text);
-			const sanitized = sanitizeText(text);
-			const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
-			this.ctx.showStatus(`Copied line: ${preview}`);
-		} catch {
-			this.ctx.showWarning("Failed to copy to clipboard");
-		}
+		const sanitized = sanitizeText(text);
+		const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
+		// `copyToClipboard` settles asynchronously; report the outcome instead of
+		// claiming success before the clipboard backend has run.
+		copyToClipboard(text).then(
+			() => this.ctx.showStatus(`Copied line: ${preview}`),
+			() => this.ctx.showWarning("Failed to copy to clipboard"),
+		);
 	}
 
 	/** Copy current prompt text to system clipboard. */
@@ -3023,14 +3023,12 @@ export class InputController {
 			this.ctx.showStatus("Nothing to copy");
 			return;
 		}
-		try {
-			copyToClipboard(text);
-			const sanitized = sanitizeText(text);
-			const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
-			this.ctx.showStatus(`Copied: ${preview}`);
-		} catch {
-			this.ctx.showWarning("Failed to copy to clipboard");
-		}
+		const sanitized = sanitizeText(text);
+		const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
+		copyToClipboard(text).then(
+			() => this.ctx.showStatus(`Copied: ${preview}`),
+			() => this.ctx.showWarning("Failed to copy to clipboard"),
+		);
 	}
 
 	cycleThinkingLevel(): void {
