@@ -176,8 +176,8 @@ index 4b40488..9e8052b 100644
  	}))
  }
  
-+/// bionic exports `mkfifoat` since API 23, but the Rust `libc` Android module
-+/// omits the binding; the workspace targets API 24+.
++// bionic exports `mkfifoat` since API 23, but the Rust `libc` Android module
++// omits the binding; the workspace targets API 24+.
 +#[cfg(target_os = "android")]
 +unsafe extern "C" {
 +	#[link_name = "mkfifoat"]
