@@ -26,6 +26,7 @@ import { formatDuration, isEnoent, prompt } from "@oh-my-pi/pi-utils";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { executeSend, isIrcEnabled } from "../irc/messaging";
+import { isDeferredIntegrationSignal } from "../task/deferred-integration";
 import agentPromptDoc from "../prompts/internal-urls/agent.md" with { type: "text" };
 import agentProgressTemplate from "../prompts/tools/agent-url-progress.md" with { type: "text" };
 import agentSupersededTemplate from "../prompts/tools/agent-url-superseded.md" with { type: "text" };
@@ -174,12 +175,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		if (!session) throw new Error("agent:// messaging requires a tool session");
 		const registry = session.agentRegistry;
 		const senderId = session.getAgentId?.();
-		if (
-			!registry ||
-			!senderId ||
-			session.enableIrc === false ||
-			!isIrcEnabled(session.settings, session.taskDepth ?? 0)
-		) {
+		if (!registry || !senderId) {
 			throw new Error("Peer messaging is unavailable in this session.");
 		}
 		const to = url.rawHost || url.hostname;
@@ -190,6 +186,16 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		const progress = url.searchParams.has("progress");
 		if (progress && to === "all") throw new Error("agent://all broadcasts cannot be ?progress updates.");
 		if (!content.trim()) throw new Error("agent:// messages require non-empty content.");
+		// `/integrate` is a manager control, not chat: keep it out of the child's
+		// inbox and point the parent at the endpoint that performs the handoff.
+		if (to !== "all" && isDeferredIntegrationSignal(content)) {
+			throw new Error(
+				`${content.trim()} is an isolation-manager signal, not a message: call write with ${JSON.stringify({ path: `worktree://${to}`, content: content.trim() })}.`,
+			);
+		}
+		if (session.enableIrc === false || !isIrcEnabled(session.settings, session.taskDepth ?? 0)) {
+			throw new Error("Peer messaging is unavailable in this session.");
+		}
 		const result = await executeSend(
 			{ registry, senderId, sessionFileHint: session.getSessionFile?.() },
 			{ to, message: content, progress },
