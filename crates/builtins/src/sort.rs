@@ -126,7 +126,7 @@ fn file_size_hint(fs: &BlockingFs, files: &[OsString]) -> Option<usize> {
 
 fn available_memory_hint() -> Option<usize> {
 	let system = system_available_memory();
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	let system = match (system, linux_cgroup_memory_headroom()) {
 		(Some(system), Some(cgroup)) => Some(system.min(cgroup)),
 		(system, cgroup) => system.or(cgroup),
@@ -146,7 +146,10 @@ fn memory_hint(available: u128) -> usize {
 }
 
 fn system_available_memory() -> Option<u128> {
-	#[cfg(target_os = "linux")]
+	// Android exposes the same Linux procfs and cgroup files; every read is
+	// fallible, so a kernel/SELinux policy that hides them still falls back to
+	// physical memory instead of sizing the buffer from an assumption.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	if let Some(bytes) =
 		std::fs::read_to_string("/proc/meminfo").ok().as_deref().and_then(meminfo_available_bytes)
 	{
@@ -162,7 +165,7 @@ fn system_available_memory() -> Option<u128> {
 /// the procfs crate's values, already in bytes, by 1024 again, so available
 /// memory always gave the 1 GiB maximum; only a cgroup limit made the hint
 /// smaller.)
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn meminfo_available_bytes(meminfo: &str) -> Option<u128> {
 	let field = |name: &str| -> Option<u128> {
 		meminfo
@@ -183,7 +186,7 @@ fn meminfo_available_bytes(meminfo: &str) -> Option<u128> {
 /// Memory the process's cgroups still let it use. `/proc/meminfo` reports the
 /// whole machine, so in a container or a systemd scope with a lower limit a
 /// buffer sized from it gets the process killed.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn linux_cgroup_memory_headroom() -> Option<u128> {
 	let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
 	cgroup_memory_headroom(&membership, Path::new("/sys/fs/cgroup"))
@@ -194,7 +197,7 @@ fn linux_cgroup_memory_headroom() -> Option<u128> {
 /// limit is the lower of `memory.max` and `memory.high` (cgroup v2), or
 /// `memory.limit_in_bytes` (cgroup v1, mounted at `root/memory`). `None`
 /// when no cgroup on the path sets a limit.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn cgroup_memory_headroom(membership: &str, root: &Path) -> Option<u128> {
 	for line in membership.lines() {
 		let mut fields = line.splitn(3, ':');
@@ -220,7 +223,7 @@ fn cgroup_memory_headroom(membership: &str, root: &Path) -> Option<u128> {
 }
 
 /// Where a cgroup version reports a memory limit and its use.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 struct MemoryFiles {
 	limits:      &'static [&'static str],
 	usage:       &'static str,
@@ -229,14 +232,14 @@ struct MemoryFiles {
 	reclaimable: &'static str,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 const CGROUP_V2: MemoryFiles = MemoryFiles {
 	limits:      &["memory.max", "memory.high"],
 	usage:       "memory.current",
 	reclaimable: "inactive_file",
 };
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 const CGROUP_V1: MemoryFiles = MemoryFiles {
 	limits:      &["memory.limit_in_bytes"],
 	usage:       "memory.usage_in_bytes",
@@ -245,7 +248,7 @@ const CGROUP_V1: MemoryFiles = MemoryFiles {
 
 /// Walks from `dir` up to `top`, returning the smallest headroom that any
 /// level with a numeric limit allows.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn headroom_along(dir: &Path, top: &Path, files: &MemoryFiles) -> Option<u128> {
 	let read = |dir: &Path, name: &str| -> Option<u128> {
 		std::fs::read_to_string(dir.join(name)).ok()?.trim().parse().ok()
@@ -406,6 +409,20 @@ mod tests {
 		// The minimum applies again where a quarter reaches it.
 		assert_eq!(memory_hint(2 * 1024 * KIB), 512 * 1024);
 		assert_eq!(memory_hint(8 * 1024 * KIB), 2 * 1024 * 1024);
+	}
+
+	// Failure mode: a kernel or SELinux policy that hides `/proc/meminfo`
+	// or the cgroup files must fall back to the physical-memory hint rather
+	// than panicking or assuming the files are readable.
+	#[test]
+	fn unavailable_memory_files_fall_back_instead_of_assuming_procfs() {
+		assert_eq!(meminfo_available_bytes(""), None);
+		assert_eq!(meminfo_available_bytes("MemFree: nope\nBuffers: nope\nCached: nope\n"), None);
+		assert_eq!(
+			cgroup_memory_headroom("0::/user.slice/app.scope\n", Path::new("/nonexistent-omp-cgroup")),
+			None
+		);
+		assert_eq!(cgroup_memory_headroom("not-a-cgroup-line\n", Path::new("/nonexistent-omp-cgroup")), None);
 	}
 
 	fn write_files(dir: &Path, files: &[(&str, &str)]) {
