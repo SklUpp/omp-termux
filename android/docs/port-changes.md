@@ -52,8 +52,12 @@ because its hunks are written against the port result. The sync workflow
 applies the queue in CI. Release workflows apply it again, idempotently, after
 they check out the immutable release tag.
 
-Current port target: upstream oh-my-pi **18.22.0**, commit
-`a344c4b31a12ca27fc7c426ebf91b2de302f4bca`. `android/versions.env` pins
+Current port target: upstream oh-my-pi **19.1.0**, commit
+`e1a9f4b41d24fe223bb71e864bef552f0fae6948`. That release renamed the crate
+directories (`pi-natives`/`pi-shell`/`pi-builtins`/`pi-vfs` to
+`natives`/`shell`/`builtins`/`vfs`, packages `omp-*`) and moved the published
+installer to `scripts/install.sh`; the queue and the helper scripts resolve the
+directory instead of hardcoding one generation of names. `android/versions.env` pins
 Android Bun 1.4.4. The release workflow verifies its SHA-256.
 
 ## Queue scope inventory
@@ -63,11 +67,15 @@ auditable on every refresh:
 
 | layer | files | added | removed | new files |
 |---|---|---|---|---|
-| `01-bionic-rust.patch` | 26 | 508 | 178 | 0 |
-| `02-native-ipc.patch` | 7 | 549 | 38 | 0 |
-| `03-termux-api.patch` | 25 | 1745 | 157 | 5 |
-| `04-repo-root.patch` | 7 | 85 | 11 | 1 |
-| `90-isolation-retained.patch` | 40 | 5147 | 236 | 7 |
+| `01-bionic-rust.patch` | 26 | 475 | 172 | 0 |
+| `02-native-ipc.patch` | 7 | 517 | 38 | 0 |
+| `03-termux-api.patch` | 25 | 1555 | 178 | 5 |
+| `04-repo-root.patch` | 7 | 94 | 13 | 1 |
+| `90-isolation-retained.patch` | 40 | 4726 | 172 | 7 |
+
+`04` is repoRoot only, and `90` is the diff from the standard result to the
+full tree, so the standard profile stays self-contained: no file in `04` may
+reference a module that only `90` creates.
 
 - Port work in slices `01`..`03`: 58 files. bionic gaps, dropped native
   backends, IPC relocation, Termux:API surfaces, Android platform gating,

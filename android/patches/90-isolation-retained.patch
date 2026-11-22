@@ -349,7 +349,7 @@ index d4c45ac..10f10bb 100644
  		this.register(new CfgProtocolHandler());
  		this.register(new SshProtocolHandler());
  		// Reserved OMP-owned security-analysis namespace; vendor adapters normalize into its store.
-diff --git a/packages/coding-agent/src/internal-urls/worktree-protocol.ts b/packages/coding-agent/src/internal-urls/worktree-protocol.ts
+diff --git b/packages/coding-agent/src/internal-urls/worktree-protocol.ts b/packages/coding-agent/src/internal-urls/worktree-protocol.ts
 new file mode 100644
 index 0000000..429b37c
 --- /dev/null
@@ -456,7 +456,7 @@ index 0000000..429b37c
 +	}
 +	return id;
 +}
-diff --git a/packages/coding-agent/src/prompts/internal-urls/worktree.md b/packages/coding-agent/src/prompts/internal-urls/worktree.md
+diff --git b/packages/coding-agent/src/prompts/internal-urls/worktree.md b/packages/coding-agent/src/prompts/internal-urls/worktree.md
 new file mode 100644
 index 0000000..c41f9b6
 --- /dev/null
@@ -541,7 +541,7 @@ index fbd03c0..09dce41 100644
  
  Shared edits need one integration owner; give each task its files{{#unless batchEnabled}} and interfaces{{/unless}}.
 diff --git a/packages/coding-agent/src/registry/agent-lifecycle.ts b/packages/coding-agent/src/registry/agent-lifecycle.ts
-index 2d8950f..ee90724 100644
+index 2d8950f..e589db9 100644
 --- a/packages/coding-agent/src/registry/agent-lifecycle.ts
 +++ b/packages/coding-agent/src/registry/agent-lifecycle.ts
 @@ -43,7 +43,11 @@ const AGENT_RELEASE_GRACE_MS = 5000;
@@ -632,16 +632,15 @@ index 2d8950f..ee90724 100644
  	/** Dispose if live and drop timers; `tombstone` keeps a terminal `aborted` row. */
  	release(id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions): Promise<boolean>;
  	/** Tear down every adopted agent. */
-@@ -219,6 +251,8 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -219,6 +251,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  		this.#revivals.clear();
  		this.#reopens.clear();
  		this.#parks.clear();
 +		this.#reservations.clear();
-+		this.#releasing.clear();
  		this.#persistedReviverFactory = undefined;
  	}
  
-@@ -234,6 +268,13 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -234,6 +267,13 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  	readonly #revivals = new Map<string, RevivingAgent>();
  	/** In-flight reopens of killed refs, bound to the killed ref, so concurrent {@link ensureLive} calls coalesce. */
  	readonly #reopens = new Map<string, ReopeningAgent>();
@@ -655,7 +654,7 @@ index 2d8950f..ee90724 100644
  	/** Releases can overlap; keep the exact ref fenced until the last one finishes. */
  	readonly #releasing = new WeakMap<AgentRef, ReleaseFence>();
  	#unsubscribe: (() => void) | undefined;
-@@ -436,7 +477,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -436,7 +476,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  						this.#registry.setHistory(id, { directCost }, ref.sessionFile ?? undefined);
  					}
  				} catch (error) {
@@ -667,7 +666,7 @@ index 2d8950f..ee90724 100644
  				}
  
  				// Commit: detach + parked *before* dispose so callers never see a
-@@ -448,7 +492,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -448,7 +491,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  				try {
  					await session.dispose();
  				} catch (error) {
@@ -679,7 +678,7 @@ index 2d8950f..ee90724 100644
  				}
  			} finally {
  				// Only clear if we are still the in-flight entry (a later park would
-@@ -461,6 +508,61 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -461,6 +507,61 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  		return park.promise;
  	}
  
@@ -741,7 +740,7 @@ index 2d8950f..ee90724 100644
  	/**
  	 * Return the live session, reviving from the sessionFile if parked or
  	 * killed. Concurrent calls share one in-flight revive.
-@@ -476,6 +578,9 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -476,6 +577,9 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  	 * - its transcript cannot be revived (no reviver, no session contract, workspace gone).
  	 */
  	async ensureLive(id: string): Promise<AgentSessionHandle> {
@@ -751,7 +750,7 @@ index 2d8950f..ee90724 100644
  		let ref = this.#registry.get(id);
  		if (!ref) {
  			throw new Error(
-@@ -570,7 +675,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -570,7 +674,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  		}
  		if (!reviver) {
  			throw new Error(
@@ -760,7 +759,7 @@ index 2d8950f..ee90724 100644
  			);
  		}
  		const reopened = this.#registry.reopen(id, killed);
-@@ -587,6 +692,9 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -587,6 +691,9 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  	 * when the agent is not revivable or no reviver can be produced.
  	 */
  	async #resolveAndRevive(id: string, ref: AgentRef): Promise<AgentSessionHandle> {
@@ -770,7 +769,7 @@ index 2d8950f..ee90724 100644
  		let adoption = this.#adopted.get(id);
  		// A reviver-less adoption of this ref (its warm reviver's thread died) keeps
  		// its release hook through cold revival and restores it if that fails.
-@@ -594,7 +702,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -594,7 +701,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  		let revive = prior?.revive;
  		let coldAdopted = false;
  		if (!revive && ref.status === "parked" && ref.sessionFile && this.#persistedReviverFactory) {
@@ -779,7 +778,7 @@ index 2d8950f..ee90724 100644
  			// Teardown can complete during the factory await. A late cold revive must
  			// not cold-adopt (and later attach a live session + TTL) into a disposed
  			// manager — reject deterministically before creating any session.
-@@ -608,12 +716,14 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -608,12 +715,14 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  			if (this.#registry.get(id) !== ref) {
  				throw new Error(`Agent "${id}" changed while its persisted session was being prepared.`);
  			}
@@ -796,7 +795,7 @@ index 2d8950f..ee90724 100644
  				};
  				this.#adopted.set(id, adoption);
  				coldAdopted = true;
-@@ -655,6 +765,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -655,6 +764,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  	 * `finalizeSubagentLifecycle`'s explicit-kill path. The kill stops the agent,
  	 * it does not destroy it: {@link ensureLive} (a message, Hub revive/focus)
  	 * reopens the transcript.
@@ -807,7 +806,7 @@ index 2d8950f..ee90724 100644
  	 */
  	async release(id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions): Promise<boolean> {
  		const adopted = this.#adopted.get(id);
-@@ -665,6 +779,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -665,6 +778,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  			adopted && (expected === undefined || adopted.ref === expected || adopted.ref.session === expected);
  		const ref = currentMatches ? current : adoptedMatches ? adopted.ref : undefined;
  		if (!ref) return false;
@@ -818,7 +817,7 @@ index 2d8950f..ee90724 100644
  
  		// Fence this generation before the first await: a waiter that joined the same
  		// park resumes before the ref is marked aborted or unregistered.
-@@ -735,7 +853,9 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -735,7 +852,9 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  				}
  			}
  			try {
@@ -829,7 +828,7 @@ index 2d8950f..ee90724 100644
  			} catch (error) {
  				logger.warn("AgentLifecycleManager.release: owned resource cleanup failed", {
  					id,
-@@ -759,7 +879,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
+@@ -759,7 +878,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
  		await Promise.all(
  			ids.map(async id => {
  				const running = this.#registry.get(id)?.status === "running";
@@ -945,7 +944,7 @@ index d595e40..625ee9c 100644
  	isolated?: boolean;
  	/** Work-pool yield items of the last model call; revival restores them so the yield tool matches. Absent when none. */
  	workPoolYieldItems?: WorkPoolYieldItem[];
-diff --git a/packages/coding-agent/src/task/deferred-integration.ts b/packages/coding-agent/src/task/deferred-integration.ts
+diff --git b/packages/coding-agent/src/task/deferred-integration.ts b/packages/coding-agent/src/task/deferred-integration.ts
 new file mode 100644
 index 0000000..921195e
 --- /dev/null
@@ -3864,7 +3863,7 @@ index 1c659cc..ece25e3 100644
  	};
  }
  
-diff --git a/packages/coding-agent/test/cli/worktree-release-isolation.test.ts b/packages/coding-agent/test/cli/worktree-release-isolation.test.ts
+diff --git b/packages/coding-agent/test/cli/worktree-release-isolation.test.ts b/packages/coding-agent/test/cli/worktree-release-isolation.test.ts
 new file mode 100644
 index 0000000..466b7a2
 --- /dev/null
@@ -4218,7 +4217,7 @@ index 0000000..466b7a2
 +		expect(result.stderr.toString()).toContain("Cannot release");
 +	});
 +});
-diff --git a/packages/coding-agent/test/fixtures/isolation-lease-child.ts b/packages/coding-agent/test/fixtures/isolation-lease-child.ts
+diff --git b/packages/coding-agent/test/fixtures/isolation-lease-child.ts b/packages/coding-agent/test/fixtures/isolation-lease-child.ts
 new file mode 100644
 index 0000000..2da7523
 --- /dev/null
@@ -4257,7 +4256,7 @@ index 0000000..2da7523
 +} else {
 +	throw new Error(`Unknown mode ${mode}`);
 +}
-diff --git a/packages/coding-agent/test/task/deferred-integration.test.ts b/packages/coding-agent/test/task/deferred-integration.test.ts
+diff --git b/packages/coding-agent/test/task/deferred-integration.test.ts b/packages/coding-agent/test/task/deferred-integration.test.ts
 new file mode 100644
 index 0000000..beb559c
 --- /dev/null
@@ -4926,7 +4925,7 @@ index b6c3841..1124b99 100644
  		openWorkspace: nativeWorkspace(undefined),
  		agentId: id,
  		mergeMode: "branch",
-diff --git a/packages/coding-agent/test/task/isolation-retained.test.ts b/packages/coding-agent/test/task/isolation-retained.test.ts
+diff --git b/packages/coding-agent/test/task/isolation-retained.test.ts b/packages/coding-agent/test/task/isolation-retained.test.ts
 new file mode 100644
 index 0000000..1da487a
 --- /dev/null
