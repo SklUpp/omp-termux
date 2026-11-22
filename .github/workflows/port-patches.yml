@@ -78,7 +78,7 @@ jobs:
           git diff --check
           test -f package.json
           test -f bun.lock
-          test -f crates/pi-natives/Cargo.toml
+          test -f crates/natives/Cargo.toml || test -f crates/pi-natives/Cargo.toml
           test -f packages/natives/native/loader-state.js
           git status --short
       # A tag whose workflow files do not parse cannot be dispatched, and tags
