@@ -41,11 +41,11 @@ pub const WRITE: i16 = libc::POLLOUT;
 
 /// Bytes a write may carry after [`now`] reported `WRITE` without risking a
 /// wait: `PIPE_BUF` (POSIX: a pipe that polls writable takes this much).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub const WRITE_CHUNK: usize = libc::PIPE_BUF;
 /// Bytes a write may carry after [`now`] reported `WRITE` without risking a
 /// wait: `PIPE_BUF` of `<sys/syslimits.h>`.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub const WRITE_CHUNK: usize = 512;
 
 /// Whether `fd` is ready for `events` right now (also when it hung up or

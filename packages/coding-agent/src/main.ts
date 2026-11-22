@@ -45,7 +45,7 @@ import { fetchBuild } from "./cli/build-service";
 import { applyStartupCwd } from "./cli/startup-cwd";
 import { runAutoUpdate } from "./cli/auto-update";
 import { managedInstallName } from "./cli/managed-install";
-import { getLatestRelease, isSourceCheckout } from "./cli/update-cli";
+import { getLatestRelease, isAndroidUpdateHost, isSourceCheckout } from "./cli/update-cli";
 import { findConfigFile } from "./config";
 import { cfgNoJudge, cfgNoSpotlight, cfgOffline } from "./config/auxiliary-model-policy";
 import { ModelRegistry } from "./config/model-registry";
@@ -277,6 +277,11 @@ function writeStartupWarning(warning: string): void {
 
 async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
 	if (!cfgStartupCheckUpdate.get(settings) && !cfgUpdateAuto.get(settings)) {
+		return;
+	}
+	// Android updates only through the port installer; `omp update` refuses, so
+	// a "run omp update" notification would be wrong advice.
+	if (isAndroidUpdateHost()) {
 		return;
 	}
 	try {

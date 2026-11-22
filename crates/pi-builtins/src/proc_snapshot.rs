@@ -116,7 +116,7 @@ fn parse_procargs2(buffer: &[u8]) -> Vec<String> {
 }
 
 /// Linux process primitives: procfs and pidfds.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod sys {
 	use std::{
 		fs,
@@ -133,9 +133,53 @@ pub mod sys {
 			.filter_map(|entry| entry.file_name().to_str()?.parse().ok())
 	}
 
+	/// Whether this process may issue `pidfd_open` at all.
+	///
+	/// Android answers unknown syscalls with `SECCOMP_RET_TRAP`, so a raw
+	/// `pidfd_open` on a release that does not admit it (everything before
+	/// API 31) kills the caller with SIGSYS instead of returning an error.
+	/// The level comes from bionic itself; that symbol only exists from
+	/// API 29, and a device without it is older than that.
+	#[cfg(target_os = "android")]
+	pub fn pidfd_open_supported() -> bool {
+		use std::{
+			ffi::{c_char, c_void},
+			sync::LazyLock,
+		};
+
+		unsafe extern "C" {
+			fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+		}
+
+		static LEVEL: LazyLock<Option<libc::c_int>> = LazyLock::new(|| {
+			// SAFETY: RTLD_DEFAULT searches the loaded objects for the
+			// NUL-terminated name; a miss returns null.
+			let symbol =
+				unsafe { dlsym(libc::RTLD_DEFAULT, c"android_get_device_api_level".as_ptr()) };
+			if symbol.is_null() {
+				return None;
+			}
+			// SAFETY: bionic declares the symbol as `int (void)`.
+			let level: unsafe extern "C" fn() -> libc::c_int = unsafe { std::mem::transmute(symbol) };
+			// SAFETY: the signature matches the resolved symbol.
+			Some(unsafe { level() })
+		});
+		LEVEL.is_some_and(|level| level >= 31)
+	}
+
+	/// Linux has the syscall since 5.3; the macOS and Windows modules never
+	/// compile this one.
+	#[cfg(not(target_os = "android"))]
+	pub const fn pidfd_open_supported() -> bool {
+		true
+	}
+
 	/// Opens a pidfd on whichever process holds `pid` now; callers pin identity
 	/// by re-checking [`start_time`] after the open.
 	pub fn open_pidfd(pid: i32) -> Option<OwnedFd> {
+		if !pidfd_open_supported() {
+			return None;
+		}
 		// SAFETY: pidfd_open takes scalar arguments and returns a new owned fd.
 		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
 		(fd >= 0).then(|| {
@@ -197,7 +241,7 @@ pub mod sys {
 	}
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod proc_snapshot {
 	use std::{collections::HashMap, fs, os::fd::AsFd, time::Duration};
 
@@ -1876,7 +1920,7 @@ mod proc_snapshot {
 	}
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
 pub use proc_snapshot::{ProcInfo, threads_by_pid};
 
 /// The processes a signal must never reach: this one and its ancestors.
@@ -1900,7 +1944,7 @@ pub use proc_snapshot::{ProcInfo, threads_by_pid};
 ///
 /// Listing is unaffected: `pgrep` still reports ancestors and `ps` still shows
 /// them. Only signalling consults this.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
 pub struct HostProcesses {
 	/// This process and its ancestors, nearest first.
 	pub pids:  smallvec::SmallVec<[i32; 16]>,
@@ -1913,7 +1957,7 @@ pub struct HostProcesses {
 /// Keeping the walk over this rather than over [`ProcInfo`] lets the recycling
 /// cases — which are otherwise only reachable by winning a race against the OS —
 /// be tested with a synthetic tree.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
 #[derive(Clone, Copy)]
 struct ChainNode {
 	ppid:  Option<i32>,
@@ -1923,7 +1967,7 @@ struct ChainNode {
 	start: u64,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
 impl HostProcesses {
 	/// Whether signalling `target` would reach this process or one of its
 	/// ancestors.
@@ -2009,7 +2053,7 @@ impl HostProcesses {
 	}
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(all(test, any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
 mod tests {
 	use super::{HostProcesses, ProcInfo};
 
