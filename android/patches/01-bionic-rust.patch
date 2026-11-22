@@ -1150,7 +1150,7 @@ index 03cb012..9ae8527 100644
  	use std::{
  		collections::HashSet,
 diff --git a/crates/shell/src/sys/proc.rs b/crates/shell/src/sys/proc.rs
-index 4a49af4..f2b4ad9 100644
+index 4a49af4..57b6586 100644
 --- a/crates/shell/src/sys/proc.rs
 +++ b/crates/shell/src/sys/proc.rs
 @@ -124,7 +124,7 @@ pub fn signal_pinned(p: &ProcInfo, sig: Signal) -> io::Result<bool> {
@@ -1185,10 +1185,10 @@ index 4a49af4..f2b4ad9 100644
  	}
  
 +	/// Whether this process may call `pidfd_open`. The API-level query lives
-+	/// with the syscall itself, in `pi_builtins::proc_sys`, so the policy has
++	/// with the syscall itself, in `omp_builtins::proc_sys`, so the policy has
 +	/// one definition: Android traps the call with SIGSYS before API 31.
 +	fn pidfd_supported() -> bool {
-+		pi_builtins::proc_sys::pidfd_open_supported()
++		omp_builtins::proc_sys::pidfd_open_supported()
 +	}
 +
  	pub fn signal_pinned(p: &ProcInfo, sig: i32) -> io::Result<bool> {
