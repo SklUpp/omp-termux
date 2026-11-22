@@ -1,0 +1,811 @@
+diff --git a/crates/natives/src/ipc/endpoint.rs b/crates/natives/src/ipc/endpoint.rs
+index 2f9b06c..81a8446 100644
+--- a/crates/natives/src/ipc/endpoint.rs
++++ b/crates/natives/src/ipc/endpoint.rs
+@@ -32,19 +32,80 @@ pub fn hash16(bytes: &[u8]) -> String {
+ 	format!("{:016x}", xxh64(bytes, 0))
+ }
+ 
++/// Termux install root used when neither installed-root variable is set.
++#[cfg(any(target_os = "android", all(test, unix)))]
++const ANDROID_DEFAULT_PREFIX: &str = "/data/data/com.termux/files/usr";
++
++/// Message returned when no `sun_path`-sized endpoint can be built.
++pub const ENDPOINT_TOO_LONG: &str =
++	"socket path does not fit sockaddr_un (set OMP_ANDROID_PREFIX to the installed Termux root)";
++
+ /// Private per-user directory that hosts relocated Unix sockets.
++///
++/// The value is a pure function of the effective uid and, on Android, of the
++/// installed Termux root: `/tmp/omp-<euid>` elsewhere and
++/// `<install root>/tmp/omp-<euid>` on Android. The launcher exports the
++/// installed root as `OMP_ANDROID_PREFIX`, so every process started from the
++/// same install computes the same directory even when a shell's `PREFIX`
++/// differs or is unset. No filesystem probe takes part, so naming cannot
++/// change with a transient permission or an existing-but-unusable directory.
++/// `TMPDIR` is deliberately not consulted: shells, `termux-chroot`, and child
++/// environments set it independently of the install.
+ #[cfg_attr(windows, allow(dead_code, reason = "pure helper unit-tested on every host"))]
+ pub fn relocation_dir(euid: u32) -> String {
+-	format!("/tmp/omp-{euid}")
++	#[cfg(target_os = "android")]
++	{
++		android_relocation_dir(
++			env::var_os("OMP_ANDROID_PREFIX").as_deref().map(Path::new),
++			env::var_os("PREFIX").as_deref().map(Path::new),
++			euid,
++		)
++	}
++	#[cfg(not(target_os = "android"))]
++	{
++		format!("/tmp/omp-{euid}")
++	}
++}
++
++/// `<root>/tmp/omp-<euid>`, where `root` is the installed root exported by the
++/// launcher, else `PREFIX`, else the default Termux root. Relative candidates
++/// are ignored so the endpoint is always absolute and shared.
++#[cfg(any(target_os = "android", all(test, unix)))]
++fn android_relocation_dir(installed: Option<&Path>, prefix: Option<&Path>, euid: u32) -> String {
++	let root = installed
++		.filter(|path| path.is_absolute())
++		.or_else(|| prefix.filter(|path| path.is_absolute()))
++		.unwrap_or_else(|| Path::new(ANDROID_DEFAULT_PREFIX));
++	let tmp = root.join("tmp");
++	let tmp = tmp.to_string_lossy();
++	format!("{}/omp-{euid}", tmp.trim_end_matches('/'))
+ }
+ 
+ /// Unix socket path for `name` in the already-resolved `dir`.
+ ///
+ /// `sun_path_max` is the size of `sockaddr_un::sun_path` including the NUL
+ /// terminator; a path that does not fit is relocated under
+-/// [`relocation_dir`] with a hashed basename.
++/// [`relocation_dir`] with a hashed basename. Fails with
++/// [`ENDPOINT_TOO_LONG`] when even the relocated path cannot fit (an install
++/// root long enough to exhaust `sun_path`).
+ #[cfg_attr(windows, allow(dead_code, reason = "pure helper unit-tested on every host"))]
+-pub fn unix_endpoint(dir: &str, name: &str, euid: u32, sun_path_max: usize) -> String {
++pub fn unix_endpoint(
++	dir: &str,
++	name: &str,
++	euid: u32,
++	sun_path_max: usize,
++) -> Result<String, &'static str> {
++	unix_endpoint_with(dir, name, &relocation_dir(euid), sun_path_max)
++}
++
++/// [`unix_endpoint`] with an explicit relocation directory, for tests and for
++/// callers that already resolved it.
++fn unix_endpoint_with(
++	dir: &str,
++	name: &str,
++	relocation: &str,
++	sun_path_max: usize,
++) -> Result<String, &'static str> {
+ 	let stem = sanitize_stem(name);
+ 	let direct = if dir.ends_with('/') {
+ 		format!("{dir}{stem}.sock")
+@@ -52,13 +113,17 @@ pub fn unix_endpoint(dir: &str, name: &str, euid: u32, sun_path_max: usize) -> S
+ 		format!("{dir}/{stem}.sock")
+ 	};
+ 	if direct.len() < sun_path_max {
+-		return direct;
++		return Ok(direct);
+ 	}
+ 	let mut key = Vec::with_capacity(dir.len() + 1 + name.len());
+ 	key.extend_from_slice(dir.as_bytes());
+ 	key.push(0);
+ 	key.extend_from_slice(name.as_bytes());
+-	format!("{}/{}.sock", relocation_dir(euid), hash16(&key))
++	let relocated = format!("{relocation}/{}.sock", hash16(&key));
++	if relocated.len() >= sun_path_max {
++		return Err(ENDPOINT_TOO_LONG);
++	}
++	Ok(relocated)
+ }
+ 
+ /// Windows named-pipe path for `name` in the already-resolved `dir`.
+@@ -147,8 +212,8 @@ mod tests {
+ 
+ 	#[test]
+ 	fn unix_endpoint_keeps_short_paths_in_dir() {
+-		assert_eq!(unix_endpoint("/tmp/x", "a b", 501, 104), "/tmp/x/a_b.sock");
+-		assert_eq!(unix_endpoint("/", "s", 501, 104), "/s.sock");
++		assert_eq!(unix_endpoint("/tmp/x", "a b", 501, 104).as_deref(), Ok("/tmp/x/a_b.sock"));
++		assert_eq!(unix_endpoint("/", "s", 501, 104).as_deref(), Ok("/s.sock"));
+ 	}
+ 
+ 	#[test]
+@@ -159,22 +224,93 @@ mod tests {
+ 		let fits = format!("/{}", "d".repeat(104 - 1 - suffix_len - 1));
+ 		let direct = format!("{fits}/n.sock");
+ 		assert_eq!(direct.len(), 103);
+-		assert_eq!(unix_endpoint(&fits, name, 501, 104), direct);
++		assert_eq!(unix_endpoint(&fits, name, 501, 104).as_deref(), Ok(direct.as_str()));
+ 
+ 		let too_long = format!("{fits}d");
+-		let relocated = unix_endpoint(&too_long, name, 501, 104);
++		let relocated = unix_endpoint(&too_long, name, 501, 104).unwrap();
+ 		let mut key = too_long.clone().into_bytes();
+ 		key.push(0);
+ 		key.extend_from_slice(name.as_bytes());
+-		assert_eq!(relocated, format!("/tmp/omp-501/{}.sock", hash16(&key)));
++		assert_eq!(relocated, format!("{}/{}.sock", relocation_dir(501), hash16(&key)));
+ 		// Linux's larger sun_path keeps the same directory in place.
+-		assert_eq!(unix_endpoint(&too_long, name, 501, 108), format!("{too_long}/n.sock"));
++		assert_eq!(unix_endpoint(&too_long, name, 501, 108).unwrap(), format!("{too_long}/n.sock"));
++	}
++
++	#[cfg(unix)]
++	#[test]
++	fn unix_endpoint_rejects_relocated_paths_that_cannot_fit() {
++		let too_long = format!("/{}", "d".repeat(200));
++		let prefix_of = |len: usize| format!("/{}", "p".repeat(len - 1));
++
++		// `<root>/omp-<uid>/<hash16>.sock`: 34 bytes with uid 501 and one path
++		// separator, so an 74-byte install root lands exactly on 108.
++		let at_limit = android_relocation_dir(Some(Path::new(&prefix_of(74))), None, 501);
++		assert_eq!(at_limit.len(), 74 + "/tmp/omp-501".len());
++		assert_eq!(unix_endpoint_with(&too_long, "n", &at_limit, 108), Err(ENDPOINT_TOO_LONG));
++
++		let one_short = android_relocation_dir(Some(Path::new(&prefix_of(73))), None, 501);
++		assert_eq!(
++			unix_endpoint_with(&too_long, "n", &one_short, 108)
++				.unwrap()
++				.len(),
++			107
++		);
++
++		// The limit counts bytes, not chars: a multibyte root of the same byte
++		// length is rejected identically.
++		let multibyte = format!("/{}{}", "é".repeat(36), "p");
++		assert_eq!(multibyte.len(), 74);
++		let multibyte = android_relocation_dir(Some(Path::new(&multibyte)), None, 501);
++		assert_eq!(unix_endpoint_with(&too_long, "n", &multibyte, 108), Err(ENDPOINT_TOO_LONG));
++	}
++
++	#[cfg(unix)]
++	#[test]
++	fn android_relocation_dir_is_fixed_by_install_root() {
++		let default = "/data/data/com.termux/files/usr/tmp/omp-501";
++		assert_eq!(android_relocation_dir(None, None, 501), default);
++		assert_eq!(
++			android_relocation_dir(Some(Path::new(ANDROID_DEFAULT_PREFIX)), None, 501),
++			default
++		);
++		assert_eq!(android_relocation_dir(None, Some(Path::new("/x")), 501), "/x/tmp/omp-501");
++		assert_eq!(
++			android_relocation_dir(Some(Path::new("/x/")), Some(Path::new("/y")), 501),
++			"/x/tmp/omp-501"
++		);
++		// A relative root cannot name a shared absolute socket.
++		assert_eq!(
++			android_relocation_dir(Some(Path::new("relative")), Some(Path::new("relative")), 501),
++			default
++		);
++		// The launcher's installed root wins over a shell's differing PREFIX, so
++		// the same install names one socket regardless of the caller environment.
++		assert_eq!(
++			android_relocation_dir(Some(Path::new("/installed")), Some(Path::new("/other")), 501),
++			android_relocation_dir(Some(Path::new("/installed")), None, 501)
++		);
++	}
++
++	#[cfg(target_os = "android")]
++	#[test]
++	fn android_relocated_endpoint_uses_install_root_and_stays_bounded() {
++		let installed = std::env::var_os("OMP_ANDROID_PREFIX").map(std::path::PathBuf::from);
++		let prefix = std::env::var_os("PREFIX").map(std::path::PathBuf::from);
++		let root = android_relocation_dir(installed.as_deref(), prefix.as_deref(), 501);
++		let relocated =
++			unix_endpoint(&format!("/{}", "d".repeat(200)), "n", 501, SUN_PATH_MAX).unwrap();
++		assert!(relocated.starts_with(&format!("{root}/")), "{relocated}");
++		assert!(relocated.ends_with(".sock"));
++		assert!(relocated.len() < SUN_PATH_MAX);
+ 	}
+ 
+ 	#[test]
+ 	fn relocation_hash_separates_dir_and_name() {
+ 		let dir = format!("/{}", "x".repeat(200));
+-		assert_ne!(unix_endpoint(&dir, "ab", 0, 104), unix_endpoint(&format!("{dir}a"), "b", 0, 104));
++		assert_ne!(
++			unix_endpoint(&dir, "ab", 0, 104).unwrap(),
++			unix_endpoint(&format!("{dir}a"), "b", 0, 104).unwrap()
++		);
+ 	}
+ 
+ 	#[test]
+diff --git a/crates/natives/src/ipc/mod.rs b/crates/natives/src/ipc/mod.rs
+index 0cdd57e..f10b684 100644
+--- a/crates/natives/src/ipc/mod.rs
++++ b/crates/natives/src/ipc/mod.rs
+@@ -48,6 +48,7 @@ const DEFAULT_MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
+ const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 3000;
+ 
+ /// Transport failure carrying an errno-style code.
++#[derive(Debug)]
+ pub struct IpcError {
+ 	code:    &'static str,
+ 	message: String,
+@@ -151,20 +152,25 @@ pub struct IpcConnectOptions {
+ /// Platform endpoint for `name` scoped to directory `dir`.
+ ///
+ /// Unix: `<dir>/<stem>.sock`; when that path does not fit `sun_path` (104 bytes
+-/// on macOS/BSD, 108 on Linux, including NUL), `/tmp/omp-<euid>/<hash16>.sock`.
++/// on macOS/BSD, 108 on Linux, including NUL), the per-user relocation directory
++/// (`/tmp/omp-<euid>`; on Android `<install root>/tmp/omp-<euid>`) plus
++/// `<hash16>.sock`. Throws when even that cannot fit — an install root long
++/// enough to exhaust `sun_path`.
+ /// Windows: `\\.\pipe\omp-<stem>-<hash16(lowercase(resolve(dir)))>`.
+ /// `stem` is `name` with every char outside `[A-Za-z0-9._-]` replaced by "_".
+-/// Pure and deterministic: every process computes the same endpoint.
++/// Pure and deterministic: every process of one install computes the same
++/// endpoint.
+ #[napi(js_name = "ipcEndpoint")]
+-pub fn ipc_endpoint(dir: String, name: String) -> String {
++pub fn ipc_endpoint(dir: String, name: String) -> Result<String> {
+ 	let resolved = endpoint::resolve_dir(&dir);
+ 	#[cfg(unix)]
+ 	{
+ 		endpoint::unix_endpoint(&resolved, &name, platform::euid(), endpoint::SUN_PATH_MAX)
++			.map_err(Error::from_reason)
+ 	}
+ 	#[cfg(windows)]
+ 	{
+-		endpoint::windows_pipe_name(&resolved, &name)
++		Ok(endpoint::windows_pipe_name(&resolved, &name))
+ 	}
+ }
+ 
+diff --git a/crates/natives/src/ipc/unix.rs b/crates/natives/src/ipc/unix.rs
+index 332b982..3703f89 100644
+--- a/crates/natives/src/ipc/unix.rs
++++ b/crates/natives/src/ipc/unix.rs
+@@ -276,7 +276,25 @@ fn prepare_parent(path: &Path) -> Result<(), IpcError> {
+ 		.map_err(|error| IpcError::io(&error, &format!("create {}", parent.display())))
+ }
+ 
++/// uid/gid owning Android's system-managed data tree (`/data/data`).
++#[cfg(any(target_os = "android", test))]
++const ANDROID_SYSTEM_UID: u32 = 1000;
++#[cfg(any(target_os = "android", test))]
++const ANDROID_SYSTEM_GID: u32 = 1000;
++
++/// Create/reuse the shared relocation directory.
++///
++/// `dir` is `<base>/omp-<euid>` and the only component this process creates, so
++/// it must be a real directory of ours with mode `0700`. On Android the whole
++/// lexical base path is validated first (see [`ensure_trusted_base`]).
+ fn ensure_private_dir(dir: &Path, euid: u32) -> Result<(), IpcError> {
++	#[cfg(target_os = "android")]
++	{
++		let Some(base) = dir.parent().filter(|base| !base.as_os_str().is_empty()) else {
++			return Err(relocation_error(dir, "has no parent directory"));
++		};
++		ensure_trusted_base(base, euid)?;
++	}
+ 	match DirBuilder::new().mode(0o700).create(dir) {
+ 		Ok(()) => {},
+ 		Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+@@ -284,19 +302,120 @@ fn ensure_private_dir(dir: &Path, euid: u32) -> Result<(), IpcError> {
+ 	}
+ 	let meta = fs::symlink_metadata(dir)
+ 		.map_err(|error| IpcError::io(&error, &format!("stat {}", dir.display())))?;
+-	if !meta.file_type().is_dir() || meta.uid() != euid {
+-		return Err(IpcError::new(
+-			"EACCES",
+-			format!("{} is not a directory owned by uid {euid}", dir.display()),
++	if !meta.file_type().is_dir() {
++		return Err(relocation_error(dir, "exists and is not a directory"));
++	}
++	if meta.uid() != euid {
++		return Err(relocation_error(
++			dir,
++			format!("is owned by uid {} instead of {euid}", meta.uid()),
+ 		));
+ 	}
+-	if meta.mode() & 0o077 != 0 {
++	// We own it, so any mode other than the required `0700` is repaired: `0500`
++	// or `0600` would accept the directory and then fail when the socket file is
++	// created, and group/other access is never needed.
++	if meta.mode() & 0o777 != 0o700 {
+ 		fs::set_permissions(dir, Permissions::from_mode(0o700))
+ 			.map_err(|error| IpcError::io(&error, &format!("chmod {}", dir.display())))?;
+ 	}
+ 	Ok(())
+ }
+ 
++/// `EACCES` naming the relocation directory and the reason it is unusable.
++fn relocation_error(dir: &Path, reason: impl std::fmt::Display) -> IpcError {
++	IpcError::new(
++		"EACCES",
++		format!("no usable IPC relocation directory {}: {reason}", dir.display()),
++	)
++}
++
++/// Validate the base directory of the relocation leaf.
++///
++/// Every component of the absolute, normalized path is checked lexically with
++/// `symlink_metadata`, so nothing is resolved and there is no second path an
++/// attacker could swap between validation and use. A symlinked install root is
++/// rejected rather than followed. Each component must be owned by us, root, or
++/// Android's system uid, and must not be writable by another uid; the base
++/// itself must additionally accept a new entry.
++#[cfg(any(target_os = "android", test))]
++fn ensure_trusted_base(base: &Path, euid: u32) -> Result<(), IpcError> {
++	if !base.is_absolute() {
++		return Err(relocation_error(base, "is not an absolute path"));
++	}
++	// SAFETY: `getegid` has no preconditions and cannot fail.
++	let egid = unsafe { libc::getegid() };
++	let mut path = PathBuf::from("/");
++	for component in base.components() {
++		match component {
++			std::path::Component::RootDir => continue,
++			std::path::Component::Normal(part) => path.push(part),
++			_ => return Err(relocation_error(base, "is not a normalized path")),
++		}
++		let meta = fs::symlink_metadata(&path).map_err(|error| {
++			relocation_error(base, format!("cannot stat {}: {error}", path.display()))
++		})?;
++		if !meta.file_type().is_dir() {
++			return Err(relocation_error(base, format!("{} is not a real directory", path.display())));
++		}
++		if !trusted_component(meta.uid(), meta.gid(), meta.mode(), euid, egid) {
++			return Err(relocation_error(
++				base,
++				format!(
++					"{} is not trusted (uid {} mode {:o})",
++					path.display(),
++					meta.uid(),
++					meta.mode() & 0o7777
++				),
++			));
++		}
++		if path.as_path() == base && !base_accepts_new_entries(meta.uid(), meta.mode(), euid) {
++			return Err(relocation_error(base, "is not writable by this uid"));
++		}
++	}
++	Ok(())
++}
++
++/// Whether a directory's owner **and** write permissions keep our leaf safe.
++///
++/// The owner must be us, root, or Android's system uid — any other owner can
++/// `chmod` and rename its own entries regardless of mode. Ownership alone is
++/// not enough: a non-sticky directory writable by a group or by everyone lets a
++/// non-owner replace the leaf after validation. Only the sticky bit makes a
++/// write-open directory safe, because then only the entry owner (or root) can
++/// rename or remove our leaf, which is the `/tmp` rule. Group write is accepted
++/// only for groups that cannot contain another app: our own group and the
++/// Android system group (the `/data/data` tree is `0771 system:system`).
++#[cfg(any(target_os = "android", test))]
++fn trusted_component(uid: u32, gid: u32, mode: u32, euid: u32, egid: u32) -> bool {
++	let owner_trusted = uid == euid || uid == 0 || uid == ANDROID_SYSTEM_UID;
++	if !owner_trusted {
++		return false;
++	}
++	if mode & 0o1000 != 0 {
++		return true;
++	}
++	if mode & 0o002 != 0 {
++		return false;
++	}
++	if mode & 0o020 != 0 {
++		return gid == egid || gid == 0 || gid == ANDROID_SYSTEM_GID;
++	}
++	true
++}
++
++/// Whether the base lets this uid create the per-user entry.
++///
++/// An app-owned base needs owner write and search. A root/system-owned base is
++/// usable only when it is sticky and world-writable (`/tmp`); root-owned `0755`
++/// cannot hold the entry for an ordinary app uid.
++#[cfg(any(target_os = "android", test))]
++fn base_accepts_new_entries(uid: u32, mode: u32, euid: u32) -> bool {
++	if uid == euid {
++		return mode & 0o300 == 0o300;
++	}
++	(uid == 0 || uid == ANDROID_SYSTEM_UID) && mode & 0o1003 == 0o1003
++}
++
+ /// Dial `endpoint` and verify the server runs as our effective uid.
+ pub async fn connect(endpoint: &str, _timeout: Duration) -> Result<Stream, IpcError> {
+ 	let stream = UnixStream::connect(endpoint)
+@@ -354,3 +473,168 @@ impl Stream {
+ 		Ok(WriteFinish::HalfClosed)
+ 	}
+ }
++
++#[cfg(test)]
++mod tests {
++	use super::*;
++
++	fn scratch(tag: &str) -> PathBuf {
++		let dir = std::env::temp_dir().join(format!("omp-ipc-{}-{tag}", std::process::id()));
++		let _ = fs::remove_dir_all(&dir);
++		fs::create_dir_all(&dir).unwrap();
++		dir
++	}
++
++	fn leaf(base: &Path) -> PathBuf {
++		base.join(format!("omp-{}", euid()))
++	}
++
++	#[test]
++	fn ensure_private_dir_creates_leaf_0700() {
++		let base = scratch("create");
++		let dir = leaf(&base);
++		ensure_private_dir(&dir, euid()).unwrap();
++		let meta = fs::symlink_metadata(&dir).unwrap();
++		assert!(meta.file_type().is_dir());
++		assert_eq!(meta.mode() & 0o777, 0o700);
++		fs::remove_dir_all(base).unwrap();
++	}
++
++	#[test]
++	fn ensure_private_dir_repairs_any_non_0700_owner_mode() {
++		for mode in [0o500, 0o600, 0o200, 0o705] {
++			let base = scratch(&format!("repair-{mode:o}"));
++			let dir = leaf(&base);
++			fs::create_dir(&dir).unwrap();
++			fs::set_permissions(&dir, Permissions::from_mode(mode)).unwrap();
++			ensure_private_dir(&dir, euid()).unwrap();
++			assert_eq!(fs::symlink_metadata(&dir).unwrap().mode() & 0o777, 0o700);
++			fs::remove_dir_all(base).unwrap();
++		}
++	}
++
++	#[test]
++	fn ensure_private_dir_rejects_non_directory_leaf() {
++		let base = scratch("file");
++		let dir = leaf(&base);
++		fs::write(&dir, b"x").unwrap();
++		let error = ensure_private_dir(&dir, euid()).unwrap_err();
++		assert_eq!(error.code, "EACCES");
++		assert!(error.message.contains("not a directory"), "{}", error.message);
++		fs::remove_dir_all(base).unwrap();
++	}
++
++	#[test]
++	fn ensure_private_dir_rejects_symlink_leaf() {
++		let base = scratch("symlink");
++		let target = base.join("target");
++		fs::create_dir(&target).unwrap();
++		let dir = leaf(&base);
++		std::os::unix::fs::symlink(&target, &dir).unwrap();
++		let error = ensure_private_dir(&dir, euid()).unwrap_err();
++		assert_eq!(error.code, "EACCES");
++		assert!(error.message.contains("not a directory"), "{}", error.message);
++		fs::remove_dir_all(base).unwrap();
++	}
++
++	#[cfg(any(target_os = "android", target_os = "linux"))]
++	#[test]
++	fn ensure_trusted_base_accepts_app_private_chain() {
++		let base = scratch("trusted");
++		assert!(ensure_trusted_base(&base, euid()).is_ok());
++		fs::remove_dir_all(base).unwrap();
++	}
++
++	#[cfg(any(target_os = "android", target_os = "linux"))]
++	#[test]
++	fn ensure_trusted_base_rejects_world_writable_base() {
++		let base = scratch("open");
++		fs::set_permissions(&base, Permissions::from_mode(0o777)).unwrap();
++		let error = ensure_trusted_base(&base, euid()).unwrap_err();
++		assert_eq!(error.code, "EACCES");
++		assert!(error.message.contains("no usable IPC relocation directory"), "{}", error.message);
++		fs::set_permissions(&base, Permissions::from_mode(0o700)).unwrap();
++		fs::remove_dir_all(base).unwrap();
++	}
++
++	#[cfg(any(target_os = "android", target_os = "linux"))]
++	#[test]
++	fn ensure_trusted_base_rejects_symlink_component() {
++		let root = scratch("link");
++		let real = root.join("real");
++		fs::create_dir(&real).unwrap();
++		let link = root.join("link");
++		std::os::unix::fs::symlink(&real, &link).unwrap();
++		let error = ensure_trusted_base(&link, euid()).unwrap_err();
++		assert_eq!(error.code, "EACCES");
++		assert!(error.message.contains("not a real directory"), "{}", error.message);
++		fs::remove_dir_all(root).unwrap();
++	}
++
++	#[test]
++	fn ensure_trusted_base_requires_normalized_absolute_path() {
++		assert!(ensure_trusted_base(Path::new("relative/path"), euid()).is_err());
++		assert!(ensure_trusted_base(Path::new("/tmp/../etc"), euid()).is_err());
++	}
++
++	#[test]
++	fn trusted_component_requires_trusted_owner_and_safe_writes() {
++		let euid = 501;
++		let egid = 501;
++		assert!(trusted_component(euid, egid, 0o700, euid, egid));
++		// Own group may write (Android app dirs are 0771); a foreign group may not.
++		assert!(trusted_component(euid, egid, 0o770, euid, egid));
++		assert!(!trusted_component(euid, 20, 0o770, euid, egid));
++		assert!(!trusted_component(euid, egid, 0o702, euid, egid));
++		// A foreign owner can chmod/rename its own entries, whatever the mode.
++		assert!(!trusted_component(502, 502, 0o755, euid, egid));
++		assert!(!trusted_component(502, 502, 0o555, euid, egid));
++		// Owner alone is not enough: non-sticky group/other write is replaceable.
++		assert!(!trusted_component(0, 0, 0o777, euid, egid));
++		assert!(!trusted_component(ANDROID_SYSTEM_UID, ANDROID_SYSTEM_GID, 0o777, euid, egid));
++		assert!(!trusted_component(euid, egid, 0o777, euid, egid));
++		// Sticky write-open directories only let the entry owner rename (the /tmp rule).
++		assert!(trusted_component(0, 0, 0o1777, euid, egid));
++		assert!(trusted_component(euid, egid, 0o1770, euid, egid));
++		// Android's system tree is 0771 system:system; that group cannot hold apps.
++		assert!(trusted_component(ANDROID_SYSTEM_UID, ANDROID_SYSTEM_GID, 0o771, euid, egid));
++		assert!(!trusted_component(ANDROID_SYSTEM_UID, 20, 0o770, euid, egid));
++		// Read-only foreign-group modes are safe without the sticky bit.
++		assert!(trusted_component(euid, 20, 0o750, euid, egid));
++		assert!(trusted_component(0, 20, 0o755, euid, egid));
++	}
++
++	#[test]
++	fn base_accepts_new_entries_requires_owner_write_and_search() {
++		let euid = 501;
++		assert!(base_accepts_new_entries(euid, 0o700, euid));
++		assert!(!base_accepts_new_entries(euid, 0o600, euid));
++		assert!(!base_accepts_new_entries(euid, 0o500, euid));
++		// Root/system bases qualify only as sticky world-writable (`/tmp`), never
++		// as root-owned 0755 for an ordinary app uid.
++		assert!(base_accepts_new_entries(0, 0o1777, euid));
++		assert!(!base_accepts_new_entries(0, 0o755, euid));
++		assert!(!base_accepts_new_entries(0, 0o777, euid));
++		// Sticky but not searchable for others cannot accept our entry.
++		assert!(!base_accepts_new_entries(0, 0o1002, euid));
++		assert!(!base_accepts_new_entries(ANDROID_SYSTEM_UID, 0o777, euid));
++		assert!(base_accepts_new_entries(ANDROID_SYSTEM_UID, 0o1777, euid));
++	}
++
++	/// Exercise the real install-root ancestry: every lexical component of the
++	/// host's relocation base (`/tmp` on Linux CI, `<prefix>/tmp` on Android)
++	/// must satisfy the owner/mode policy. macOS is excluded because its `/tmp`
++	/// is a symlink the policy intentionally rejects.
++	#[cfg(any(target_os = "android", target_os = "linux"))]
++	#[test]
++	fn android_install_root_ancestry_is_trusted() {
++		let euid = euid();
++		let dir = PathBuf::from(endpoint::relocation_dir(euid));
++		let Some(base) = dir.parent() else { return };
++		if !base.is_dir() {
++			eprintln!("SKIP: {} is absent on this host", base.display());
++			return;
++		}
++		ensure_trusted_base(base, euid).unwrap();
++	}
++}
+diff --git a/packages/natives/native/index.js b/packages/natives/native/index.js
+index c519335..c3a6b31 100644
+--- a/packages/natives/native/index.js
++++ b/packages/natives/native/index.js
+@@ -23,8 +23,12 @@ import { adaptDesktopSession } from "./desktop-adapter.js";
+ const nativeBindings = loadNative();
+ // --- generated native exports (do not edit) ---
+ // classes
+-export const AudioCapture = nativeBindings.AudioCapture ?? missingNativeClass("AudioCapture");
+-export const AudioPlayback = nativeBindings.AudioPlayback ?? missingNativeClass("AudioPlayback");
++export const AudioCapture = process.platform === "android"
++	? (() => { const v = nativeBindings.AudioCapture; if (v !== undefined) return v; const err = function err() { throw new Error("Native AudioCapture is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
++	: (nativeBindings.AudioCapture ?? missingNativeClass("AudioCapture"));
++export const AudioPlayback = process.platform === "android"
++	? (() => { const v = nativeBindings.AudioPlayback; if (v !== undefined) return v; const err = function err() { throw new Error("Native AudioPlayback is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
++	: (nativeBindings.AudioPlayback ?? missingNativeClass("AudioPlayback"));
+ export const DesktopSession = adaptDesktopSession(nativeBindings.DesktopSession);
+ export const DiffStream = nativeBindings.DiffStream ?? missingNativeClass("DiffStream");
+ export const DirectoryWatcher = nativeBindings.DirectoryWatcher ?? missingNativeClass("DirectoryWatcher");
+@@ -36,7 +40,9 @@ export const HighlightStream = nativeBindings.HighlightStream ?? missingNativeCl
+ export const IpcConnection = nativeBindings.IpcConnection ?? missingNativeClass("IpcConnection");
+ export const IpcServer = nativeBindings.IpcServer ?? missingNativeClass("IpcServer");
+ export const LineMatcher = nativeBindings.LineMatcher ?? missingNativeClass("LineMatcher");
+-export const LiveWebRtcPeer = nativeBindings.LiveWebRtcPeer ?? missingNativeClass("LiveWebRtcPeer");
++export const LiveWebRtcPeer = process.platform === "android"
++	? (() => { const v = nativeBindings.LiveWebRtcPeer; if (v !== undefined) return v; const err = function err() { throw new Error("Native LiveWebRtcPeer is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
++	: (nativeBindings.LiveWebRtcPeer ?? missingNativeClass("LiveWebRtcPeer"));
+ export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver ?? missingNativeClass("MacAppearanceObserver");
+ export const MacOSFrontApp = nativeBindings.MacOSFrontApp ?? missingNativeClass("MacOSFrontApp");
+ export const NativeOAuthCallback = nativeBindings.NativeOAuthCallback ?? missingNativeClass("NativeOAuthCallback");
+@@ -67,7 +73,9 @@ export const astGrep = nativeBindings.astGrep ?? missingNativeExport("astGrep");
+ export const astMatch = nativeBindings.astMatch ?? missingNativeExport("astMatch");
+ export const blockRangeAt = nativeBindings.blockRangeAt ?? missingNativeExport("blockRangeAt");
+ export const closeDesktopEventTaps = nativeBindings.closeDesktopEventTaps ?? missingNativeExport("closeDesktopEventTaps");
+-export const copyToClipboard = nativeBindings.copyToClipboard ?? missingNativeExport("copyToClipboard");
++export const copyToClipboard = process.platform === "android"
++	? (() => { const v = nativeBindings.copyToClipboard; if (v !== undefined) return v; const err = function err() { throw new Error("Native copyToClipboard is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
++	: (nativeBindings.copyToClipboard ?? missingNativeExport("copyToClipboard"));
+ export const cosineSimilarityPairs = nativeBindings.cosineSimilarityPairs ?? missingNativeExport("cosineSimilarityPairs");
+ export const countTokens = nativeBindings.countTokens ?? missingNativeExport("countTokens");
+ export const decodeSixelToPng = nativeBindings.decodeSixelToPng ?? missingNativeExport("decodeSixelToPng");
+@@ -140,7 +148,9 @@ export const parseKey = nativeBindings.parseKey ?? missingNativeExport("parseKey
+ export const parseKittySequence = nativeBindings.parseKittySequence ?? missingNativeExport("parseKittySequence");
+ export const pdfToMarkdown = nativeBindings.pdfToMarkdown ?? missingNativeExport("pdfToMarkdown");
+ export const rasterizeSvg = nativeBindings.rasterizeSvg ?? missingNativeExport("rasterizeSvg");
+-export const readImageFromClipboard = nativeBindings.readImageFromClipboard ?? missingNativeExport("readImageFromClipboard");
++export const readImageFromClipboard = process.platform === "android"
++	? (() => { const v = nativeBindings.readImageFromClipboard; if (v !== undefined) return v; const err = function err() { throw new Error("Native readImageFromClipboard is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
++	: (nativeBindings.readImageFromClipboard ?? missingNativeExport("readImageFromClipboard"));
+ export const readTextFromClipboard = nativeBindings.readTextFromClipboard ?? missingNativeExport("readTextFromClipboard");
+ export const reapChild = nativeBindings.reapChild ?? missingNativeExport("reapChild");
+ export const renderMermaidAscii = nativeBindings.renderMermaidAscii ?? missingNativeExport("renderMermaidAscii");
+diff --git a/packages/natives/native/loader-state.js b/packages/natives/native/loader-state.js
+index f10eac3..549b1f7 100644
+--- a/packages/natives/native/loader-state.js
++++ b/packages/natives/native/loader-state.js
+@@ -38,6 +38,7 @@ const SUPPORTED_PLATFORMS = [
+ 	"darwin-arm64",
+ 	"win32-x64",
+ 	"win32-arm64",
++	"android-arm64",
+ ];
+ 
+ /**
+diff --git a/packages/natives/scripts/gen-enums.ts b/packages/natives/scripts/gen-enums.ts
+index bb1750b..9b6af51 100644
+--- a/packages/natives/scripts/gen-enums.ts
++++ b/packages/natives/scripts/gen-enums.ts
+@@ -16,9 +16,7 @@
+  */
+ import * as path from "node:path";
+ 
+-const nativeDir = path.resolve(import.meta.dir, "../native");
+-const dtsPath = path.join(nativeDir, "index.d.ts");
+-const jsPath = path.join(nativeDir, "index.js");
++const defaultNativeDir = path.resolve(import.meta.dir, "../native");
+ 
+ const MARKER_START = "// --- generated native exports (do not edit) ---";
+ const MARKER_END = "// --- end generated native exports ---";
+@@ -82,7 +80,7 @@ function collectMatches(dts: string, re: RegExp): string[] {
+ 	return names;
+ }
+ 
+-function buildGeneratedBlock(dts: string): string {
++export function buildGeneratedBlock(dts: string): string {
+ 	const classes = collectMatches(dts, CLASS_RE);
+ 	const functions = collectMatches(dts, FUNCTION_RE);
+ 	const enums = collectEnums(dts);
+@@ -92,6 +90,18 @@ function buildGeneratedBlock(dts: string): string {
+ 	}
+ 
+ 	const lines: string[] = [];
++	const androidUnsupported = new Set([
++		"AudioCapture",
++		"AudioPlayback",
++		"LiveWebRtcPeer",
++		"copyToClipboard",
++		"readImageFromClipboard",
++	]);
++	// The proxy is Android-only. On other platforms the generated line must keep
++	// the upstream fallback (`missingNativeExport`) so a stale or mismatched
++	// desktop addon gets the rebuild diagnostic, not "unsupported on Android".
++	const androidStub = (name: string) =>
++		`(() => { const v = nativeBindings.${name}; if (v !== undefined) return v; const err = function err() { throw new Error("Native ${name} is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()`;
+ 	if (classes.length > 0) {
+ 		lines.push("// classes");
+ 		for (const name of classes) {
+@@ -104,19 +114,27 @@ function buildGeneratedBlock(dts: string): string {
+ 				name === "DesktopSession"
+ 					? `adaptDesktopSession(nativeBindings.${name})`
+ 					: `nativeBindings.${name} ?? missingNativeClass("${name}")`;
+-			lines.push(`export const ${name} = ${binding};`);
++			if (androidUnsupported.has(name)) {
++				lines.push(
++					`export const ${name} = process.platform === "android"\n\t? ${androidStub(name)}\n\t: (${binding});`,
++				);
++			} else {
++				lines.push(`export const ${name} = ${binding};`);
++			}
+ 		}
+ 	}
+ 	if (functions.length > 0) {
+ 		if (lines.length > 0) lines.push("");
+ 		lines.push("// functions");
+ 		for (const name of functions) {
+-			// `missingNativeExport` returns `undefined` on a current addon and a
+-			// throwing stub on a stale one, so capability probes
+-			// (`typeof native.x === "function"`) keep their meaning and only the
+-			// stale case gains an actionable failure. See `loader-state.js`.
+ 			const fallback = RELEASE_IDENTITY_NAME_RE.test(name) ? "" : ` ?? missingNativeExport("${name}")`;
+-			lines.push(`export const ${name} = nativeBindings.${name}${fallback};`);
++			if (androidUnsupported.has(name)) {
++				lines.push(
++					`export const ${name} = process.platform === "android"\n\t? ${androidStub(name)}\n\t: (nativeBindings.${name}${fallback});`,
++				);
++			} else {
++				lines.push(`export const ${name} = nativeBindings.${name}${fallback};`);
++			}
+ 		}
+ 	}
+ 	if (enums.length > 0) {
+@@ -130,7 +148,10 @@ function buildGeneratedBlock(dts: string): string {
+ 	return `${MARKER_START}\n${lines.join("\n")}\n${MARKER_END}`;
+ }
+ 
+-export async function generateEnumExports(): Promise<void> {
++export async function generateEnumExports(options: { nativeDir?: string } = {}): Promise<void> {
++	const nativeDir = options.nativeDir ?? defaultNativeDir;
++	const dtsPath = path.join(nativeDir, "index.d.ts");
++	const jsPath = path.join(nativeDir, "index.js");
+ 	const dts = await Bun.file(dtsPath).text();
+ 	const existing = await Bun.file(jsPath).text();
+ 	const generatedBlock = buildGeneratedBlock(dts);
+diff --git a/packages/natives/test/ipc.test.ts b/packages/natives/test/ipc.test.ts
+index a1919c5..ff2696d 100644
+--- a/packages/natives/test/ipc.test.ts
++++ b/packages/natives/test/ipc.test.ts
+@@ -223,7 +223,15 @@ describe("native IPC", () => {
+ 		const dir = path.join(await tempDir(), "d".repeat(120));
+ 		const name = `long-${process.pid}`;
+ 		const endpoint = ipcEndpoint(dir, name);
+-		expect(endpoint).toMatch(new RegExp(`^/tmp/omp-${process.getuid!()}/[0-9a-f]{16}\\.sock$`));
++		// Android has no /tmp: the relocation directory is <installed root>/tmp/omp-<uid>,
++		// where the launcher exports the installed root as OMP_ANDROID_PREFIX.
++		const prefix = process.env.OMP_ANDROID_PREFIX ?? process.env.PREFIX ?? "/data/data/com.termux/files/usr";
++		const relocationRoot =
++			process.platform === "android"
++				? path.join(prefix, "tmp", `omp-${process.getuid!()}`)
++				: `/tmp/omp-${process.getuid!()}`;
++		expect(endpoint.startsWith(`${relocationRoot}/`)).toBe(true);
++		expect(endpoint).toMatch(/[0-9a-f]{16}\.sock$/);
+ 		expect(ipcEndpoint(dir, name)).toBe(endpoint);
+ 		expect(Buffer.byteLength(endpoint)).toBeLessThan(104);
+ 		await listen(endpoint, { framing: "lines" }, connection => {
+@@ -239,6 +247,51 @@ describe("native IPC", () => {
+ 		expect(seen.events).toEqual(["RELOCATED"]);
+ 	});
+ 
++	test.skipIf(isWindows)("relocated endpoint is stable across processes with different TMPDIR", async () => {
++		const dir = path.join(await tempDir(), "d".repeat(120));
++		const name = `cross-${process.pid}`;
++		const endpoint = ipcEndpoint(dir, name);
++		const { accepted } = await acceptingServer(endpoint, { framing: "lines" });
++
++		// The child inherits the install (PREFIX) but a different per-shell TMPDIR.
++		// Naming must ignore it, otherwise the child dials another socket than the
++		// live broker listens on.
++		const nativeEntry = path.resolve(import.meta.dir, "../native/index.js");
++		const scriptPath = path.join(await tempDir(), "child.ts");
++		await Bun.write(
++			scriptPath,
++			`import { IpcConnection, ipcEndpoint } from ${JSON.stringify(nativeEntry)};
++const endpoint = ipcEndpoint(${JSON.stringify(dir)}, ${JSON.stringify(name)});
++process.stdout.write(\`\${endpoint}\n\`);
++const connection = await IpcConnection.connect(endpoint, { framing: "lines" });
++connection.send("from-child");
++await connection.drained();
++connection.destroy();
++`,
++		);
++		const child = Bun.spawn([process.execPath, scriptPath], {
++			env: { ...process.env, TMPDIR: await tempDir() },
++			stdout: "pipe",
++			stderr: "pipe",
++		});
++		cleanups.push(() => child.kill());
++
++		const peer = record(await accepted);
++		// The child sends, drains, then destroys its connection; the peer sees
++		// the message followed by the natural close. Waiting for both removes
++		// the race where close arrived just before the assertion.
++		await peer.until(2);
++		const [stdout, stderr, exitCode] = await Promise.all([
++			new Response(child.stdout).text(),
++			new Response(child.stderr).text(),
++			child.exited,
++		]);
++		expect(stderr).toBe("");
++		expect(exitCode).toBe(0);
++		expect(stdout.trim()).toBe(endpoint);
++		expect(peer.events).toEqual(["from-child", "<close>"]);
++	});
++
+ 	test("small and large frames arrive in send order, within and across tasks", async () => {
+ 		// Small frames coalesce until the end of the task while large ones may
+ 		// be written immediately; a 4 MiB frame also overflows the socket

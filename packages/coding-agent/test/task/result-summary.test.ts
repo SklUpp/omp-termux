@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { ASYNC_INLINE_RESULT_MAX_CHARS } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { formatTaskResultSummary, INLINE_OUTPUT_CHARS } from "@oh-my-pi/pi-coding-agent/task/result-summary";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 
@@ -43,6 +44,30 @@ describe("formatTaskResultSummary", () => {
 		expect(preview).toContain('"summary": "Audit of 37 tools"');
 		expect(preview.length).toBeGreaterThan(2000);
 		expect(preview.length).toBeLessThanOrEqual(5000);
+	});
+
+	it("marks an aborted isolated run resumable now that retained workspaces revive", () => {
+		// Isolation used to park the agent with no reviver, so the summary
+		// suppressed the resume hint. Retained workspaces now revive through the
+		// persisted factory, and `isResumable` is the single source of truth.
+		const registry = AgentRegistry.global();
+		registry.register({
+			id: "Isolated",
+			displayName: "Isolated",
+			kind: "sub",
+			session: null,
+			sessionFile: "/tmp/Isolated.jsonl",
+			status: "parked",
+		});
+		try {
+			const summary = formatTaskResultSummary(
+				{ ...settledResult("partial audit"), id: "Isolated", aborted: true, isolated: true, abortReason: "user" },
+				{ totalDurationMs: 5 },
+			);
+			expect(summary).toContain("write agent://Isolated");
+		} finally {
+			registry.unregister("Isolated");
+		}
 	});
 
 	it("keeps a markdown preview on a line boundary when one is in range", () => {

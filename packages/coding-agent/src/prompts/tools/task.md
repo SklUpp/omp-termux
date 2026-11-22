@@ -82,10 +82,15 @@ Run one agent synchronously.
 {{/if}}
 {{#if isolationEnabled}}
 {{#if applyIsolatedChanges}}
+{{#if deferIntegration}}
+- `isolated`: worktree; successful changes stay there until you write `/integrate` to `worktree://<id>` (deferred integration).
+{{else}}
 - `isolated`: worktree; successful changes apply to parent.
+{{/if}}
 {{else}}
 - `isolated`: worktree; changes retained, not applied.
 {{/if}}
+- `repoRoot`: with `isolated`, an explicit repo root to copy when the work belongs to a DIFFERENT repo than the current cwd (`isolated` alone always uses the current cwd's repo). `repoRoot` alone enables nothing, and it never changes the parent cwd.
 {{/if}}
 
 Shared edits need one integration owner; give each task its files{{#unless batchEnabled}} and interfaces{{/unless}}.
