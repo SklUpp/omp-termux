@@ -561,6 +561,10 @@ type EscapeMonitor = macos::EscapeMonitor;
 type EscapeMonitor = linux::EscapeMonitor;
 #[cfg(windows)]
 type EscapeMonitor = windows::EscapeMonitor;
+/// Android has no desktop input surface, so there is nothing to monitor and the
+/// takeover path never arms one (`escape_monitor` answers `None`).
+#[cfg(target_os = "android")]
+type EscapeMonitor = ();
 
 /// The kernel owner lives on its own thread: Windows mutex release must happen
 /// on the same thread that acquired it, even when the session is disposed from
@@ -572,6 +576,8 @@ struct ControlLease {
 	_escape: Option<windows::EscapeMonitor>,
 	#[cfg(target_os = "linux")]
 	_escape: Option<linux::EscapeMonitor>,
+	#[cfg(target_os = "android")]
+	_escape: Option<EscapeMonitor>,
 	_kernel: KernelOwner,
 	running: AtomicBool,
 }
@@ -637,6 +643,8 @@ impl ControlLease {
 			_escape: Some(escape),
 			#[cfg(target_os = "linux")]
 			_escape: escape,
+			#[cfg(target_os = "android")]
+			_escape: None,
 			_kernel: kernel,
 			running: AtomicBool::new(false),
 		})
@@ -661,6 +669,12 @@ impl ControlLease {
 	#[cfg(target_os = "linux")]
 	fn escape_monitor(source: &CancellationSource) -> CoreResult<Option<EscapeMonitor>> {
 		linux::EscapeMonitor::start(EmergencyStop(Arc::downgrade(&source.0)))
+	}
+
+	/// No desktop input surface on Android, so a takeover arms no monitor.
+	#[cfg(target_os = "android")]
+	fn escape_monitor(_source: &CancellationSource) -> CoreResult<Option<EscapeMonitor>> {
+		Ok(None)
 	}
 }
 
