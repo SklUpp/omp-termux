@@ -49,6 +49,12 @@ import askResultTemplate from "../prompts/tools/ask-result.md" with { type: "tex
 import { renderAttachmentSourceNotice } from "../session/attachment-source-notice";
 import { cfgSpeechEnabled } from "../tts/settings";
 import { vocalizer } from "../tts/vocalizer";
+import {
+	type AndroidOutcome,
+	clearAndroidNotification,
+	newAndroidAskNotificationId,
+	sendAndroidNotification,
+} from "../utils/android-helpers";
 import { describeAttachedImagesForTextModel, shouldDescribeImagesForTextModel } from "../utils/image-vision-fallback";
 import type { ToolSession } from ".";
 import { ToolAbortError } from "./tool-errors";
@@ -378,8 +384,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		return (session.canPromptUser ?? session.hasUI) || session.advertiseHeadlessAsk ? new AskTool(session) : null;
 	}
 
-	/** Send terminal notification when ask tool is waiting for input */
-	#sendAskNotification(): void {
+	/**
+	 * Notify that the ask dialog is waiting for input: the terminal notification
+	 * plus, on Android, a system card. The caller keeps the card's post promise
+	 * so the removal can be serialized behind it.
+	 */
+	#sendAskNotification(): { id: string; posted: Promise<AndroidOutcome> } | undefined {
 		if (!this.session.hasUI) return;
 		const method = cfgAskNotify.get(this.session.settings);
 		if (method === "off") return;
@@ -390,6 +400,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			urgency: "normal",
 			actions: "focus",
 		});
+		// A per-prompt id: removing it must not erase a completion/error card
+		// posted under the process status id while the dialog was pending.
+		const id = newAndroidAskNotificationId();
+		return { id, posted: sendAndroidNotification("omp", "Waiting for input", { id }) };
 	}
 
 	async #answerImageBlocks(
@@ -481,51 +495,67 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			throw new ToolAbortError("Ask tool was cancelled by the user");
 		};
 
-		// Send notification if waiting and not suppressed
-		this.#sendAskNotification();
+		// Notify only after validation, so no card is posted for a request that
+		// returns an error without ever waiting for input.
+		const askAndroidCard = this.#sendAskNotification();
 
-		// Speak the questions aloud before surfacing them. Ask vocalizes in every
-		// mode — it's the assistant addressing the user — gated only by speech.enabled
-		// (the vocalizer re-checks the setting and no-ops when disabled).
-		if (cfgSpeechEnabled.get(this.session.settings)) {
-			vocalizer.speak(named.map(field => questions.get(field) ?? field.name).join("\n"));
+		async function clearAndroidAskCard(
+			card: { id: string; posted: Promise<AndroidOutcome> } | undefined,
+		): Promise<void> {
+			if (!card) return;
+			// Serialize behind the post: the two Termux:API commands are separate
+			// processes, so a removal that races an in-flight post leaves the card
+			// behind. A suppressed or failed post has no card to remove.
+			if (!(await card.posted).ok) return;
+			await clearAndroidNotification(card.id).catch(() => {});
 		}
 
-		let answered: { data: HtmlFormData; notes?: OptionNote[]; timedOut?: boolean } | undefined;
 		try {
-			if (extensionUi.formDialog) {
-				const formDialog = extensionUi.formDialog.bind(extensionUi);
-				answered = await untilAborted(dialogSignal, () =>
-					formDialog(params.html, { timeout, signal: dialogSignal, acceptImages: true }),
-				);
-			} else {
-				answered = await askFieldByField(extensionUi, form, timeout, dialogSignal);
+			// Speak the questions aloud before surfacing them. Ask vocalizes in every
+			// mode — it's the assistant addressing the user — gated only by speech.enabled
+			// (the vocalizer re-checks the setting and no-ops when disabled).
+			if (cfgSpeechEnabled.get(this.session.settings)) {
+				vocalizer.speak(named.map(field => questions.get(field) ?? field.name).join("\n"));
 			}
-		} catch (error) {
-			if (error instanceof Error && error.name === "AbortError") throw abortError();
-			throw error;
-		}
-		if (!answered) return cancelAsk();
 
-		const notes = answered.notes?.length ? answered.notes : undefined;
-		// Each note numbers its markers from 1; shift them so `[Image #N]` indexes all result images.
-		const answerImages: ImageContent[] = [];
-		const resultNotes: OptionNote[] = [];
-		for (const { images, ...note } of notes ?? []) {
-			resultNotes.push({ ...note, text: shiftImageMarkers(note.text, answerImages.length, images?.length ?? 0) });
-			if (images) answerImages.push(...images);
+			let answered: { data: HtmlFormData; notes?: OptionNote[]; timedOut?: boolean } | undefined;
+			try {
+				if (extensionUi.formDialog) {
+					const formDialog = extensionUi.formDialog.bind(extensionUi);
+					answered = await untilAborted(dialogSignal, () =>
+						formDialog(params.html, { timeout, signal: dialogSignal, acceptImages: true }),
+					);
+				} else {
+					answered = await askFieldByField(extensionUi, form, timeout, dialogSignal);
+				}
+			} catch (error) {
+				if (error instanceof Error && error.name === "AbortError") throw abortError();
+				throw error;
+			}
+			if (!answered) return cancelAsk();
+
+			const notes = answered.notes?.length ? answered.notes : undefined;
+			// Each note numbers its markers from 1; shift them so `[Image #N]` indexes all result images.
+			const answerImages: ImageContent[] = [];
+			const resultNotes: OptionNote[] = [];
+			for (const { images, ...note } of notes ?? []) {
+				resultNotes.push({ ...note, text: shiftImageMarkers(note.text, answerImages.length, images?.length ?? 0) });
+				if (images) answerImages.push(...images);
+			}
+			const details: AskToolDetails = {
+				answers: formAnswers(form, answered.data),
+				...(notes ? { notes: resultNotes } : {}),
+				...(answered.timedOut ? { timedOut: true } : {}),
+			};
+			const text = prompt.render(askResultTemplate, {
+				timedOut: answered.timedOut,
+				json: JSON.stringify(answered.data, null, 2),
+				notes: notes && resultNotes.map(note => ({ ...note, text: note.text.replace(/\s+/g, " ").trim() })),
+			});
+			const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
+			return { content: [{ type: "text", text }, ...imageBlocks], details };
+		} finally {
+			await clearAndroidAskCard(askAndroidCard);
 		}
-		const details: AskToolDetails = {
-			answers: formAnswers(form, answered.data),
-			...(notes ? { notes: resultNotes } : {}),
-			...(answered.timedOut ? { timedOut: true } : {}),
-		};
-		const text = prompt.render(askResultTemplate, {
-			timedOut: answered.timedOut,
-			json: JSON.stringify(answered.data, null, 2),
-			notes: notes && resultNotes.map(note => ({ ...note, text: note.text.replace(/\s+/g, " ").trim() })),
-		});
-		const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
-		return { content: [{ type: "text", text }, ...imageBlocks], details };
 	}
 }

@@ -1,0 +1,2330 @@
+diff --git a/packages/coding-agent/src/cli/update-cli.ts b/packages/coding-agent/src/cli/update-cli.ts
+index ed12d3f..cb9889d 100644
+--- a/packages/coding-agent/src/cli/update-cli.ts
++++ b/packages/coding-agent/src/cli/update-cli.ts
+@@ -2305,6 +2305,54 @@ async function runManagedUpdate(
+ 	return { kind: "installed", version: installed };
+ }
+ 
++/**
++ * Repo that publishes the Termux/Android port. Upstream release binaries and
++ * npm natives target desktop glibc/musl systems; the Android bundle is built
++ * and installed from here instead.
++ */
++const ANDROID_REPO = "SklUpp/omp-termux";
++const ANDROID_INSTALLER_URL = `https://raw.githubusercontent.com/${ANDROID_REPO}/main/install.sh`;
++
++/**
++ * Whether this process runs the Termux/Android port.
++ *
++ * Bun reports `android` as its platform, which no upstream release target
++ * covers; the installer's launcher also exports `OMP_PLATFORM=android`.
++ * Parameters are explicit so callers and tests do not depend on the host.
++ */
++export function isAndroidUpdateHost(
++	platform: string = process.platform,
++	platformOverride: string | undefined = process.env.OMP_PLATFORM,
++): boolean {
++	return platform === "android" || platformOverride === "android";
++}
++
++/**
++ * Reinstall instructions for the Termux/Android port. Both release profiles
++ * are shown because the installed bundle does not record which patch set it
++ * was built from.
++ */
++export function androidReinstallInstructions(): string {
++	return [
++		"OMP on Termux/Android does not support update checks or in-place updates.",
++		"Reinstall the release profile you use:",
++		`  standard: curl -fsSL ${ANDROID_INSTALLER_URL} | sh`,
++		`  extended: curl -fsSL ${ANDROID_INSTALLER_URL} | sh -s -- -ex`,
++		`Releases: https://github.com/${ANDROID_REPO}/releases`,
++	].join("\n");
++}
++
++/**
++ * Answer `omp update` on Android without consulting upstream release
++ * metadata. In-place update and the upstream check are both unsupported, so
++ * this exits non-zero after printing the reinstall commands.
++ */
++function runAndroidUpdate(): void {
++	console.log(chalk.dim(`Current version: ${VERSION}`));
++	console.error(chalk.red(androidReinstallInstructions()));
++	process.exitCode = 1;
++}
++
+ /**
+  * Run the update command.
+  *
+@@ -2317,6 +2365,10 @@ async function runManagedUpdate(
+  * fails, or when another update holds the install lock.
+  */
+ export async function runUpdateCommand(opts: UpdateOptions): Promise<UpdateOutcome> {
++	if (isAndroidUpdateHost()) {
++		runAndroidUpdate();
++		return { kind: "unsupported", reason: androidReinstallInstructions() };
++	}
+ 	const ompPath = resolveOmpPath();
+ 	const manager = ompPath ? await managedInstallName(ompPath) : undefined;
+ 	if (manager) {
+diff --git a/packages/coding-agent/src/main.ts b/packages/coding-agent/src/main.ts
+index eb3870f..3d91766 100644
+--- a/packages/coding-agent/src/main.ts
++++ b/packages/coding-agent/src/main.ts
+@@ -45,7 +45,7 @@ import { fetchBuild } from "./cli/build-service";
+ import { applyStartupCwd } from "./cli/startup-cwd";
+ import { runAutoUpdate } from "./cli/auto-update";
+ import { managedInstallName } from "./cli/managed-install";
+-import { getLatestRelease, isSourceCheckout } from "./cli/update-cli";
++import { getLatestRelease, isAndroidUpdateHost, isSourceCheckout } from "./cli/update-cli";
+ import { findConfigFile } from "./config";
+ import { cfgNoJudge, cfgNoSpotlight, cfgOffline } from "./config/auxiliary-model-policy";
+ import { ModelRegistry } from "./config/model-registry";
+@@ -279,6 +279,11 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
+ 	if (!cfgStartupCheckUpdate.get(settings) && !cfgUpdateAuto.get(settings)) {
+ 		return;
+ 	}
++	// Android updates only through the port installer; `omp update` refuses, so
++	// a "run omp update" notification would be wrong advice.
++	if (isAndroidUpdateHost()) {
++		return;
++	}
+ 	try {
+ 		// Checkouts update through git and a manager (Tern) updates its omp itself:
+ 		// "run omp update" would be wrong advice for both.
+diff --git a/packages/coding-agent/src/modes/controllers/command-controller.ts b/packages/coding-agent/src/modes/controllers/command-controller.ts
+index 0e58ed2..74bb8d3 100644
+--- a/packages/coding-agent/src/modes/controllers/command-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/command-controller.ts
+@@ -460,12 +460,15 @@ export class CommandController {
+ 				this.ctx.showError("Advisor has no history yet.");
+ 				return;
+ 			}
+-			copyToClipboard(advisorHistory);
+-			this.ctx.showStatus("Advisor history copied to clipboard");
+-		} catch (error: unknown) {
+-			this.ctx.showError(
+-				`Failed to copy advisor history: ${error instanceof Error ? error.message : "Unknown error"}`,
++			copyToClipboard(advisorHistory).then(
++				() => this.ctx.showStatus("Advisor history copied to clipboard"),
++				(error: unknown) =>
++					this.ctx.showError(
++						`Failed to copy advisor history: ${error instanceof Error ? error.message : "Unknown error"}`,
++					),
+ 			);
++		} catch (error: unknown) {
++			this.ctx.showError(error instanceof Error ? error.message : "Unknown error");
+ 		}
+ 	}
+ 
+diff --git a/packages/coding-agent/src/modes/controllers/event-controller.ts b/packages/coding-agent/src/modes/controllers/event-controller.ts
+index f61cbbc..4e7e2ec 100644
+--- a/packages/coding-agent/src/modes/controllers/event-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/event-controller.ts
+@@ -58,6 +58,7 @@ import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
+ import { writeDeviceDispatch } from "../../tools/resolve";
+ import { SpeechEnhancer } from "../../tts/speech-enhancer";
+ import { vocalizer } from "../../tts/vocalizer";
++import { sendAndroidNotification } from "../../utils/android-helpers";
+ import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
+ import { type RunFlowStatus, setRunStatus } from "../../utils/run-status";
+ import {
+@@ -2970,6 +2971,11 @@ export class EventController {
+ 			type: "error",
+ 			actions: "focus",
+ 		});
++		// Android has no OSC terminal chrome: mirror the same gated card into the
++		// system shade with a fixed title. The session name is auto-generated from
++		// conversation text, so it must not persist into a notification-listener
++		// readable card. Best-effort and silent when Termux:API is absent.
++		void sendAndroidNotification("omp", "Stopped with error").catch(() => {});
+ 	}
+ 
+ 	sendCompletionNotification(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
+@@ -2995,5 +3001,8 @@ export class EventController {
+ 			type: "completion",
+ 			actions: "focus",
+ 		});
++		// Same gated completion card in the Android shade, fixed title (see error
++		// above for why the conversation-derived session name is not used).
++		void sendAndroidNotification("omp", "Complete").catch(() => {});
+ 	}
+ }
+diff --git a/packages/coding-agent/src/modes/controllers/input-controller.ts b/packages/coding-agent/src/modes/controllers/input-controller.ts
+index c04354e..adeb3b0 100644
+--- a/packages/coding-agent/src/modes/controllers/input-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/input-controller.ts
+@@ -3120,14 +3120,14 @@ export class InputController {
+ 			this.ctx.showStatus("Nothing to copy");
+ 			return;
+ 		}
+-		try {
+-			copyToClipboard(text);
+-			const sanitized = sanitizeText(text);
+-			const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
+-			this.ctx.showStatus(`Copied line: ${preview}`);
+-		} catch {
+-			this.ctx.showWarning("Failed to copy to clipboard");
+-		}
++		const sanitized = sanitizeText(text);
++		const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
++		// `copyToClipboard` settles asynchronously; report the outcome instead of
++		// claiming success before the clipboard backend has run.
++		copyToClipboard(text).then(
++			() => this.ctx.showStatus(`Copied line: ${preview}`),
++			() => this.ctx.showWarning("Failed to copy to clipboard"),
++		);
+ 	}
+ 
+ 	/** Copy current prompt text to system clipboard. */
+@@ -3137,14 +3137,12 @@ export class InputController {
+ 			this.ctx.showStatus("Nothing to copy");
+ 			return;
+ 		}
+-		try {
+-			copyToClipboard(text);
+-			const sanitized = sanitizeText(text);
+-			const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
+-			this.ctx.showStatus(`Copied: ${preview}`);
+-		} catch {
+-			this.ctx.showWarning("Failed to copy to clipboard");
+-		}
++		const sanitized = sanitizeText(text);
++		const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
++		copyToClipboard(text).then(
++			() => this.ctx.showStatus(`Copied: ${preview}`),
++			() => this.ctx.showWarning("Failed to copy to clipboard"),
++		);
+ 	}
+ 
+ 	cycleThinkingLevel(): void {
+diff --git a/packages/coding-agent/src/modes/controllers/selector-controller.ts b/packages/coding-agent/src/modes/controllers/selector-controller.ts
+index 1478cb2..cc03da5 100644
+--- a/packages/coding-agent/src/modes/controllers/selector-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/selector-controller.ts
+@@ -1553,8 +1553,10 @@ export class SelectorController {
+ 					this.ctx.showStatus("Nothing to copy in that item");
+ 					return;
+ 				}
+-				void copyToClipboard(content);
+-				this.ctx.showStatus(`Copied ${label} to clipboard`);
++				copyToClipboard(content).then(
++					() => this.ctx.showStatus(`Copied ${label} to clipboard`),
++					() => this.ctx.showWarning("Failed to copy to clipboard"),
++				);
+ 			},
+ 			onOpen: (href, label) => {
+ 				done();
+diff --git a/packages/coding-agent/src/modes/controllers/todo-command-controller.ts b/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
+index 9417117..eba5a58 100644
+--- a/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
+@@ -212,12 +212,10 @@ export class TodoCommandController {
+ 			this.ctx.showWarning("No todos to copy.");
+ 			return;
+ 		}
+-		try {
+-			copyToClipboard(phasesToMarkdown(phases));
+-			this.ctx.showStatus("Copied todos as Markdown to clipboard.");
+-		} catch (error) {
+-			this.ctx.showError(error instanceof Error ? error.message : String(error));
+-		}
++		copyToClipboard(phasesToMarkdown(phases)).then(
++			() => this.ctx.showStatus("Copied todos as Markdown to clipboard."),
++			(error: unknown) => this.ctx.showError(error instanceof Error ? error.message : String(error)),
++		);
+ 	}
+ 
+ 	#resolveTodoPath(rest: string): string {
+diff --git a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
+index 0b03496..52560ef 100644
+--- a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
++++ b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
+@@ -577,50 +577,52 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
+ 		description: "Pick text or code from the conversation to copy",
+ 		allowArgs: true,
+ 		handleTui: async (command, runtime) => {
+-			const arg = command.args.trim().toLowerCase();
+-			if (!arg) {
+-				runtime.ctx.showCopySelector();
+-				clearSubmittedText(runtime);
+-				return;
+-			}
+-			if (arg === "code") {
+-				const block = extractLastCodeBlock(runtime.ctx.viewSession.messages);
+-				if (!block) {
+-					runtime.ctx.showStatus("No code block to copy.");
+-					clearSubmittedText(runtime);
++			try {
++				const arg = command.args.trim().toLowerCase();
++				if (!arg) {
++					runtime.ctx.showCopySelector();
+ 					return;
+ 				}
+-				await copyToClipboard(block.code);
+-				runtime.ctx.showStatus("Copied code block to clipboard");
+-				clearSubmittedText(runtime);
+-				return;
+-			}
+-			if (arg === "cmd" || arg === "command") {
+-				const lastCommand = extractLastCommand(runtime.ctx.viewSession.messages);
+-				if (!lastCommand) {
+-					runtime.ctx.showStatus("No command to copy.");
+-					clearSubmittedText(runtime);
++				if (arg === "code") {
++					const block = extractLastCodeBlock(runtime.ctx.viewSession.messages);
++					if (!block) {
++						runtime.ctx.showStatus("No code block to copy.");
++						return;
++					}
++					await copyToClipboard(block.code);
++					runtime.ctx.showStatus("Copied code block to clipboard");
+ 					return;
+ 				}
+-				await copyToClipboard(lastCommand.code);
+-				runtime.ctx.showStatus(`Copied ${lastCommand.kind === "bash" ? "bash command" : "eval code"} to clipboard`);
+-				clearSubmittedText(runtime);
+-				return;
+-			}
+-			if (arg === "link" || arg === "url") {
+-				const link = extractLastLink(runtime.ctx.viewSession.messages);
+-				if (!link) {
+-					runtime.ctx.showStatus("No link to copy.");
+-					clearSubmittedText(runtime);
++				if (arg === "cmd" || arg === "command") {
++					const lastCommand = extractLastCommand(runtime.ctx.viewSession.messages);
++					if (!lastCommand) {
++						runtime.ctx.showStatus("No command to copy.");
++						return;
++					}
++					await copyToClipboard(lastCommand.code);
++					runtime.ctx.showStatus(
++						`Copied ${lastCommand.kind === "bash" ? "bash command" : "eval code"} to clipboard`,
++					);
+ 					return;
+ 				}
+-				await copyToClipboard(link.href);
+-				runtime.ctx.showStatus("Copied link to clipboard");
++				if (arg === "link" || arg === "url") {
++					const link = extractLastLink(runtime.ctx.viewSession.messages);
++					if (!link) {
++						runtime.ctx.showStatus("No link to copy.");
++						return;
++					}
++					await copyToClipboard(link.href);
++					runtime.ctx.showStatus("Copied link to clipboard");
++					return;
++				}
++				runtime.ctx.showStatus("Usage: /copy [code|cmd|link]");
++			} catch (error) {
++				// A rejected copy must not escape as an unhandled rejection and
++				// leave the draft in the editor without any feedback.
++				runtime.ctx.showWarning(`Copy failed: ${errorMessage(error)}`);
++			} finally {
+ 				clearSubmittedText(runtime);
+-				return;
+ 			}
+-			runtime.ctx.showStatus("Usage: /copy [code|cmd|link]");
+-			clearSubmittedText(runtime);
+ 		},
+ 	},
+ 	{
+diff --git a/packages/coding-agent/src/tools/ask.ts b/packages/coding-agent/src/tools/ask.ts
+index d9b7bcd..4ad0fd4 100644
+--- a/packages/coding-agent/src/tools/ask.ts
++++ b/packages/coding-agent/src/tools/ask.ts
+@@ -49,6 +49,12 @@ import askResultTemplate from "../prompts/tools/ask-result.md" with { type: "tex
+ import { renderAttachmentSourceNotice } from "../session/attachment-source-notice";
+ import { cfgSpeechEnabled } from "../tts/settings";
+ import { vocalizer } from "../tts/vocalizer";
++import {
++	type AndroidOutcome,
++	clearAndroidNotification,
++	newAndroidAskNotificationId,
++	sendAndroidNotification,
++} from "../utils/android-helpers";
+ import { describeAttachedImagesForTextModel, shouldDescribeImagesForTextModel } from "../utils/image-vision-fallback";
+ import type { ToolSession } from ".";
+ import { ToolAbortError } from "./tool-errors";
+@@ -378,8 +384,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+ 		return (session.canPromptUser ?? session.hasUI) || session.advertiseHeadlessAsk ? new AskTool(session) : null;
+ 	}
+ 
+-	/** Send terminal notification when ask tool is waiting for input */
+-	#sendAskNotification(): void {
++	/**
++	 * Notify that the ask dialog is waiting for input: the terminal notification
++	 * plus, on Android, a system card. The caller keeps the card's post promise
++	 * so the removal can be serialized behind it.
++	 */
++	#sendAskNotification(): { id: string; posted: Promise<AndroidOutcome> } | undefined {
+ 		if (!this.session.hasUI) return;
+ 		const method = cfgAskNotify.get(this.session.settings);
+ 		if (method === "off") return;
+@@ -390,6 +400,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+ 			urgency: "normal",
+ 			actions: "focus",
+ 		});
++		// A per-prompt id: removing it must not erase a completion/error card
++		// posted under the process status id while the dialog was pending.
++		const id = newAndroidAskNotificationId();
++		return { id, posted: sendAndroidNotification("omp", "Waiting for input", { id }) };
+ 	}
+ 
+ 	async #answerImageBlocks(
+@@ -481,51 +495,67 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+ 			throw new ToolAbortError("Ask tool was cancelled by the user");
+ 		};
+ 
+-		// Send notification if waiting and not suppressed
+-		this.#sendAskNotification();
+-
+-		// Speak the questions aloud before surfacing them. Ask vocalizes in every
+-		// mode — it's the assistant addressing the user — gated only by speech.enabled
+-		// (the vocalizer re-checks the setting and no-ops when disabled).
+-		if (cfgSpeechEnabled.get(this.session.settings)) {
+-			vocalizer.speak(named.map(field => questions.get(field) ?? field.name).join("\n"));
++		// Notify only after validation, so no card is posted for a request that
++		// returns an error without ever waiting for input.
++		const askAndroidCard = this.#sendAskNotification();
++
++		async function clearAndroidAskCard(
++			card: { id: string; posted: Promise<AndroidOutcome> } | undefined,
++		): Promise<void> {
++			if (!card) return;
++			// Serialize behind the post: the two Termux:API commands are separate
++			// processes, so a removal that races an in-flight post leaves the card
++			// behind. A suppressed or failed post has no card to remove.
++			if (!(await card.posted).ok) return;
++			await clearAndroidNotification(card.id).catch(() => {});
+ 		}
+ 
+-		let answered: { data: HtmlFormData; notes?: OptionNote[]; timedOut?: boolean } | undefined;
+ 		try {
+-			if (extensionUi.formDialog) {
+-				const formDialog = extensionUi.formDialog.bind(extensionUi);
+-				answered = await untilAborted(dialogSignal, () =>
+-					formDialog(params.html, { timeout, signal: dialogSignal, acceptImages: true }),
+-				);
+-			} else {
+-				answered = await askFieldByField(extensionUi, form, timeout, dialogSignal);
++			// Speak the questions aloud before surfacing them. Ask vocalizes in every
++			// mode — it's the assistant addressing the user — gated only by speech.enabled
++			// (the vocalizer re-checks the setting and no-ops when disabled).
++			if (cfgSpeechEnabled.get(this.session.settings)) {
++				vocalizer.speak(named.map(field => questions.get(field) ?? field.name).join("\n"));
+ 			}
+-		} catch (error) {
+-			if (error instanceof Error && error.name === "AbortError") throw abortError();
+-			throw error;
+-		}
+-		if (!answered) return cancelAsk();
+-
+-		const notes = answered.notes?.length ? answered.notes : undefined;
+-		// Each note numbers its markers from 1; shift them so `[Image #N]` indexes all result images.
+-		const answerImages: ImageContent[] = [];
+-		const resultNotes: OptionNote[] = [];
+-		for (const { images, ...note } of notes ?? []) {
+-			resultNotes.push({ ...note, text: shiftImageMarkers(note.text, answerImages.length, images?.length ?? 0) });
+-			if (images) answerImages.push(...images);
++
++			let answered: { data: HtmlFormData; notes?: OptionNote[]; timedOut?: boolean } | undefined;
++			try {
++				if (extensionUi.formDialog) {
++					const formDialog = extensionUi.formDialog.bind(extensionUi);
++					answered = await untilAborted(dialogSignal, () =>
++						formDialog(params.html, { timeout, signal: dialogSignal, acceptImages: true }),
++					);
++				} else {
++					answered = await askFieldByField(extensionUi, form, timeout, dialogSignal);
++				}
++			} catch (error) {
++				if (error instanceof Error && error.name === "AbortError") throw abortError();
++				throw error;
++			}
++			if (!answered) return cancelAsk();
++
++			const notes = answered.notes?.length ? answered.notes : undefined;
++			// Each note numbers its markers from 1; shift them so `[Image #N]` indexes all result images.
++			const answerImages: ImageContent[] = [];
++			const resultNotes: OptionNote[] = [];
++			for (const { images, ...note } of notes ?? []) {
++				resultNotes.push({ ...note, text: shiftImageMarkers(note.text, answerImages.length, images?.length ?? 0) });
++				if (images) answerImages.push(...images);
++			}
++			const details: AskToolDetails = {
++				answers: formAnswers(form, answered.data),
++				...(notes ? { notes: resultNotes } : {}),
++				...(answered.timedOut ? { timedOut: true } : {}),
++			};
++			const text = prompt.render(askResultTemplate, {
++				timedOut: answered.timedOut,
++				json: JSON.stringify(answered.data, null, 2),
++				notes: notes && resultNotes.map(note => ({ ...note, text: note.text.replace(/\s+/g, " ").trim() })),
++			});
++			const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
++			return { content: [{ type: "text", text }, ...imageBlocks], details };
++		} finally {
++			await clearAndroidAskCard(askAndroidCard);
+ 		}
+-		const details: AskToolDetails = {
+-			answers: formAnswers(form, answered.data),
+-			...(notes ? { notes: resultNotes } : {}),
+-			...(answered.timedOut ? { timedOut: true } : {}),
+-		};
+-		const text = prompt.render(askResultTemplate, {
+-			timedOut: answered.timedOut,
+-			json: JSON.stringify(answered.data, null, 2),
+-			notes: notes && resultNotes.map(note => ({ ...note, text: note.text.replace(/\s+/g, " ").trim() })),
+-		});
+-		const imageBlocks = await this.#answerImageBlocks(answerImages, signal);
+-		return { content: [{ type: "text", text }, ...imageBlocks], details };
+ 	}
+ }
+diff --git a/packages/coding-agent/src/tools/browser/launch.ts b/packages/coding-agent/src/tools/browser/launch.ts
+index ed7c496..1a923d9 100644
+--- a/packages/coding-agent/src/tools/browser/launch.ts
++++ b/packages/coding-agent/src/tools/browser/launch.ts
+@@ -342,8 +342,11 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
+  * link clicks (#8673). Chrome for Testing uses a dedicated bundle id
+  * (`com.google.chrome.for.testing`) that is never a user's default handler;
+  * system Chrome is used on macOS only when Chrome for Testing cannot be
+- * obtained. Other platforms keep the download-avoiding system Chrome
+- * preference and fall back to Chrome for Testing. The managed browser is
++ * obtained. Android/Termux validates the explicit override and only accepts
++ * the external Termux:X11 package (a glibc Chrome cannot run there); when no
++ * working binary exists it throws install guidance instead of falling back to
++ * a managed Linux download. Other platforms keep the download-avoiding system
++ * Chrome preference and fall back to Chrome for Testing. The managed browser is
+  * cached under ~/.omp/puppeteer (getPuppeteerDir). Returns undefined when
+  * platform detection fails (puppeteer default resolution takes over).
+  * Exported so real-browser tests can probe launchability and skip on hosts
+@@ -352,7 +355,31 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
+ let chromiumExecutablePromise: Promise<string | undefined> | undefined;
+ export async function ensureChromiumExecutable(): Promise<string | undefined> {
+ 	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+-	if (envPath) return envPath;
++	if (envPath) {
++		// Android cannot run a generic Linux Chrome: only the Termux:X11
++		// package is Bionic-compatible. Reject a stale or broken override here
++		// instead of handing puppeteer an unusable path.
++		if (process.platform === "android" && !(await isChromiumExecutable(envPath))) {
++			throw new ToolError(
++				`PUPPETEER_EXECUTABLE_PATH="${envPath}" is not a working Chromium executable. ` +
++					`Install the Termux:X11 package:\n  pkg install -y x11-repo\n  pkg install -y chromium\n` +
++					"or unset PUPPETEER_EXECUTABLE_PATH.",
++			);
++		}
++		return envPath;
++	}
++	if (process.platform === "android") {
++		// Termux: never download a glibc Chrome build; only the external
++		// Termux:X11 package under $PREFIX can run on Bionic.
++		const sysChrome = await resolveSystemChromium();
++		if (sysChrome) return sysChrome;
++		throw new ToolError(
++			"No working Chromium executable found on Android. Install the Termux:X11 package:\n" +
++				"  pkg install -y x11-repo\n" +
++				"  pkg install -y chromium\n" +
++				"or set PUPPETEER_EXECUTABLE_PATH to a working Chromium binary.",
++		);
++	}
+ 	// macOS: never route a background daemon through the user's GUI Chrome
+ 	// bundle; prefer the isolated Chrome for Testing binary instead (#8673).
+ 	const preferManagedChromium = process.platform === "darwin";
+@@ -494,14 +521,16 @@ function isExecutableFile(p: string): boolean {
+ async function isChromiumExecutable(p: string): Promise<boolean> {
+ 	if (!isExecutableFile(p)) return false;
+ 	// The version probe below launches the candidate. It exists to reject
+-	// non-Chromium `chrome`/`chromium` wrapper scripts that appear on a Linux
+-	// PATH (ecb22957, "validate Linux browser executables"). On Windows and
+-	// macOS the candidates are fixed GUI application paths, not PATH wrappers,
+-	// and executing them is harmful: a GUI `chrome.exe --version` does not print
+-	// to a detached stdout and can hand off to the user's running instance,
+-	// opening/activating a normal browser window (#8445). Confine the probe to
+-	// Linux and trust the executable-file check elsewhere.
+-	if (process.platform !== "linux") return true;
++	// non-Chromium `chrome`/`chromium` wrapper scripts that appear on a
++	// Linux/Android PATH (ecb22957, "validate Linux browser executables"). On
++	// Windows and macOS the candidates are fixed GUI application paths, not
++	// PATH wrappers, and executing them is harmful: a GUI `chrome.exe --version`
++	// does not print to a detached stdout and can hand off to the user's
++	// running instance, opening/activating a normal browser window (#8445).
++	// Android/Termux has the same PATH-wrapper hazard as Linux (and may hold a
++	// glibc build), so it gets the probe too: an existing but broken file must
++	// be rejected rather than accepted as a browser.
++	if (process.platform !== "linux" && process.platform !== "android") return true;
+ 	try {
+ 		const probeTimeoutMs = 3000;
+ 		const proc = Bun.spawn([p, "--version"], {
+@@ -582,6 +611,25 @@ function systemChromiumCandidates(
+ 			);
+ 			break;
+ 		}
++		case "android": {
++			// Termux installs Chromium outside PATH. Prefer the package's real
++			// binary; `$PREFIX/bin` entries are wrappers and PATH may hold
++			// unrelated or glibc shims. PUPPETEER_EXECUTABLE_PATH is handled by
++			// the caller before candidates are consulted.
++			const prefix = process.env.PREFIX ?? "/data/data/com.termux/files/usr";
++			candidates.push(path.join(prefix, "lib/chromium/chrome"));
++			for (const name of ["chromium", "chromium-browser", "google-chrome", "chrome"]) {
++				const found = which(name);
++				if (found) candidates.push(found);
++			}
++			candidates.push(
++				path.join(prefix, "bin/chromium"),
++				path.join(prefix, "bin/chromium-browser"),
++				path.join(prefix, "bin/google-chrome"),
++				path.join(prefix, "bin/chrome"),
++			);
++			break;
++		}
+ 		case "win32": {
+ 			const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+ 			const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+diff --git b/packages/coding-agent/src/utils/android-helpers.ts b/packages/coding-agent/src/utils/android-helpers.ts
+new file mode 100644
+index 0000000..db76062
+--- /dev/null
++++ b/packages/coding-agent/src/utils/android-helpers.ts
+@@ -0,0 +1,172 @@
++/**
++ * Android/Termux best-effort helpers: wake-lock, notification, OOM-score.
++ * Each operation reports its actual outcome (success/failure) and never logs
++ * secrets, tokens, or raw command arguments.
++ */
++
++import * as fs from "node:fs/promises";
++import { isNotificationSuppressed } from "@oh-my-pi/pi-tui";
++
++export type AndroidOutcome = { ok: boolean; error?: string };
++
++export interface AndroidNotificationOptions {
++	/** Android notification id; a stable id overwrites instead of stacking. */
++	id?: string;
++}
++
++/**
++ * Notification id shared by this process' completion/error/ask cards.
++ *
++ * Termux:API treats `--id` as a global NotificationManager tag, so one literal
++ * id would let a second omp process (another Termux session, tmux pane, or
++ * background agent) overwrite the first one's card. Scoping the tag to the pid
++ * keeps concurrent sessions independent while one session still replaces its
++ * own card instead of stacking.
++ */
++export function androidNotificationId(): string {
++	return `omp-status-${process.pid}`;
++}
++
++let askNotificationSequence = 0;
++
++/**
++ * Id for one ask card, unique per prompt within this process.
++ *
++ * The ask card must be removed without touching the completion/error card that
++ * may be posted while the dialog is still pending, so it cannot share the
++ * status id. The pid keeps concurrent sessions independent.
++ */
++export function newAndroidAskNotificationId(): string {
++	askNotificationSequence += 1;
++	return `omp-ask-${process.pid}-${askNotificationSequence}`;
++}
++
++async function spawnBestEffort(cmd: string[], timeoutMs = 3000): Promise<AndroidOutcome> {
++	const proc = Bun.spawn(cmd, {
++		stdout: "ignore",
++		stderr: "pipe",
++	});
++	const timer = setTimeout(() => {
++		try {
++			proc.kill();
++		} catch {}
++	}, timeoutMs);
++	let stderr = "";
++	try {
++		const out = await new Response(proc.stderr).text();
++		stderr = out.slice(0, 512);
++	} catch {}
++	clearTimeout(timer);
++	const code = await proc.exited;
++	if (code === 0) return { ok: true };
++	const msg = stderr.trim() || `command ${cmd[0]} exited ${code}`;
++	// Do not log raw args; only return bounded error.
++	return { ok: false, error: msg.slice(0, 512) };
++}
++
++export async function acquireWakeLock(): Promise<AndroidOutcome> {
++	if (process.platform !== "android" && !process.env.TERMUX_VERSION) {
++		// Best-effort: on non-Android, report not applicable without claiming success.
++		return { ok: false, error: "wake-lock unavailable on this platform" };
++	}
++	try {
++		return await spawnBestEffort(["termux-wake-lock"]);
++	} catch (e) {
++		return { ok: false, error: e instanceof Error ? e.message.slice(0, 512) : String(e).slice(0, 512) };
++	}
++}
++
++export async function releaseWakeLock(): Promise<AndroidOutcome> {
++	if (process.platform !== "android" && !process.env.TERMUX_VERSION) {
++		return { ok: false, error: "wake-lock unavailable on this platform" };
++	}
++	try {
++		return await spawnBestEffort(["termux-wake-unlock"]);
++	} catch (e) {
++		return { ok: false, error: e instanceof Error ? e.message.slice(0, 512) : String(e).slice(0, 512) };
++	}
++}
++
++/**
++ * Post one Android status card through Termux:API.
++ *
++ * Best-effort: no-op when Termux:API is absent, and honours the global
++ * `PI_NOTIFICATIONS` suppression that already gates terminal notifications.
++ * Callers pass fixed status strings (`Complete`, `Stopped with error`,
++ * `Waiting for input`), never conversation text or session names; text is
++ * truncated regardless, so a card cannot carry session content or secrets.
++ */
++export async function sendAndroidNotification(
++	title: string,
++	body: string,
++	options?: AndroidNotificationOptions,
++): Promise<AndroidOutcome> {
++	if (isNotificationSuppressed()) {
++		return { ok: false, error: "notifications suppressed" };
++	}
++	// Redact before any handling: truncate and strip potential secrets.
++	const safeTitle = title.slice(0, 200);
++	const safeBody = body.slice(0, 500);
++	if (process.platform !== "android" && !process.env.TERMUX_VERSION) {
++		return { ok: false, error: "notification unavailable on this platform" };
++	}
++	try {
++		return await spawnBestEffort([
++			"termux-notification",
++			"--id",
++			options?.id ?? androidNotificationId(),
++			"--title",
++			safeTitle,
++			"--content",
++			safeBody,
++		]);
++	} catch (e) {
++		return { ok: false, error: e instanceof Error ? e.message.slice(0, 512) : String(e).slice(0, 512) };
++	}
++}
++
++/**
++ * Remove one of this process' status cards (e.g. the ask prompt once answered).
++ *
++ * Removal is not user-visible, so it intentionally ignores the global
++ * suppression flag: a card posted before the user muted notifications must
++ * still be cleared. Ids are caller-provided (`androidNotificationId()` or an
++ * explicit one) and never contain session text.
++ */
++export async function clearAndroidNotification(id: string): Promise<AndroidOutcome> {
++	if (process.platform !== "android" && !process.env.TERMUX_VERSION) {
++		return { ok: false, error: "notification unavailable on this platform" };
++	}
++	try {
++		return await spawnBestEffort(["termux-notification-remove", id]);
++	} catch (e) {
++		return { ok: false, error: e instanceof Error ? e.message.slice(0, 512) : String(e).slice(0, 512) };
++	}
++}
++
++/**
++ * Adjust OOM score for current process. Best-effort, reports denial accurately.
++ * Does not claim protection when OS denies the operation.
++ */
++export async function adjustOomScoreAdj(score: number): Promise<AndroidOutcome> {
++	const clamped = Math.max(-1000, Math.min(1000, Math.trunc(score)));
++	const candidates = ["/proc/self/oom_score_adj", "/proc/self/oom_adj"];
++	for (const p of candidates) {
++		try {
++			await fs.writeFile(p, String(clamped));
++			// Verify write succeeded by reading back
++			const readBack = (await fs.readFile(p, "utf8")).trim();
++			if (String(clamped) === readBack || (p.endsWith("oom_adj") && String(clamped) === readBack)) {
++				return { ok: true };
++			}
++			// If readback mismatch, continue to next candidate but report failure at end
++		} catch (e) {
++			const msg = e instanceof Error ? e.message.slice(0, 512) : String(e).slice(0, 512);
++			// Permission denied must be reported, not claimed as success
++			if (msg.includes("EACCES") || msg.includes("EPERM") || msg.includes("permission")) {
++				return { ok: false, error: `OOM adjust denied: ${msg.slice(0, 200)}` };
++			}
++		}
++	}
++	return { ok: false, error: "OOM adjust not available or denied" };
++}
+diff --git a/packages/coding-agent/src/utils/clipboard.ts b/packages/coding-agent/src/utils/clipboard.ts
+index d47389e..edd4268 100644
+--- a/packages/coding-agent/src/utils/clipboard.ts
++++ b/packages/coding-agent/src/utils/clipboard.ts
+@@ -126,10 +126,24 @@ let macClipboardWrite = Promise.resolve();
+  * The OSC 52 goes through `writeTerminalSequence`, so it cannot tear a TUI
+  * frame; from a worker thread it is skipped and only the native copy runs.
+  *
++ * Resolves once at least one channel actually emitted or accepted the text:
++ * OSC 52 written to a TTY on the main thread, `termux-clipboard-set`, `pbcopy`,
++ * or the native bridge. A worker thread cannot emit OSC 52, and a swallowed
++ * stdout write does not count. Rejects when every channel failed, so a caller
++ * cannot claim the copy succeeded when nothing received the text (for example
++ * Termux without `termux-api` and no TTY for OSC 52). OSC 52 is still
++ * best-effort even when emitted: the external terminal may ignore it.
++ *
+  * @param text - UTF-8 text to place on the clipboard.
++ * @throws Error when no channel accepted the text.
+  */
+ export async function copyToClipboard(text: string): Promise<void> {
+-	if (process.stdout.isTTY) writeTerminalSequence(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
++	// `writeTerminalSequence` reports whether it actually emitted the sequence:
++	// a Bun worker cannot reach the main thread's terminal, and a closed stdout
++	// is swallowed, so neither may count as delivery.
++	const osc52Emitted =
++		process.stdout.isTTY && writeTerminalSequence(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
++	let delivered = osc52Emitted;
+ 
+ 	// Keep pbcopy, document-header writes, and native fallbacks in invocation order.
+ 	let releaseWrite: (() => void) | undefined;
+@@ -146,9 +160,13 @@ export async function copyToClipboard(text: string): Promise<void> {
+ 		if (process.env.TERMUX_VERSION) {
+ 			try {
+ 				await spawnCapture(["termux-clipboard-set"], { input: text, timeoutMs: 5000 });
++				delivered = true;
+ 				return;
+-			} catch {
+-				// Fall through to native
++			} catch (error) {
++				logger.warn("clipboard: termux-clipboard-set failed; trying native bridge", {
++					error: String(error),
++				});
++				// Fall through to native.
+ 			}
+ 		}
+ 		// macOS: prefer `pbcopy` over the in-process AppKit write, mirroring the
+@@ -174,15 +192,21 @@ export async function copyToClipboard(text: string): Promise<void> {
+ 					timeoutMs: 5000,
+ 					env: { ...process.env, LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" },
+ 				});
++				delivered = true;
+ 				return;
+-			} catch {
++			} catch (error) {
++				logger.warn("clipboard: pbcopy failed; trying native bridge", { error: String(error) });
+ 				// Fall through to native.
+ 			}
+ 		}
+ 
+ 		await nativeCopyToClipboard(text);
+-	} catch {
+-		// Ignore — clipboard copy is best-effort
++		delivered = true;
++	} catch (error) {
++		if (!delivered) {
++			throw error instanceof Error ? error : new Error(`clipboard copy failed: ${String(error)}`);
++		}
++		logger.warn("clipboard: copy failed after OSC 52 was emitted", { error: String(error) });
+ 	} finally {
+ 		releaseWrite?.();
+ 	}
+diff --git b/packages/coding-agent/test/android-helpers.test.ts b/packages/coding-agent/test/android-helpers.test.ts
+new file mode 100644
+index 0000000..143a092
+--- /dev/null
++++ b/packages/coding-agent/test/android-helpers.test.ts
+@@ -0,0 +1,147 @@
++/**
++ * Android helper behaviour at the process boundary. Notification tests mock
++ * `Bun.spawn`, so running the suite on a Termux device never posts a real card.
++ */
++import { afterEach, describe, expect, it, vi } from "bun:test";
++import {
++	acquireWakeLock,
++	adjustOomScoreAdj,
++	androidNotificationId,
++	clearAndroidNotification,
++	newAndroidAskNotificationId,
++	releaseWakeLock,
++	sendAndroidNotification,
++} from "../src/utils/android-helpers";
++
++const originalTermuxVersion = process.env.TERMUX_VERSION;
++const originalPiNotifications = process.env.PI_NOTIFICATIONS;
++
++afterEach(() => {
++	vi.restoreAllMocks();
++	restoreEnv("TERMUX_VERSION", originalTermuxVersion);
++	restoreEnv("PI_NOTIFICATIONS", originalPiNotifications);
++});
++
++function restoreEnv(key: string, value: string | undefined): void {
++	if (value === undefined) {
++		delete process.env[key];
++	} else {
++		process.env[key] = value;
++	}
++}
++
++function mockSpawn(result: { code?: number; stderr?: string } = {}): string[][] {
++	process.env.TERMUX_VERSION = "0.118";
++	const calls: string[][] = [];
++	vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
++		calls.push(cmd);
++		return {
++			stderr: new ReadableStream({
++				start(controller) {
++					if (result.stderr) controller.enqueue(new TextEncoder().encode(result.stderr));
++					controller.close();
++				},
++			}),
++			kill: () => {},
++			exited: Promise.resolve(result.code ?? 0),
++		} as never;
++	}) as unknown as typeof Bun.spawn);
++	return calls;
++}
++
++describe("android helpers: notifications", () => {
++	it("posts the fixed status text, addressed to the process status id", async () => {
++		const calls = mockSpawn();
++
++		const outcome = await sendAndroidNotification("omp", "Complete");
++
++		expect(outcome).toEqual({ ok: true });
++		expect(calls).toEqual([
++			["termux-notification", "--id", androidNotificationId(), "--title", "omp", "--content", "Complete"],
++		]);
++	});
++
++	it("uses a distinct per-prompt id that cannot collide with the status card", async () => {
++		const calls = mockSpawn();
++		const first = newAndroidAskNotificationId();
++		const second = newAndroidAskNotificationId();
++
++		await sendAndroidNotification("omp", "Waiting for input", { id: first });
++		await sendAndroidNotification("omp", "Waiting for input", { id: second });
++
++		expect(first).not.toBe(second);
++		expect(first).not.toBe(androidNotificationId());
++		expect(first.startsWith(`omp-ask-${process.pid}-`)).toBe(true);
++		expect(calls.map(args => args[2])).toEqual([first, second]);
++	});
++
++	it("removes exactly the id it is given, even when notifications are muted", async () => {
++		const calls = mockSpawn();
++		process.env.PI_NOTIFICATIONS = "off";
++
++		await clearAndroidNotification("omp-ask-1-7");
++
++		expect(calls).toEqual([["termux-notification-remove", "omp-ask-1-7"]]);
++	});
++
++	it("does not spawn when PI_NOTIFICATIONS suppresses notifications", async () => {
++		const calls = mockSpawn();
++		process.env.PI_NOTIFICATIONS = "off";
++
++		const outcome = await sendAndroidNotification("omp", "Complete");
++
++		expect(calls).toHaveLength(0);
++		expect(outcome).toEqual({ ok: false, error: "notifications suppressed" });
++	});
++
++	it("bounds the reported failure message and never adds raw argv", async () => {
++		mockSpawn({ code: 1, stderr: "x".repeat(2000) });
++
++		const outcome = await sendAndroidNotification("omp", "Complete");
++
++		expect(outcome.ok).toBe(false);
++		expect(outcome.error?.length).toBeLessThanOrEqual(512);
++		expect(outcome.error).not.toContain("--id");
++	});
++
++	it("reports unavailability outside Termux without spawning", async () => {
++		const calls = mockSpawn();
++		delete process.env.TERMUX_VERSION;
++		if (process.platform === "android") return; // A real device always reports android.
++
++		const outcome = await sendAndroidNotification("omp", "Complete");
++
++		expect(calls).toHaveLength(0);
++		expect(outcome).toEqual({ ok: false, error: "notification unavailable on this platform" });
++	});
++
++	it("clamps and truncates text before spawning", async () => {
++		const calls = mockSpawn();
++
++		await sendAndroidNotification("t".repeat(400), "b".repeat(900));
++
++		expect(calls[0]).toContain("t".repeat(200));
++		expect(calls[0]).toContain("b".repeat(500));
++	});
++});
++
++describe("android helpers: wake-lock and OOM", () => {
++	it("wake-lock reports the real outcome without claiming success", async () => {
++		const res = await acquireWakeLock();
++		expect(typeof res.ok).toBe("boolean");
++		if (!res.ok) expect(res.error).toBeDefined();
++		if (res.error) expect(res.error).not.toContain("ghp_");
++	});
++
++	it("release reports the real outcome", async () => {
++		const res = await releaseWakeLock();
++		expect(typeof res.ok).toBe("boolean");
++	});
++
++	it("OOM adjust reports denial accurately and does not claim success", async () => {
++		const res = await adjustOomScoreAdj(-500);
++		expect(typeof res.ok).toBe("boolean");
++		if (!res.ok) expect(res.error).toBeDefined();
++		if (res.error) expect(res.error).not.toContain("ghp_");
++	});
++});
+diff --git a/packages/coding-agent/test/cli/update-cli.test.ts b/packages/coding-agent/test/cli/update-cli.test.ts
+index 8985a0b..a1e4fd1 100644
+--- a/packages/coding-agent/test/cli/update-cli.test.ts
++++ b/packages/coding-agent/test/cli/update-cli.test.ts
+@@ -1,11 +1,16 @@
+-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
++import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+ import * as fs from "node:fs/promises";
+ import * as os from "node:os";
+ import * as path from "node:path";
+ import { removeWithRetries, setAgentDir, setProjectDir, VERSION } from "@oh-my-pi/pi-utils";
+ import { currentBuildHost, OMP_BUILD } from "../../src/cli/build-service";
+ import { fixedNpmRegistry } from "../../src/cli/npm-registry";
+-import { getLatestRelease, runUpdateCommand } from "../../src/cli/update-cli";
++import {
++	androidReinstallInstructions,
++	getLatestRelease,
++	isAndroidUpdateHost,
++	runUpdateCommand,
++} from "../../src/cli/update-cli";
+ import { cfgUpdateChannel } from "../../src/modes/settings";
+ import { AgentStorage } from "../../src/session/agent-storage";
+ import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "../helpers/settings-test-state";
+@@ -18,12 +23,18 @@ type FetchInit = RequestInit | BunFetchRequestInit;
+ describe("runUpdateCommand version source", () => {
+ 	const dirs: string[] = [];
+ 	let settingsState: SettingsTestState | undefined;
++	const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
++	const platformOverride = process.env.OMP_PLATFORM;
+ 
+ 	// `runUpdateCommand` initializes the global Settings singleton from the
+ 	// project and agent dirs; point both at a scratch dir so the host's config
+ 	// is never read, and drop the singleton afterwards so later files get a
+ 	// fresh `Settings.init()`.
+ 	beforeEach(async () => {
++		// `runUpdateCommand` refuses on the Android port; these cases exercise the
++		// desktop update path, so report a desktop host regardless of the runner.
++		if (platformDescriptor) Object.defineProperty(process, "platform", { ...platformDescriptor, value: "linux" });
++		delete process.env.OMP_PLATFORM;
+ 		settingsState = beginSettingsTest();
+ 		const scratch = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-update-settings-")));
+ 		dirs.push(scratch);
+@@ -32,6 +43,9 @@ describe("runUpdateCommand version source", () => {
+ 	});
+ 
+ 	afterEach(async () => {
++		if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
++		if (platformOverride === undefined) delete process.env.OMP_PLATFORM;
++		else process.env.OMP_PLATFORM = platformOverride;
+ 		AgentStorage.close();
+ 		restoreSettingsTestState(settingsState);
+ 		settingsState = undefined;
+@@ -426,3 +440,53 @@ describe("getLatestRelease proxy errors", () => {
+ 		expect(err?.message).toMatch(/https?:\/\//i);
+ 	});
+ });
++
++describe("Termux/Android updates", () => {
++	const savedOverride = process.env.OMP_PLATFORM;
++
++	afterEach(() => {
++		vi.restoreAllMocks();
++		if (savedOverride === undefined) delete process.env.OMP_PLATFORM;
++		else process.env.OMP_PLATFORM = savedOverride;
++		process.exitCode = 0;
++	});
++
++	afterAll(() => {
++		if (savedOverride === undefined) delete process.env.OMP_PLATFORM;
++		else process.env.OMP_PLATFORM = savedOverride;
++	});
++
++	it("detects the Android host from the runtime platform or OMP_PLATFORM", () => {
++		expect(isAndroidUpdateHost("android", undefined)).toBe(true);
++		expect(isAndroidUpdateHost("linux", "android")).toBe(true);
++		expect(isAndroidUpdateHost("linux", undefined)).toBe(false);
++		expect(isAndroidUpdateHost("darwin", "linux")).toBe(false);
++	});
++
++	it("refuses both check and install without querying upstream release metadata", async () => {
++		const errors: string[] = [];
++		const logs: string[] = [];
++		const fetchStub = vi.spyOn(globalThis, "fetch");
++		vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
++			errors.push(args.join(" "));
++		});
++		vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
++			logs.push(args.join(" "));
++		});
++		process.env.OMP_PLATFORM = "android";
++
++		for (const check of [true, false]) {
++			errors.length = 0;
++			logs.length = 0;
++			process.exitCode = 0;
++
++			await runUpdateCommand({ force: false, check });
++
++			expect(fetchStub).not.toHaveBeenCalled();
++			expect(errors.join("\n")).toContain(androidReinstallInstructions());
++			expect(errors.join("\n")).toContain("| sh -s -- -ex");
++			expect(logs.join("\n")).toContain("Current version:");
++			expect(process.exitCode).toBe(1);
++		}
++	});
++});
+diff --git a/packages/coding-agent/test/fixtures/browser-executable-probe.ts b/packages/coding-agent/test/fixtures/browser-executable-probe.ts
+index 497d309..f215916 100644
+--- a/packages/coding-agent/test/fixtures/browser-executable-probe.ts
++++ b/packages/coding-agent/test/fixtures/browser-executable-probe.ts
+@@ -9,7 +9,7 @@ import {
+ // Launch policy reads `process.platform`; Chrome-for-Testing platform detection reads `os.platform()`, which Bun does
+ // not derive from the `process.platform` override. Pin both so the child resolves the emulated host's paths.
+ const platform = process.env.OMP_BROWSER_PROBE_PLATFORM;
+-if (platform === "darwin" || platform === "win32") {
++if (platform === "darwin" || platform === "win32" || platform === "android") {
+ 	Object.defineProperty(process, "platform", { value: platform });
+ 	spyOn(os, "platform").mockReturnValue(platform);
+ } else if (platform) {
+diff --git a/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts b/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
+index 98ca39a..a2dc6d1 100644
+--- a/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
++++ b/packages/coding-agent/test/fixtures/clipboard-worker-copy.ts
+@@ -7,19 +7,37 @@ import { copyToClipboard } from "@oh-my-pi/pi-coding-agent/utils/clipboard";
+ import * as natives from "@oh-my-pi/pi-natives/clipboard";
+ 
+ declare const self: Worker;
++// `workerData` is not typed in every Bun WorkerOptions build, so the test sends
++// the mode as the first message; it is queued until this listener registers.
++const mode = await new Promise<string>(resolve => {
++	self.addEventListener("message", event => resolve(String(event.data)), { once: true });
++});
++const failNativeCopy = mode === "native-fails";
+ 
+ Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+ // Linux keeps macOS runs off the real pbcopy; the native write is stubbed.
+ Object.defineProperty(process, "platform", { value: "linux", configurable: true });
++// A Termux host inherits TERMUX_VERSION; the fixture tests OSC 52/native
++// routing, so keep the real termux-clipboard-set out of the worker.
++delete process.env.TERMUX_VERSION;
+ const stdout: string[] = [];
+ spyOn(process.stdout, "write").mockImplementation(chunk => {
+ 	stdout.push(typeof chunk === "string" ? chunk : chunk.toString());
+ 	return true;
+ });
+ const nativeCopies: string[] = [];
+-spyOn(natives, "copyToClipboard").mockImplementation(text => {
++spyOn(natives, "copyToClipboard").mockImplementation(async text => {
+ 	nativeCopies.push(text);
++	if (failNativeCopy) throw new Error("native clipboard unavailable");
+ });
+ 
+-await copyToClipboard("worker probe");
+-self.postMessage({ stdout, nativeCopies });
++try {
++	await copyToClipboard("worker probe");
++	self.postMessage({ stdout, nativeCopies });
++} catch (error) {
++	self.postMessage({
++		stdout,
++		nativeCopies,
++		error: error instanceof Error ? error.message : String(error),
++	});
++}
+diff --git b/packages/coding-agent/test/generator-android.test.ts b/packages/coding-agent/test/generator-android.test.ts
+new file mode 100644
+index 0000000..b27275e
+--- /dev/null
++++ b/packages/coding-agent/test/generator-android.test.ts
+@@ -0,0 +1,209 @@
++import { describe, expect, it } from "bun:test";
++import * as fs from "node:fs/promises";
++import * as os from "node:os";
++import * as path from "node:path";
++import { buildGeneratedBlock, generateEnumExports } from "../../natives/scripts/gen-enums";
++
++const FAKE_DTS = `
++export declare class AudioCapture {}
++export declare class AudioPlayback {}
++export declare class LiveWebRtcPeer {}
++export declare class Process {}
++export declare function copyToClipboard(text: string): void;
++export declare function readImageFromClipboard(): Promise<unknown>;
++export declare function glob(): void;
++`;
++
++/**
++ * Only the names the Android branch replaces. A block built from it has no
++ * ungated fallback to excuse a call, so "the fallback ran" is observable.
++ */
++const GATED_DTS = `
++export declare class AudioCapture {}
++export declare class AudioPlayback {}
++export declare class LiveWebRtcPeer {}
++export declare function copyToClipboard(text: string): void;
++export declare function readImageFromClipboard(): Promise<unknown>;
++`;
++
++const MARKER_START = "// --- generated native exports (do not edit) ---";
++const MARKER_END = "// --- end generated native exports ---";
++
++function extractBlock(source: string): string {
++	const start = source.indexOf(MARKER_START);
++	const end = source.indexOf(MARKER_END);
++	if (start === -1 || end === -1) throw new Error("generated marker block missing");
++	return source.slice(start + MARKER_START.length, end);
++}
++
++/** Evaluate the generated exports against a fake addon and platform. */
++function instantiate(
++	block: string,
++	options: {
++		platform: NodeJS.Platform;
++		bindings: Record<string, unknown>;
++		missingNativeExport: (name: string) => unknown;
++		/**
++		 * Class counterpart of `missingNativeExport`. The default is the current-addon
++		 * shape (`undefined`), which keeps upstream's absent-binding passthrough.
++		 */
++		missingNativeClass?: (name: string) => unknown;
++	},
++): Record<string, any> {
++	const names = [...block.matchAll(/^export const (\w+) =/gm)].map(match => match[1]!);
++	const body = block.replace(/^export const /gm, "const ");
++	const factory = new Function(
++		"nativeBindings",
++		"missingNativeExport",
++		"missingNativeClass",
++		"process",
++		`${body}\nreturn { ${names.join(", ")} };`,
++	);
++	return factory(options.bindings, options.missingNativeExport, options.missingNativeClass ?? (() => undefined), {
++		platform: options.platform,
++	});
++}
++
++function missingExport(name: string): () => never {
++	return () => {
++		throw new Error(`missingNativeExport:${name}`);
++	};
++}
++
++describe("gen-enums Android platform gating", () => {
++	it("Android keeps the unsupported-on-Termux proxies", () => {
++		const missingCalls: string[] = [];
++		const missingClassCalls: string[] = [];
++		const exports = instantiate(buildGeneratedBlock(GATED_DTS), {
++			platform: "android",
++			bindings: {},
++			missingNativeExport: name => {
++				missingCalls.push(name);
++				return undefined;
++			},
++			missingNativeClass: name => {
++				missingClassCalls.push(name);
++				return undefined;
++			},
++		});
++
++		expect(() => exports.copyToClipboard("x")).toThrow("unsupported on Android/Termux");
++		expect(() => exports.readImageFromClipboard()).toThrow("unsupported on Android/Termux");
++		expect(() => new exports.AudioCapture()).toThrow("unsupported on Android/Termux");
++		expect(() => new exports.AudioPlayback()).toThrow("unsupported on Android/Termux");
++		expect(() => new exports.LiveWebRtcPeer()).toThrow("unsupported on Android/Termux");
++		// The unsupported names must take the Android branch, not the desktop
++		// missing-export fallback.
++		expect(missingCalls).not.toContain("copyToClipboard");
++		expect(missingCalls).not.toContain("readImageFromClipboard");
++		// `GATED_DTS` holds nothing but gated names, so any fallback call — for a
++		// function or for a class — proves the Android branch was bypassed.
++		expect(missingCalls).toEqual([]);
++		expect(missingClassCalls).toEqual([]);
++	});
++
++	it("desktop keeps the stale-addon diagnostic instead of the Android message", () => {
++		const exports = instantiate(buildGeneratedBlock(FAKE_DTS), {
++			platform: "linux",
++			bindings: {},
++			missingNativeExport: missingExport,
++		});
++
++		expect(() => exports.copyToClipboard("x")).toThrow("missingNativeExport:copyToClipboard");
++		expect(() => exports.readImageFromClipboard()).toThrow("missingNativeExport:readImageFromClipboard");
++		// Upstream passthrough for classes: absent binding stays absent on a
++		// current addon (the harness default `missingNativeClass`).
++		expect(exports.AudioCapture).toBeUndefined();
++	});
++
++	it("desktop throws the stale class stub where Android still says unsupported", () => {
++		// `missingNativeClass` returns `undefined` for a current addon and a
++		// throwing stub for a stale one (loader-state.js); the Android branch must
++		// never surface that desktop-only diagnostic, which is the whole point of
++		// the platform split.
++		const staleClass = (name: string) =>
++			class StaleNativeClass {
++				constructor() {
++					throw new Error(`missingNativeClass:${name}`);
++				}
++			};
++		const block = buildGeneratedBlock(GATED_DTS);
++
++		const desktop = instantiate(block, {
++			platform: "linux",
++			bindings: {},
++			missingNativeExport: missingExport,
++			missingNativeClass: staleClass,
++		});
++		expect(() => new desktop.AudioCapture()).toThrow("missingNativeClass:AudioCapture");
++		expect(() => new desktop.AudioPlayback()).toThrow("missingNativeClass:AudioPlayback");
++		expect(() => new desktop.LiveWebRtcPeer()).toThrow("missingNativeClass:LiveWebRtcPeer");
++
++		const android = instantiate(block, {
++			platform: "android",
++			bindings: {},
++			missingNativeExport: missingExport,
++			missingNativeClass: staleClass,
++		});
++		expect(() => new android.AudioCapture()).toThrow("unsupported on Android/Termux");
++		expect(() => new android.AudioPlayback()).toThrow("unsupported on Android/Termux");
++		expect(() => new android.LiveWebRtcPeer()).toThrow("unsupported on Android/Termux");
++	});
++
++	it("both platforms use the real binding when the addon exports it", () => {
++		const copy = () => "copied";
++		const glob = () => "globbed";
++		for (const platform of ["android", "linux"] as const) {
++			const exports = instantiate(buildGeneratedBlock(FAKE_DTS), {
++				platform,
++				bindings: { copyToClipboard: copy, glob },
++				missingNativeExport: missingExport,
++			});
++			expect(exports.copyToClipboard).toBe(copy);
++			expect(exports.glob).toBe(glob);
++		}
++	});
++});
++
++describe("generateEnumExports consumer", () => {
++	it("writes a platform-gated block that keeps desktop diagnostics", async () => {
++		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-gen-enums-"));
++		try {
++			await fs.writeFile(path.join(dir, "index.d.ts"), FAKE_DTS);
++			await fs.writeFile(
++				path.join(dir, "index.js"),
++				`import { loadNative, missingNativeExport } from "./loader-state.js";\nconst nativeBindings = loadNative();\n${MARKER_START}\n${MARKER_END}\n`,
++			);
++
++			await generateEnumExports({ nativeDir: dir });
++
++			const written = await fs.readFile(path.join(dir, "index.js"), "utf8");
++			const block = extractBlock(written);
++
++			const androidMissing: string[] = [];
++			const android = instantiate(block, {
++				platform: "android",
++				bindings: {},
++				missingNativeExport: name => {
++					androidMissing.push(name);
++					return undefined;
++				},
++			});
++			expect(androidMissing).not.toContain("copyToClipboard");
++			expect(() => android.copyToClipboard("x")).toThrow("unsupported on Android/Termux");
++
++			const glob = () => "globbed";
++			const desktop = instantiate(block, {
++				platform: "linux",
++				bindings: { glob },
++				missingNativeExport: missingExport,
++			});
++			expect(() => desktop.copyToClipboard("x")).toThrow("missingNativeExport:copyToClipboard");
++			expect(() => desktop.readImageFromClipboard()).toThrow("missingNativeExport:readImageFromClipboard");
++			// Supported exports stay direct passthroughs on both platforms.
++			expect(desktop.glob).toBe(glob);
++		} finally {
++			await fs.rm(dir, { recursive: true, force: true });
++		}
++	});
++});
+diff --git a/packages/coding-agent/test/slash-commands/copy.test.ts b/packages/coding-agent/test/slash-commands/copy.test.ts
+index a4b6d2e..702fb78 100644
+--- a/packages/coding-agent/test/slash-commands/copy.test.ts
++++ b/packages/coding-agent/test/slash-commands/copy.test.ts
+@@ -110,6 +110,17 @@ describe("/copy slash command", () => {
+ 		expect(harness.showStatus).toHaveBeenCalledWith("No link to copy.");
+ 	});
+ 
++	it("reports a rejected copy and still clears the submitted text", async () => {
++		spyOn(clipboard, "copyToClipboard").mockRejectedValue(new Error("no clipboard channel"));
++		const harness = createRuntimeHarness([assistantText("```ts\nconst value = 1;\n```")]);
++
++		expect(await executeBuiltinSlashCommand("/copy code", harness.runtime)).toBe(true);
++
++		expect(harness.showWarning).toHaveBeenCalledWith("Copy failed: no clipboard channel");
++		expect(harness.showStatus).not.toHaveBeenCalledWith("Copied code block to clipboard");
++		expect(harness.setText).toHaveBeenCalledWith("");
++	});
++
+ 	it("keeps bare /copy on the picker", async () => {
+ 		const copySpy = spyOn(clipboard, "copyToClipboard").mockResolvedValue(undefined);
+ 		const harness = createRuntimeHarness([assistantText("answer")]);
+diff --git b/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
+new file mode 100644
+index 0000000..782dbf0
+--- /dev/null
++++ b/packages/coding-agent/test/termux-notifications.test.ts
+@@ -0,0 +1,500 @@
++/**
++ * Termux notification wiring: the existing `completion.notify` / `error.notify` /
++ * `ask.notify` gates and the global `PI_NOTIFICATIONS` suppression decide whether
++ * an Android system notification (`termux-notification` via Termux:API) fires.
++ *
++ * Assertions stop at the real spawn boundary, so the tests exercise the same
++ * helper and gating code the binary runs — not a mocked module binding.
++ */
++import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
++import * as fs from "node:fs";
++import * as os from "node:os";
++import * as path from "node:path";
++import type { AssistantMessage } from "@oh-my-pi/pi-ai";
++import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
++import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
++import { cfgAskNotify, cfgCompletionNotify, cfgErrorNotify } from "@oh-my-pi/pi-coding-agent/modes/settings";
++import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
++import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
++import { AskTool } from "@oh-my-pi/pi-coding-agent/tools/ask";
++import {
++	androidNotificationId,
++	clearAndroidNotification,
++	sendAndroidNotification,
++} from "@oh-my-pi/pi-coding-agent/utils/android-helpers";
++import { TERMINAL } from "@oh-my-pi/pi-tui";
++import { initTheme } from "@oh-my-pi/pi-tui/theme";
++
++import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
++
++const originalWarpProtocol = process.env.WARP_CLI_AGENT_PROTOCOL_VERSION;
++const originalPiNotifications = process.env.PI_NOTIFICATIONS;
++const originalTermuxVersion = process.env.TERMUX_VERSION;
++const statusId = androidNotificationId();
++
++beforeAll(() => {
++	initTheme();
++});
++
++beforeEach(async () => {
++	resetSettingsForTest();
++	delete process.env.WARP_CLI_AGENT_PROTOCOL_VERSION;
++	delete process.env.PI_NOTIFICATIONS;
++	delete process.env.TERMUX_VERSION;
++	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-notify-test-"));
++	await Settings.init({ inMemory: true, cwd: tempDir });
++});
++
++afterEach(() => {
++	vi.restoreAllMocks();
++	resetSettingsForTest();
++	restoreEnv("WARP_CLI_AGENT_PROTOCOL_VERSION", originalWarpProtocol);
++	restoreEnv("PI_NOTIFICATIONS", originalPiNotifications);
++	restoreEnv("TERMUX_VERSION", originalTermuxVersion);
++});
++
++function restoreEnv(key: string, value: string | undefined): void {
++	if (value === undefined) {
++		delete process.env[key];
++	} else {
++		process.env[key] = value;
++	}
++}
++
++/** Capture real `termux-notification` invocations; mark the runtime as Termux. */
++function captureAndroidSpawns(): string[][] {
++	process.env.TERMUX_VERSION = "0.118";
++	const calls: string[][] = [];
++	vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
++		calls.push(cmd);
++		return {
++			stderr: new ReadableStream({
++				start(controller) {
++					controller.close();
++				},
++			}),
++			kill: () => {},
++			exited: Promise.resolve(0),
++		} as never;
++	}) as unknown as typeof Bun.spawn);
++	return calls;
++}
++
++function makeAssistantMessage(stopReason: "stop" | "aborted" | "error", text = "result text"): AssistantMessage {
++	return {
++		role: "assistant",
++		content: [{ type: "text", text }],
++		stopReason,
++		usage: { inputTokens: 0, outputTokens: 0 },
++		timestamp: Date.now(),
++	} as unknown as AssistantMessage;
++}
++
++function makeContext(sessionName = "test-session") {
++	return createInteractiveModeContext({
++		sessionManager: { getSessionName: () => sessionName },
++	});
++}
++
++function makeAgentEndEvent(messages: AssistantMessage[]): Extract<AgentSessionEvent, { type: "agent_end" }> {
++	return { type: "agent_end", messages };
++}
++
++function makeAskSession(overrides: Partial<ToolSession> = {}): ToolSession {
++	return {
++		cwd: "/tmp",
++		hasUI: true,
++		canPromptUser: true,
++		getSessionFile: () => null,
++		getSessionSpawns: () => "*",
++		getPlanModeState: () => null,
++		settings,
++		...overrides,
++	} as unknown as ToolSession;
++}
++
++function answeredAskDialog() {
++	return vi.fn().mockResolvedValue({
++		kind: "submit",
++		results: [{ id: "q1", question: "Proceed?", selectedOptions: ["Yes"] }],
++	});
++}
++
++function askContext(dialog: ReturnType<typeof answeredAskDialog>) {
++	return {
++		hasUI: true,
++		ui: { askDialog: dialog },
++		abort: vi.fn(),
++	} as never;
++}
++
++/** Non-rich UI surface: `askDialog` is absent, like an RPC host without set_ask_dialog. */
++function plainAskContext(select: () => Promise<string | undefined>) {
++	return {
++		hasUI: true,
++		ui: {
++			select,
++			editor: async () => undefined,
++			timeoutStartsOnPresentation: false,
++		},
++		abort: vi.fn(),
++	} as never;
++}
++
++const ASK_PARAMS = { questions: [{ id: "q1", question: "Proceed?", options: [{ label: "Yes" }] }] };
++
++describe("Termux notifications: completion", () => {
++	it("posts one Android notification when completion.notify is on", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgCompletionNotify.override(settings, "on");
++
++		new EventController(makeContext("my-session")).sendCompletionNotification(
++			makeAgentEndEvent([makeAssistantMessage("stop")]),
++		);
++
++		expect(calls).toEqual([["termux-notification", "--id", statusId, "--title", "omp", "--content", "Complete"]]);
++	});
++
++	it("uses the fixed app title, never the conversation-derived session name", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgCompletionNotify.override(settings, "on");
++
++		// Session names are generated from conversation text; a notification
++		// listener must not be able to read them back.
++		new EventController(makeContext("ghp_1234567890abcdef")).sendCompletionNotification(
++			makeAgentEndEvent([makeAssistantMessage("stop")]),
++		);
++
++		expect(calls).toHaveLength(1);
++		expect(calls[0]).toContain("omp");
++		expect(calls[0]).not.toContain("ghp_");
++	});
++
++	it("never puts assistant message text into the notification", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgCompletionNotify.override(settings, "on");
++
++		new EventController(makeContext("my-session")).sendCompletionNotification(
++			makeAgentEndEvent([makeAssistantMessage("stop", "token ghp_1234567890abcdef")]),
++		);
++
++		expect(calls).toHaveLength(1);
++		expect(JSON.stringify(calls)).not.toContain("ghp_");
++	});
++
++	it("honours completion.notify=off", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgCompletionNotify.override(settings, "off");
++
++		new EventController(makeContext()).sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
++
++		expect(calls).toHaveLength(0);
++	});
++
++	it("stays silent for aborted and errored turns", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgCompletionNotify.override(settings, "on");
++		const controller = new EventController(makeContext());
++
++		controller.sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("aborted")]));
++		controller.sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("error")]));
++
++		expect(calls).toHaveLength(0);
++	});
++
++	it("stays silent when the Warp CLI-agent protocol drives native UX", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgCompletionNotify.override(settings, "on");
++		process.env.WARP_CLI_AGENT_PROTOCOL_VERSION = "1";
++
++		new EventController(makeContext()).sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
++
++		expect(calls).toHaveLength(0);
++	});
++});
++
++describe("Termux notifications: error", () => {
++	it("posts one Android notification when error.notify is on and stopReason is error", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgErrorNotify.override(settings, "on");
++
++		new EventController(makeContext("err-session")).sendErrorNotification(
++			makeAgentEndEvent([makeAssistantMessage("error")]),
++		);
++
++		expect(calls).toEqual([
++			["termux-notification", "--id", statusId, "--title", "omp", "--content", "Stopped with error"],
++		]);
++	});
++
++	it("honours error.notify=off (schema default)", () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgErrorNotify.override(settings, "off");
++
++		new EventController(makeContext()).sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("error")]));
++
++		expect(calls).toHaveLength(0);
++	});
++
++	it("stays silent for normal completions and scheduling pauses", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgErrorNotify.override(settings, "on");
++		const controller = new EventController(makeContext());
++
++		controller.sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
++		// A model loop that stops while the run continues emits `agent_pause`,
++		// never an `agent_end`; an errored pause is still a scheduling pause, so
++		// nothing settled and no error card may fire.
++		await controller.handleEvent({
++			type: "agent_pause",
++			messages: [makeAssistantMessage("error")],
++			yielded: false,
++			awaiting: false,
++		});
++
++		expect(calls).toHaveLength(0);
++	});
++});
++
++describe("Termux notifications: ask", () => {
++	it("posts one per-prompt card and removes it after the dialog is answered", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "on");
++
++		await new AskTool(makeAskSession()).execute(
++			"call-ask",
++			ASK_PARAMS,
++			undefined,
++			undefined,
++			askContext(answeredAskDialog()),
++		);
++
++		const post = calls.find(args => args[0] === "termux-notification");
++		const remove = calls.find(args => args[0] === "termux-notification-remove");
++		expect(post).toBeDefined();
++		// Distinct from the completion/error status id, so the removal cannot
++		// erase a card posted while the dialog was pending.
++		expect(post?.[2]?.startsWith(`omp-ask-${process.pid}-`)).toBe(true);
++		expect(post?.[2]).not.toBe(statusId);
++		// Removal is serialized behind the post promise, so it comes second.
++		expect(calls.map(args => args[0])).toEqual(["termux-notification", "termux-notification-remove"]);
++		expect(remove?.[1]).toBe(post?.[2]);
++	});
++
++	it("clears the card on the plain (non-rich-dialog) path", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "on");
++
++		await new AskTool(makeAskSession()).execute(
++			"call-ask",
++			ASK_PARAMS,
++			undefined,
++			undefined,
++			plainAskContext(async () => "Yes"),
++		);
++
++		const post = calls.find(args => args[0] === "termux-notification");
++		expect(post?.[2]?.startsWith(`omp-ask-${process.pid}-`)).toBe(true);
++		expect(post).toBeDefined();
++		expect(calls.at(-1)).toEqual(["termux-notification-remove", post![2]]);
++	});
++
++	it("clears the card when the dialog throws", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "on");
++
++		await expect(
++			new AskTool(makeAskSession()).execute(
++				"call-ask",
++				ASK_PARAMS,
++				undefined,
++				undefined,
++				plainAskContext(async () => {
++					throw new Error("ui failure");
++				}),
++			),
++		).rejects.toBeDefined();
++
++		const post = calls.find(args => args[0] === "termux-notification");
++		expect(post).toBeDefined();
++		expect(calls.at(-1)).toEqual(["termux-notification-remove", post![2]]);
++	});
++
++	it("clears the card when the ask is aborted before the dialog settles", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "on");
++		const controller = new AbortController();
++		controller.abort();
++
++		await expect(
++			new AskTool(makeAskSession()).execute(
++				"call-ask",
++				ASK_PARAMS,
++				controller.signal,
++				undefined,
++				askContext(vi.fn(() => new Promise(() => {}))),
++			),
++		).rejects.toBeDefined();
++
++		const post = calls.find(args => args[0] === "termux-notification");
++		expect(post).toBeDefined();
++		expect(calls.at(-1)).toEqual(["termux-notification-remove", post![2]]);
++	});
++
++	it("posts and removes nothing when notifications are globally suppressed", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "on");
++		process.env.PI_NOTIFICATIONS = "off";
++
++		await new AskTool(makeAskSession()).execute(
++			"call-ask",
++			ASK_PARAMS,
++			undefined,
++			undefined,
++			askContext(answeredAskDialog()),
++		);
++
++		expect(calls).toHaveLength(0);
++	});
++
++	it("honours ask.notify=off", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "off");
++
++		await new AskTool(makeAskSession()).execute(
++			"call-ask",
++			ASK_PARAMS,
++			undefined,
++			undefined,
++			askContext(answeredAskDialog()),
++		);
++
++		expect(calls).toHaveLength(0);
++	});
++
++	it("stays silent when the session has no UI", async () => {
++		const calls = captureAndroidSpawns();
++		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		cfgAskNotify.override(settings, "on");
++
++		await new AskTool(makeAskSession({ hasUI: false })).execute(
++			"call-ask",
++			ASK_PARAMS,
++			undefined,
++			undefined,
++			askContext(answeredAskDialog()),
++		);
++
++		expect(calls).toHaveLength(0);
++	});
++});
++
++describe("Termux notifications: global suppression and failure modes", () => {
++	it("suppresses Android notifications when PI_NOTIFICATIONS is off", async () => {
++		const calls = captureAndroidSpawns();
++		process.env.PI_NOTIFICATIONS = "off";
++
++		const outcome = await sendAndroidNotification("Title", "Body");
++
++		expect(calls).toHaveLength(0);
++		expect(outcome).toEqual({ ok: false, error: "notifications suppressed" });
++	});
++
++	it("suppresses Android notifications when PI_NOTIFICATIONS is 0 or false", async () => {
++		const calls = captureAndroidSpawns();
++
++		process.env.PI_NOTIFICATIONS = "0";
++		expect((await sendAndroidNotification("T", "B")).ok).toBe(false);
++		process.env.PI_NOTIFICATIONS = "false";
++		expect((await sendAndroidNotification("T", "B")).ok).toBe(false);
++
++		expect(calls).toHaveLength(0);
++	});
++
++	it("reports unavailability instead of firing outside Termux", async () => {
++		const calls = captureAndroidSpawns();
++		delete process.env.TERMUX_VERSION;
++		if (process.platform === "android") return; // Termux itself: platform check cannot be faked.
++
++		const outcome = await sendAndroidNotification("T", "B");
++
++		expect(calls).toHaveLength(0);
++		expect(outcome).toEqual({ ok: false, error: "notification unavailable on this platform" });
++	});
++
++	it("does not throw when Termux:API is missing", async () => {
++		process.env.TERMUX_VERSION = "0.118";
++		vi.spyOn(Bun, "spawn").mockImplementation(() => {
++			throw new Error("ENOENT: termux-notification not found");
++		});
++
++		const outcome = await sendAndroidNotification("Title", "Body");
++
++		expect(outcome.ok).toBe(false);
++		expect(outcome.error).toBeDefined();
++	});
++
++	it("returns the command error without leaking arguments or secrets", async () => {
++		process.env.TERMUX_VERSION = "0.118";
++		vi.spyOn(Bun, "spawn").mockImplementation((() => {
++			return {
++				stderr: new ReadableStream({
++					start(controller) {
++						controller.enqueue(new TextEncoder().encode("generic failure\n"));
++						controller.close();
++					},
++				}),
++				kill: () => {},
++				exited: Promise.resolve(1),
++			} as never;
++		}) as unknown as typeof Bun.spawn);
++
++		const outcome = await sendAndroidNotification("Safe Title", "Contains secret: ghp_1234567890abcdef");
++
++		expect(outcome).toEqual({ ok: false, error: "generic failure" });
++		expect(outcome.error).not.toContain("ghp_");
++	});
++
++	it("truncates title to 200 and content to 500 characters", async () => {
++		const calls = captureAndroidSpawns();
++
++		await sendAndroidNotification("t".repeat(400), "b".repeat(900));
++
++		expect(calls[0]).toContain("t".repeat(200));
++		expect(calls[0]).toContain("b".repeat(500));
++	});
++
++	it("reuses one per-process id so events overwrite instead of stacking", async () => {
++		const calls = captureAndroidSpawns();
++
++		await sendAndroidNotification("First", "Complete");
++		await sendAndroidNotification("Second", "Waiting for input");
++		await sendAndroidNotification("Custom", "Body", { id: "omp-custom" });
++
++		expect(calls.map(args => args[2])).toEqual([statusId, statusId, "omp-custom"]);
++	});
++
++	it("clearAndroidNotification removes only the id it is given", async () => {
++		const calls = captureAndroidSpawns();
++		process.env.PI_NOTIFICATIONS = "off";
++
++		await clearAndroidNotification(statusId);
++
++		expect(calls).toEqual([["termux-notification-remove", statusId]]);
++	});
++});
+diff --git b/packages/coding-agent/test/tools/browser-android-chromium.test.ts b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
+new file mode 100644
+index 0000000..7720ed1
+--- /dev/null
++++ b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
+@@ -0,0 +1,151 @@
++import { afterAll, describe, expect, it } from "bun:test";
++import * as fs from "node:fs";
++import * as os from "node:os";
++import * as path from "node:path";
++
++const repoRoot = path.resolve(import.meta.dir, "../..");
++const probeFixture = path.join(import.meta.dir, "..", "fixtures", "browser-executable-probe.ts");
++// Android has no /bin; Termux and the emulator both ship /system/bin/sh.
++const shell = fs.existsSync("/system/bin/sh") ? "/system/bin/sh" : "/bin/sh";
++const tempDirs: string[] = [];
++
++function makeTempDir(): string {
++	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-android-chromium-"));
++	tempDirs.push(dir);
++	return dir;
++}
++
++function writeChrome(file: string, versionOutput: string): void {
++	fs.mkdirSync(path.dirname(file), { recursive: true });
++	fs.writeFileSync(file, `#!${shell}\necho "${versionOutput}"\n`);
++	fs.chmodSync(file, 0o755);
++}
++
++/** The parent's environment without variables that pick or relocate a browser. */
++function probeEnv(extra: Record<string, string>): Record<string, string> {
++	const env: Record<string, string> = {};
++	for (const [key, value] of Object.entries(process.env)) {
++		if (value === undefined) continue;
++		if (key.startsWith("PUPPETEER_") || key.startsWith("XDG_")) continue;
++		if (key === "PI_CODING_AGENT_DIR" || key === "PI_CONFIG_DIR" || key === "OMP_PROFILE" || key === "PI_PROFILE") {
++			continue;
++		}
++		env[key] = value;
++	}
++	env.HOME = env.HOME ?? os.homedir();
++	env.OMP_BROWSER_PROBE_PLATFORM = "android";
++	env.PUPPETEER_EXECUTABLE_PATH = "";
++	return { ...env, ...extra };
++}
++
++interface ProbeResult {
++	stdout: string;
++	stderr: string;
++	exitCode: number;
++}
++
++/** Run launch.ts in a child whose `process.platform` is forced to `android`. */
++function probeAndroid(extra: Record<string, string>): ProbeResult {
++	const result = Bun.spawnSync([process.execPath, probeFixture], {
++		cwd: repoRoot,
++		env: probeEnv(extra),
++		stdout: "pipe",
++		stderr: "pipe",
++	});
++	return {
++		stdout: new TextDecoder().decode(result.stdout).trim(),
++		stderr: new TextDecoder().decode(result.stderr),
++		exitCode: result.exitCode ?? -1,
++	};
++}
++
++afterAll(() => {
++	for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
++});
++
++// Chrome validation execs a shell script, so the fixture cannot run on Windows.
++describe.skipIf(process.platform === "win32")("Android Chromium discovery", () => {
++	it("finds the canonical Termux:X11 binary under $PREFIX/lib/chromium", () => {
++		const root = makeTempDir();
++		const prefix = path.join(root, "prefix");
++		const emptyPath = path.join(root, "empty-path");
++		fs.mkdirSync(emptyPath, { recursive: true });
++		// A PATH wrapper that also answers `--version`; the canonical package
++		// binary must still win.
++		writeChrome(path.join(prefix, "bin", "chromium"), "Chromium 100.0.0.0");
++		const chrome = path.join(prefix, "lib", "chromium", "chrome");
++		writeChrome(chrome, "Chromium 149.0.7827.155");
++
++		const result = probeAndroid({ PREFIX: prefix, PATH: emptyPath });
++
++		expect(result.exitCode, result.stderr).toBe(0);
++		expect(result.stdout).toBe(chrome);
++	});
++
++	it("falls back to the $PREFIX/bin wrapper when the canonical binary is absent", () => {
++		const root = makeTempDir();
++		const prefix = path.join(root, "prefix");
++		const emptyPath = path.join(root, "empty-path");
++		fs.mkdirSync(emptyPath, { recursive: true });
++		const wrapper = path.join(prefix, "bin", "chromium");
++		writeChrome(wrapper, "Chromium 149.0.7827.155");
++
++		const result = probeAndroid({ PREFIX: prefix, PATH: emptyPath });
++
++		expect(result.exitCode, result.stderr).toBe(0);
++		expect(result.stdout).toBe(wrapper);
++	});
++
++	it("throws install guidance when the only binary is broken", () => {
++		const root = makeTempDir();
++		const prefix = path.join(root, "prefix");
++		const emptyPath = path.join(root, "empty-path");
++		fs.mkdirSync(emptyPath, { recursive: true });
++		writeChrome(path.join(prefix, "lib", "chromium", "chrome"), "not-a-browser");
++
++		const result = probeAndroid({ PREFIX: prefix, PATH: emptyPath });
++
++		expect(result.exitCode).not.toBe(0);
++		expect(result.stderr).toContain("No working Chromium executable found on Android");
++		expect(result.stderr).toContain("pkg install -y x11-repo");
++		// The managed Linux download must never be reached on Android.
++		expect(result.stderr).not.toContain("must not download a browser");
++	});
++
++	it("accepts a working explicit PUPPETEER_EXECUTABLE_PATH", () => {
++		const root = makeTempDir();
++		const chrome = path.join(root, "custom", "chrome");
++		writeChrome(chrome, "Chromium 149.0.7827.155");
++
++		const result = probeAndroid({
++			PREFIX: path.join(root, "prefix"),
++			PATH: path.join(root, "empty-path"),
++			PUPPETEER_EXECUTABLE_PATH: chrome,
++		});
++
++		expect(result.exitCode, result.stderr).toBe(0);
++		expect(result.stdout).toBe(chrome);
++	});
++
++	it("fails an explicit PUPPETEER_EXECUTABLE_PATH that does not exist", () => {
++		const root = makeTempDir();
++		const missing = path.join(root, "missing", "chrome");
++
++		const result = probeAndroid({ PREFIX: path.join(root, "prefix"), PUPPETEER_EXECUTABLE_PATH: missing });
++
++		expect(result.exitCode).not.toBe(0);
++		expect(result.stderr).toContain("not a working Chromium executable");
++		expect(result.stderr).toContain(missing);
++	});
++
++	it("fails an explicit PUPPETEER_EXECUTABLE_PATH that is not Chromium", () => {
++		const root = makeTempDir();
++		const broken = path.join(root, "custom", "chrome");
++		writeChrome(broken, "not-a-browser");
++
++		const result = probeAndroid({ PREFIX: path.join(root, "prefix"), PUPPETEER_EXECUTABLE_PATH: broken });
++
++		expect(result.exitCode).not.toBe(0);
++		expect(result.stderr).toContain("not a working Chromium executable");
++	});
++});
+diff --git a/packages/coding-agent/test/utils/clipboard-osc52.test.ts b/packages/coding-agent/test/utils/clipboard-osc52.test.ts
+index 32b5f21..b4fdc3a 100644
+--- a/packages/coding-agent/test/utils/clipboard-osc52.test.ts
++++ b/packages/coding-agent/test/utils/clipboard-osc52.test.ts
+@@ -56,6 +56,7 @@ describe("copyToClipboard OSC 52 routing", () => {
+ 		const worker = new Worker(new URL("../fixtures/clipboard-worker-copy.ts", import.meta.url).href, {
+ 			type: "module",
+ 		});
++		worker.postMessage("ok");
+ 		const report = Promise.withResolvers<{ stdout: string[]; nativeCopies: string[] }>();
+ 		worker.addEventListener("message", event => report.resolve(event.data));
+ 		worker.addEventListener("error", event => report.reject(event.error ?? new Error(event.message)));
+@@ -67,4 +68,24 @@ describe("copyToClipboard OSC 52 routing", () => {
+ 			worker.terminate();
+ 		}
+ 	});
++
++	// The worker fixture forces `stdout.isTTY` true; that must not count as a
++	// delivered OSC 52, or a failed native write would still report success.
++	it("rejects in a worker when the native copy fails because OSC 52 cannot be emitted there", async () => {
++		const worker = new Worker(new URL("../fixtures/clipboard-worker-copy.ts", import.meta.url).href, {
++			type: "module",
++		});
++		worker.postMessage("native-fails");
++		const report = Promise.withResolvers<{ stdout: string[]; nativeCopies: string[]; error?: string }>();
++		worker.addEventListener("message", event => report.resolve(event.data));
++		worker.addEventListener("error", event => report.reject(event.error ?? new Error(event.message)));
++		try {
++			const result = await report.promise;
++			expect(result.stdout.join("")).not.toContain("\x1b]52;");
++			expect(result.nativeCopies).toEqual(["worker probe"]);
++			expect(result.error).toBe("native clipboard unavailable");
++		} finally {
++			worker.terminate();
++		}
++	});
+ });
+diff --git a/packages/coding-agent/test/utils/clipboard.test.ts b/packages/coding-agent/test/utils/clipboard.test.ts
+index 581c2bf..4a835ca 100644
+--- a/packages/coding-agent/test/utils/clipboard.test.ts
++++ b/packages/coding-agent/test/utils/clipboard.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+ import {
++	copyToClipboard,
+ 	isClipboardTerminalLocal,
+ 	readImageFromClipboard,
+ 	readMacFileUrlsFromClipboard,
+@@ -60,6 +61,17 @@ function restorePlatform(): void {
+ 	if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+ }
+ 
++const stdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
++
++function setStdoutIsTTY(value: boolean): void {
++	Object.defineProperty(process.stdout, "isTTY", { value, configurable: true });
++}
++
++function restoreStdoutIsTTY(): void {
++	if (stdoutIsTTY) Object.defineProperty(process.stdout, "isTTY", stdoutIsTTY);
++	else delete (process.stdout as { isTTY?: boolean }).isTTY;
++}
++
+ const ENV_KEYS = ["WSL_DISTRO_NAME", "WSL_INTEROP", "DISPLAY", "WAYLAND_DISPLAY", "TERMUX_VERSION"] as const;
+ let savedEnv: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
+ 
+@@ -78,6 +90,7 @@ afterEach(() => {
+ 		else process.env[key] = prior;
+ 	}
+ 	restorePlatform();
++	restoreStdoutIsTTY();
+ 	vi.restoreAllMocks();
+ });
+ 
+@@ -244,6 +257,101 @@ describe("readImageFromClipboard dispatch", () => {
+ 	});
+ });
+ 
++describe("Termux clipboard", () => {
++	it("copies through termux-clipboard-set with the text on stdin and skips the native bridge", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++		setStdoutIsTTY(false);
++
++		const calls: SpawnCall[] = [];
++		spySpawn(calls, "");
++		const nativeSpy = vi.spyOn(native, "copyToClipboard").mockImplementation(async () => {});
++
++		await copyToClipboard("hello");
++
++		expect(calls).toHaveLength(1);
++		expect(calls[0]?.cmd).toEqual(["termux-clipboard-set"]);
++		expect(calls[0]?.options.stdin).toEqual(Buffer.from("hello"));
++		expect(nativeSpy).not.toHaveBeenCalled();
++	});
++
++	it("rejects when termux-api is missing and no TTY received OSC 52", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++		setStdoutIsTTY(false);
++
++		vi.spyOn(Bun, "spawn").mockImplementation(() => {
++			throw new Error("ENOENT: termux-clipboard-set not found");
++		});
++		const nativeSpy = vi.spyOn(native, "copyToClipboard").mockImplementation(() => {
++			throw new Error("Native arboard clipboard is unsupported on Android/Termux");
++		});
++
++		await expect(copyToClipboard("hello")).rejects.toThrow(/unsupported on Android\/Termux/);
++		expect(nativeSpy).toHaveBeenCalledTimes(1);
++	});
++
++	it("rejects when the OSC 52 write is swallowed and no other channel works", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++		setStdoutIsTTY(true);
++
++		vi.spyOn(Bun, "spawn").mockImplementation(() => {
++			throw new Error("ENOENT: termux-clipboard-set not found");
++		});
++		vi.spyOn(native, "copyToClipboard").mockImplementation(() => {
++			throw new Error("arboard unavailable");
++		});
++		vi.spyOn(process.stdout, "write").mockImplementation(() => {
++			throw new Error("EPIPE");
++		});
++
++		await expect(copyToClipboard("hello")).rejects.toThrow(/arboard unavailable/);
++	});
++
++	it("resolves after emitting OSC 52 even when the Termux and native backends fail", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++		setStdoutIsTTY(true);
++
++		vi.spyOn(Bun, "spawn").mockImplementation(() => {
++			throw new Error("ENOENT: termux-clipboard-set not found");
++		});
++		vi.spyOn(native, "copyToClipboard").mockImplementation(() => {
++			throw new Error("arboard unavailable");
++		});
++		const writeSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
++
++		await copyToClipboard("hello");
++
++		const osc52 = `\x1b]52;c;${Buffer.from("hello").toString("base64")}\x07`;
++		expect(writeSpy.mock.calls.some(([chunk]) => String(chunk) === osc52)).toBe(true);
++	});
++
++	it("reads text through termux-clipboard-get", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++
++		const calls: SpawnCall[] = [];
++		spySpawn(calls, "hello\n");
++
++		expect(await readTextFromClipboard()).toBe("hello\n");
++		expect(calls).toHaveLength(1);
++		expect(calls[0]?.cmd).toEqual(["termux-clipboard-get"]);
++	});
++
++	it("returns an empty string and warns when the Termux read fails", async () => {
++		setPlatform("android");
++		process.env.TERMUX_VERSION = "0.118";
++
++		const calls: SpawnCall[] = [];
++		spySpawn(calls, "", 1);
++
++		expect(await readTextFromClipboard()).toBe("");
++		expect(calls[0]?.cmd).toEqual(["termux-clipboard-get"]);
++	});
++});
++
+ describe("readMacFileUrlsFromClipboard", () => {
+ 	it("returns an empty list on non-darwin platforms without spawning osascript", async () => {
+ 		setPlatform("linux");
+diff --git a/packages/tui/src/active-terminal.ts b/packages/tui/src/active-terminal.ts
+index 6ef0e4c..9501254 100644
+--- a/packages/tui/src/active-terminal.ts
++++ b/packages/tui/src/active-terminal.ts
+@@ -67,14 +67,22 @@ export function writeThroughActiveTerminal(data: string): boolean {
+  * terminal's ordered output path, and goes straight to stdout, best-effort, only
+  * when no terminal owns it. A worker thread cannot reach the main thread's
+  * terminal and would write around its pump, so it writes nothing.
++ *
++ * Returns whether the sequence was handed to a real output path (the active
++ * terminal's ordered pump, or a direct stdout write that did not throw). A
++ * worker, a terminal that never owned stdout, or a closed stdout returns
++ * `false`. Even `true` only means "emitted", not that the user's terminal
++ * honored it: OSC 52 is best-effort by design.
+  */
+-export function writeTerminalSequence(data: string): void {
+-	if (!Bun.isMainThread) return;
+-	if (writeThroughActiveTerminal(data)) return;
++export function writeTerminalSequence(data: string): boolean {
++	if (!Bun.isMainThread) return false;
++	if (writeThroughActiveTerminal(data)) return true;
+ 	installStdoutErrorListener();
+ 	try {
+ 		process.stdout.write(data);
++		return true;
+ 	} catch {
+ 		// Best-effort: a closed stdout must not fail the caller.
++		return false;
+ 	}
+ }
+diff --git a/packages/tui/src/apps/debug/log-viewer.ts b/packages/tui/src/apps/debug/log-viewer.ts
+index 04e7361..f3d058c 100644
+--- a/packages/tui/src/apps/debug/log-viewer.ts
++++ b/packages/tui/src/apps/debug/log-viewer.ts
+@@ -1205,15 +1205,19 @@ export class DebugLogViewerComponent implements Component {
+ 			return;
+ 		}
+ 
+-		try {
+-			this.#deps.copyToClipboard(selectedPayload);
+-			const message = `Copied ${selected.length} log ${selected.length === 1 ? "entry" : "entries"}`;
+-			this.#statusMessage = message;
+-			this.#onStatus?.(message);
+-		} catch (error) {
+-			const message = error instanceof Error ? error.message : String(error);
+-			this.#statusMessage = `Copy failed: ${message}`;
+-			this.#onError?.(`Failed to copy logs: ${message}`);
+-		}
++		void Promise.resolve()
++			.then(() => this.#deps.copyToClipboard(selectedPayload))
++			.then(
++				() => {
++					const message = `Copied ${selected.length} log ${selected.length === 1 ? "entry" : "entries"}`;
++					this.#statusMessage = message;
++					this.#onStatus?.(message);
++				},
++				(error: unknown) => {
++					const message = error instanceof Error ? error.message : String(error);
++					this.#statusMessage = `Copy failed: ${message}`;
++					this.#onError?.(`Failed to copy logs: ${message}`);
++				},
++			);
+ 	}
+ }
+diff --git a/packages/tui/src/apps/debug/raw-sse.ts b/packages/tui/src/apps/debug/raw-sse.ts
+index 14e294a..982c574 100644
+--- a/packages/tui/src/apps/debug/raw-sse.ts
++++ b/packages/tui/src/apps/debug/raw-sse.ts
+@@ -483,17 +483,21 @@ export class RawSseViewerComponent implements Component {
+ 			return;
+ 		}
+ 
+-		try {
+-			this.#deps.copyToClipboard(payload);
+-			const message = "Copied raw SSE stream";
+-			this.#statusMessage = message;
+-			this.#statusFailed = false;
+-			this.#onStatus?.(message);
+-		} catch (error) {
+-			const message = error instanceof Error ? error.message : String(error);
+-			this.#statusMessage = `Copy failed: ${message}`;
+-			this.#statusFailed = true;
+-		}
+-		this.#onUpdate?.();
++		void Promise.resolve()
++			.then(() => this.#deps.copyToClipboard(payload))
++			.then(
++				() => {
++					const message = "Copied raw SSE stream";
++					this.#statusMessage = message;
++					this.#statusFailed = false;
++					this.#onStatus?.(message);
++				},
++				(error: unknown) => {
++					const message = error instanceof Error ? error.message : String(error);
++					this.#statusMessage = `Copy failed: ${message}`;
++					this.#statusFailed = true;
++				},
++			)
++			.finally(() => this.#onUpdate?.());
+ 	}
+ }
