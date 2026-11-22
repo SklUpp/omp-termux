@@ -255,7 +255,9 @@ trap restore_cargo_config EXIT
 # builds, which creates incompatible Opus objects. Cargo config above keeps all
 # C/C++/Rust objects on selected NDK r27.
 set +e
-cargo build --manifest-path crates/pi-natives/Cargo.toml \
+NATIVES_MANIFEST=crates/natives/Cargo.toml
+[ -f "$NATIVES_MANIFEST" ] || NATIVES_MANIFEST=crates/pi-natives/Cargo.toml
+cargo build --manifest-path "$NATIVES_MANIFEST" \
 	--target aarch64-linux-android --profile ci --locked -j "$CARGO_BUILD_JOBS"
 CARGO_RC=$?
 set -e

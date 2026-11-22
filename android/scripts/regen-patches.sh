@@ -70,8 +70,11 @@ gen() { # name pathspec...
 }
 
 gen 01-bionic-rust.patch \
-	crates ':(exclude)crates/pi-natives/src/ipc'
+	crates \
+	':(exclude)crates/natives/src/ipc' \
+	':(exclude)crates/pi-natives/src/ipc'
 gen 02-native-ipc.patch \
+	crates/natives/src/ipc \
 	crates/pi-natives/src/ipc \
 	packages/natives/native/index.js \
 	packages/natives/native/loader-state.js \
