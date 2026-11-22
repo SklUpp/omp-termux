@@ -58,6 +58,65 @@ describe("task schema (single-spawn)", () => {
 		}
 	});
 
+	it.each([false, true])("preserves an explicit repoRoot in every dynamic shape (batch=%s)", batchEnabled => {
+		// Non-default options select `createTaskSchema` instead of the static
+		// schemas. Its `"+": "delete"` strips any field it does not declare, so
+		// each of the four returns (isolation × batch) must declare repoRoot;
+		// otherwise a per-call workspace override silently vanished.
+		for (const isolationEnabled of [false, true]) {
+			const schema = getTaskSchema({
+				batchEnabled,
+				isolationEnabled,
+				effortEnabled: true,
+				structured: false,
+			});
+			const item = {
+				task: "Do the defined change",
+				solutionSpace: "one defined change",
+				repoRoot: "/repo/override",
+			};
+			const parsed = schema(batchEnabled ? { context: "shared context", tasks: [item] } : item);
+			if (parsed instanceof type.errors) throw new Error(parsed.summary);
+			const parsedItem = batchEnabled ? (parsed as { tasks: unknown[] }).tasks[0] : parsed;
+			expect(parsedItem).toMatchObject({ repoRoot: "/repo/override" });
+		}
+	});
+
+	it.each([false, true])("declares repoRoot in the static and builder task schemas (batch=%s)", batchEnabled => {
+		// `structured: true` (the default) publishes this wire shape to the model
+		// and the exported `taskSchema` parses directly, so the static schemas and
+		// `createTaskSchema` must agree: a static shape that hid repoRoot while the
+		// builder declared it left the documented parameter unadvertised, and the
+		// `"+": "delete"` path silently stripped it from a direct parse.
+		for (const isolationEnabled of [false, true]) {
+			// Default options select a static schema; `effortEnabled` forces the builder.
+			for (const builder of [false, true]) {
+				const schema = getTaskSchema({
+					batchEnabled,
+					isolationEnabled,
+					...(builder ? { effortEnabled: true } : {}),
+				});
+				const wire = schema.toJsonSchema();
+				const properties = isRecord(wire.properties) ? wire.properties : undefined;
+				const tasks = properties && isRecord(properties.tasks) ? properties.tasks : undefined;
+				const itemWire = batchEnabled && tasks ? tasks.items : wire;
+				if (!isRecord(itemWire) || !isRecord(itemWire.properties)) {
+					throw new Error("Expected an object schema for the task input");
+				}
+				expect(itemWire.properties.repoRoot).toEqual({ type: "string" });
+				const item = {
+					task: "Re-root the spawn",
+					solutionSpace: "one defined change",
+					repoRoot: "/repo/override",
+				};
+				const parsed = schema(batchEnabled ? { context: "shared context", tasks: [item] } : item);
+				if (parsed instanceof type.errors) throw new Error(parsed.summary);
+				const batchItems = batchEnabled && isRecord(parsed) ? parsed.tasks : undefined;
+				expect(Array.isArray(batchItems) ? batchItems[0] : parsed).toMatchObject({ repoRoot: "/repo/override" });
+			}
+		}
+	});
+
 	it("removes eval tool names from the wire shape when eval.tools.enabled is off", () => {
 		const schema = getTaskSchema({
 			isolationEnabled: false,

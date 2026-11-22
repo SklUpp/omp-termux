@@ -67,6 +67,7 @@ export const taskItemSchema = type({
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
+	"repoRoot?": "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
@@ -77,6 +78,7 @@ const taskItemSchemaIsolated = type({
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
+	"repoRoot?": "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
@@ -89,6 +91,7 @@ export const taskSchema = type({
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
+	"repoRoot?": "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
@@ -100,6 +103,7 @@ const taskSchemaNoIsolation = type({
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
+	"repoRoot?": "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
@@ -161,6 +165,11 @@ function createTaskSchema(options: {
 }): BaseType {
 	const agent = taskAgentSchemaRule(options.defaultAgent);
 	const taskFields = options.steps ? { steps: "string[]" } : { task: "string" };
+	// Declared by every return, isolated or not (unused without isolation), to
+	// match the static schemas above: `"+": "delete"` drops any field the shape
+	// omits, so omitting it here erased an explicit root whenever a non-default
+	// option (task.file, structured, …) selected this builder.
+	const repoRootField = { "repoRoot?": "string" };
 	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
 	const schemaFields = options.structured
 		? { "outputSchema?": outputSchemaInputSchema, "schemaMode?": '"permissive" | "strict"' }
@@ -177,6 +186,7 @@ function createTaskSchema(options: {
 				"name?": "string",
 				agent,
 				...taskFields,
+				...repoRootField,
 				solutionSpace: "string",
 				...effortField,
 				...schemaFields,
@@ -197,6 +207,7 @@ function createTaskSchema(options: {
 			"name?": "string",
 			agent,
 			...taskFields,
+			...repoRootField,
 			solutionSpace: "string",
 			...effortField,
 			...schemaFields,
@@ -217,6 +228,7 @@ function createTaskSchema(options: {
 			"name?": "string",
 			agent,
 			...taskFields,
+			...repoRootField,
 			solutionSpace: "string",
 			...effortField,
 			...schemaFields,
@@ -230,6 +242,7 @@ function createTaskSchema(options: {
 		"name?": "string",
 		agent,
 		...taskFields,
+		...repoRootField,
 		solutionSpace: "string",
 		...effortField,
 		...schemaFields,

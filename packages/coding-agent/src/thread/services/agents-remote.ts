@@ -216,6 +216,10 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return this.#remote.call("park", id);
 	}
 
+	reserve(_id: string, _expected: AgentRef): Promise<() => void> {
+		return Promise.reject(new Error("Isolation handoff holds are owned by the main thread"));
+	}
+
 	ensureLive(id: string): Promise<AgentSessionHandle> {
 		return this.#remote.call("ensureLive", id);
 	}

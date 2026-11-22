@@ -5,7 +5,7 @@
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { worktreeHelp as commandHelp } from "../cli/command-help";
-import { addWorktree, clearWorktrees, listWorktrees } from "../cli/worktree-cli";
+import { addWorktree, clearWorktrees, listWorktrees, releaseWorktree } from "../cli/worktree-cli";
 import { Settings } from "../config/settings";
 
 export default class Worktree extends Command {
@@ -15,13 +15,13 @@ export default class Worktree extends Command {
 	static args = {
 		// A positional action keeps `omp worktree` (the no-arg form) useful.
 		action: Args.string({
-			description: "list (default), clear, or add",
+			description: "list (default), clear, add, or release",
 			required: false,
-			options: ["list", "clear", "add"],
+			options: ["list", "clear", "add", "release"],
 			default: "list",
 		}),
 		path: Args.string({
-			description: "Worktree path (add)",
+			description: "Worktree path (add, release)",
 			required: false,
 		}),
 		commit: Args.string({
@@ -56,7 +56,8 @@ export default class Worktree extends Command {
 			default: false,
 		}),
 		all: Flags.boolean({
-			description: "Clear every entry, including live PR-checkout worktrees (clear)",
+			description:
+				"Clear every entry, including live PR-checkout worktrees; retained task-isolation workspaces are always preserved (clear)",
 			default: false,
 		}),
 		"dry-run": Flags.boolean({
@@ -107,6 +108,20 @@ export default class Worktree extends Command {
 		}
 
 		await Settings.init({ cwd: getProjectDir() });
+		if (args.action === "release") {
+			if (!args.path) {
+				console.error("Error: Missing required argument: path");
+				process.exitCode = 1;
+				return;
+			}
+			try {
+				await releaseWorktree({ path: args.path, json: flags.json ?? false });
+			} catch (error) {
+				console.error(error instanceof Error ? error.message : String(error));
+				process.exitCode = 1;
+			}
+			return;
+		}
 		if (args.action === "clear") {
 			const { failed } = await clearWorktrees({
 				all: flags.all ?? false,

@@ -1029,7 +1029,7 @@ mod os {
 	/// on failure. Linux re-executes `/proc/self/exe`, so a binary replaced
 	/// on disk meanwhile does not take over.
 	pub fn exec(args: &[OsString]) -> io::Error {
-		let exe = if cfg!(target_os = "linux") {
+		let exe = if cfg!(any(target_os = "linux", target_os = "android")) {
 			PathBuf::from("/proc/self/exe")
 		} else {
 			match std::env::current_exe() {
