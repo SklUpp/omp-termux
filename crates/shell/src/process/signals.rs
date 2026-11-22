@@ -38,15 +38,15 @@ mod unix {
 		forgotten: Vec<i32>,
 	}
 
-	/// Read Linux's disposition bitmap in one query, falling back to
-	/// sigaction when procfs is unavailable or its status format changes.
-	#[cfg(target_os = "linux")]
+	/// Read `/proc/self/status`'s disposition bitmap in one query, falling
+	/// back to sigaction when procfs is unavailable or its format changes.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	fn ignored_from_proc() -> Option<SigSet> {
 		let file = std::fs::File::open("/proc/self/status").ok()?;
 		ignored_from_status(io::BufReader::new(file))
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	fn ignored_from_status(mut input: impl io::BufRead) -> Option<SigSet> {
 		let mut line = Vec::new();
 		while input.read_until(b'\n', &mut line).ok()? != 0 {
@@ -68,7 +68,7 @@ mod unix {
 		None
 	}
 
-	#[cfg(all(test, target_os = "linux"))]
+	#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 	mod tests {
 		use super::*;
 
@@ -109,7 +109,7 @@ mod unix {
 	impl Signals {
 		/// Signals ignored when the process started (inherited dispositions).
 		pub fn ignored() -> SigSet {
-			#[cfg(target_os = "linux")]
+			#[cfg(any(target_os = "linux", target_os = "android"))]
 			if let Some(ignored) = ignored_from_proc() {
 				return ignored;
 			}
