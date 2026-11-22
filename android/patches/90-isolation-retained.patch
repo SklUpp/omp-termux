@@ -1,8 +1,8 @@
 diff --git a/packages/coding-agent/src/cli/worktree-cli.ts b/packages/coding-agent/src/cli/worktree-cli.ts
-index c2610f2..d3016cb 100644
+index c2610f2..65f024f 100644
 --- a/packages/coding-agent/src/cli/worktree-cli.ts
 +++ b/packages/coding-agent/src/cli/worktree-cli.ts
-@@ -5,8 +5,16 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
+@@ -5,10 +5,19 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
  import { isEnoent } from "@oh-my-pi/pi-utils";
  import chalk from "@oh-my-pi/pi-utils/chalk";
  import { Settings } from "../config/settings";
@@ -19,8 +19,11 @@ index c2610f2..d3016cb 100644
 +} from "../task/worktree";
  import type { ManagedWorktree } from "../worktree/backend";
  import { managedWorktrees } from "../worktree/worktrees";
++export { stopRetainedMount } from "../worktree/git-managed";
  
-@@ -25,12 +33,19 @@ export interface ListWorktreesOptions {
+ export interface AddWorktreeOptions {
+ 	cwd?: string;
+@@ -25,12 +34,19 @@ export interface ListWorktreesOptions {
  }
  
  export interface ClearWorktreesOptions {
@@ -41,7 +44,7 @@ index c2610f2..d3016cb 100644
  export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
  	if (options.branch && options.forceBranch) {
  		throw new Error("fatal: options '-b' and '-B' cannot be used together");
-@@ -116,37 +131,58 @@ export async function listWorktrees(options: ListWorktreesOptions): Promise<void
+@@ -116,37 +132,58 @@ export async function listWorktrees(options: ListWorktreesOptions): Promise<void
  	}
  	let live = 0;
  	let orphaned = 0;
@@ -106,7 +109,7 @@ index c2610f2..d3016cb 100644
  			console.log(chalk.dim(`\n${targets.length} dir${targets.length === 1 ? "" : "s"} would be removed.`));
  		}
  		return { removed: 0, failed: 0 };
-@@ -155,6 +191,18 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
+@@ -155,6 +192,18 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
  	const results: { path: string; ok: boolean; error?: string }[] = [];
  	for (const target of targets) {
  		try {
@@ -125,7 +128,7 @@ index c2610f2..d3016cb 100644
  			await target.remove();
  			results.push({ path: target.path, ok: true });
  		} catch (err) {
-@@ -166,7 +214,9 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
+@@ -166,7 +215,9 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
  	const failed = results.length - succeeded;
  
  	if (options.json) {
@@ -136,7 +139,7 @@ index c2610f2..d3016cb 100644
  		return { removed: succeeded, failed };
  	}
  
-@@ -178,10 +228,52 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
+@@ -178,10 +229,52 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<{
  			if (result.error) console.log(`          ${chalk.dim(result.error)}`);
  		}
  	}
@@ -189,7 +192,7 @@ index c2610f2..d3016cb 100644
  function formatEntryDetail(entry: ManagedWorktree): string {
  	const parts: string[] = [];
  	if (entry.kind === "pr-checkout") {
-@@ -191,7 +283,13 @@ function formatEntryDetail(entry: ManagedWorktree): string {
+@@ -191,7 +284,13 @@ function formatEntryDetail(entry: ManagedWorktree): string {
  	} else if (entry.kind === "ovnfs") {
  		parts.push(`ovnfs · ${entry.parentRepo ?? "unknown source"}${entry.branch ? ` · ${entry.branch}` : ""}`);
  	} else if (entry.kind === "task-isolation") {
@@ -3824,7 +3827,7 @@ index 88c7570..032db5e 100644
  	remove(): Promise<void>;
  }
 diff --git a/packages/coding-agent/src/worktree/git-managed.ts b/packages/coding-agent/src/worktree/git-managed.ts
-index 1c659cc..ece25e3 100644
+index 1c659cc..899cab4 100644
 --- a/packages/coding-agent/src/worktree/git-managed.ts
 +++ b/packages/coding-agent/src/worktree/git-managed.ts
 @@ -5,6 +5,7 @@ import * as natives from "@oh-my-pi/pi-natives";
@@ -3844,6 +3847,15 @@ index 1c659cc..ece25e3 100644
  }
  
  /**
+@@ -36,7 +39,7 @@ interface DiskEntry {
+  * traversing a possibly live mount — the entry is then reported failed
+  * with the error, data intact.
+  */
+-async function stopRetainedMount(dir: string): Promise<boolean> {
++export async function stopRetainedMount(dir: string): Promise<boolean> {
+ 	const backend = await readRetainedMountBackend(dir);
+ 	if (backend === undefined) return false;
+ 	for (const name of TASK_ISOLATION_MOUNT_DIRS) {
 @@ -145,12 +148,15 @@ async function classifyDir(dir: string): Promise<DiskEntry | null> {
  	}
  	if (!isIsolation) return null;
