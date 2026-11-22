@@ -1,8 +1,8 @@
-diff --git a/crates/pi-builtins/src/lib.rs b/crates/pi-builtins/src/lib.rs
-index 3e52d51..0461b12 100644
---- a/crates/pi-builtins/src/lib.rs
-+++ b/crates/pi-builtins/src/lib.rs
-@@ -257,6 +257,6 @@ pub use proc_snapshot::{ProcInfo, ProcessStatus};
+diff --git a/crates/builtins/src/lib.rs b/crates/builtins/src/lib.rs
+index 46d3e61..cace0f6 100644
+--- a/crates/builtins/src/lib.rs
++++ b/crates/builtins/src/lib.rs
+@@ -278,6 +278,6 @@ pub use proc_snapshot::{ProcInfo, ProcessStatus};
  /// implementation.
  #[cfg(all(
  	feature = "util.procs",
@@ -10,10 +10,10 @@ index 3e52d51..0461b12 100644
 +	any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")
  ))]
  pub use proc_snapshot::sys as proc_sys;
-diff --git a/crates/pi-builtins/src/proc_snapshot.rs b/crates/pi-builtins/src/proc_snapshot.rs
-index 144dd2a..94dbcc5 100644
---- a/crates/pi-builtins/src/proc_snapshot.rs
-+++ b/crates/pi-builtins/src/proc_snapshot.rs
+diff --git a/crates/builtins/src/proc_snapshot.rs b/crates/builtins/src/proc_snapshot.rs
+index 7bbe5a2..fe5b23f 100644
+--- a/crates/builtins/src/proc_snapshot.rs
++++ b/crates/builtins/src/proc_snapshot.rs
 @@ -116,7 +116,7 @@ fn parse_procargs2(buffer: &[u8]) -> Vec<String> {
  }
  
@@ -131,11 +131,11 @@ index 144dd2a..94dbcc5 100644
  mod tests {
  	use super::{HostProcesses, ProcInfo};
  
-diff --git a/crates/pi-builtins/src/ps.rs b/crates/pi-builtins/src/ps.rs
-index 7f1249e..8a8a0c1 100644
---- a/crates/pi-builtins/src/ps.rs
-+++ b/crates/pi-builtins/src/ps.rs
-@@ -1274,7 +1274,7 @@ fn format_ps_elapsed(duration: Duration) -> String {
+diff --git a/crates/builtins/src/ps.rs b/crates/builtins/src/ps.rs
+index 8ea2936..8fe0a9f 100644
+--- a/crates/builtins/src/ps.rs
++++ b/crates/builtins/src/ps.rs
+@@ -1281,7 +1281,7 @@ fn format_ps_elapsed(duration: Duration) -> String {
  	}
  }
  
@@ -144,10 +144,10 @@ index 7f1249e..8a8a0c1 100644
  fn ps_total_memory_bytes() -> Option<u64> {
  	let value = fs::read_to_string("/proc/meminfo")
  		.ok()?
-diff --git a/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs b/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
+diff --git a/crates/builtins/src/rsync/transport/tcp/sock_unix.rs b/crates/builtins/src/rsync/transport/tcp/sock_unix.rs
 index d28e8c0..c6f521f 100644
---- a/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
-+++ b/crates/pi-builtins/src/rsync/transport/tcp/sock_unix.rs
+--- a/crates/builtins/src/rsync/transport/tcp/sock_unix.rs
++++ b/crates/builtins/src/rsync/transport/tcp/sock_unix.rs
 @@ -133,13 +133,18 @@ pub(super) fn resolve(
  /// The numeric form of an address (`getnameinfo(NI_NUMERICHOST)`).
  pub(super) fn numeric_host(addr: &Addr) -> String {
@@ -168,10 +168,10 @@ index d28e8c0..c6f521f 100644
  			std::ptr::null_mut(),
  			0,
  			libc::NI_NUMERICHOST,
-diff --git a/crates/pi-builtins/src/rsync/tree/sys.rs b/crates/pi-builtins/src/rsync/tree/sys.rs
-index 4b40488..efb997a 100644
---- a/crates/pi-builtins/src/rsync/tree/sys.rs
-+++ b/crates/pi-builtins/src/rsync/tree/sys.rs
+diff --git a/crates/builtins/src/rsync/tree/sys.rs b/crates/builtins/src/rsync/tree/sys.rs
+index e15c133..71d40f1 100644
+--- a/crates/builtins/src/rsync/tree/sys.rs
++++ b/crates/builtins/src/rsync/tree/sys.rs
 @@ -267,7 +267,20 @@ pub(crate) fn mknodat(
  	}))
  }
@@ -209,10 +209,10 @@ index 4b40488..efb997a 100644
  /// Names in the directory `fd` (opened for reading), without `.` and `..`.
  pub(crate) fn read_dir(fd: OwnedFd) -> io::Result<Vec<OsString>> {
  	let mut dir = rustix::fs::Dir::new(fd)?;
-diff --git a/crates/pi-builtins/src/sort.rs b/crates/pi-builtins/src/sort.rs
-index d5c0442..f9a040e 100644
---- a/crates/pi-builtins/src/sort.rs
-+++ b/crates/pi-builtins/src/sort.rs
+diff --git a/crates/builtins/src/sort.rs b/crates/builtins/src/sort.rs
+index 0732f5c..ece1a7f 100644
+--- a/crates/builtins/src/sort.rs
++++ b/crates/builtins/src/sort.rs
 @@ -126,7 +126,7 @@ fn file_size_hint(fs: &BlockingFs, files: &[OsString]) -> Option<usize> {
  
  fn available_memory_hint() -> Option<usize> {
@@ -317,11 +317,11 @@ index d5c0442..f9a040e 100644
  	fn write_files(dir: &Path, files: &[(&str, &str)]) {
  		std::fs::create_dir_all(dir).unwrap();
  		for (name, contents) in files {
-diff --git a/crates/pi-natives/Cargo.toml b/crates/pi-natives/Cargo.toml
-index 4b0f073..336010a 100644
---- a/crates/pi-natives/Cargo.toml
-+++ b/crates/pi-natives/Cargo.toml
-@@ -16,7 +16,6 @@ workspace = true
+diff --git a/crates/natives/Cargo.toml b/crates/natives/Cargo.toml
+index 97f698e..87c92e4 100644
+--- a/crates/natives/Cargo.toml
++++ b/crates/natives/Cargo.toml
+@@ -18,7 +18,6 @@ workspace = true
  [dependencies]
  anyhow.workspace = true
  async-trait.workspace = true
@@ -329,31 +329,31 @@ index 4b0f073..336010a 100644
  base64.workspace = true
  fontdue.workspace = true
  grep-matcher.workspace = true
-@@ -50,7 +49,6 @@ pi-iso.workspace = true
- pi-predict.workspace = true
- pi-shell.workspace = true
- pi-vfs.workspace = true
--pi-voice.workspace = true
+@@ -54,7 +53,6 @@ omp-iso.workspace = true
+ omp-predict.workspace = true
+ omp-shell.workspace = true
+ omp-vfs.workspace = true
+-omp-voice.workspace = true
  ptts.workspace = true
  portable-pty.workspace = true
  png.workspace = true
-@@ -66,6 +64,10 @@ xutf.workspace = true
+@@ -70,6 +68,10 @@ xutf.workspace = true
  zstd.workspace = true
  xxhash-rust.workspace = true
  
 +[target.'cfg(not(target_os = "android"))'.dependencies]
 +arboard.workspace = true
-+pi-voice.workspace = true
++omp-voice.workspace = true
 +
  [target.'cfg(target_os = "linux")'.dependencies]
  ashpd = { version = "=0.11.1", default-features = false, features = ["tokio"] }
  atspi = { version = "=0.30.0", default-features = false, features = ["proxies", "tokio", "wrappers", "zbus"] }
-diff --git a/crates/pi-natives/src/audio.rs b/crates/pi-natives/src/audio.rs
-index 8377dcf..305c4ef 100644
---- a/crates/pi-natives/src/audio.rs
-+++ b/crates/pi-natives/src/audio.rs
+diff --git a/crates/natives/src/audio.rs b/crates/natives/src/audio.rs
+index 0ac8ad3..81ef44a 100644
+--- a/crates/natives/src/audio.rs
++++ b/crates/natives/src/audio.rs
 @@ -4,6 +4,7 @@
- //! lives in `pi_voice::audio`; these classes adapt its mono `f32` contract to
+ //! lives in `omp_voice::audio`; these classes adapt its mono `f32` contract to
  //! TypeScript callbacks and `Float32Array` buffers.
  
 +#[cfg(not(target_os = "android"))]
@@ -364,10 +364,11 @@ index 8377dcf..305c4ef 100644
  	threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue},
  };
  use napi_derive::napi;
+-use omp_voice::audio::{CaptureStream, PlaybackState, PlaybackStream};
 +#[cfg(not(target_os = "android"))]
  use parking_lot::Mutex;
 +#[cfg(not(target_os = "android"))]
- use pi_voice::audio::{CaptureStream, PlaybackState, PlaybackStream};
++use omp_voice::audio::{CaptureStream, PlaybackState, PlaybackStream};
  
  type CaptureCallback = ThreadsafeFunction<Float32Array, UnknownReturnValue>;
  
@@ -474,10 +475,10 @@ index 8377dcf..305c4ef 100644
 +		Ok(())
 +	}
 +}
-diff --git a/crates/pi-natives/src/clipboard.rs b/crates/pi-natives/src/clipboard.rs
+diff --git a/crates/natives/src/clipboard.rs b/crates/natives/src/clipboard.rs
 index 50d6dab..d09bc27 100644
---- a/crates/pi-natives/src/clipboard.rs
-+++ b/crates/pi-natives/src/clipboard.rs
+--- a/crates/natives/src/clipboard.rs
++++ b/crates/natives/src/clipboard.rs
 @@ -5,9 +5,12 @@
  //! caller thread.
  //! This avoids worker-thread `AppKit` pasteboard warnings in CLI contexts.
@@ -612,10 +613,10 @@ index 50d6dab..d09bc27 100644
  mod tests {
  	use super::dib_to_png;
  
-diff --git a/crates/pi-natives/src/crash_handler.rs b/crates/pi-natives/src/crash_handler.rs
-index 68fbb8f..b697718 100644
---- a/crates/pi-natives/src/crash_handler.rs
-+++ b/crates/pi-natives/src/crash_handler.rs
+diff --git a/crates/natives/src/crash_handler.rs b/crates/natives/src/crash_handler.rs
+index 0b98a9a..de0fb29 100644
+--- a/crates/natives/src/crash_handler.rs
++++ b/crates/natives/src/crash_handler.rs
 @@ -96,7 +96,7 @@ pub fn install() {
  				prev_panic(info);
  			},
@@ -625,10 +626,10 @@ index 68fbb8f..b697718 100644
  		std::alloc::set_alloc_error_hook(|layout| {
  			// Print the canonical line before doing anything allocation-prone.
  			// If this is genuine process-wide OOM, report formatting/path work may
-diff --git a/crates/pi-natives/src/desktop/ax.rs b/crates/pi-natives/src/desktop/ax.rs
-index 6f668c8..1bc21af 100644
---- a/crates/pi-natives/src/desktop/ax.rs
-+++ b/crates/pi-natives/src/desktop/ax.rs
+diff --git a/crates/natives/src/desktop/ax.rs b/crates/natives/src/desktop/ax.rs
+index 1529dd4..b5abe40 100644
+--- a/crates/natives/src/desktop/ax.rs
++++ b/crates/natives/src/desktop/ax.rs
 @@ -24,6 +24,8 @@ pub enum AxHandle {
  	Uia(uiautomation::UIElement, Option<Box<[i32]>>),
  	#[cfg(target_os = "linux")]
@@ -665,11 +666,11 @@ index 6f668c8..1bc21af 100644
  			#[cfg(test)]
  			Self::Test(id) => id.hash(state),
  			#[cfg(test)]
-diff --git a/crates/pi-natives/src/desktop/control.rs b/crates/pi-natives/src/desktop/control.rs
-index 0051c8a..3847e9f 100644
---- a/crates/pi-natives/src/desktop/control.rs
-+++ b/crates/pi-natives/src/desktop/control.rs
-@@ -561,6 +561,10 @@ type EscapeMonitor = macos::EscapeMonitor;
+diff --git a/crates/natives/src/desktop/control.rs b/crates/natives/src/desktop/control.rs
+index 836fe42..c0e3575 100644
+--- a/crates/natives/src/desktop/control.rs
++++ b/crates/natives/src/desktop/control.rs
+@@ -583,6 +583,10 @@ type EscapeMonitor = macos::EscapeMonitor;
  type EscapeMonitor = linux::EscapeMonitor;
  #[cfg(windows)]
  type EscapeMonitor = windows::EscapeMonitor;
@@ -680,7 +681,7 @@ index 0051c8a..3847e9f 100644
  
  /// The kernel owner lives on its own thread: Windows mutex release must happen
  /// on the same thread that acquired it, even when the session is disposed from
-@@ -572,6 +576,8 @@ struct ControlLease {
+@@ -594,6 +598,8 @@ struct ControlLease {
  	_escape: Option<windows::EscapeMonitor>,
  	#[cfg(target_os = "linux")]
  	_escape: Option<linux::EscapeMonitor>,
@@ -689,7 +690,7 @@ index 0051c8a..3847e9f 100644
  	_kernel: KernelOwner,
  	running: AtomicBool,
  }
-@@ -637,6 +643,8 @@ impl ControlLease {
+@@ -659,6 +665,8 @@ impl ControlLease {
  			_escape: Some(escape),
  			#[cfg(target_os = "linux")]
  			_escape: escape,
@@ -698,7 +699,7 @@ index 0051c8a..3847e9f 100644
  			_kernel: kernel,
  			running: AtomicBool::new(false),
  		})
-@@ -662,6 +670,12 @@ impl ControlLease {
+@@ -684,6 +692,12 @@ impl ControlLease {
  	fn escape_monitor(source: &CancellationSource) -> CoreResult<Option<EscapeMonitor>> {
  		linux::EscapeMonitor::start(EmergencyStop(Arc::downgrade(&source.0)))
  	}
@@ -711,10 +712,10 @@ index 0051c8a..3847e9f 100644
  }
  
  struct KernelOwner {
-diff --git a/crates/pi-natives/src/lib.rs b/crates/pi-natives/src/lib.rs
-index 5f9846b..228e127 100644
---- a/crates/pi-natives/src/lib.rs
-+++ b/crates/pi-natives/src/lib.rs
+diff --git a/crates/natives/src/lib.rs b/crates/natives/src/lib.rs
+index af3a083..582d8e9 100644
+--- a/crates/natives/src/lib.rs
++++ b/crates/natives/src/lib.rs
 @@ -20,7 +20,7 @@
  
  #![allow(clippy::trailing_empty_array, reason = "generated by napi macro")]
@@ -722,14 +723,14 @@ index 5f9846b..228e127 100644
 -#![feature(alloc_error_hook)]
 +#![cfg_attr(not(target_os = "android"), feature(alloc_error_hook))]
  
+ pub mod altgr;
  pub mod appearance;
- pub mod applefm;
-diff --git a/crates/pi-natives/src/live.rs b/crates/pi-natives/src/live.rs
-index 9cbcd99..0fc449f 100644
---- a/crates/pi-natives/src/live.rs
-+++ b/crates/pi-natives/src/live.rs
+diff --git a/crates/natives/src/live.rs b/crates/natives/src/live.rs
+index 1686600..234d7f6 100644
+--- a/crates/natives/src/live.rs
++++ b/crates/natives/src/live.rs
 @@ -5,117 +5,185 @@
- //! `pi_voice::live`. This class adapts its callbacks to non-blocking
+ //! `omp_voice::live`. This class adapts its callbacks to non-blocking
  //! threadsafe functions and its PCM input to `Float32Array`.
  
 +#[cfg(not(target_os = "android"))]
@@ -743,7 +744,7 @@ index 9cbcd99..0fc449f 100644
  };
  use napi_derive::napi;
 +#[cfg(not(target_os = "android"))]
- use pi_voice::live::{DEFAULT_OPEN_TIMEOUT_MS, LiveCallbacks, LivePeerCore};
+ use omp_voice::live::{DEFAULT_OPEN_TIMEOUT_MS, LiveCallbacks, LivePeerCore};
  
  type StringCallback = ThreadsafeFunction<String, UnknownReturnValue>;
  type LevelCallback = ThreadsafeFunction<f64, UnknownReturnValue>;
@@ -1007,10 +1008,10 @@ index 9cbcd99..0fc449f 100644
 -	}
 +    fn drop(&mut self) {}
  }
-diff --git a/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs b/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs
+diff --git a/crates/shell/src/bash/vm/builtins/zsh_mod_rlimits.rs b/crates/shell/src/bash/vm/builtins/zsh_mod_rlimits.rs
 index aab7845..96929b2 100644
---- a/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs
-+++ b/crates/pi-shell/src/bash/vm/builtins/zsh_mod_rlimits.rs
+--- a/crates/shell/src/bash/vm/builtins/zsh_mod_rlimits.rs
++++ b/crates/shell/src/bash/vm/builtins/zsh_mod_rlimits.rs
 @@ -53,7 +53,7 @@ enum Kind {
  	/// `ZLIMTYPE_MICROSECONDS` (Linux's `RLIMIT_RTTIME`).
  	#[cfg_attr(
@@ -1046,10 +1047,10 @@ index aab7845..96929b2 100644
  const RESINFO: &[ResInfo] = &[
  	ri(Rlimit::Cpu, "cputime", Kind::Time, 1, b't', "cpu time (seconds)"),
  	ri(Rlimit::Fsize, "filesize", Kind::Memory, 512, b'f', "file size (blocks)"),
-diff --git a/crates/pi-shell/src/bin/obash/fault.rs b/crates/pi-shell/src/bin/obash/fault.rs
-index 8450318..013d2a8 100644
---- a/crates/pi-shell/src/bin/obash/fault.rs
-+++ b/crates/pi-shell/src/bin/obash/fault.rs
+diff --git a/crates/shell/src/bin/obash/fault.rs b/crates/shell/src/bin/obash/fault.rs
+index 8d8bdef..faf8b42 100644
+--- a/crates/shell/src/bin/obash/fault.rs
++++ b/crates/shell/src/bin/obash/fault.rs
 @@ -1029,7 +1029,7 @@ mod os {
  	/// on failure. Linux re-executes `/proc/self/exe`, so a binary replaced
  	/// on disk meanwhile does not take over.
@@ -1059,10 +1060,10 @@ index 8450318..013d2a8 100644
  			PathBuf::from("/proc/self/exe")
  		} else {
  			match std::env::current_exe() {
-diff --git a/crates/pi-shell/src/process/host.rs b/crates/pi-shell/src/process/host.rs
+diff --git a/crates/shell/src/process/host.rs b/crates/shell/src/process/host.rs
 index e09adda..3ca832f 100644
---- a/crates/pi-shell/src/process/host.rs
-+++ b/crates/pi-shell/src/process/host.rs
+--- a/crates/shell/src/process/host.rs
++++ b/crates/shell/src/process/host.rs
 @@ -576,9 +576,9 @@ pub fn ignored_on_entry() -> crate::bash::SigSet {
  pub fn inherited_fds(embedded: bool) -> Vec<(i32, Box<dyn File>)> {
  	use std::os::fd::FromRawFd;
@@ -1093,10 +1094,10 @@ index e09adda..3ca832f 100644
  #[test]
  fn open_fds_spans_directory_batches() {
  	use std::os::fd::AsRawFd;
-diff --git a/crates/pi-shell/src/process/signals.rs b/crates/pi-shell/src/process/signals.rs
+diff --git a/crates/shell/src/process/signals.rs b/crates/shell/src/process/signals.rs
 index 200294c..cf09fb0 100644
---- a/crates/pi-shell/src/process/signals.rs
-+++ b/crates/pi-shell/src/process/signals.rs
+--- a/crates/shell/src/process/signals.rs
++++ b/crates/shell/src/process/signals.rs
 @@ -38,15 +38,15 @@ mod unix {
  		forgotten: Vec<i32>,
  	}
@@ -1135,11 +1136,11 @@ index 200294c..cf09fb0 100644
  			if let Some(ignored) = ignored_from_proc() {
  				return ignored;
  			}
-diff --git a/crates/pi-shell/src/proctree.rs b/crates/pi-shell/src/proctree.rs
-index ffcb9c5..79724ad 100644
---- a/crates/pi-shell/src/proctree.rs
-+++ b/crates/pi-shell/src/proctree.rs
-@@ -15,7 +15,7 @@ pub use pi_builtins::ProcessStatus;
+diff --git a/crates/shell/src/proctree.rs b/crates/shell/src/proctree.rs
+index 03cb012..9ae8527 100644
+--- a/crates/shell/src/proctree.rs
++++ b/crates/shell/src/proctree.rs
+@@ -15,7 +15,7 @@ pub use omp_builtins::ProcessStatus;
  
  use crate::cancel::CancelToken;
  
@@ -1148,10 +1149,10 @@ index ffcb9c5..79724ad 100644
  mod platform {
  	use std::{
  		collections::HashSet,
-diff --git a/crates/pi-shell/src/sys/proc.rs b/crates/pi-shell/src/sys/proc.rs
+diff --git a/crates/shell/src/sys/proc.rs b/crates/shell/src/sys/proc.rs
 index 4a49af4..f2b4ad9 100644
---- a/crates/pi-shell/src/sys/proc.rs
-+++ b/crates/pi-shell/src/sys/proc.rs
+--- a/crates/shell/src/sys/proc.rs
++++ b/crates/shell/src/sys/proc.rs
 @@ -124,7 +124,7 @@ pub fn signal_pinned(p: &ProcInfo, sig: Signal) -> io::Result<bool> {
  /// The command name may itself contain spaces and parentheses, so it ends at
  /// the *last* `)`.
@@ -1212,10 +1213,10 @@ index 4a49af4..f2b4ad9 100644
  		};
  		// With the pidfd open the pid cannot be reused for another process
  		// while we check that it still names the scanned one.
-diff --git a/crates/pi-shell/src/sys/ready.rs b/crates/pi-shell/src/sys/ready.rs
+diff --git a/crates/shell/src/sys/ready.rs b/crates/shell/src/sys/ready.rs
 index 02743e8..0db7ef0 100644
---- a/crates/pi-shell/src/sys/ready.rs
-+++ b/crates/pi-shell/src/sys/ready.rs
+--- a/crates/shell/src/sys/ready.rs
++++ b/crates/shell/src/sys/ready.rs
 @@ -41,11 +41,11 @@ pub const WRITE: i16 = libc::POLLOUT;
  
  /// Bytes a write may carry after [`now`] reported `WRITE` without risking a
@@ -1230,10 +1231,10 @@ index 02743e8..0db7ef0 100644
  pub const WRITE_CHUNK: usize = 512;
  
  /// Whether `fd` is ready for `events` right now (also when it hung up or
-diff --git a/crates/pi-shell/src/sys/rlimit.rs b/crates/pi-shell/src/sys/rlimit.rs
+diff --git a/crates/shell/src/sys/rlimit.rs b/crates/shell/src/sys/rlimit.rs
 index f8a28ae..f558bf9 100644
---- a/crates/pi-shell/src/sys/rlimit.rs
-+++ b/crates/pi-shell/src/sys/rlimit.rs
+--- a/crates/shell/src/sys/rlimit.rs
++++ b/crates/shell/src/sys/rlimit.rs
 @@ -31,18 +31,23 @@ pub(crate) const fn resource(r: Rlimit) -> Option<Resource> {
  		Rlimit::Nproc => libc::RLIMIT_NPROC,
  		Rlimit::Nofile => libc::RLIMIT_NOFILE,
@@ -1282,10 +1283,10 @@ index f8a28ae..f558bf9 100644
  		assert_eq!(get(Rlimit::Swap).unwrap_err().kind(), io::ErrorKind::Unsupported);
  	}
  
-diff --git a/crates/pi-shell/src/sys/socket.rs b/crates/pi-shell/src/sys/socket.rs
+diff --git a/crates/shell/src/sys/socket.rs b/crates/shell/src/sys/socket.rs
 index c351de7..5eb1c79 100644
---- a/crates/pi-shell/src/sys/socket.rs
-+++ b/crates/pi-shell/src/sys/socket.rs
+--- a/crates/shell/src/sys/socket.rs
++++ b/crates/shell/src/sys/socket.rs
 @@ -378,6 +378,11 @@ fn lookup(host: &str, family: IpFamily) -> io::Result<Vec<IpAddr>> {
  fn reverse(addr: IpAddr) -> Option<BString> {
  	let (ss, len) = to_c(&SockAddr::Inet(SocketAddr::new(addr, 0)));
@@ -1307,10 +1308,10 @@ index c351de7..5eb1c79 100644
  			std::ptr::null_mut(),
  			0,
  			libc::NI_NAMEREQD,
-diff --git a/crates/pi-shell/src/sys/spawn/unix.rs b/crates/pi-shell/src/sys/spawn/unix.rs
-index eafd841..440b163 100644
---- a/crates/pi-shell/src/sys/spawn/unix.rs
-+++ b/crates/pi-shell/src/sys/spawn/unix.rs
+diff --git a/crates/shell/src/sys/spawn/unix.rs b/crates/shell/src/sys/spawn/unix.rs
+index 2280773..7c2af81 100644
+--- a/crates/shell/src/sys/spawn/unix.rs
++++ b/crates/shell/src/sys/spawn/unix.rs
 @@ -70,9 +70,9 @@ use crate::{
  };
  
@@ -1323,10 +1324,10 @@ index eafd841..440b163 100644
  const NSIG: usize = 32;
  
  /// Waiter and escalation threads only wait and signal.
-diff --git a/crates/pi-shell/src/sys/tty.rs b/crates/pi-shell/src/sys/tty.rs
+diff --git a/crates/shell/src/sys/tty.rs b/crates/shell/src/sys/tty.rs
 index c588279..f30de2c 100644
---- a/crates/pi-shell/src/sys/tty.rs
-+++ b/crates/pi-shell/src/sys/tty.rs
+--- a/crates/shell/src/sys/tty.rs
++++ b/crates/shell/src/sys/tty.rs
 @@ -51,7 +51,7 @@ mod unix {
  		(TermFlag::Inlcr, Field::I, libc::INLCR),
  		(TermFlag::Igncr, Field::I, libc::IGNCR),
@@ -1438,11 +1439,11 @@ index c588279..f30de2c 100644
  		let (ispeed, ospeed) = (Some(code(t.ispeed)), Some(code(t.ospeed)));
  		if let Some(i) = ispeed {
  			// SAFETY: `os` is a valid termios.
-diff --git a/crates/pi-vfs/src/fs.rs b/crates/pi-vfs/src/fs.rs
-index a378045..f11e5e6 100644
---- a/crates/pi-vfs/src/fs.rs
-+++ b/crates/pi-vfs/src/fs.rs
-@@ -510,8 +510,21 @@ fn may_access(path: &Path, mode: libc::c_int) -> bool {
+diff --git a/crates/vfs/src/fs.rs b/crates/vfs/src/fs.rs
+index 76d67f7..bc110fe 100644
+--- a/crates/vfs/src/fs.rs
++++ b/crates/vfs/src/fs.rs
+@@ -518,8 +518,21 @@ fn may_access(path: &Path, mode: libc::c_int) -> bool {
  	let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
  		return false;
  	};

@@ -1,8 +1,8 @@
 diff --git a/packages/coding-agent/src/cli/update-cli.ts b/packages/coding-agent/src/cli/update-cli.ts
-index ed12d3f..cb9889d 100644
+index 6b8defd..f15cebe 100644
 --- a/packages/coding-agent/src/cli/update-cli.ts
 +++ b/packages/coding-agent/src/cli/update-cli.ts
-@@ -2305,6 +2305,54 @@ async function runManagedUpdate(
+@@ -2318,6 +2318,54 @@ async function runManagedUpdate(
  	return { kind: "installed", version: installed };
  }
  
@@ -57,7 +57,7 @@ index ed12d3f..cb9889d 100644
  /**
   * Run the update command.
   *
-@@ -2317,6 +2365,10 @@ async function runManagedUpdate(
+@@ -2330,6 +2378,10 @@ async function runManagedUpdate(
   * fails, or when another update holds the install lock.
   */
  export async function runUpdateCommand(opts: UpdateOptions): Promise<UpdateOutcome> {
@@ -69,10 +69,10 @@ index ed12d3f..cb9889d 100644
  	const manager = ompPath ? await managedInstallName(ompPath) : undefined;
  	if (manager) {
 diff --git a/packages/coding-agent/src/main.ts b/packages/coding-agent/src/main.ts
-index eb3870f..3d91766 100644
+index 1ce3c23..6d449b2 100644
 --- a/packages/coding-agent/src/main.ts
 +++ b/packages/coding-agent/src/main.ts
-@@ -45,7 +45,7 @@ import { fetchBuild } from "./cli/build-service";
+@@ -46,7 +46,7 @@ import { fetchBuild } from "./cli/build-service";
  import { applyStartupCwd } from "./cli/startup-cwd";
  import { runAutoUpdate } from "./cli/auto-update";
  import { managedInstallName } from "./cli/managed-install";
@@ -94,10 +94,10 @@ index eb3870f..3d91766 100644
  		// Checkouts update through git and a manager (Tern) updates its omp itself:
  		// "run omp update" would be wrong advice for both.
 diff --git a/packages/coding-agent/src/modes/controllers/command-controller.ts b/packages/coding-agent/src/modes/controllers/command-controller.ts
-index 0e58ed2..74bb8d3 100644
+index 73eb577..10194f3 100644
 --- a/packages/coding-agent/src/modes/controllers/command-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/command-controller.ts
-@@ -460,12 +460,15 @@ export class CommandController {
+@@ -463,12 +463,15 @@ export class CommandController {
  				this.ctx.showError("Advisor has no history yet.");
  				return;
  			}
@@ -119,18 +119,18 @@ index 0e58ed2..74bb8d3 100644
  	}
  
 diff --git a/packages/coding-agent/src/modes/controllers/event-controller.ts b/packages/coding-agent/src/modes/controllers/event-controller.ts
-index f61cbbc..4e7e2ec 100644
+index 754e2b4..3031bd7 100644
 --- a/packages/coding-agent/src/modes/controllers/event-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/event-controller.ts
-@@ -58,6 +58,7 @@ import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
- import { writeDeviceDispatch } from "../../tools/resolve";
+@@ -59,6 +59,7 @@ import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
+ import { proposeDispatchDetails } from "../../tools/resolve";
  import { SpeechEnhancer } from "../../tts/speech-enhancer";
  import { vocalizer } from "../../tts/vocalizer";
 +import { sendAndroidNotification } from "../../utils/android-helpers";
  import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
  import { type RunFlowStatus, setRunStatus } from "../../utils/run-status";
  import {
-@@ -2970,6 +2971,11 @@ export class EventController {
+@@ -3005,6 +3006,11 @@ export class EventController {
  			type: "error",
  			actions: "focus",
  		});
@@ -142,7 +142,7 @@ index f61cbbc..4e7e2ec 100644
  	}
  
  	sendCompletionNotification(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
-@@ -2995,5 +3001,8 @@ export class EventController {
+@@ -3030,5 +3036,8 @@ export class EventController {
  			type: "completion",
  			actions: "focus",
  		});
@@ -152,10 +152,10 @@ index f61cbbc..4e7e2ec 100644
  	}
  }
 diff --git a/packages/coding-agent/src/modes/controllers/input-controller.ts b/packages/coding-agent/src/modes/controllers/input-controller.ts
-index c04354e..adeb3b0 100644
+index 60dc02a..9f18e20 100644
 --- a/packages/coding-agent/src/modes/controllers/input-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/input-controller.ts
-@@ -3120,14 +3120,14 @@ export class InputController {
+@@ -3137,14 +3137,14 @@ export class InputController {
  			this.ctx.showStatus("Nothing to copy");
  			return;
  		}
@@ -178,7 +178,7 @@ index c04354e..adeb3b0 100644
  	}
  
  	/** Copy current prompt text to system clipboard. */
-@@ -3137,14 +3137,12 @@ export class InputController {
+@@ -3154,14 +3154,12 @@ export class InputController {
  			this.ctx.showStatus("Nothing to copy");
  			return;
  		}
@@ -200,10 +200,10 @@ index c04354e..adeb3b0 100644
  
  	cycleThinkingLevel(): void {
 diff --git a/packages/coding-agent/src/modes/controllers/selector-controller.ts b/packages/coding-agent/src/modes/controllers/selector-controller.ts
-index 1478cb2..cc03da5 100644
+index 8050461..ba3c638 100644
 --- a/packages/coding-agent/src/modes/controllers/selector-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/selector-controller.ts
-@@ -1553,8 +1553,10 @@ export class SelectorController {
+@@ -1561,8 +1561,10 @@ export class SelectorController {
  					this.ctx.showStatus("Nothing to copy in that item");
  					return;
  				}
@@ -217,7 +217,7 @@ index 1478cb2..cc03da5 100644
  			onOpen: (href, label) => {
  				done();
 diff --git a/packages/coding-agent/src/modes/controllers/todo-command-controller.ts b/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
-index 9417117..eba5a58 100644
+index 29f6546..7321b72 100644
 --- a/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
 @@ -212,12 +212,10 @@ export class TodoCommandController {
@@ -238,10 +238,10 @@ index 9417117..eba5a58 100644
  
  	#resolveTodoPath(rest: string): string {
 diff --git a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
-index 0b03496..52560ef 100644
+index 2b64729..cb035ec 100644
 --- a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
 +++ b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
-@@ -577,50 +577,52 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
+@@ -578,59 +578,60 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
  		description: "Pick text or code from the conversation to copy",
  		allowArgs: true,
  		handleTui: async (command, runtime) => {
@@ -306,6 +306,15 @@ index 0b03496..52560ef 100644
  				}
 -				await copyToClipboard(link.href);
 -				runtime.ctx.showStatus("Copied link to clipboard");
+-				clearSubmittedText(runtime);
+-				return;
+-			}
+-			if (arg === "local") {
+-				// Created first, so the copied path is one to cd into or drop files in.
+-				const localRoot = runtime.ctx.session.localRoot;
+-				await fs.mkdir(localRoot, { recursive: true });
+-				await copyToClipboard(localRoot);
+-				runtime.ctx.showStatus(`Copied ${shortenPath(localRoot)} to clipboard`);
 +				if (arg === "link" || arg === "url") {
 +					const link = extractLastLink(runtime.ctx.viewSession.messages);
 +					if (!link) {
@@ -316,7 +325,15 @@ index 0b03496..52560ef 100644
 +					runtime.ctx.showStatus("Copied link to clipboard");
 +					return;
 +				}
-+				runtime.ctx.showStatus("Usage: /copy [code|cmd|link]");
++				if (arg === "local") {
++					// Created first, so the copied path is one to cd into or drop files in.
++					const localRoot = runtime.ctx.session.localRoot;
++					await fs.mkdir(localRoot, { recursive: true });
++					await copyToClipboard(localRoot);
++					runtime.ctx.showStatus(`Copied ${shortenPath(localRoot)} to clipboard`);
++					return;
++				}
++				runtime.ctx.showStatus("Usage: /copy [code|cmd|link|local]");
 +			} catch (error) {
 +				// A rejected copy must not escape as an unhandled rejection and
 +				// leave the draft in the editor without any feedback.
@@ -325,16 +342,16 @@ index 0b03496..52560ef 100644
  				clearSubmittedText(runtime);
 -				return;
  			}
--			runtime.ctx.showStatus("Usage: /copy [code|cmd|link]");
+-			runtime.ctx.showStatus("Usage: /copy [code|cmd|link|local]");
 -			clearSubmittedText(runtime);
  		},
  	},
  	{
 diff --git a/packages/coding-agent/src/tools/ask.ts b/packages/coding-agent/src/tools/ask.ts
-index d9b7bcd..4ad0fd4 100644
+index 0375d62..98ea030 100644
 --- a/packages/coding-agent/src/tools/ask.ts
 +++ b/packages/coding-agent/src/tools/ask.ts
-@@ -49,6 +49,12 @@ import askResultTemplate from "../prompts/tools/ask-result.md" with { type: "tex
+@@ -54,6 +54,12 @@ import askResultTemplate from "../prompts/tools/ask-result.md" with { type: "tex
  import { renderAttachmentSourceNotice } from "../session/attachment-source-notice";
  import { cfgSpeechEnabled } from "../tts/settings";
  import { vocalizer } from "../tts/vocalizer";
@@ -347,7 +364,7 @@ index d9b7bcd..4ad0fd4 100644
  import { describeAttachedImagesForTextModel, shouldDescribeImagesForTextModel } from "../utils/image-vision-fallback";
  import type { ToolSession } from ".";
  import { ToolAbortError } from "./tool-errors";
-@@ -378,8 +384,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+@@ -421,8 +427,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
  		return (session.canPromptUser ?? session.hasUI) || session.advertiseHeadlessAsk ? new AskTool(session) : null;
  	}
  
@@ -362,7 +379,7 @@ index d9b7bcd..4ad0fd4 100644
  		if (!this.session.hasUI) return;
  		const method = cfgAskNotify.get(this.session.settings);
  		if (method === "off") return;
-@@ -390,6 +400,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+@@ -433,6 +443,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
  			urgency: "normal",
  			actions: "focus",
  		});
@@ -373,7 +390,7 @@ index d9b7bcd..4ad0fd4 100644
  	}
  
  	async #answerImageBlocks(
-@@ -481,51 +495,67 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+@@ -544,65 +558,81 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
  			throw new ToolAbortError("Ask tool was cancelled by the user");
  		};
  
@@ -405,7 +422,14 @@ index d9b7bcd..4ad0fd4 100644
 -			if (extensionUi.formDialog) {
 -				const formDialog = extensionUi.formDialog.bind(extensionUi);
 -				answered = await untilAborted(dialogSignal, () =>
--					formDialog(params.html, { timeout, signal: dialogSignal, acceptImages: true }),
+-					formDialog(html, {
+-						timeout,
+-						signal: dialogSignal,
+-						acceptImages: true,
+-						onAbandon: partial => {
+-							given = partial;
+-						},
+-					}),
 -				);
 -			} else {
 -				answered = await askFieldByField(extensionUi, form, timeout, dialogSignal);
@@ -420,7 +444,14 @@ index d9b7bcd..4ad0fd4 100644
 -			throw error;
 -		}
 -		if (!answered) return cancelAsk();
--
+-		// A timeout submits what the form holds; with a required field still empty that is no answer, not data.
+-		if (answered.timedOut && named.some(field => fieldError(field, answered.data[field.name!]) !== undefined)) {
+-			return {
+-				content: [{ type: "text", text: ASK_TIMED_OUT_UNANSWERED }],
+-				details: { answers: [], timedOut: true },
+-			};
+-		}
+ 
 -		const notes = answered.notes?.length ? answered.notes : undefined;
 -		// Each note numbers its markers from 1; shift them so `[Image #N]` indexes all result images.
 -		const answerImages: ImageContent[] = [];
@@ -428,13 +459,19 @@ index d9b7bcd..4ad0fd4 100644
 -		for (const { images, ...note } of notes ?? []) {
 -			resultNotes.push({ ...note, text: shiftImageMarkers(note.text, answerImages.length, images?.length ?? 0) });
 -			if (images) answerImages.push(...images);
-+
 +			let answered: { data: HtmlFormData; notes?: OptionNote[]; timedOut?: boolean } | undefined;
 +			try {
 +				if (extensionUi.formDialog) {
 +					const formDialog = extensionUi.formDialog.bind(extensionUi);
 +					answered = await untilAborted(dialogSignal, () =>
-+						formDialog(params.html, { timeout, signal: dialogSignal, acceptImages: true }),
++						formDialog(html, {
++							timeout,
++							signal: dialogSignal,
++							acceptImages: true,
++							onAbandon: partial => {
++								given = partial;
++							},
++						}),
 +					);
 +				} else {
 +					answered = await askFieldByField(extensionUi, form, timeout, dialogSignal);
@@ -444,6 +481,13 @@ index d9b7bcd..4ad0fd4 100644
 +				throw error;
 +			}
 +			if (!answered) return cancelAsk();
++			// A timeout submits what the form holds; with a required field still empty that is no answer, not data.
++			if (answered.timedOut && named.some(field => fieldError(field, answered.data[field.name!]) !== undefined)) {
++				return {
++					content: [{ type: "text", text: ASK_TIMED_OUT_UNANSWERED }],
++					details: { answers: [], timedOut: true },
++				};
++			}
 +
 +			const notes = answered.notes?.length ? answered.notes : undefined;
 +			// Each note numbers its markers from 1; shift them so `[Image #N]` indexes all result images.
@@ -483,10 +527,10 @@ index d9b7bcd..4ad0fd4 100644
  	}
  }
 diff --git a/packages/coding-agent/src/tools/browser/launch.ts b/packages/coding-agent/src/tools/browser/launch.ts
-index ed7c496..1a923d9 100644
+index 1b367b0..7105e12 100644
 --- a/packages/coding-agent/src/tools/browser/launch.ts
 +++ b/packages/coding-agent/src/tools/browser/launch.ts
-@@ -342,8 +342,11 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
+@@ -343,8 +343,11 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
   * link clicks (#8673). Chrome for Testing uses a dedicated bundle id
   * (`com.google.chrome.for.testing`) that is never a user's default handler;
   * system Chrome is used on macOS only when Chrome for Testing cannot be
@@ -500,7 +544,7 @@ index ed7c496..1a923d9 100644
   * cached under ~/.omp/puppeteer (getPuppeteerDir). Returns undefined when
   * platform detection fails (puppeteer default resolution takes over).
   * Exported so real-browser tests can probe launchability and skip on hosts
-@@ -352,7 +355,31 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
+@@ -353,7 +356,31 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
  let chromiumExecutablePromise: Promise<string | undefined> | undefined;
  export async function ensureChromiumExecutable(): Promise<string | undefined> {
  	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -533,7 +577,7 @@ index ed7c496..1a923d9 100644
  	// macOS: never route a background daemon through the user's GUI Chrome
  	// bundle; prefer the isolated Chrome for Testing binary instead (#8673).
  	const preferManagedChromium = process.platform === "darwin";
-@@ -494,14 +521,16 @@ function isExecutableFile(p: string): boolean {
+@@ -495,14 +522,16 @@ function isExecutableFile(p: string): boolean {
  async function isChromiumExecutable(p: string): Promise<boolean> {
  	if (!isExecutableFile(p)) return false;
  	// The version probe below launches the candidate. It exists to reject
@@ -558,7 +602,7 @@ index ed7c496..1a923d9 100644
  	try {
  		const probeTimeoutMs = 3000;
  		const proc = Bun.spawn([p, "--version"], {
-@@ -582,6 +611,25 @@ function systemChromiumCandidates(
+@@ -583,6 +612,25 @@ function systemChromiumCandidates(
  			);
  			break;
  		}
@@ -584,7 +628,7 @@ index ed7c496..1a923d9 100644
  		case "win32": {
  			const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
  			const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
-diff --git b/packages/coding-agent/src/utils/android-helpers.ts b/packages/coding-agent/src/utils/android-helpers.ts
+diff --git a/packages/coding-agent/src/utils/android-helpers.ts b/packages/coding-agent/src/utils/android-helpers.ts
 new file mode 100644
 index 0000000..db76062
 --- /dev/null
@@ -833,7 +877,7 @@ index d47389e..edd4268 100644
  	} finally {
  		releaseWrite?.();
  	}
-diff --git b/packages/coding-agent/test/android-helpers.test.ts b/packages/coding-agent/test/android-helpers.test.ts
+diff --git a/packages/coding-agent/test/android-helpers.test.ts b/packages/coding-agent/test/android-helpers.test.ts
 new file mode 100644
 index 0000000..143a092
 --- /dev/null
@@ -1150,7 +1194,7 @@ index 98ca39a..a2dc6d1 100644
 +		error: error instanceof Error ? error.message : String(error),
 +	});
 +}
-diff --git b/packages/coding-agent/test/generator-android.test.ts b/packages/coding-agent/test/generator-android.test.ts
+diff --git a/packages/coding-agent/test/generator-android.test.ts b/packages/coding-agent/test/generator-android.test.ts
 new file mode 100644
 index 0000000..b27275e
 --- /dev/null
@@ -1366,10 +1410,10 @@ index 0000000..b27275e
 +	});
 +});
 diff --git a/packages/coding-agent/test/slash-commands/copy.test.ts b/packages/coding-agent/test/slash-commands/copy.test.ts
-index a4b6d2e..702fb78 100644
+index 7e55ad8..0647b6d 100644
 --- a/packages/coding-agent/test/slash-commands/copy.test.ts
 +++ b/packages/coding-agent/test/slash-commands/copy.test.ts
-@@ -110,6 +110,17 @@ describe("/copy slash command", () => {
+@@ -113,6 +113,17 @@ describe("/copy slash command", () => {
  		expect(harness.showStatus).toHaveBeenCalledWith("No link to copy.");
  	});
  
@@ -1384,15 +1428,15 @@ index a4b6d2e..702fb78 100644
 +		expect(harness.setText).toHaveBeenCalledWith("");
 +	});
 +
- 	it("keeps bare /copy on the picker", async () => {
+ 	it("creates and copies the session's local:// directory with /copy local", async () => {
  		const copySpy = spyOn(clipboard, "copyToClipboard").mockResolvedValue(undefined);
- 		const harness = createRuntimeHarness([assistantText("answer")]);
-diff --git b/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
+ 		using tempDir = TempDir.createSync("@pi-copy-local-");
+diff --git a/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
 new file mode 100644
-index 0000000..782dbf0
+index 0000000..9b80f42
 --- /dev/null
 +++ b/packages/coding-agent/test/termux-notifications.test.ts
-@@ -0,0 +1,500 @@
+@@ -0,0 +1,501 @@
 +/**
 + * Termux notification wiring: the existing `completion.notify` / `error.notify` /
 + * `ask.notify` gates and the global `PI_NOTIFICATIONS` suppression decide whether
@@ -1509,26 +1553,25 @@ index 0000000..782dbf0
 +}
 +
 +function answeredAskDialog() {
-+	return vi.fn().mockResolvedValue({
-+		kind: "submit",
-+		results: [{ id: "q1", question: "Proceed?", selectedOptions: ["Yes"] }],
-+	});
++	return vi.fn().mockResolvedValue({ data: { answer: "Yes" } });
 +}
 +
++/** Rich surface: the form dialog submits the control values it collected. */
 +function askContext(dialog: ReturnType<typeof answeredAskDialog>) {
 +	return {
 +		hasUI: true,
-+		ui: { askDialog: dialog },
++		ui: { formDialog: dialog },
 +		abort: vi.fn(),
 +	} as never;
 +}
 +
-+/** Non-rich UI surface: `askDialog` is absent, like an RPC host without set_ask_dialog. */
-+function plainAskContext(select: () => Promise<string | undefined>) {
++/** Non-rich UI surface: `formDialog` is absent, so the tool walks the form field by field. */
++function plainAskContext(answer: () => Promise<string | undefined>) {
 +	return {
 +		hasUI: true,
 +		ui: {
-+			select,
++			input: answer,
++			select: answer,
 +			editor: async () => undefined,
 +			timeoutStartsOnPresentation: false,
 +		},
@@ -1536,7 +1579,9 @@ index 0000000..782dbf0
 +	} as never;
 +}
 +
-+const ASK_PARAMS = { questions: [{ id: "q1", question: "Proceed?", options: [{ label: "Yes" }] }] };
++/** One named text control: the form contract both the dialog and the fallback walk. */
++const ASK_HTML = '<form><label for="answer">Proceed?</label><input id="answer" name="answer" type="text" /></form>';
++const ASK_PARAMS = { html: ASK_HTML };
 +
 +describe("Termux notifications: completion", () => {
 +	it("posts one Android notification when completion.notify is on", () => {
@@ -1893,7 +1938,7 @@ index 0000000..782dbf0
 +		expect(calls).toEqual([["termux-notification-remove", statusId]]);
 +	});
 +});
-diff --git b/packages/coding-agent/test/tools/browser-android-chromium.test.ts b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
+diff --git a/packages/coding-agent/test/tools/browser-android-chromium.test.ts b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
 new file mode 100644
 index 0000000..7720ed1
 --- /dev/null

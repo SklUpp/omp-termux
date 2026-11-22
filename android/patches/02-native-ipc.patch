@@ -1,7 +1,7 @@
-diff --git a/crates/pi-natives/src/ipc/endpoint.rs b/crates/pi-natives/src/ipc/endpoint.rs
+diff --git a/crates/natives/src/ipc/endpoint.rs b/crates/natives/src/ipc/endpoint.rs
 index 2f9b06c..81a8446 100644
---- a/crates/pi-natives/src/ipc/endpoint.rs
-+++ b/crates/pi-natives/src/ipc/endpoint.rs
+--- a/crates/natives/src/ipc/endpoint.rs
++++ b/crates/natives/src/ipc/endpoint.rs
 @@ -32,19 +32,80 @@ pub fn hash16(bytes: &[u8]) -> String {
  	format!("{:016x}", xxh64(bytes, 0))
  }
@@ -216,11 +216,11 @@ index 2f9b06c..81a8446 100644
  	}
  
  	#[test]
-diff --git a/crates/pi-natives/src/ipc/mod.rs b/crates/pi-natives/src/ipc/mod.rs
-index afe6bc9..fc0f929 100644
---- a/crates/pi-natives/src/ipc/mod.rs
-+++ b/crates/pi-natives/src/ipc/mod.rs
-@@ -46,6 +46,7 @@ const DEFAULT_MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
+diff --git a/crates/natives/src/ipc/mod.rs b/crates/natives/src/ipc/mod.rs
+index 0cdd57e..f10b684 100644
+--- a/crates/natives/src/ipc/mod.rs
++++ b/crates/natives/src/ipc/mod.rs
+@@ -48,6 +48,7 @@ const DEFAULT_MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
  const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 3000;
  
  /// Transport failure carrying an errno-style code.
@@ -228,7 +228,7 @@ index afe6bc9..fc0f929 100644
  pub struct IpcError {
  	code:    &'static str,
  	message: String,
-@@ -142,20 +143,25 @@ pub struct IpcConnectOptions {
+@@ -151,20 +152,25 @@ pub struct IpcConnectOptions {
  /// Platform endpoint for `name` scoped to directory `dir`.
  ///
  /// Unix: `<dir>/<stem>.sock`; when that path does not fit `sun_path` (104 bytes
@@ -258,10 +258,10 @@ index afe6bc9..fc0f929 100644
  	}
  }
  
-diff --git a/crates/pi-natives/src/ipc/unix.rs b/crates/pi-natives/src/ipc/unix.rs
+diff --git a/crates/natives/src/ipc/unix.rs b/crates/natives/src/ipc/unix.rs
 index 332b982..3703f89 100644
---- a/crates/pi-natives/src/ipc/unix.rs
-+++ b/crates/pi-natives/src/ipc/unix.rs
+--- a/crates/natives/src/ipc/unix.rs
++++ b/crates/natives/src/ipc/unix.rs
 @@ -276,7 +276,25 @@ fn prepare_parent(path: &Path) -> Result<(), IpcError> {
  		.map_err(|error| IpcError::io(&error, &format!("create {}", parent.display())))
  }
@@ -584,7 +584,7 @@ index 332b982..3703f89 100644
 +	}
 +}
 diff --git a/packages/natives/native/index.js b/packages/natives/native/index.js
-index 8838638..ba3f139 100644
+index c519335..c3a6b31 100644
 --- a/packages/natives/native/index.js
 +++ b/packages/natives/native/index.js
 @@ -23,8 +23,12 @@ import { adaptDesktopSession } from "./desktop-adapter.js";
@@ -602,7 +602,7 @@ index 8838638..ba3f139 100644
  export const DesktopSession = adaptDesktopSession(nativeBindings.DesktopSession);
  export const DiffStream = nativeBindings.DiffStream ?? missingNativeClass("DiffStream");
  export const DirectoryWatcher = nativeBindings.DirectoryWatcher ?? missingNativeClass("DirectoryWatcher");
-@@ -35,7 +39,9 @@ export const HighlightStream = nativeBindings.HighlightStream ?? missingNativeCl
+@@ -36,7 +40,9 @@ export const HighlightStream = nativeBindings.HighlightStream ?? missingNativeCl
  export const IpcConnection = nativeBindings.IpcConnection ?? missingNativeClass("IpcConnection");
  export const IpcServer = nativeBindings.IpcServer ?? missingNativeClass("IpcServer");
  export const LineMatcher = nativeBindings.LineMatcher ?? missingNativeClass("LineMatcher");
@@ -613,7 +613,7 @@ index 8838638..ba3f139 100644
  export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver ?? missingNativeClass("MacAppearanceObserver");
  export const MacOSFrontApp = nativeBindings.MacOSFrontApp ?? missingNativeClass("MacOSFrontApp");
  export const NativeOAuthCallback = nativeBindings.NativeOAuthCallback ?? missingNativeClass("NativeOAuthCallback");
-@@ -66,7 +72,9 @@ export const astGrep = nativeBindings.astGrep ?? missingNativeExport("astGrep");
+@@ -67,7 +73,9 @@ export const astGrep = nativeBindings.astGrep ?? missingNativeExport("astGrep");
  export const astMatch = nativeBindings.astMatch ?? missingNativeExport("astMatch");
  export const blockRangeAt = nativeBindings.blockRangeAt ?? missingNativeExport("blockRangeAt");
  export const closeDesktopEventTaps = nativeBindings.closeDesktopEventTaps ?? missingNativeExport("closeDesktopEventTaps");
@@ -624,7 +624,7 @@ index 8838638..ba3f139 100644
  export const cosineSimilarityPairs = nativeBindings.cosineSimilarityPairs ?? missingNativeExport("cosineSimilarityPairs");
  export const countTokens = nativeBindings.countTokens ?? missingNativeExport("countTokens");
  export const decodeSixelToPng = nativeBindings.decodeSixelToPng ?? missingNativeExport("decodeSixelToPng");
-@@ -136,7 +144,9 @@ export const parseKey = nativeBindings.parseKey ?? missingNativeExport("parseKey
+@@ -140,7 +148,9 @@ export const parseKey = nativeBindings.parseKey ?? missingNativeExport("parseKey
  export const parseKittySequence = nativeBindings.parseKittySequence ?? missingNativeExport("parseKittySequence");
  export const pdfToMarkdown = nativeBindings.pdfToMarkdown ?? missingNativeExport("pdfToMarkdown");
  export const rasterizeSvg = nativeBindings.rasterizeSvg ?? missingNativeExport("rasterizeSvg");
@@ -633,10 +633,10 @@ index 8838638..ba3f139 100644
 +	? (() => { const v = nativeBindings.readImageFromClipboard; if (v !== undefined) return v; const err = function err() { throw new Error("Native readImageFromClipboard is unsupported on Android/Termux"); }; return new Proxy(err, { construct: err, apply: err, get(_t, p){ if(p==="then") return undefined; return err; } }); })()
 +	: (nativeBindings.readImageFromClipboard ?? missingNativeExport("readImageFromClipboard"));
  export const readTextFromClipboard = nativeBindings.readTextFromClipboard ?? missingNativeExport("readTextFromClipboard");
+ export const reapChild = nativeBindings.reapChild ?? missingNativeExport("reapChild");
  export const renderMermaidAscii = nativeBindings.renderMermaidAscii ?? missingNativeExport("renderMermaidAscii");
- export const renderSnapcompactPng = nativeBindings.renderSnapcompactPng ?? missingNativeExport("renderSnapcompactPng");
 diff --git a/packages/natives/native/loader-state.js b/packages/natives/native/loader-state.js
-index d2290bd..8dfba40 100644
+index f10eac3..549b1f7 100644
 --- a/packages/natives/native/loader-state.js
 +++ b/packages/natives/native/loader-state.js
 @@ -38,6 +38,7 @@ const SUPPORTED_PLATFORMS = [
