@@ -203,7 +203,7 @@ Relevant files:
 Unix IPC paths have the form `<dir>/<stem>.sock`. Linux and Android allow 108
 bytes in `sockaddr_un::sun_path`, including the NUL. Longer paths are relocated
 to a per-user private directory with a hashed basename (see
-`crates/pi-natives/src/ipc/endpoint.rs`).
+`crates/natives/src/ipc/endpoint.rs`).
 
 Android has no `/tmp` in Termux, so the relocation directory is
 `<install root>/tmp/omp-<euid>`. The install root is the value the installer
@@ -246,9 +246,12 @@ validates.
 
 Relevant files:
 
-- `crates/pi-natives/src/ipc/endpoint.rs`
-- `crates/pi-natives/src/ipc/unix.rs`
-- `crates/pi-natives/src/ipc/mod.rs`
+- `crates/natives/src/ipc/endpoint.rs`
+- `crates/natives/src/ipc/unix.rs`
+- `crates/natives/src/ipc/mod.rs`
+
+(18.x named this directory `crates/pi-natives`; the scripts resolve whichever
+exists on the pinned tree.)
 - `install.sh` (the launcher exports `OMP_ANDROID_PREFIX`)
 - `packages/natives/test/ipc.test.ts`
 
@@ -324,8 +327,8 @@ startup. `getAddonFilenames()` maps it to `pi_natives.android-arm64.node`.
 
 ### The addon
 
-- Built by napi-rs from `crates/pi-natives` plus the `pi-shell`,
-  `pi-builtins`, `pi-iso` crate family.
+- Built by napi-rs from `crates/natives` plus the `shell`, `builtins`,
+  `iso` crate family (`pi-` prefixed before 19.1.0).
 - `cargo build` produces `libpi_natives.so`. Packaging renames it to
   `pi_natives.android-arm64.node` (a shared ELF object that Bun dlopen's) and
   strips it with `llvm-strip --strip-unneeded`.

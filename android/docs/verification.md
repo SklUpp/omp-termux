@@ -61,7 +61,8 @@ bun test ./packages/coding-agent/test/generator-android.test.ts
 # Android memory hint uses MemAvailable when /proc/meminfo is readable and
 # treats unreadable /sys/fs/cgroup files as no limit (physical RAM is only the
 # last fallback when /proc/meminfo itself fails).
-cargo test --profile local -p pi-builtins --lib sort::
+pkg=omp-builtins; [ -f crates/builtins/Cargo.toml ] || pkg=pi-builtins
+cargo test --profile local -p "$pkg" --lib sort::
 # endpoint naming is pure/stable; relocation-directory validation covers
 # creation, owner-mode repair, file/symlink leaves, and an untrusted base.
 cargo test --profile local -p pi-natives --lib ipc::
@@ -97,7 +98,8 @@ bun test ./packages/coding-agent/test/utils/clipboard.test.ts
 bun test ./packages/coding-agent/test/utils/clipboard-osc52.test.ts
 bun test ./packages/coding-agent/test/slash-commands/copy.test.ts
 bun test ./packages/coding-agent/test/generator-android.test.ts
-cargo test --profile local -p pi-builtins --lib sort::
+pkg=omp-builtins; [ -f crates/builtins/Cargo.toml ] || pkg=pi-builtins
+cargo test --profile local -p "$pkg" --lib sort::
 cargo test --profile local -p pi-natives --lib ipc::
 bun test ./packages/natives/test/ipc.test.ts
 ```
