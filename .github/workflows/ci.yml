@@ -75,9 +75,12 @@ jobs:
       - name: Run IPC endpoint and relocation-directory unit tests
         shell: bash
         run: |
-          pkg=omp-natives
-          [ -f crates/natives/Cargo.toml ] || pkg=pi-natives
-          cargo test --profile local -p "$pkg" --lib 'ipc::'
+          natives=omp-natives;  [ -f crates/natives/Cargo.toml ]  || natives=pi-natives
+          builtins=omp-builtins; [ -f crates/builtins/Cargo.toml ] || builtins=pi-builtins
+          # One package selection for every cargo step: cargo unifies features
+          # per invocation, so a narrower later call would rebuild the shared
+          # dependency tree from scratch.
+          cargo test --profile local -p "$natives" -p "$builtins" --lib 'ipc::'
       - name: Run native IPC integration tests
         run: bun test ./packages/natives/test/ipc.test.ts
       - name: Type check applied patch queue
@@ -126,9 +129,9 @@ jobs:
       - name: Run Android sort memory-hint tests
         shell: bash
         run: |
-          pkg=omp-builtins
-          [ -f crates/builtins/Cargo.toml ] || pkg=pi-builtins
-          cargo test --profile local -p "$pkg" --lib 'sort::'
+          natives=omp-natives;  [ -f crates/natives/Cargo.toml ]  || natives=pi-natives
+          builtins=omp-builtins; [ -f crates/builtins/Cargo.toml ] || builtins=pi-builtins
+          cargo test --profile local -p "$natives" -p "$builtins" --lib 'sort::'
       # Required, not optional coverage: these exercise the retained-workspace
       # lifecycle, dynamic-schema repoRoot, resume-hint, and explicit cold
       # release contracts added by patch 90, so a missing/renamed file must fail the job instead of
