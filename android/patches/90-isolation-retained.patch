@@ -2954,7 +2954,7 @@ index 4efc1cd..05d4a95 100644
  		const cleanupArtifacts = async (): Promise<void> => {
  			await fs.rm(lease.artifactsDir, { recursive: true, force: true });
 diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/src/task/worktree.ts
-index dea777e..3effe09 100644
+index dea777e..593afb2 100644
 --- a/packages/coding-agent/src/task/worktree.ts
 +++ b/packages/coding-agent/src/task/worktree.ts
 @@ -1,17 +1,26 @@
@@ -2986,15 +2986,7 @@ index dea777e..3effe09 100644
  import { mapWithConcurrencyLimit } from "./parallel";
  import type { cfgIsolationBackend } from "./settings";
  
-@@ -107,6 +116,7 @@ export async function getRepoRoot(cwd: string, explicitRepoRoot?: string): Promi
- 	return repoRoot;
- }
- 
-+
- /** Whether a git config value reads as true; unset and unparsable values count as false. */
- function isGitTrue(value: string | null | undefined): boolean {
- 	if (!value) return false;
-@@ -285,7 +295,10 @@ async function captureRepoBaseline(repoRoot: string, budgetBytes: number): Promi
+@@ -285,7 +294,10 @@ async function captureRepoBaseline(repoRoot: string, budgetBytes: number): Promi
  		// The renderer's cap and the budget are UTF-8 bytes; a render that
  		// succeeded is at most `budgetBytes` of them, so the remainder is never
  		// negative.
@@ -3006,7 +2998,7 @@ index dea777e..3effe09 100644
  	} catch (error) {
  		if (vcs.isVcsError(error) && error.code === "OutputTooLarge") {
  			throw new IsolationBaselineTooLargeError(repoRoot, undefined, budgetBytes);
-@@ -632,15 +645,34 @@ function errorMessage(err: unknown): string {
+@@ -632,15 +644,34 @@ function errorMessage(err: unknown): string {
  	return err instanceof Error ? err.message : String(err);
  }
  
@@ -3044,7 +3036,7 @@ index dea777e..3effe09 100644
  }
  
  /**
-@@ -689,51 +721,83 @@ export async function ensureIsolation(
+@@ -689,51 +720,83 @@ export async function ensureIsolation(
  ): Promise<IsolationHandle> {
  	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
  	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
@@ -3168,7 +3160,7 @@ index dea777e..3effe09 100644
  /**
   * Tear down a handle returned by {@link ensureIsolation}. When native teardown fails for a mount or
   * subvolume backend, the workspace is kept with a retained-backend sidecar (recursive `rm` would
-@@ -766,6 +830,633 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
+@@ -766,6 +829,633 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
  	await fs.rm(baseDir, { recursive: true, force: true });
  }
  
@@ -3833,7 +3825,7 @@ index 88c7570..032db5e 100644
  	remove(): Promise<void>;
  }
 diff --git a/packages/coding-agent/src/worktree/git-managed.ts b/packages/coding-agent/src/worktree/git-managed.ts
-index 1c659cc..2c331f1 100644
+index 1c659cc..ece25e3 100644
 --- a/packages/coding-agent/src/worktree/git-managed.ts
 +++ b/packages/coding-agent/src/worktree/git-managed.ts
 @@ -5,6 +5,7 @@ import * as natives from "@oh-my-pi/pi-natives";
@@ -3853,7 +3845,7 @@ index 1c659cc..2c331f1 100644
  }
  
  /**
-@@ -145,12 +148,16 @@ async function classifyDir(dir: string): Promise<DiskEntry | null> {
+@@ -145,12 +148,15 @@ async function classifyDir(dir: string): Promise<DiskEntry | null> {
  	}
  	if (!isIsolation) return null;
  	const live = await hasLiveIsolationOwner(dir);
@@ -3868,8 +3860,7 @@ index 1c659cc..2c331f1 100644
 +		ownerAlive: live,
 +		// Live owners and retained descriptors stay out of orphan GC; clear --all
 +		// still preserves both. Only an explicit release may tear them down.
-+		orphanReason:
-+			live || retained ? undefined : "task-isolation leftover (no live task owns it)",
++		orphanReason: live || retained ? undefined : "task-isolation leftover (no live task owns it)",
  	};
  }
  
