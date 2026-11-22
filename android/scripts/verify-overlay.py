@@ -8,11 +8,16 @@ import sys
 ROOT = Path.cwd()
 
 def crate(name):
-    """19.1.0 dropped the `pi-` prefix from crate directories."""
+    """19.1.0 dropped the `pi-` prefix from crate directories.
+
+    Fixtures that only exercise the tag check have no crates at all, so a
+    missing tree resolves to the current name and fails later at the read
+    that actually needs the file.
+    """
     for candidate in (f"crates/{name}", f"crates/pi-{name}"):
         if (ROOT / candidate).is_dir():
             return candidate
-    raise SystemExit(f"overlay verification failed: crate directory missing: crates/{name}")
+    return f"crates/{name}"
 
 NATIVES = crate("natives")
 SHELL = crate("shell")
