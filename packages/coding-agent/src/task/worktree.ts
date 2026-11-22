@@ -52,23 +52,41 @@ export interface WorktreeBaseline {
  * The root of the git work tree holding `cwd`, which isolated tasks copy and
  * merge back into.
  *
- * Throws when `cwd` is in a pure Jujutsu workspace, outside any git
+ * When `explicitRepoRoot` is set, resolve against that path instead of `cwd`
+ * and require it to land inside the discovered repository.
+ *
+ * Throws when the target is in a pure Jujutsu workspace, outside any git
  * repository, or in a bare repository's directory — a container whose `.git`
  * is bare and whose work trees live elsewhere — which has no work tree to copy.
  */
-export async function getRepoRoot(cwd: string): Promise<string> {
+export async function getRepoRoot(cwd: string, explicitRepoRoot?: string): Promise<string> {
+	const targetPath = explicitRepoRoot ? path.resolve(cwd, explicitRepoRoot) : cwd;
 	// Pure-jj check runs first so a jj workspace nested under an unrelated
 	// outer Git checkout is rejected at its own root rather than silently
 	// mutating the surrounding Git tree behind jj's back.
-	if (vcs.isPureJj(cwd)) {
+	if (vcs.isPureJj(targetPath)) {
 		throw new Error(
 			"Isolated task execution requires a Git checkout, but this workspace is pure Jujutsu (`.jj/` without a colocated `.git/`). Run `jj git init --colocate` to add a Git checkout, or set `task.isolation.enabled: false` to disable task isolation.",
 		);
 	}
 
-	const repo = vcs.git(cwd);
-	if (!repo) throw new Error("Git repository not found for isolated task execution.");
+	const repo = vcs.git(targetPath);
+	if (!repo) {
+		if (explicitRepoRoot) {
+			throw new Error(`Explicit repoRoot '${explicitRepoRoot}' is not a valid Git repository.`);
+		}
+		throw new Error("Git repository not found for isolated task execution.");
+	}
 	const { repoRoot, gitDir, commonDir } = repo.info();
+	if (explicitRepoRoot) {
+		const canonicalTarget = path.resolve(targetPath);
+		const canonicalResolved = path.resolve(repoRoot);
+		if (canonicalTarget !== canonicalResolved && !canonicalTarget.startsWith(canonicalResolved + path.sep)) {
+			throw new Error(
+				`Explicit repoRoot '${explicitRepoRoot}' does not match resolved git repository '${repoRoot}'.`,
+			);
+		}
+	}
 	// A linked work tree's git dir differs from the common dir; git ignores
 	// `core.bare` there, so only the main git dir can be bare.
 	if (gitDir === commonDir && isGitTrue(await repo.configGet("core.bare"))) {
@@ -667,8 +685,9 @@ export async function ensureIsolation(
 	baseCwd: string,
 	id: string,
 	preferred?: IsoBackendKind,
+	explicitRepoRoot?: string,
 ): Promise<IsolationHandle> {
-	const repoRoot = await getRepoRoot(baseCwd);
+	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
 	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
 	const baseDir = taskIsolationBaseDir(repoRoot, id);
 	const mergedDir = path.join(baseDir, TASK_ISOLATION_MOUNT_DIR);

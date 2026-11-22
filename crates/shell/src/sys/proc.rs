@@ -124,7 +124,7 @@ pub fn signal_pinned(p: &ProcInfo, sig: Signal) -> io::Result<bool> {
 /// The command name may itself contain spaces and parentheses, so it ends at
 /// the *last* `)`.
 #[cfg_attr(
-	not(target_os = "linux"),
+	not(any(target_os = "linux", target_os = "android")),
 	allow(dead_code, reason = "Linux-only outside tests; the parser is tested everywhere")
 )]
 fn split_stat(line: &[u8]) -> Option<(&[u8], impl Iterator<Item = &[u8]>)> {
@@ -142,7 +142,7 @@ fn split_stat(line: &[u8]) -> Option<(&[u8], impl Iterator<Item = &[u8]>)> {
 
 /// Parse a Linux `/proc/<pid>/stat` line.
 #[cfg_attr(
-	not(target_os = "linux"),
+	not(any(target_os = "linux", target_os = "android")),
 	allow(dead_code, reason = "Linux-only outside tests; the parser is tested everywhere")
 )]
 fn parse_stat(pid: i32, line: &[u8]) -> Option<ProcInfo> {
@@ -169,7 +169,7 @@ fn parse_stat(pid: i32, line: &[u8]) -> Option<ProcInfo> {
 	})
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod sys {
 	use std::{
 		fs,
@@ -236,13 +236,26 @@ mod sys {
 		Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 	}
 
+	/// Whether this process may call `pidfd_open`. The API-level query lives
+	/// with the syscall itself, in `omp_builtins::proc_sys`, so the policy has
+	/// one definition: Android traps the call with SIGSYS before API 31.
+	fn pidfd_supported() -> bool {
+		omp_builtins::proc_sys::pidfd_open_supported()
+	}
+
 	pub fn signal_pinned(p: &ProcInfo, sig: i32) -> io::Result<bool> {
-		let pidfd = match pidfd_open(p.pid) {
-			Ok(fd) => Some(fd),
-			Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
-			// Kernels before 5.3: fall back to a start-time recheck.
-			Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => None,
-			Err(e) => return Err(e),
+		let pidfd = if pidfd_supported() {
+			match pidfd_open(p.pid) {
+				Ok(fd) => Some(fd),
+				Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
+				// Kernels before 5.3: fall back to a start-time recheck.
+				Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => None,
+				Err(e) => return Err(e),
+			}
+		} else {
+			// Android before 12: kill(2) after the start-time recheck, the
+			// same window the pre-pidfd fallback accepts.
+			None
 		};
 		// With the pidfd open the pid cannot be reused for another process
 		// while we check that it still names the scanned one.
