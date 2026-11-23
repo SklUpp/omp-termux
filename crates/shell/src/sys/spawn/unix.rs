@@ -70,9 +70,9 @@ use crate::{
 };
 
 /// Include Linux realtime signal 64; macOS has only signals 1 through 31.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const NSIG: usize = 65;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 const NSIG: usize = 32;
 
 /// Waiter and escalation threads only wait and signal.

@@ -59,6 +59,7 @@ import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import { proposeDispatchDetails } from "../../tools/resolve";
 import { SpeechEnhancer } from "../../tts/speech-enhancer";
 import { vocalizer } from "../../tts/vocalizer";
+import { sendAndroidNotification } from "../../utils/android-helpers";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
 import { type RunFlowStatus, setRunStatus } from "../../utils/run-status";
 import {
@@ -3005,6 +3006,11 @@ export class EventController {
 			type: "error",
 			actions: "focus",
 		});
+		// Android has no OSC terminal chrome: mirror the same gated card into the
+		// system shade with a fixed title. The session name is auto-generated from
+		// conversation text, so it must not persist into a notification-listener
+		// readable card. Best-effort and silent when Termux:API is absent.
+		void sendAndroidNotification("omp", "Stopped with error").catch(() => {});
 	}
 
 	sendCompletionNotification(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
@@ -3030,5 +3036,8 @@ export class EventController {
 			type: "completion",
 			actions: "focus",
 		});
+		// Same gated completion card in the Android shade, fixed title (see error
+		// above for why the conversation-derived session name is not used).
+		void sendAndroidNotification("omp", "Complete").catch(() => {});
 	}
 }
