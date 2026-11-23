@@ -80,6 +80,8 @@ import {
 	cfgTaskAgentServiceTierOverrides,
 	cfgTaskDisabledAgents,
 	cfgTaskIsolationApply,
+	cfgTaskEnableLsp,
+	cfgTaskIsolationDeferIntegration,
 	cfgTaskIsolationEnabled,
 	cfgTaskIsolationMerge,
 	cfgTaskMaxRecursionDepth,
@@ -113,6 +115,8 @@ export interface StructuredSubagentIsolationControls {
 	requested?: boolean;
 	merge?: "patch" | "branch";
 	apply?: boolean;
+	/** Git root the isolated workspace is copied from; relative to the session cwd. */
+	repoRoot?: string;
 }
 
 /** Identity and presentation metadata supplied by the calling surface. */
@@ -224,8 +228,14 @@ export interface EffectiveSubagentPolicy {
 	schema: StructuredSubagentSchemaResolution;
 	planMode: boolean;
 	isIsolated: boolean;
+	repoRoot?: string;
 	mergeMode: "patch" | "branch";
 	applyChanges: boolean;
+	/** Keep a successful run's changes in its workspace until the parent sends `/integrate`. */
+	deferIntegration: boolean;
+	/** Persisted parent transcript/id that alone may signal the deferred handoff. */
+	parentSessionFile?: string;
+	parentSessionId?: string;
 	enableLsp: boolean;
 	enableIrc: boolean;
 	/** Caller `effort` hint to apply; dropped when the agent's level comes from the user's `^model:level` tag. */
@@ -322,7 +332,10 @@ function assertPlanControlsAllowed(request: StructuredSubagentRequest, planMode:
 	const isolation = request.isolation;
 	if (
 		isolation &&
-		(Object.hasOwn(isolation, "requested") || Object.hasOwn(isolation, "apply") || Object.hasOwn(isolation, "merge"))
+		(Object.hasOwn(isolation, "requested") ||
+			Object.hasOwn(isolation, "apply") ||
+			Object.hasOwn(isolation, "merge") ||
+			(isolation.requested === true && Object.hasOwn(isolation, "repoRoot")))
 	) {
 		throw new StructuredSubagentError(
 			"preflight",
@@ -613,6 +626,24 @@ export async function resolveEffectiveSubagentPolicy(
 			"Subagent isolated execution requires task.isolation.enabled; it is currently false.",
 		);
 	}
+	// Effective apply is decided once: deferral only narrows an apply=true run,
+	// never changes the apply=false contract (retain artifacts, touch nothing).
+	const applyChanges =
+		request.isolation?.apply ??
+		(request.invocationKind === "task" ? cfgTaskIsolationApply.get(request.session.settings) : true);
+	const parentSessionFile = request.session.getSessionFile?.() ?? undefined;
+	const parentSessionId = request.session.getSessionId?.() ?? undefined;
+	const deferIntegration =
+		isIsolated &&
+		applyChanges &&
+		cfgTaskIsolationApply.get(request.session.settings) &&
+		cfgTaskIsolationDeferIntegration.get(request.session.settings);
+	if (deferIntegration && (!parentSessionFile || !parentSessionId)) {
+		throw new StructuredSubagentError(
+			"preflight",
+			"Deferred integration requires a persisted parent session (getSessionFile + getSessionId); this session has no durable identity to bind the handoff to.",
+		);
+	}
 	return {
 		discovery,
 		agentName,
@@ -629,11 +660,14 @@ export async function resolveEffectiveSubagentPolicy(
 		schema,
 		planMode,
 		isIsolated,
+		repoRoot: isIsolated ? request.isolation?.repoRoot : undefined,
 		mergeMode: request.isolation?.merge ?? cfgTaskIsolationMerge.get(request.session.settings),
-		applyChanges:
-			request.isolation?.apply ??
-			(request.invocationKind === "task" ? cfgTaskIsolationApply.get(request.session.settings) : true),
-		enableLsp: !planMode && (request.enableLsp ?? request.session.enableLsp ?? true),
+		applyChanges,
+		deferIntegration,
+		...(deferIntegration ? { parentSessionFile, parentSessionId } : {}),
+		enableLsp:
+			!planMode &&
+			(request.enableLsp ?? ((request.session.enableLsp ?? true) && cfgTaskEnableLsp.get(request.session.settings))),
 		enableIrc:
 			!planMode &&
 			(request.enableIrc ??
@@ -940,6 +974,23 @@ function describeCapturedChanges(result: SingleResult): string {
 	});
 }
 
+/**
+ * Summary for an apply=true run whose integration was deferred. The workspace
+ * and every captured artifact stay in place; the parent's explicit
+ * `/integrate` signal is the only writer of the parent checkout.
+ */
+function describeDeferredChanges(result: SingleResult): string {
+	const nestedPatchPaths = result.nestedPatchPaths ?? [];
+	return renderIsolationSummary({
+		kind: "deferred",
+		agentId: result.id,
+		branchName: result.branchName,
+		rootPatchPath: result.hasRootChanges === false ? undefined : result.patchPath,
+		nestedCount: nestedPatchPaths.length || (result.nestedPatches?.length ?? 0),
+		nestedPatchPaths,
+	});
+}
+
 function attachStructuredOutputMetadata(result: SingleResult, schema: StructuredSubagentSchemaResolution): void {
 	if (schema.source === "none") {
 		delete result.structuredOutput;
@@ -1023,7 +1074,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 		let isolationContext: IsolationContext | null = null;
 		if (policy.isIsolated) {
 			try {
-				isolationContext = await prepareIsolationContext(request.session.cwd);
+				isolationContext = await prepareIsolationContext(request.session.cwd, policy.repoRoot);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				throw new StructuredSubagentError(
@@ -1055,6 +1106,9 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 					openWorkspace: openIsolatedWorkspace(request.session.settings),
 					agentId: id,
 					mergeMode: policy.mergeMode,
+					deferredIntegration: policy.deferIntegration,
+					parentSessionFile: policy.parentSessionFile,
+					parentSessionId: policy.parentSessionId,
 					artifactsDir: lease.artifactsDir,
 					description: trimToUndefined(request.identity?.label),
 					buildCommitMessage: makeIsolationCommitMessage(request.session),
@@ -1077,6 +1131,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			policy.isIsolated &&
 			isolationContext &&
 			policy.applyChanges &&
+			!policy.deferIntegration &&
 			result.exitCode === 0 &&
 			!result.error &&
 			!result.aborted
@@ -1116,6 +1171,16 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			});
 		} else if (policy.isIsolated && isolationContext && !policy.applyChanges) {
 			mergeSummary = describeCapturedChanges(result);
+		} else if (
+			policy.isIsolated &&
+			isolationContext &&
+			policy.deferIntegration &&
+			result.exitCode === 0 &&
+			!result.error &&
+			!result.aborted
+		) {
+			mergeSummary = describeDeferredChanges(result);
+			AgentRegistry.global().setHistory(result.id, { deferredIntegration: "pending" });
 		}
 
 		completedSuccessfully = result.exitCode === 0 && !result.error && !result.aborted;
@@ -1142,7 +1207,8 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			request.detached === true ||
 			retainSalvagedArtifact ||
 			(request.retainArtifacts && (completedSuccessfully || hasValidStructuredOutput)) ||
-			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
+			(policy.isIsolated &&
+				(policy.deferIntegration || !policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
 		const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
 		const cleanupArtifacts = async (): Promise<void> => {
 			await fs.rm(lease.artifactsDir, { recursive: true, force: true });

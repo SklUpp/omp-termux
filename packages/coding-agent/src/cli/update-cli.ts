@@ -2319,6 +2319,54 @@ async function runManagedUpdate(
 }
 
 /**
+ * Repo that publishes the Termux/Android port. Upstream release binaries and
+ * npm natives target desktop glibc/musl systems; the Android bundle is built
+ * and installed from here instead.
+ */
+const ANDROID_REPO = "SklUpp/omp-termux";
+const ANDROID_INSTALLER_URL = `https://raw.githubusercontent.com/${ANDROID_REPO}/main/install.sh`;
+
+/**
+ * Whether this process runs the Termux/Android port.
+ *
+ * Bun reports `android` as its platform, which no upstream release target
+ * covers; the installer's launcher also exports `OMP_PLATFORM=android`.
+ * Parameters are explicit so callers and tests do not depend on the host.
+ */
+export function isAndroidUpdateHost(
+	platform: string = process.platform,
+	platformOverride: string | undefined = process.env.OMP_PLATFORM,
+): boolean {
+	return platform === "android" || platformOverride === "android";
+}
+
+/**
+ * Reinstall instructions for the Termux/Android port. Both release profiles
+ * are shown because the installed bundle does not record which patch set it
+ * was built from.
+ */
+export function androidReinstallInstructions(): string {
+	return [
+		"OMP on Termux/Android does not support update checks or in-place updates.",
+		"Reinstall the release profile you use:",
+		`  standard: curl -fsSL ${ANDROID_INSTALLER_URL} | sh`,
+		`  extended: curl -fsSL ${ANDROID_INSTALLER_URL} | sh -s -- -ex`,
+		`Releases: https://github.com/${ANDROID_REPO}/releases`,
+	].join("\n");
+}
+
+/**
+ * Answer `omp update` on Android without consulting upstream release
+ * metadata. In-place update and the upstream check are both unsupported, so
+ * this exits non-zero after printing the reinstall commands.
+ */
+function runAndroidUpdate(): void {
+	console.log(chalk.dim(`Current version: ${VERSION}`));
+	console.error(chalk.red(androidReinstallInstructions()));
+	process.exitCode = 1;
+}
+
+/**
  * Run the update command.
  *
  * The installer that owns the PATH `omp` decides where the version comes
@@ -2330,6 +2378,10 @@ async function runManagedUpdate(
  * fails, or when another update holds the install lock.
  */
 export async function runUpdateCommand(opts: UpdateOptions): Promise<UpdateOutcome> {
+	if (isAndroidUpdateHost()) {
+		runAndroidUpdate();
+		return { kind: "unsupported", reason: androidReinstallInstructions() };
+	}
 	const ompPath = resolveOmpPath();
 	const manager = ompPath ? await managedInstallName(ompPath) : undefined;
 	if (manager) {

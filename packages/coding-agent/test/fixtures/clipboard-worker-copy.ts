@@ -7,19 +7,37 @@ import { copyToClipboard } from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import * as natives from "@oh-my-pi/pi-natives/clipboard";
 
 declare const self: Worker;
+// `workerData` is not typed in every Bun WorkerOptions build, so the test sends
+// the mode as the first message; it is queued until this listener registers.
+const mode = await new Promise<string>(resolve => {
+	self.addEventListener("message", event => resolve(String(event.data)), { once: true });
+});
+const failNativeCopy = mode === "native-fails";
 
 Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
 // Linux keeps macOS runs off the real pbcopy; the native write is stubbed.
 Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+// A Termux host inherits TERMUX_VERSION; the fixture tests OSC 52/native
+// routing, so keep the real termux-clipboard-set out of the worker.
+delete process.env.TERMUX_VERSION;
 const stdout: string[] = [];
 spyOn(process.stdout, "write").mockImplementation(chunk => {
 	stdout.push(typeof chunk === "string" ? chunk : chunk.toString());
 	return true;
 });
 const nativeCopies: string[] = [];
-spyOn(natives, "copyToClipboard").mockImplementation(text => {
+spyOn(natives, "copyToClipboard").mockImplementation(async text => {
 	nativeCopies.push(text);
+	if (failNativeCopy) throw new Error("native clipboard unavailable");
 });
 
-await copyToClipboard("worker probe");
-self.postMessage({ stdout, nativeCopies });
+try {
+	await copyToClipboard("worker probe");
+	self.postMessage({ stdout, nativeCopies });
+} catch (error) {
+	self.postMessage({
+		stdout,
+		nativeCopies,
+		error: error instanceof Error ? error.message : String(error),
+	});
+}
