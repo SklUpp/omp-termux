@@ -30,6 +30,7 @@ import { executeSend, isIrcEnabled } from "../irc/messaging";
 import { agentMesh } from "../irc/mesh";
 import { formatPeerAddress, type PeerAddress } from "../irc/mesh-protocol";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
+import { isDeferredIntegrationSignal } from "../task/deferred-integration";
 import { cfgTaskCrossInstance } from "../task/settings";
 import agentPromptDoc from "../prompts/internal-urls/agent.md" with { type: "text" };
 import agentProgressTemplate from "../prompts/tools/agent-url-progress.md" with { type: "text" };
@@ -268,12 +269,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		if (!session) throw new Error("agent:// messaging requires a tool session");
 		const registry = session.agentRegistry;
 		const senderId = session.getAgentId?.();
-		if (
-			!registry ||
-			!senderId ||
-			session.enableIrc === false ||
-			!isIrcEnabled(session.settings, session.taskDepth ?? 0)
-		) {
+		if (!registry || !senderId) {
 			throw new Error("Peer messaging is unavailable in this session.");
 		}
 		const pid = cfgTaskCrossInstance.get(session.settings) ? pidTarget(url) : undefined;
@@ -290,6 +286,16 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		const progress = url.searchParams.has("progress");
 		if (progress && to === "all") throw new Error("agent://all broadcasts cannot be ?progress updates.");
 		if (!content.trim()) throw new Error("agent:// messages require non-empty content.");
+		// `/integrate` is a manager control, not chat: keep it out of the child's
+		// inbox and point the parent at the endpoint that performs the handoff.
+		if (to !== "all" && isDeferredIntegrationSignal(content)) {
+			throw new Error(
+				`${content.trim()} is an isolation-manager signal, not a message: call write with ${JSON.stringify({ path: `worktree://${to}`, content: content.trim() })}.`,
+			);
+		}
+		if (session.enableIrc === false || !isIrcEnabled(session.settings, session.taskDepth ?? 0)) {
+			throw new Error("Peer messaging is unavailable in this session.");
+		}
 		// A spawn waiting for a slot (or still opening its session) has a job but
 		// no live session yet: hold the message for its run to take on start.
 		const recipient = registry.get(to);

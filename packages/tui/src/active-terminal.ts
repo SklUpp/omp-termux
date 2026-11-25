@@ -67,14 +67,22 @@ export function writeThroughActiveTerminal(data: string): boolean {
  * terminal's ordered output path, and goes straight to stdout, best-effort, only
  * when no terminal owns it. A worker thread cannot reach the main thread's
  * terminal and would write around its pump, so it writes nothing.
+ *
+ * Returns whether the sequence was handed to a real output path (the active
+ * terminal's ordered pump, or a direct stdout write that did not throw). A
+ * worker, a terminal that never owned stdout, or a closed stdout returns
+ * `false`. Even `true` only means "emitted", not that the user's terminal
+ * honored it: OSC 52 is best-effort by design.
  */
-export function writeTerminalSequence(data: string): void {
-	if (!Bun.isMainThread) return;
-	if (writeThroughActiveTerminal(data)) return;
+export function writeTerminalSequence(data: string): boolean {
+	if (!Bun.isMainThread) return false;
+	if (writeThroughActiveTerminal(data)) return true;
 	installStdoutErrorListener();
 	try {
 		process.stdout.write(data);
+		return true;
 	} catch {
 		// Best-effort: a closed stdout must not fail the caller.
+		return false;
 	}
 }
