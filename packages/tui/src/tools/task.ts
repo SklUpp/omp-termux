@@ -2275,6 +2275,8 @@ export interface TaskItem {
 	tools?: string[];
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
+	/** Optional explicit git repository root for task isolation. */
+	repoRoot?: string;
 }
 
 /**
@@ -2310,6 +2312,8 @@ export interface TaskParams {
 	context?: string;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
+	/** Explicit repository root (flat form or batch context override). */
+	repoRoot?: string;
 }
 
 /**
