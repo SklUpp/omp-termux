@@ -82,6 +82,8 @@ export interface TaskItem {
 	tools?: string[];
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
+	/** Repository to isolate: defaults to the current cwd's. Meaningless without `isolated`. */
+	repoRoot?: string;
 }
 
 /**
@@ -117,6 +119,8 @@ export interface TaskParams {
 	context?: string;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
+	/** Repository to isolate: defaults to the current cwd's. Meaningless without `isolated`. */
+	repoRoot?: string;
 }
 
 /**

@@ -31,18 +31,23 @@ pub(crate) const fn resource(r: Rlimit) -> Option<Resource> {
 		Rlimit::Nproc => libc::RLIMIT_NPROC,
 		Rlimit::Nofile => libc::RLIMIT_NOFILE,
 		Rlimit::Vmem => libc::RLIMIT_AS,
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		Rlimit::Locks => libc::RLIMIT_LOCKS,
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		Rlimit::Sigpending => libc::RLIMIT_SIGPENDING,
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		Rlimit::Msgqueue => libc::RLIMIT_MSGQUEUE,
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		Rlimit::Nice => libc::RLIMIT_NICE,
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		Rlimit::Rtprio => libc::RLIMIT_RTPRIO,
 		#[cfg(target_os = "linux")]
 		Rlimit::Rttime => libc::RLIMIT_RTTIME,
+		// bionic exposes `RLIMIT_RTTIME` (15) through `linux/resource.h`, but
+		// the `libc` crate declares no Android constant for it, and the engine
+		// maps only the resources it can name.
+		#[cfg(target_os = "android")]
+		Rlimit::Rttime => return None,
 		_ => return None,
 	})
 }
@@ -120,12 +125,15 @@ mod tests {
 		for r in [Rlimit::Npts, Rlimit::Kqueues, Rlimit::Sbsize, Rlimit::Threads, Rlimit::Swap] {
 			assert!(!mapped.contains(&r), "{r:?} is FreeBSD-only");
 		}
-		let linux_only = [Rlimit::Locks, Rlimit::Rtprio, Rlimit::Rttime];
+		let android_limits = [Rlimit::Locks, Rlimit::Rtprio];
 		assert!(
-			linux_only
+			android_limits
 				.iter()
-				.all(|r| mapped.contains(r) == cfg!(target_os = "linux"))
+				.all(|r| mapped.contains(r) == cfg!(any(target_os = "linux", target_os = "android")))
 		);
+		// bionic exposes `RLIMIT_RTTIME` (15) through `linux/resource.h`, but the
+		// `libc` crate has no Android constant, so only the Linux table maps it.
+		assert_eq!(mapped.contains(&Rlimit::Rttime), cfg!(target_os = "linux"));
 		assert_eq!(get(Rlimit::Swap).unwrap_err().kind(), io::ErrorKind::Unsupported);
 	}
 

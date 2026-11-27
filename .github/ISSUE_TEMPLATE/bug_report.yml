@@ -72,7 +72,8 @@ body:
         - Anthropic (Claude Pro/Max)
         - ChatGPT Plus/Pro (Codex)
         - GitHub Copilot
-        - Google Antigravity (Gemini, Claude, GPT-OSS)
+        - Google Cloud Code Assist (Gemini CLI)
+        - Antigravity (Gemini 3, Claude, GPT-OSS)
         - Cursor
         - OpenCode Zen
         - Kimi Code
