@@ -134,6 +134,20 @@ Then exercise one read tool and one bash tool, and launch interactive `omp`. Do
 not call a release fully verified until `stats --json` and interactive startup
 pass on device.
 
+`android/scripts/test-e2e-models.sh` automates the model path: it asserts an
+exact reply, an exact JSON object, a bash-tool file side effect, write/read
+tool events with exact bytes, and (with `--image`) a vision round trip. It
+needs configured provider credentials, so it never runs in CI; it fails closed
+on a missing token, tool event, or file. Tool cases run model-chosen commands,
+so they require `--allow-tools` and print a warning — the temp working
+directory is not a filesystem sandbox.
+
+```sh
+bash android/scripts/test-e2e-models.sh                 # reply + JSON only
+bash android/scripts/test-e2e-models.sh --allow-tools   # + tool cases
+bash android/scripts/test-e2e-models.sh --allow-tools --image  # full matrix
+```
+
 ### Device browser gate (external Termux:X11 Chromium)
 
 The browser tool has its own hard gate. It requires the pinned external
