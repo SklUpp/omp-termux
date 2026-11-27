@@ -22,7 +22,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { postmortem, prompt } from "@oh-my-pi/pi-utils";
+import { logger, postmortem, prompt } from "@oh-my-pi/pi-utils";
 import isolationErrorTemplate from "../prompts/tools/isolation-error.md" with { type: "text" };
 import isolationSummaryTemplate from "../prompts/tools/isolation-summary.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
@@ -35,10 +35,16 @@ import { trackLateCleanup } from "../utils/late-cleanup";
 import { withRepoLock } from "../utils/repo-lock";
 import type { ExecutorOptions } from "./executor";
 import { runSubprocess } from "./executor";
-import { needsNativeTeardown, writeRetainedBackend } from "./isolation-ownership";
+import {
+	needsNativeTeardown,
+	readIsolationOwner,
+	withIsolationLease,
+	writeRetainedBackend,
+} from "./isolation-ownership";
 import type { NestedRepoPatch, SingleResult } from "./task-details";
 import {
 	applyNestedPatches,
+	bindIsolationState,
 	captureDeltaPatch,
 	captureIsolationBaseline,
 	cleanupIsolation,
@@ -48,7 +54,13 @@ import {
 	type DeltaPatchResult,
 	ensureIsolation,
 	getRepoRoot,
+	isolationHandle,
+	type LoadedIsolationState,
 	mergeTaskBranches,
+	patchIsolationState,
+	readIsolationState,
+	readSessionHeaderId,
+	writeIsolationState,
 	type WorktreeBaseline,
 } from "./worktree";
 
@@ -60,6 +72,7 @@ type IsoBackendKind = natives.IsoBackendKind;
 export type IsolationSummaryKind =
 	| "captured"
 	| "capture-error"
+	| "deferred"
 	| "nested-apply-failed"
 	| "not-applied"
 	| "branch-merge-failed"
@@ -69,6 +82,8 @@ export type IsolationSummaryKind =
 /** Context for `isolation-summary.md`; unused fields are simply absent. */
 export interface IsolationSummaryContext {
 	kind: IsolationSummaryKind;
+	/** Target of the parent's explicit `/integrate` signal. */
+	agentId?: string;
 	branchName?: string;
 	/** Root patch path, only when it holds changes. */
 	rootPatchPath?: string;
@@ -76,6 +91,8 @@ export interface IsolationSummaryContext {
 	nestedPatchPaths?: string[];
 	error?: string;
 	conflict?: string;
+	/** Workspace kept because its changes could not be captured; a later release still owns it. */
+	retainedDir?: string;
 }
 
 /**
@@ -145,8 +162,8 @@ export interface IsolationContext {
  * the error as a task-tool failure. Each spawn captures its own baseline from
  * its isolation copy (see {@link captureIsolationBaseline}).
  */
-export async function prepareIsolationContext(cwd: string): Promise<IsolationContext> {
-	return { repoRoot: await getRepoRoot(cwd) };
+export async function prepareIsolationContext(cwd: string, explicitRepoRoot?: string): Promise<IsolationContext> {
+	return { repoRoot: await getRepoRoot(cwd, explicitRepoRoot) };
 }
 
 /** Fingerprint of a captured delta, used to skip re-committing an unchanged workspace on release. */
@@ -205,6 +222,15 @@ export interface IsolatedRunOptions {
 	agentId: string;
 	/** Merge mode driving how changes are captured ("branch" commits, "patch" diffs). */
 	mergeMode: "patch" | "branch";
+	/**
+	 * Hold a successful run's changes in the retained workspace instead of
+	 * applying them. The descriptor records the intent so a later `/integrate`
+	 * signal (possibly in another process) can finish the handoff.
+	 */
+	deferredIntegration?: boolean;
+	/** Persisted parent transcript/id captured at spawn; required for deferred handoff. */
+	parentSessionFile?: string;
+	parentSessionId?: string;
 	/** Output dir for `${agentId}.patch` artifacts (patch mode and branch-mode commit failures). */
 	artifactsDir: string;
 	/** Human description carried onto the branch commit (branch mode). */
@@ -255,14 +281,14 @@ export async function persistNestedPatches(
 	return saved;
 }
 
-interface IsolationPatchArtifacts {
+export interface IsolationPatchArtifacts {
 	patchPath: string;
 	hasRootChanges: boolean;
 	nestedPatches: NestedRepoPatch[];
 	nestedPatchPaths: string[];
 }
 
-interface IsolationPatchCapture {
+export interface IsolationPatchCapture {
 	artifacts: IsolationPatchArtifacts;
 	/** The delta written. */
 	delta: DeltaPatchResult;
@@ -275,7 +301,7 @@ interface IsolationPatchCapture {
  * patch and one file per nested repo — before the caller tears the workspace
  * down. Throws when any write fails so nothing captured is ever the only copy.
  */
-async function writeIsolationPatch(
+export async function writeIsolationPatch(
 	changes: RunChanges,
 	artifactsDir: string,
 	agentId: string,
@@ -297,7 +323,7 @@ async function writeIsolationPatch(
 }
 
 /** How an isolated run's changes are read: relative to the state its workspace opened in. */
-interface RunChanges {
+export interface RunChanges {
 	/** Every change since the workspace opened. */
 	delta(): Promise<DeltaPatchResult>;
 	/** The baseline the workspace opened in, for branch commits. */
@@ -425,6 +451,11 @@ export interface WorkspaceStart {
 export interface IsolationWorkspace {
 	/** The checkout the subagent runs in. */
 	readonly dir: string;
+	/**
+	 * PAL backend of a natively materialised workspace; absent for an ovnfs
+	 * checkout, which keeps its own starting state instead of a descriptor.
+	 */
+	readonly backend?: IsoBackendKind;
 	/** Set when the workspace keeps the state it opened in; then no baseline is taken at start. */
 	readonly start?: WorkspaceStart;
 	/** Keep the workspace past the run (its changes could not be captured) and say where it stays. */
@@ -442,6 +473,7 @@ export function nativeWorkspace(backend: IsoBackendKind | undefined): OpenWorksp
 		const handle = await ensureIsolation(repoRoot, agentId, backend);
 		return {
 			dir: handle.mergedDir,
+			backend: handle.backend,
 			retain: () => retainIsolationWorkspace(handle.mergedDir, handle.backend),
 			cleanup: () => cleanupIsolation(handle),
 		};
@@ -465,6 +497,191 @@ interface IsolationErrorContext {
 
 function renderIsolationError(context: IsolationErrorContext): string {
 	return prompt.render(isolationErrorTemplate, { ...context });
+}
+
+/** Pointer beside the transcript naming where an agent's isolation sandbox lives, across retention renames. */
+function retainedPointerPath(artifactsDir: string, id: string): string {
+	return path.join(artifactsDir, `${id}.isolation.json`);
+}
+
+/**
+ * Record the sandbox `baseDir` that holds `workspace` beside the transcript.
+ * Best-effort: the header cwd still resolves an unrenamed workspace, and a
+ * rename-time failure keeps the (already reported) error path working.
+ */
+async function writeIsolationPointer(
+	artifactsDir: string,
+	id: string,
+	baseDir: string,
+	workspace: string,
+): Promise<void> {
+	try {
+		await Bun.write(retainedPointerPath(artifactsDir, id), JSON.stringify({ dir: baseDir, workspace }));
+	} catch (error) {
+		logger.debug("isolation pointer write failed", {
+			id,
+			workspace,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+/**
+ * Record a workspace that was moved out of its deterministic slot: the pointer
+ * lets a later process find the descriptor, and the Hub row can show where the
+ * retained work lives.
+ */
+async function rememberRetainedWorkspace(artifactsDir: string, id: string, retained: RetainedWorkspace): Promise<void> {
+	AgentRegistry.global().setHistory(id, { isolationDir: retained.dir });
+	await writeIsolationPointer(artifactsDir, id, path.dirname(retained.dir), retained.dir);
+}
+
+/** Options for {@link releaseIsolationWorkspace}. */
+export interface IsolationReleaseOptions {
+	/** Dir holding `${id}.patch` artifacts. */
+	artifactsDir: string;
+	/** Human description carried onto a branch commit. */
+	description?: string;
+	/** Release the owning session's resources before the workspace teardown. */
+	releaseParent?: () => Promise<void>;
+	/**
+	 * Transcript the CALLER knows this agent owns, independent of the descriptor.
+	 * Binding against it stops a forged/copied descriptor from naming its own
+	 * transcript to authorize capture and deletion of another session's sandbox.
+	 */
+	expectedSessionFile: string;
+	/**
+	 * Explicit CLI recovery only: allow a descriptor that predates
+	 * `childSessionId`. The caller must have independently verified transcript
+	 * cwd/pointer/slot/repo/baseline first; automatic lifecycle release never
+	 * sets this.
+	 */
+	allowLegacyGeneration?: boolean;
+	/**
+	 * Live release before the run-end descriptor patch: use the child header id
+	 * read from `expectedSessionFile` as an independent generation proof.
+	 */
+	allowHeaderGeneration?: boolean;
+}
+
+/**
+ * Capture a workspace's changes, commit them when they differ from the handoff
+ * already delivered, and tear the workspace down.
+ *
+ * Shared by the live release (same process) and the cold release of a revived
+ * run, so both diff against the persisted baseline, skip a duplicate commit,
+ * and stop the backend the workspace recorded. Capture failure retains the
+ * workspace under a unique sibling, points the transcript at it, and throws
+ * WITHOUT cleanup — the workspace is then the only copy of the run's changes.
+ */
+export async function releaseIsolationWorkspace(
+	state: LoadedIsolationState,
+	opts: IsolationReleaseOptions,
+): Promise<void> {
+	// Prove the descriptor is bound to the caller's transcript and slot BEFORE
+	// any capture or teardown: a copied pointer/descriptor must not hand release
+	// another session's workspace. Refusal throws with no mutation.
+	// The live lifecycle may build its release state in memory before the run-end
+	// patch lands; take the generation from the persisted descriptor (verified
+	// against the same id/dir) or independently from the transcript header.
+	if (!state.childSessionId) {
+		const persisted = await readIsolationState(state.dir, state.id);
+		const persistedId = "state" in persisted ? persisted.state.childSessionId : undefined;
+		const headerId = opts.allowHeaderGeneration ? await readSessionHeaderId(opts.expectedSessionFile) : undefined;
+		const generation = persistedId ?? headerId;
+		if (generation) state = { ...state, childSessionId: generation };
+	}
+	const binding = await bindIsolationState(state, opts.expectedSessionFile, {
+		allowLegacyGeneration: opts.allowLegacyGeneration,
+	});
+	if ("refusal" in binding) throw new Error(`Cannot release isolation workspace: ${binding.refusal}`);
+	const handle = isolationHandle(state);
+	// Re-read the sandbox as it is now: a retention rename recorded in the
+	// descriptor moved it off the caller's original path.
+	const changes: RunChanges = {
+		delta: () => captureDeltaPatch(handle.mergedDir, state.baseline),
+		baseline: async () => state.baseline,
+	};
+	// Destructive release also runs under the claim lock and requires that THIS
+	// process currently owns the sandbox (marker written by spawn/revive claim):
+	// a foreign-live or unclaimed workspace is refused untouched, and `clear`
+	// cannot tear it down mid-release.
+	await withIsolationLease(state.slot, async () => {
+		const owner = await readIsolationOwner(state.dir);
+		if (!owner || owner.pid !== process.pid) {
+			throw new Error(
+				`Cannot release isolation workspace: it is ${owner ? `owned by omp process ${owner.pid}` : "not claimed by any process"}; revive and claim it first`,
+			);
+		}
+		let retain = false;
+		try {
+			let capture: IsolationPatchCapture;
+			try {
+				capture = await writeIsolationPatch(changes, opts.artifactsDir, state.id);
+			} catch (captureErr) {
+				retain = true;
+				const retained = await retainIsolationWorkspace(handle.mergedDir, handle.backend);
+				await rememberRetainedWorkspace(opts.artifactsDir, state.id, retained);
+				throw new Error(
+					renderIsolationError({
+						kind: "patch-capture-failed",
+						message: captureErr instanceof Error ? captureErr.message : String(captureErr),
+						retainedDir: retained.dir,
+						sidecarMissing: !retained.sidecarOk,
+					}),
+				);
+			}
+			const patchResult = capture.artifacts;
+			AgentRegistry.global().setHistory(state.id, {
+				patchPath: patchResult.patchPath,
+				nestedPatchPaths: patchResult.nestedPatchPaths,
+			});
+			// Nothing changed since the run-end capture the caller already merged
+			// or applied: a branch now would only duplicate that work.
+			if (state.handedOff !== undefined && String(capture.fingerprint) === state.handedOff) return;
+			let commitResult: CommitToBranchResult | null;
+			try {
+				commitResult = await commitToBranch(
+					handle.mergedDir,
+					state.baseline,
+					state.id,
+					opts.description,
+					undefined,
+					capture.delta,
+				);
+			} catch (commitErr) {
+				// The written patch holds the diff, but commits made inside the
+				// workspace and the branch ref live only there. Keep the workspace
+				// and its descriptor so the release can be retried instead of
+				// losing them.
+				retain = true;
+				const rescueBranch = await rescueTaskBranch(
+					state.baseline.root.repoRoot,
+					`omp/task/${state.id}`,
+					state.baseline.root.headCommit,
+				);
+				const retained = await retainIsolationWorkspace(handle.mergedDir, handle.backend);
+				await rememberRetainedWorkspace(opts.artifactsDir, state.id, retained);
+				throw new Error(
+					renderIsolationError({
+						kind: "merge-failed",
+						message: commitErr instanceof Error ? commitErr.message : String(commitErr),
+						rescueBranch,
+						retainedDir: retained.dir,
+						sidecarMissing: !retained.sidecarOk,
+					}),
+				);
+			}
+			AgentRegistry.global().setHistory(state.id, {
+				patchPath: patchResult.patchPath,
+				branchName: commitResult?.branchName,
+				nestedPatchPaths: patchResult.nestedPatchPaths,
+			});
+		} finally {
+			await opts.releaseParent?.();
+			if (!retain) await cleanupIsolation(handle);
+		}
+	});
 }
 
 /**
@@ -496,6 +713,16 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 	/** Fingerprint of the delta already handed to the caller at run end; release only re-captures on change. */
 	let handedOff: bigint | number | undefined;
 	let workspace: IsolationWorkspace | undefined;
+	/** Sandbox dir currently holding this run's descriptor (follows retention renames). */
+	let stateDir: string | undefined;
+	/** Immutable slot basename: retention renames the base dir, the slot never changes. */
+	let isolationSlot: string | undefined;
+	/** PAL backend that materialised the workspace; descriptors are native-only. */
+	let isolationBackend: IsoBackendKind | undefined;
+	/** True once the descriptor exists: such a workspace is retained until an explicit release. */
+	let stateWritten = false;
+	/** Only a run that finished successfully may later be integrated. */
+	let deferredReady = false;
 	let deferredCleanup: Promise<void> | undefined;
 	let retainWorkspace = false;
 	let baseReleasePromise: Promise<void> | undefined;
@@ -514,11 +741,51 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		})();
 		return cleanupPromise;
 	};
-	const releaseIsolation = (): Promise<void> => {
+	/**
+	 * Terminal handler wired into the agent lifecycle for EVERY isolated run.
+	 * `retain` keeps the workspace (one-shot completion, kill tombstone,
+	 * shutdown) for the explicit release that a revived run performs later; a
+	 * plain release captures and lands the delta through the shared handler.
+	 */
+	const releaseIsolation = (release?: { retain?: boolean }): Promise<void> => {
 		if (releasePromise) return releasePromise;
 		releasePromise = (async () => {
 			if (!workspace || !changes || retainWorkspace) {
 				await cleanupHandle();
+				return;
+			}
+			if (release?.retain) {
+				retainWorkspace = true;
+				await releaseBase();
+				return;
+			}
+			if (stateWritten && stateDir && isolationBackend !== undefined && isolationSlot !== undefined) {
+				const sessionFile =
+					AgentRegistry.global().get(opts.agentId)?.sessionFile ??
+					path.join(opts.artifactsDir, `${opts.agentId}.jsonl`);
+				await releaseIsolationWorkspace(
+					{
+						version: 1,
+						id: opts.agentId,
+						repoRoot: opts.context.repoRoot,
+						backend: isolationBackend,
+						slot: isolationSlot,
+						mergedDir: path.basename(workspace.dir),
+						baseline: await changes.baseline(),
+						// Follow a retention rename performed at run end: the original
+						// workspace path no longer exists after `retain()`.
+						dir: stateDir,
+						sessionFile,
+						...(handedOff === undefined ? {} : { handedOff: String(handedOff) }),
+					},
+					{
+						artifactsDir: opts.artifactsDir,
+						description: opts.description,
+						releaseParent: releaseBase,
+						expectedSessionFile: sessionFile,
+						allowHeaderGeneration: true,
+					},
+				);
 				return;
 			}
 			try {
@@ -528,6 +795,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				} catch (captureErr) {
 					retainWorkspace = true;
 					const retained = await workspace.retain();
+					stateDir = path.dirname(retained.dir);
+					await rememberRetainedWorkspace(opts.artifactsDir, opts.agentId, retained);
 					throw new Error(
 						renderIsolationError({
 							kind: "patch-capture-failed",
@@ -578,9 +847,52 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		const isolationDir = workspace.dir;
 		const runChanges = await trackChanges(workspace, opts.context.repoRoot);
 		changes = runChanges;
+		isolationBackend = workspace.backend;
+		isolationSlot = path.basename(path.dirname(isolationDir));
+		stateDir = path.dirname(isolationDir);
+		// A natively materialised workspace persists its recovery contract before
+		// the agent can change it: a later process must capture this run's delta
+		// against this exact baseline and stop the backend that materialised it.
+		// A write failure is a setup failure — the catch below discards the copy
+		// and the agent never runs. An ovnfs checkout keeps its own starting
+		// state instead, so it has no descriptor to record.
+		if (isolationBackend !== undefined) {
+			await writeIsolationState(stateDir, {
+				version: 1,
+				id: opts.agentId,
+				repoRoot: opts.context.repoRoot,
+				backend: isolationBackend,
+				slot: isolationSlot,
+				mergedDir: path.basename(isolationDir),
+				baseline: await runChanges.baseline(),
+				// Convention path; the run-end patch replaces it with the exact
+				// transcript the registry recorded.
+				sessionFile: path.join(opts.artifactsDir, `${opts.agentId}.jsonl`),
+				...(opts.deferredIntegration
+					? {
+							deferred: true,
+							mergeMode: opts.mergeMode,
+							...(opts.parentSessionFile === undefined ? {} : { parentSessionFile: opts.parentSessionFile }),
+							...(opts.parentSessionId === undefined ? {} : { parentSessionId: opts.parentSessionId }),
+						}
+					: {}),
+			});
+			stateWritten = true;
+			await writeIsolationPointer(opts.artifactsDir, opts.agentId, stateDir, isolationDir);
+		}
 		const result = await runSubprocess({
 			...opts.baseOptions,
 			worktree: isolationDir,
+			// Persist the generation token as soon as the transcript header exists,
+			// before the child can change the workspace: an abrupt crash must still
+			// leave a cold-revivable descriptor.
+			onSessionFileReady: async sessionFile => {
+				await opts.baseOptions.onSessionFileReady?.(sessionFile);
+				const childSessionId = await readSessionHeaderId(sessionFile);
+				if (childSessionId && stateDir && stateWritten) {
+					await patchIsolationState(stateDir, { childSessionId });
+				}
+			},
 			preloadedExtensionPaths: undefined,
 			preloadedPreparedExtensions: undefined,
 			preloadedCustomToolPaths: undefined,
@@ -599,6 +911,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			},
 		});
 		opts.onSubprocessResult?.(result);
+		AgentRegistry.global().setHistory(opts.agentId, { isolationDir });
 		// A successful result cannot be captured while deferred owner jobs or
 		// shutdown hooks may still write the worktree. Failed runs skip capture,
 		// so their cleanup remains asynchronous.
@@ -645,6 +958,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				} catch (patchErr) {
 					retainWorkspace = true;
 					const retained = await workspace.retain();
+					stateDir = path.dirname(retained.dir);
+					await rememberRetainedWorkspace(opts.artifactsDir, opts.agentId, retained);
 					return rememberAgentArtifacts({
 						...result,
 						error: renderIsolationError({
@@ -659,6 +974,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				}
 			}
 			handedOff = deltaFingerprint(commitResult?.rootPatch ?? "", commitResult?.nestedPatches ?? []);
+			if (result.exitCode === 0 && !result.error && !result.aborted) deferredReady = true;
 			// The branch holds the root-repo work, but nested-repo patches exist
 			// only in memory until written; the workspace goes away in `finally`.
 			try {
@@ -677,6 +993,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			} catch (persistErr) {
 				retainWorkspace = true;
 				const retained = await workspace.retain();
+				stateDir = path.dirname(retained.dir);
+				await rememberRetainedWorkspace(opts.artifactsDir, opts.agentId, retained);
 				return rememberAgentArtifacts({
 					...result,
 					branchName: commitResult?.branchName,
@@ -695,10 +1013,13 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			try {
 				const capture = await writeIsolationPatch(runChanges, opts.artifactsDir, opts.agentId);
 				handedOff = capture.fingerprint;
+				if (result.exitCode === 0 && !result.error && !result.aborted) deferredReady = true;
 				return rememberAgentArtifacts({ ...result, ...capture.artifacts });
 			} catch (patchErr) {
 				retainWorkspace = true;
 				const retained = await workspace.retain();
+				stateDir = path.dirname(retained.dir);
+				await rememberRetainedWorkspace(opts.artifactsDir, opts.agentId, retained);
 				return rememberAgentArtifacts({
 					...result,
 					error: renderIsolationError({
@@ -714,8 +1035,33 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 	} catch (err) {
 		return rememberAgentArtifacts(opts.buildFailureResult(err));
 	} finally {
+		// Record what the caller already received so a later release commits only
+		// genuinely new work. Best-effort: a missing patch degrades to an
+		// unconditional re-capture, never to a lost workspace.
+		if (stateWritten && stateDir) {
+			const sessionFile = AgentRegistry.global().get(opts.agentId)?.sessionFile ?? undefined;
+			const childSessionId = sessionFile !== undefined ? await readSessionHeaderId(sessionFile) : undefined;
+			try {
+				await patchIsolationState(stateDir, {
+					...(sessionFile === undefined ? {} : { sessionFile }),
+					// A deferred handoff was never applied, so its fingerprint must
+					// not suppress the capture the `/integrate` signal performs.
+					...(handedOff === undefined || opts.deferredIntegration ? {} : { handedOff: String(handedOff) }),
+					...(childSessionId === undefined ? {} : { childSessionId }),
+					...(opts.deferredIntegration && deferredReady ? { deferredReady: true } : {}),
+				});
+			} catch (error) {
+				logger.debug("isolation state patch failed; a later release re-captures unconditionally", {
+					agentId: opts.agentId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		// A workspace with a descriptor is retained until an explicit release:
+		// run end (one-shot, shutdown, kill) never destroys it.
 		if (
 			workspace &&
+			!stateWritten &&
 			!retainWorkspace &&
 			!releasePromise &&
 			!(opts.baseOptions.keepAlive !== false && AgentLifecycleManager.global().has(opts.agentId))
@@ -785,6 +1131,9 @@ export interface IsolationMergeOutcome {
 export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise<IsolationMergeOutcome> {
 	const { result, repoRoot, mergeMode } = opts;
 	const repo = vcs.requireGit(repoRoot);
+	// A capture failure retains the workspace; naming it tells the parent the
+	// work is still recoverable instead of lost.
+	const retainedDir = AgentRegistry.global().get(result.id)?.history?.isolationDir;
 	try {
 		if (mergeMode === "branch") {
 			if (!result.branchName && result.exitCode === 0 && !result.aborted && result.error) {
@@ -794,6 +1143,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
 						error: result.error,
 						rootPatchPath: result.patchPath,
 						nestedPatchPaths: result.nestedPatchPaths,
+						...(retainedDir ? { retainedDir } : {}),
 					}),
 					changesApplied: false,
 					hadAnyChanges: false,
@@ -898,6 +1248,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
 				kind: "not-applied",
 				rootPatchPath: result.patchPath,
 				nestedPatchPaths: result.nestedPatchPaths,
+				...(retainedDir ? { retainedDir } : {}),
 			});
 		}
 		return { summary, changesApplied, hadAnyChanges, mergedBranchForNestedPatches: false };

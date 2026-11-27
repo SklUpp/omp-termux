@@ -4,7 +4,14 @@ import * as path from "node:path";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreesDir, isEnoent } from "@oh-my-pi/pi-utils";
-import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend } from "../task/isolation-ownership";
+import {
+	withIsolationLease,
+	hasLiveIsolationOwner,
+	ISOLATION_OWNER_FILE,
+	needsNativeTeardown,
+	readRetainedMountBackend,
+} from "../task/isolation-ownership";
+import { isolationSlotFromDirName, isolationStateExists, readIsolationState } from "../task/worktree";
 import { releaseOvnfsCheckout } from "../ovnfs/task-record";
 import type { ManagedWorktree } from "./backend";
 import { OVNFS_RECORD_DIR } from "./ovnfs-records";
@@ -22,6 +29,8 @@ interface DiskEntry {
 	branch?: string;
 	/** When set, the entry is unhealthy and `omp worktree clear` will remove it. */
 	orphanReason?: string;
+	retained?: boolean;
+	ownerAlive?: boolean;
 }
 
 /**
@@ -36,17 +45,26 @@ interface DiskEntry {
  * traversing a possibly live mount — the entry is then reported failed
  * with the error, data intact.
  */
-async function stopRetainedMount(dir: string): Promise<boolean> {
+export async function stopRetainedMount(dir: string): Promise<boolean> {
+	const isDir = (candidate: string): Promise<boolean> =>
+		fs
+			.stat(candidate)
+			.then(stat => stat.isDirectory())
+			.catch(() => false);
+	const descriptor = await readIsolationState(dir);
+	if ("error" in descriptor && descriptor.error !== "missing") throw new Error(descriptor.detail);
+	if ("state" in descriptor) {
+		if (!needsNativeTeardown(descriptor.state.backend)) return false;
+		const candidate = path.join(dir, descriptor.state.mergedDir);
+		if (!(await isDir(candidate))) return false;
+		await natives.isoStop(descriptor.state.backend, candidate);
+		return true;
+	}
 	const backend = await readRetainedMountBackend(dir);
 	if (backend === undefined) return false;
 	for (const name of TASK_ISOLATION_MOUNT_DIRS) {
 		const candidate = path.join(dir, name);
-		if (
-			await fs
-				.stat(candidate)
-				.then(stat => stat.isDirectory())
-				.catch(() => false)
-		) {
+		if (await isDir(candidate)) {
 			await natives.isoStop(backend, candidate);
 			return true;
 		}
@@ -63,10 +81,27 @@ async function removeEntry(entry: DiskEntry): Promise<void> {
 	const parent = entry.parentRepo ? vcs.git(entry.parentRepo) : null;
 	if (entry.kind === "pr-checkout" && !entry.orphanReason && (await parent?.worktreeRemove(entry.path, true))) return;
 	if (entry.kind === "task-isolation") {
-		await stopRetainedMount(entry.path);
-		await releaseOvnfsCheckout(entry.path);
+		const slot = isolationSlotFromDirName(path.basename(entry.path));
+		// Returns whether the sandbox was actually removed: a live owner or a
+		// descriptor means "kept", and `clear` must report that instead of
+		// counting the entry as removed.
+		const teardown = async (): Promise<boolean> => {
+			if (await hasLiveIsolationOwner(entry.path)) return false;
+			if (await isolationStateExists(entry.path)) return false;
+			await stopRetainedMount(entry.path);
+			await releaseOvnfsCheckout(entry.path);
+			await fs.rm(entry.path, { recursive: true, force: true });
+			return true;
+		};
+		const removed = slot ? await withIsolationLease(slot, teardown) : await teardown();
+		if (!removed) {
+			throw new Error(
+				"task-isolation workspace is owned by a live process or still holds state; use `omp worktree release`",
+			);
+		}
+	} else {
+		await fs.rm(entry.path, { recursive: true, force: true });
 	}
-	await fs.rm(entry.path, { recursive: true, force: true });
 	await parent?.worktreePrune().catch(() => {});
 }
 
@@ -145,12 +180,15 @@ async function classifyDir(dir: string): Promise<DiskEntry | null> {
 	}
 	if (!isIsolation) return null;
 	const live = await hasLiveIsolationOwner(dir);
+	const retained = await isolationStateExists(dir);
 	return {
 		path: dir,
 		kind: "task-isolation",
-		// Only after confirming no live owner is the "no live task" claim true.
-		// A running subagent's sandbox stays live so `clear` won't delete it.
-		orphanReason: live ? undefined : "task-isolation leftover (no live task owns it)",
+		retained,
+		ownerAlive: live,
+		// Live owners and retained descriptors stay out of orphan GC; clear --all
+		// still preserves both. Only an explicit release may tear them down.
+		orphanReason: live || retained ? undefined : "task-isolation leftover (no live task owns it)",
 	};
 }
 

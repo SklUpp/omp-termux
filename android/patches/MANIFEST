@@ -1,0 +1,10 @@
+# Active patch order: clean upstream -> 01..05 port slices -> 9x fork features
+# Entries whose base name starts with 9 are fork features and are excluded
+# from MANIFEST.standard.
+# This manifest is validated by android/scripts/apply-patches.sh
+01-bionic-rust.patch
+02-native-ipc.patch
+03-termux-api.patch
+04-repo-root.patch
+05-android-motion.patch
+90-isolation-retained.patch

@@ -10,15 +10,19 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { nativeWorkspace, runIsolatedSubprocess } from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
 import * as natives from "@oh-my-pi/pi-natives";
+import { getWorktreesDir, setWorktreesDir } from "@oh-my-pi/pi-utils";
+import { writeIsolationOwner } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
 import type { SingleResult } from "@oh-my-pi/pi-coding-agent/task/task-details";
 
 const tempRoots: string[] = [];
+const originalWorktreesDir = getWorktreesDir();
 /** Order of worktree captures and the run's IRC wake release. */
 let events: string[] = [];
 
 afterEach(async () => {
 	vi.restoreAllMocks();
 	events = [];
+	setWorktreesDir(originalWorktreesDir);
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
@@ -53,22 +57,47 @@ async function commitsAcrossRelease(
 ): Promise<number> {
 	const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-release-"));
 	tempRoots.push(artifactsDir);
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-release-root-"));
+	tempRoots.push(root);
+	setWorktreesDir(root);
+	const repo = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-release-repo-"));
+	tempRoots.push(repo);
+	const base = path.join(root, worktreeModule.getTaskIsolationSlot(repo, id));
+	const workspace = path.join(base, "m");
+	await fs.mkdir(workspace, { recursive: true });
+	await writeIsolationOwner(base, id);
+	const sessionFile = path.join(artifactsDir, `${id}.jsonl`);
 	const baseline = {
-		root: { repoRoot: "/repo", headCommit: "base", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
+		root: {
+			repoRoot: repo,
+			headCommit: "base",
+			staged: "",
+			unstaged: "",
+			untracked: [],
+			untrackedPatch: "",
+		},
 		nested: [],
 	};
 	vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
-		mergedDir: "/repo/isolated",
+		mergedDir: workspace,
 		backend: natives.IsoBackendKind.Rcopy,
 		fellBack: false,
 		fallbackReason: null,
 	});
 	vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(baseline);
 	vi.spyOn(worktreeModule, "cleanupIsolation").mockImplementation(options.cleanup ?? (async () => {}));
-	vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: releasePatch, nestedPatches: [] });
+	vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+		rootPatch: releasePatch,
+		nestedPatches: [],
+	});
 	const commitSpy = vi.spyOn(worktreeModule, "commitToBranch").mockImplementation(async () => {
 		events.push("commit");
-		return { branchName: `omp/task/${id}`, baseSha: "base", rootPatch: runEndPatch, nestedPatches: [] };
+		return {
+			branchName: `omp/task/${id}`,
+			baseSha: "base",
+			rootPatch: runEndPatch,
+			nestedPatches: [],
+		};
 	});
 	const session = {
 		prepareForHeadlessAdvisorDrain: () => {},
@@ -76,12 +105,13 @@ async function commitsAcrossRelease(
 		dispose: async () => {},
 	} as unknown as AgentSession;
 	vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+		await Bun.write(sessionFile, `${JSON.stringify({ type: "session", id: `session-${id}`, cwd: workspace })}\n`);
 		AgentRegistry.global().register({
 			id: options.id,
 			displayName: options.id,
 			kind: "sub",
 			session,
-			sessionFile: `/tmp/${options.id}.jsonl`,
+			sessionFile,
 			status: "running",
 		});
 		// A held peer message would wake a turn in the worktree once released.
@@ -101,13 +131,13 @@ async function commitsAcrossRelease(
 
 	await runIsolatedSubprocess({
 		baseOptions: {
-			cwd: "/repo",
+			cwd: repo,
 			agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
 			task: "Do work",
 			index: 0,
 			id,
 		},
-		context: { repoRoot: "/repo" },
+		context: { repoRoot: repo },
 		openWorkspace: nativeWorkspace(undefined),
 		agentId: id,
 		mergeMode: "branch",

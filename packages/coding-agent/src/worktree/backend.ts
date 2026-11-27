@@ -46,6 +46,10 @@ export interface ManagedWorktree {
 	parentRepo?: string;
 	branch?: string;
 	orphanReason?: string;
+	/** Isolation descriptor present: clear must preserve until explicit release. */
+	retained?: boolean;
+	/** Live lease holder still owns this task-isolation sandbox. */
+	ownerAlive?: boolean;
 	/** Teardown uses the owning backend, never the current creation preference. */
 	remove(): Promise<void>;
 }

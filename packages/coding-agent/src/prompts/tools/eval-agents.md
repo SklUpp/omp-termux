@@ -26,6 +26,7 @@ await agent(prompt, { agent?, label?, schema?, schemaMode?, isolated?, apply?, m
   - `{{#if py}}schema_mode{{else}}schemaMode{{/if}}`: "permissive" warns after retries, "strict" fails; omitted → session setting, else "permissive".
   - `isolated` runs it in a worktree (requires `task.isolation.enabled`).
   - `{{#if py}}apply=False{{else}}apply: false{{/if}}` keeps its changes as patch/branch artifacts instead of applying them.
+  - With `task.isolation.deferIntegration` enabled, an apply run holds its changes until the parent writes `/integrate` to `worktree://<id>`.
   - `{{#if py}}merge=False{{else}}merge: false{{/if}}` forces patch mode, otherwise `task.isolation.merge` decides.
 {{#if evalTools}}
   - `tools`: names of tools you defined with {{#ifAll py js}}`@tool` / `tool(fn)`{{else}}{{#if py}}`@tool`{{else}}`tool(fn)`{{/if}}{{/ifAll}} that the child may call.

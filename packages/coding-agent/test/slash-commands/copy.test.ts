@@ -113,6 +113,17 @@ describe("/copy slash command", () => {
 		expect(harness.showStatus).toHaveBeenCalledWith("No link to copy.");
 	});
 
+	it("reports a rejected copy and still clears the submitted text", async () => {
+		spyOn(clipboard, "copyToClipboard").mockRejectedValue(new Error("no clipboard channel"));
+		const harness = createRuntimeHarness([assistantText("```ts\nconst value = 1;\n```")]);
+
+		expect(await executeBuiltinSlashCommand("/copy code", harness.runtime)).toBe(true);
+
+		expect(harness.showWarning).toHaveBeenCalledWith("Copy failed: no clipboard channel");
+		expect(harness.showStatus).not.toHaveBeenCalledWith("Copied code block to clipboard");
+		expect(harness.setText).toHaveBeenCalledWith("");
+	});
+
 	it("creates and copies the session's local:// directory with /copy local", async () => {
 		const copySpy = spyOn(clipboard, "copyToClipboard").mockResolvedValue(undefined);
 		using tempDir = TempDir.createSync("@pi-copy-local-");

@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { logger } from "@oh-my-pi/pi-utils";
+import { getWorktreesDir, logger } from "@oh-my-pi/pi-utils";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
 import { validateAgentAccountPools } from "../config/account-pools";
 import type { Model } from "@oh-my-pi/pi-ai";
@@ -18,7 +18,7 @@ import { MCPManager } from "../mcp/manager";
 import { initializeExtensions } from "../modes/runtime-init";
 import type { AsyncJobManagerApi } from "../async";
 import type { PreparedExtension } from "../extensibility/extensions/types";
-import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
+import type { AgentReviver, PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
@@ -58,6 +58,9 @@ import {
 } from "./model-approval";
 import { cfgTaskAgentAccountPools, cfgTaskMaxEffort } from "./settings";
 import type { AgentDefinition } from "./types";
+import { claimIsolationOwner } from "./isolation-ownership";
+import { releaseIsolationWorkspace } from "./isolation-runner";
+import { resolveIsolationWorkspace, type LoadedIsolationState } from "./worktree";
 
 /**
  * Ambient context the reviver needs at revive time. The top-level session is
@@ -109,6 +112,12 @@ export interface PersistedReviveSpec {
 	readonly enableLsp: boolean;
 	readonly eventBus: EventBus | undefined;
 	readonly subagentEventBus: EventBus | undefined;
+	/** Retained isolation workspace this run revives into; absent for an unisolated run. */
+	readonly isolation?: LoadedIsolationState;
+	/** Working directory of {@link isolation} (the sandbox, not the parent cwd). */
+	readonly workspaceDir?: string;
+	/** System prompt rebound to {@link workspaceDir} after retention renamed it. */
+	readonly systemPrompt?: readonly string[];
 }
 
 /**
@@ -144,6 +153,17 @@ export function persistedAgentDefinition(displayName: string, init: PersistedSes
 }
 
 /**
+ * The persisted prompt was rendered at spawn, before retention renamed the
+ * workspace. Rebind those old path occurrences to the workspace the descriptor
+ * now proves, so revived instructions and the session cwd describe the SAME
+ * directory instead of pointing the agent at a path that no longer exists.
+ */
+function rebindWorkspacePrompt(prompt: string[], staleWorkspace: string, workspaceDir: string): string[] {
+	if (staleWorkspace === workspaceDir) return prompt;
+	return prompt.map(block => block.split(staleWorkspace).join(workspaceDir));
+}
+
+/**
  * Build the factory the {@link AgentLifecycleManager} uses to cold-revive a
  * `parked` subagent ref restored from disk (Agent Hub scan, collab mirror, or a
  * resumed process). Such a ref carries a sessionFile but no in-memory adoption —
@@ -171,17 +191,30 @@ export function createPersistedSubagentReviverFactory(
 		// is gone (isolated/merged worktree, moved dir): leave it transcript-only
 		// (history://) rather than resurrect a wrong or broken session.
 		if (!peek?.init) return undefined;
-		// Isolated runs are never resumable: their worktree is merged + cleaned,
-		// and the parent was told messaging is impossible. A retained workspace
-		// (capture/persist failure) still exists on disk and would pass the cwd
-		// probe below, so gate on the stamped contract instead — otherwise a
-		// restart + peer message revives the agent outside isolation, in the
-		// parent cwd, contradicting the delivery notice.
-		if (peek.init.isolated) return undefined;
-		try {
-			await fs.stat(peek.cwd);
-		} catch {
-			return undefined;
+		// An isolated run revives only onto its retained workspace: the
+		// descriptor keeps the baseline a later release must capture against and
+		// the backend it must stop. Missing/broken state refuses with the reason
+		// instead of silently resurrecting the agent in the parent cwd.
+		const isolation = peek.init.isolated ? await resolveIsolationWorkspace(sessionFile, ref.id, peek.cwd) : undefined;
+		if (isolation && "refusal" in isolation) {
+			throw new Error(
+				`Cannot revive subagent "${ref.id}": ${isolation.refusal}. Its transcript remains readable at history://${ref.id}.`,
+			);
+		}
+		const isolationState = isolation && "state" in isolation ? isolation : undefined;
+		const systemPrompt = isolationState
+			? rebindWorkspacePrompt(
+					peek.init.systemPrompt,
+					path.join(getWorktreesDir(), isolationState.state.slot, isolationState.state.mergedDir),
+					isolationState.workspaceDir,
+				)
+			: peek.init.systemPrompt;
+		if (!isolationState) {
+			try {
+				await fs.stat(peek.cwd);
+			} catch {
+				return undefined;
+			}
 		}
 		// taskDepth drives real capability gating (task-spawn allowance, memory
 		// startup, …); derive it from the persisted parent chain rather than
@@ -194,7 +227,12 @@ export function createPersistedSubagentReviverFactory(
 			taskDepth++;
 			parentId = registry.get(parentId)?.parentId;
 		}
-		return async expectedRef => {
+		const revive: AgentReviver = async expectedRef => {
+			// Claim before opening the transcript: an unowned marker would let
+			// `worktree clear` reclaim a workspace this session is about to use.
+			if (isolationState) {
+				await claimIsolationOwner(isolationState.state.dir, ref.id, isolationState.state.slot);
+			}
 			// Live root state is read per revive, so a later `/new` or cwd move is followed.
 			const spec: PersistedReviveSpec = {
 				id: ref.id,
@@ -214,6 +252,13 @@ export function createPersistedSubagentReviverFactory(
 				enableLsp: ctx.enableLsp,
 				eventBus: ctx.eventBus,
 				subagentEventBus: ctx.subagentEventBus,
+				...(isolationState
+					? {
+							isolation: isolationState.state,
+							workspaceDir: isolationState.workspaceDir,
+							systemPrompt,
+						}
+					: {}),
 			};
 			// Worker mode: a revival is placed like a fresh spawn (main thread or a worker).
 			const pool = subagentWorkerPool(ctx.settings);
@@ -221,6 +266,20 @@ export function createPersistedSubagentReviverFactory(
 				? revivePersistedPlaced(pool, spec, expectedRef, revivePersistedSubagent)
 				: revivePersistedSubagent(spec, expectedRef);
 		};
+		if (!isolationState) return revive;
+		// The cold release owns exactly what the revived run owns: capture the
+		// delta against the persisted baseline and stop the recorded backend.
+		// `retain` (kill tombstone, shutdown) leaves both for a later release.
+		return Object.assign(revive, {
+			onRelease: async (opts?: { retain?: boolean }) => {
+				if (opts?.retain) return;
+				await releaseIsolationWorkspace(isolationState.state, {
+					artifactsDir: path.dirname(sessionFile),
+					// Trusted independently of the descriptor: the ref's transcript.
+					expectedSessionFile: sessionFile,
+				});
+			},
+		});
 	};
 }
 
@@ -402,7 +461,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	let session: AgentSession;
 	try {
 		({ session } = await createAgentSession({
-			cwd: spec.root.sessionManager.getCwd(),
+			cwd: spec.workspaceDir ?? spec.root.sessionManager.getCwd(),
 			costGate: spec.costGate,
 			authStorage: spec.authStorage,
 			// Revived agents join the root session tree, so their observability
@@ -445,7 +504,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			outputSchemaMode: init.outputSchemaMode,
 			restrictToolNames: restrictToolNames || undefined,
 			requireYieldTool: usesYield(init.outputSchema),
-			systemPrompt: () => [...init.systemPrompt],
+			systemPrompt: () => [...(spec.systemPrompt ?? init.systemPrompt)],
 			// Inherit current owner policy, never extension authority from a transcript.
 			extensionRoots: () => spec.root.effectiveExtensionRoots,
 			preloadedPreparedExtensions: spec.preparedExtensions,
@@ -516,7 +575,10 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	registry.syncSessionStatus(ref.id, session);
 	attachIrcWakeTurnMonitor(session, {
 		id: ref.id,
-		agent: persistedAgentDefinition(ref.displayName, init),
+		agent: persistedAgentDefinition(
+			ref.displayName,
+			spec.systemPrompt ? { ...init, systemPrompt: [...spec.systemPrompt] } : init,
+		),
 		completionProbe: isCompletionProbeEnabled(spec.settings, taskDepth - 1),
 		...softRequestBudgetFor(persistedAgentName(ref.displayName, init), spec.settings),
 		eventBus: spec.eventBus,
