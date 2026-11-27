@@ -16,10 +16,12 @@ on:
         type: string
         default: extended
 
-# Keep PR feedback current; never cancel main pushes or manual runs.
+# A newer run on the same branch supersedes a stale one, so a rerun starts at
+# once instead of queueing behind a run that already failed. Release checkouts
+# (`workflow_call`) keep a unique group: cancelling them would abort a release.
 concurrency:
-  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || (github.event_name == 'workflow_call' && format('call-{0}', github.run_id) || github.ref_name) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -55,6 +57,10 @@ jobs:
       - name: Validate release inputs
         run: python3 android/scripts/check-release-inputs.py
       - uses: ./.github/actions/bun-install
+      # Cheapest gate of the heavy job: a type error fails here in ~2 minutes
+      # instead of after the native addon build.
+      - name: Type check applied patch queue
+        run: bun run ci:check:full
       # Lightweight synthetic installer regression: stubbed curl/pkg/uname with
       # real tar/sha256sum, no network and no native build. Runs before the
       # heavy addon build so installer breakage fails fast.
@@ -83,8 +89,6 @@ jobs:
           cargo test --profile local -p "$natives" -p "$builtins" --lib 'ipc::'
       - name: Run native IPC integration tests
         run: bun test ./packages/natives/test/ipc.test.ts
-      - name: Type check applied patch queue
-        run: bun run ci:check:full
       - name: Build applied collab web
         run: bun run collab:web:build
       - name: Run applied overlay tests
