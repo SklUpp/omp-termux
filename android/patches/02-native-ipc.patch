@@ -584,7 +584,7 @@ index 332b982..3703f89 100644
 +	}
 +}
 diff --git a/packages/natives/native/index.js b/packages/natives/native/index.js
-index c519335..c3a6b31 100644
+index 1e7a626..7169799 100644
 --- a/packages/natives/native/index.js
 +++ b/packages/natives/native/index.js
 @@ -23,8 +23,12 @@ import { adaptDesktopSession } from "./desktop-adapter.js";
@@ -624,9 +624,9 @@ index c519335..c3a6b31 100644
  export const cosineSimilarityPairs = nativeBindings.cosineSimilarityPairs ?? missingNativeExport("cosineSimilarityPairs");
  export const countTokens = nativeBindings.countTokens ?? missingNativeExport("countTokens");
  export const decodeSixelToPng = nativeBindings.decodeSixelToPng ?? missingNativeExport("decodeSixelToPng");
-@@ -140,7 +148,9 @@ export const parseKey = nativeBindings.parseKey ?? missingNativeExport("parseKey
- export const parseKittySequence = nativeBindings.parseKittySequence ?? missingNativeExport("parseKittySequence");
- export const pdfToMarkdown = nativeBindings.pdfToMarkdown ?? missingNativeExport("pdfToMarkdown");
+@@ -144,7 +152,9 @@ export const pdfToMarkdown = nativeBindings.pdfToMarkdown ?? missingNativeExport
+ export const processInfo = nativeBindings.processInfo ?? missingNativeExport("processInfo");
+ export const processOutputFiles = nativeBindings.processOutputFiles ?? missingNativeExport("processOutputFiles");
  export const rasterizeSvg = nativeBindings.rasterizeSvg ?? missingNativeExport("rasterizeSvg");
 -export const readImageFromClipboard = nativeBindings.readImageFromClipboard ?? missingNativeExport("readImageFromClipboard");
 +export const readImageFromClipboard = process.platform === "android"
@@ -636,7 +636,7 @@ index c519335..c3a6b31 100644
  export const reapChild = nativeBindings.reapChild ?? missingNativeExport("reapChild");
  export const renderMermaidAscii = nativeBindings.renderMermaidAscii ?? missingNativeExport("renderMermaidAscii");
 diff --git a/packages/natives/native/loader-state.js b/packages/natives/native/loader-state.js
-index f10eac3..549b1f7 100644
+index c24cff6..f06b595 100644
 --- a/packages/natives/native/loader-state.js
 +++ b/packages/natives/native/loader-state.js
 @@ -38,6 +38,7 @@ const SUPPORTED_PLATFORMS = [

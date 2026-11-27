@@ -142,7 +142,7 @@ for needle in (
     if needle not in clipboard_source:
         raise SystemExit(f"overlay verification failed: clipboard contract missing: {needle}")
 
-terminal_source = read_required("packages/tui/src/active-terminal.ts")
+terminal_source = read_required("packages/tui/src/driver/session.ts")
 if "export function writeTerminalSequence(data: string): boolean" not in terminal_source:
     raise SystemExit("overlay verification failed: writeTerminalSequence cannot report emission")
 

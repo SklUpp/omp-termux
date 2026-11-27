@@ -153,7 +153,7 @@ jobs:
   # requires the workflow file there. Runs only when ci.yml is manually
   # dispatched on the refresh branch; preflights reuse this file's own
   # quality-check/android-overlay-check jobs (never re-enter ci.yml), build the
-  # extended (01..04+90) profile and upload a release-identical bundle. No tags or
+  # extended (01..05+90) profile and upload a release-identical bundle. No tags or
   # releases are created and nothing is published.
   profile-compat:
     name: Patch profile compatibility (${{ matrix.profile }})

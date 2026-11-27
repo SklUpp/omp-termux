@@ -1,5 +1,5 @@
 diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src/task/index.ts
-index 912ca74..bc9ef4d 100644
+index 24a4688..65f34ce 100644
 --- a/packages/coding-agent/src/task/index.ts
 +++ b/packages/coding-agent/src/task/index.ts
 @@ -357,6 +357,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
@@ -22,7 +22,7 @@ index 912ca74..bc9ef4d 100644
  	if (params.context !== undefined) spawn.context = params.context;
  	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
  	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
-@@ -1012,7 +1018,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1003,7 +1009,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  			...spawnModelFields(params),
  			...this.#resultParams(params),
  			...this.#effortParams(params),
@@ -31,7 +31,7 @@ index 912ca74..bc9ef4d 100644
  			blockedAgent: this.#blockedAgent,
  			enableLsp: this.session.enableLsp ?? true,
  			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
-@@ -1099,7 +1105,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1090,7 +1096,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  				try {
  					return { policy: await this.#resolveSpawnPreflight(spawn) };
  				} catch (error) {
@@ -42,7 +42,7 @@ index 912ca74..bc9ef4d 100644
  				}
  			}),
  		);
-@@ -1901,7 +1909,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1892,7 +1900,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  				...(onArtifactsRetained ? { onArtifactsRetained } : {}),
  				invokedAt: launchTiming?.invokedAt,
  				acquiredAt: launchTiming?.acquiredAt,
@@ -52,7 +52,7 @@ index 912ca74..bc9ef4d 100644
  				enableLsp: this.session.enableLsp ?? true,
  				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/coding-agent/src/task/isolation-runner.ts
-index 16a98ac..5f3c11b 100644
+index bc5512b..b33d604 100644
 --- a/packages/coding-agent/src/task/isolation-runner.ts
 +++ b/packages/coding-agent/src/task/isolation-runner.ts
 @@ -145,8 +145,8 @@ export interface IsolationContext {
@@ -67,7 +67,7 @@ index 16a98ac..5f3c11b 100644
  
  /** Fingerprint of a captured delta, used to skip re-committing an unchanged workspace on release. */
 diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/coding-agent/src/task/structured-subagent.ts
-index 938d10a..4efc1cd 100644
+index daea3a3..bae850f 100644
 --- a/packages/coding-agent/src/task/structured-subagent.ts
 +++ b/packages/coding-agent/src/task/structured-subagent.ts
 @@ -113,6 +113,7 @@ export interface StructuredSubagentIsolationControls {
@@ -86,7 +86,7 @@ index 938d10a..4efc1cd 100644
  	mergeMode: "patch" | "branch";
  	applyChanges: boolean;
  	enableLsp: boolean;
-@@ -322,7 +324,10 @@ function assertPlanControlsAllowed(request: StructuredSubagentRequest, planMode:
+@@ -337,7 +339,10 @@ function assertPlanControlsAllowed(request: StructuredSubagentRequest, planMode:
  	const isolation = request.isolation;
  	if (
  		isolation &&
@@ -98,7 +98,7 @@ index 938d10a..4efc1cd 100644
  	) {
  		throw new StructuredSubagentError(
  			"preflight",
-@@ -629,6 +634,7 @@ export async function resolveEffectiveSubagentPolicy(
+@@ -620,6 +625,7 @@ export async function resolveEffectiveSubagentPolicy(
  		schema,
  		planMode,
  		isIsolated,
@@ -106,7 +106,7 @@ index 938d10a..4efc1cd 100644
  		mergeMode: request.isolation?.merge ?? cfgTaskIsolationMerge.get(request.session.settings),
  		applyChanges:
  			request.isolation?.apply ??
-@@ -1023,7 +1029,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
+@@ -1015,7 +1021,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
  		let isolationContext: IsolationContext | null = null;
  		if (policy.isIsolated) {
  			try {
@@ -116,10 +116,10 @@ index 938d10a..4efc1cd 100644
  				const message = error instanceof Error ? error.message : String(error);
  				throw new StructuredSubagentError(
 diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src/task/types.ts
-index 9dad59b..0e51716 100644
+index d18fc21..4ab80f5 100644
 --- a/packages/coding-agent/src/task/types.ts
 +++ b/packages/coding-agent/src/task/types.ts
-@@ -67,6 +67,7 @@ export const taskItemSchema = type({
+@@ -61,6 +61,7 @@ export const taskItemSchema = type({
  	agent: "string = 'task'",
  	task: "string",
  	solutionSpace: "string",
@@ -127,7 +127,7 @@ index 9dad59b..0e51716 100644
  	"outputSchema?": outputSchemaInputSchema,
  	"schemaMode?": '"permissive" | "strict"',
  	"tools?": "string[]",
-@@ -77,6 +78,7 @@ const taskItemSchemaIsolated = type({
+@@ -71,6 +72,7 @@ const taskItemSchemaIsolated = type({
  	agent: "string = 'task'",
  	task: "string",
  	solutionSpace: "string",
@@ -135,7 +135,7 @@ index 9dad59b..0e51716 100644
  	"outputSchema?": outputSchemaInputSchema,
  	"schemaMode?": '"permissive" | "strict"',
  	"tools?": "string[]",
-@@ -89,6 +91,7 @@ export const taskSchema = type({
+@@ -83,6 +85,7 @@ export const taskSchema = type({
  	agent: "string = 'task'",
  	task: "string",
  	solutionSpace: "string",
@@ -143,7 +143,7 @@ index 9dad59b..0e51716 100644
  	"outputSchema?": outputSchemaInputSchema,
  	"schemaMode?": '"permissive" | "strict"',
  	"tools?": "string[]",
-@@ -100,6 +103,7 @@ const taskSchemaNoIsolation = type({
+@@ -94,6 +97,7 @@ const taskSchemaNoIsolation = type({
  	agent: "string = 'task'",
  	task: "string",
  	solutionSpace: "string",
@@ -151,7 +151,7 @@ index 9dad59b..0e51716 100644
  	"outputSchema?": outputSchemaInputSchema,
  	"schemaMode?": '"permissive" | "strict"',
  	"tools?": "string[]",
-@@ -161,6 +165,11 @@ function createTaskSchema(options: {
+@@ -155,6 +159,11 @@ function createTaskSchema(options: {
  }): BaseType {
  	const agent = taskAgentSchemaRule(options.defaultAgent);
  	const taskFields = options.steps ? { steps: "string[]" } : { task: "string" };
@@ -163,7 +163,7 @@ index 9dad59b..0e51716 100644
  	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
  	const schemaFields = options.structured
  		? { "outputSchema?": outputSchemaInputSchema, "schemaMode?": '"permissive" | "strict"' }
-@@ -177,6 +186,7 @@ function createTaskSchema(options: {
+@@ -171,6 +180,7 @@ function createTaskSchema(options: {
  				"name?": "string",
  				agent,
  				...taskFields,
@@ -171,7 +171,7 @@ index 9dad59b..0e51716 100644
  				solutionSpace: "string",
  				...effortField,
  				...schemaFields,
-@@ -197,6 +207,7 @@ function createTaskSchema(options: {
+@@ -191,6 +201,7 @@ function createTaskSchema(options: {
  			"name?": "string",
  			agent,
  			...taskFields,
@@ -179,7 +179,7 @@ index 9dad59b..0e51716 100644
  			solutionSpace: "string",
  			...effortField,
  			...schemaFields,
-@@ -217,6 +228,7 @@ function createTaskSchema(options: {
+@@ -211,6 +222,7 @@ function createTaskSchema(options: {
  			"name?": "string",
  			agent,
  			...taskFields,
@@ -187,7 +187,7 @@ index 9dad59b..0e51716 100644
  			solutionSpace: "string",
  			...effortField,
  			...schemaFields,
-@@ -230,6 +242,7 @@ function createTaskSchema(options: {
+@@ -224,6 +236,7 @@ function createTaskSchema(options: {
  		"name?": "string",
  		agent,
  		...taskFields,
@@ -196,7 +196,7 @@ index 9dad59b..0e51716 100644
  		...effortField,
  		...schemaFields,
 diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/src/task/worktree.ts
-index c2fd953..dea777e 100644
+index 9e310f7..4a64915 100644
 --- a/packages/coding-agent/src/task/worktree.ts
 +++ b/packages/coding-agent/src/task/worktree.ts
 @@ -52,23 +52,41 @@ export interface WorktreeBaseline {
@@ -246,7 +246,7 @@ index c2fd953..dea777e 100644
  	// A linked work tree's git dir differs from the common dir; git ignores
  	// `core.bare` there, so only the main git dir can be bare.
  	if (gitDir === commonDir && isGitTrue(await repo.configGet("core.bare"))) {
-@@ -667,8 +685,9 @@ export async function ensureIsolation(
+@@ -663,8 +681,9 @@ export async function ensureIsolation(
  	baseCwd: string,
  	id: string,
  	preferred?: IsoBackendKind,
@@ -257,7 +257,7 @@ index c2fd953..dea777e 100644
  	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
  	const baseDir = taskIsolationBaseDir(repoRoot, id);
  	const mergedDir = path.join(baseDir, TASK_ISOLATION_MOUNT_DIR);
-diff --git a/packages/coding-agent/test/repo-root-isolation.test.ts b/packages/coding-agent/test/repo-root-isolation.test.ts
+diff --git b/packages/coding-agent/test/repo-root-isolation.test.ts b/packages/coding-agent/test/repo-root-isolation.test.ts
 new file mode 100644
 index 0000000..c71b3bd
 --- /dev/null
@@ -299,25 +299,3 @@ index 0000000..c71b3bd
 +		expect(content).toContain("Explicit repoRoot");
 +	});
 +});
-diff --git a/packages/tui/src/tools/task.ts b/packages/tui/src/tools/task.ts
-index 662843a..66d82d3 100644
---- a/packages/tui/src/tools/task.ts
-+++ b/packages/tui/src/tools/task.ts
-@@ -2275,6 +2275,8 @@ export interface TaskItem {
- 	tools?: string[];
- 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
- 	isolated?: boolean;
-+	/** Optional explicit git repository root for task isolation. */
-+	repoRoot?: string;
- }
- 
- /**
-@@ -2310,6 +2312,8 @@ export interface TaskParams {
- 	context?: string;
- 	/** Run in an isolated worktree (flat form; per-item in batch form). */
- 	isolated?: boolean;
-+	/** Explicit repository root (flat form or batch context override). */
-+	repoRoot?: string;
- }
- 
- /**

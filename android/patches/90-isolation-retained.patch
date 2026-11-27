@@ -269,10 +269,10 @@ index 72c4f06..1262bfb 100644
  			const { failed } = await clearWorktrees({
  				all: flags.all ?? false,
 diff --git a/packages/coding-agent/src/config/settings-ui.ts b/packages/coding-agent/src/config/settings-ui.ts
-index 209d08a..b505bfc 100644
+index e7bfd6f..b5d0cde 100644
 --- a/packages/coding-agent/src/config/settings-ui.ts
 +++ b/packages/coding-agent/src/config/settings-ui.ts
-@@ -17,7 +17,7 @@ import { cfgMemoryBackend } from "../memory-backend/settings";
+@@ -14,7 +14,7 @@ import { cfgMemoryBackend } from "../memory-backend/settings";
  import { cfgComposerPredictions, cfgTuiVimMode } from "../modes/settings";
  import { cfgAdvisorEnabled } from "../advisor/settings";
  import { cfgContextFilesExtra } from "../session/context-settings";
@@ -280,8 +280,8 @@ index 209d08a..b505bfc 100644
 +import { cfgTaskIsolationApply, cfgTaskPerCallModelAllow } from "../task/settings";
  import { cfgToolsRestrictedFolders } from "../tools/settings";
  import { cfgAuthUnpausedProviders } from "./model-settings";
- 
-@@ -40,6 +40,7 @@ const CONDITIONS: Record<string, () => boolean> = {
+ import { nativeRendering } from "@oh-my-pi/pi-tui";
+@@ -39,6 +39,7 @@ const CONDITIONS: Record<string, () => boolean> = {
  	usageAwareFallbackEnabled: whenSettings(s => cfgRetryUsageAwareFallback.get(s) === true),
  	planModeEnabled: whenSettings(s => cfgPlanEnabled.get(s)),
  	planAutosaveEnabled: whenSettings(s => cfgPlanEnabled.get(s) && cfgPlanAutosave.get(s)),
@@ -290,32 +290,18 @@ index 209d08a..b505bfc 100644
  	contextFilesExtraNotProject: whenSettings(s => cfgContextFilesExtra.provenance(s) !== "project"),
  	restrictedFoldersNotProject: whenSettings(s => cfgToolsRestrictedFolders.provenance(s) !== "project"),
 diff --git a/packages/coding-agent/src/internal-urls/agent-protocol.ts b/packages/coding-agent/src/internal-urls/agent-protocol.ts
-index 30175f7..f94a01e 100644
+index 2145b8c..1b2ba44 100644
 --- a/packages/coding-agent/src/internal-urls/agent-protocol.ts
 +++ b/packages/coding-agent/src/internal-urls/agent-protocol.ts
-@@ -30,6 +30,7 @@ import { executeSend, isIrcEnabled } from "../irc/messaging";
+@@ -32,6 +32,7 @@ import { executeSend, isIrcEnabled } from "../irc/messaging";
  import { agentMesh } from "../irc/mesh";
  import { formatPeerAddress, type PeerAddress } from "../irc/mesh-protocol";
- import type { AgentSessionHandle } from "../session/agent-session-handle";
+ import type { AgentKindModelChange, AgentModelChange, AgentSessionHandle } from "../session/agent-session-handle";
 +import { isDeferredIntegrationSignal } from "../task/deferred-integration";
- import { cfgTaskCrossInstance } from "../task/settings";
- import agentPromptDoc from "../prompts/internal-urls/agent.md" with { type: "text" };
- import agentProgressTemplate from "../prompts/tools/agent-url-progress.md" with { type: "text" };
-@@ -268,12 +269,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
- 		if (!session) throw new Error("agent:// messaging requires a tool session");
- 		const registry = session.agentRegistry;
- 		const senderId = session.getAgentId?.();
--		if (
--			!registry ||
--			!senderId ||
--			session.enableIrc === false ||
--			!isIrcEnabled(session.settings, session.taskDepth ?? 0)
--		) {
-+		if (!registry || !senderId) {
- 			throw new Error("Peer messaging is unavailable in this session.");
- 		}
- 		const pid = cfgTaskCrossInstance.get(session.settings) ? pidTarget(url) : undefined;
-@@ -290,6 +286,16 @@ export class AgentProtocolHandler implements ProtocolHandler {
+ import { discoverAgents, getAgent } from "../task/discovery";
+ import { cfgTaskAgentModelOverrides, cfgTaskCrossInstance, cfgTaskDisabledAgents } from "../task/settings";
+ import { spawnDenial } from "../task/spawn-policy";
+@@ -377,6 +378,13 @@ export class AgentProtocolHandler implements ProtocolHandler {
  		const progress = url.searchParams.has("progress");
  		if (progress && to === "all") throw new Error("agent://all broadcasts cannot be ?progress updates.");
  		if (!content.trim()) throw new Error("agent:// messages require non-empty content.");
@@ -326,17 +312,14 @@ index 30175f7..f94a01e 100644
 +				`${content.trim()} is an isolation-manager signal, not a message: call write with ${JSON.stringify({ path: `worktree://${to}`, content: content.trim() })}.`,
 +			);
 +		}
-+		if (session.enableIrc === false || !isIrcEnabled(session.settings, session.taskDepth ?? 0)) {
-+			throw new Error("Peer messaging is unavailable in this session.");
-+		}
  		// A spawn waiting for a slot (or still opening its session) has a job but
  		// no live session yet: hold the message for its run to take on start.
  		const recipient = registry.get(to);
 diff --git a/packages/coding-agent/src/internal-urls/router.ts b/packages/coding-agent/src/internal-urls/router.ts
-index d4c45ac..10f10bb 100644
+index 08f4fac..c1d79dd 100644
 --- a/packages/coding-agent/src/internal-urls/router.ts
 +++ b/packages/coding-agent/src/internal-urls/router.ts
-@@ -36,6 +36,7 @@ import { RuleProtocolHandler } from "./rule-protocol";
+@@ -34,6 +34,7 @@ import { RuleProtocolHandler } from "./rule-protocol";
  import { SecurityProtocolHandler } from "./security-protocol";
  import { SkillProtocolHandler } from "./skill-protocol";
  import { SshProtocolHandler } from "./ssh-protocol";
@@ -344,7 +327,7 @@ index d4c45ac..10f10bb 100644
  import type {
  	InternalResource,
  	InternalUrl,
-@@ -115,6 +116,7 @@ export class InternalUrlRouter {
+@@ -104,6 +105,7 @@ export class InternalUrlRouter {
  		this.register(new HistoryProtocolHandler());
  		this.register(new LocalProtocolHandler());
  		this.register(new ProcProtocolHandler());
@@ -459,6 +442,23 @@ index 0000000..429b37c
 +	}
 +	return id;
 +}
+diff --git a/packages/coding-agent/src/modes/settings.ts b/packages/coding-agent/src/modes/settings.ts
+index 2832717..f6779c6 100644
+--- a/packages/coding-agent/src/modes/settings.ts
++++ b/packages/coding-agent/src/modes/settings.ts
+@@ -689,11 +689,7 @@ export const cfgTuiMotion = register({
+ 	id: "tui.motion",
+ 	type: "enum",
+ 	values: MOTION_MODES,
+-	// Android terminals redraw the whole surface for an animated title, and the
+-	// title spinner alone costs frames on a phone; start static. An explicit
+-	// `tui.motion` or `tui.spinnerInterval` still wins, and the title still
+-	// tracks idle/working/attention transitions.
+-	default: process.platform === "android" ? "none" : "full",
++	default: "full",
+ 	env: "PI_MOTION",
+ 	ui: {
+ 		tab: "appearance",
 diff --git b/packages/coding-agent/src/prompts/internal-urls/worktree.md b/packages/coding-agent/src/prompts/internal-urls/worktree.md
 new file mode 100644
 index 0000000..c41f9b6
@@ -844,10 +844,10 @@ index 2d8950f..e589db9 100644
  					await untilAborted(AbortSignal.timeout(Math.max(0, deadlineAt - Date.now())), () => release);
  				} catch (error) {
 diff --git a/packages/coding-agent/src/registry/agent-registry.ts b/packages/coding-agent/src/registry/agent-registry.ts
-index a3d5fd4..235d5a0 100644
+index 69f1fec..b8e2b3a 100644
 --- a/packages/coding-agent/src/registry/agent-registry.ts
 +++ b/packages/coding-agent/src/registry/agent-registry.ts
-@@ -58,10 +58,22 @@ export interface AgentHistorySummary {
+@@ -57,10 +57,22 @@ export interface AgentHistorySummary {
  	outputPath?: string;
  	/** Captured isolated-worktree patch, when patch capture succeeded. */
  	patchPath?: string;
@@ -870,71 +870,11 @@ index a3d5fd4..235d5a0 100644
  }
  
  export interface AgentRef {
-diff --git a/packages/coding-agent/src/registry/persisted-agents.ts b/packages/coding-agent/src/registry/persisted-agents.ts
-index 7091edb..59e7dd2 100644
---- a/packages/coding-agent/src/registry/persisted-agents.ts
-+++ b/packages/coding-agent/src/registry/persisted-agents.ts
-@@ -323,6 +323,25 @@ function nestedPatchFilesFor(dir: string, transcriptName: string, entries: reado
- 		.map(name => path.join(dir, name));
- }
- 
-+/**
-+ * Workspace a retained isolated transcript can still resume in. The pointer
-+ * beside the transcript names the sandbox (retention renames it), and a
-+ * missing workspace reads as "not revivable" without touching the descriptor:
-+ * this runs per roster row, so it must never parse a multi-GiB baseline.
-+ */
-+async function persistedIsolationDir(sessionFile: string): Promise<string | undefined> {
-+	const id = path.basename(sessionFile, ".jsonl");
-+	try {
-+		const pointer: unknown = await Bun.file(path.join(path.dirname(sessionFile), `${id}.isolation.json`)).json();
-+		if (pointer === null || typeof pointer !== "object" || !("workspace" in pointer)) return undefined;
-+		const workspace = pointer.workspace;
-+		if (typeof workspace !== "string") return undefined;
-+		return (await fs.promises.stat(workspace)).isDirectory() ? workspace : undefined;
-+	} catch {
-+		return undefined;
-+	}
-+}
-+
- /**
-  * Read only the small session prefix needed by the Hub. A subagent's first
-  * `session_init` is written before its conversation, so this never walks a
-@@ -346,7 +365,11 @@ async function readPersistedAgentMetadata(
- 	const artifactBase = sessionFile.slice(0, -".jsonl".length);
- 	const outputPath = `${artifactBase}.md`;
- 	const patchPath = `${artifactBase}.patch`;
--	const artifactFiles = Promise.all([Bun.file(outputPath).exists(), Bun.file(patchPath).exists()]);
-+	const artifactFiles = Promise.all([
-+		Bun.file(outputPath).exists(),
-+		Bun.file(patchPath).exists(),
-+		persistedIsolationDir(sessionFile),
-+	]);
- 	let createdAt: number | undefined;
- 	let activity: string | undefined;
- 	let history: AgentHistorySummary = {};
-@@ -405,7 +428,7 @@ async function readPersistedAgentMetadata(
- 		// prefix still yields what it can.
- 		if (isFilesystemError(error)) throw error;
- 	}
--	const [statResult, [hasOutput, hasPatch]] = await Promise.all([stat, artifactFiles]);
-+	const [statResult, [hasOutput, hasPatch, isolationDir]] = await Promise.all([stat, artifactFiles]);
- 	// A transient stat fault surfaces now that both reads have settled; ENOENT
- 	// already degraded to an undefined file above.
- 	if (statResult.error !== undefined) throw statResult.error;
-@@ -420,6 +443,7 @@ async function readPersistedAgentMetadata(
- 			...(hasOutput ? { outputPath } : {}),
- 			...(hasPatch ? { patchPath } : {}),
- 			...(nestedPatchPaths.length > 0 ? { nestedPatchPaths: [...nestedPatchPaths] } : {}),
-+			...(isolationDir ? { isolationDir } : {}),
- 		},
- 	};
- }
 diff --git a/packages/coding-agent/src/session/session-entries.ts b/packages/coding-agent/src/session/session-entries.ts
-index d595e40..625ee9c 100644
+index 54a4aa2..69ec422 100644
 --- a/packages/coding-agent/src/session/session-entries.ts
 +++ b/packages/coding-agent/src/session/session-entries.ts
-@@ -386,7 +386,11 @@ export interface SessionInitEntry extends SessionEntryBase {
+@@ -406,7 +406,11 @@ export interface SessionInitEntry extends SessionEntryBase {
  	advisor?: string;
  	/** Effective thresholds for a child with an explicit compaction override. */
  	compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
@@ -949,7 +889,7 @@ index d595e40..625ee9c 100644
  	workPoolYieldItems?: WorkPoolYieldItem[];
 diff --git b/packages/coding-agent/src/task/deferred-integration.ts b/packages/coding-agent/src/task/deferred-integration.ts
 new file mode 100644
-index 0000000..921195e
+index 0000000..57c6987
 --- /dev/null
 +++ b/packages/coding-agent/src/task/deferred-integration.ts
 @@ -0,0 +1,706 @@
@@ -982,7 +922,7 @@ index 0000000..921195e
 +import * as fs from "node:fs/promises";
 +import * as path from "node:path";
 +import * as vcs from "@oh-my-pi/pi-natives/vcs";
-+import type { NestedRepoPatch, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
++import type { NestedRepoPatch, SingleResult } from "./task-details";
 +import { logger } from "@oh-my-pi/pi-utils";
 +import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 +import { AgentRegistry, type AgentRef, type AgentRegistryApi } from "../registry/agent-registry";
@@ -1660,19 +1600,19 @@ index 0000000..921195e
 +		.trim();
 +}
 diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/src/task/executor.ts
-index a72081a..45e09c0 100644
+index 8554f4c..632fbde 100644
 --- a/packages/coding-agent/src/task/executor.ts
 +++ b/packages/coding-agent/src/task/executor.ts
-@@ -31,6 +31,8 @@ import {
- import type { Rule } from "../capability/rule";
- import type { EffectiveExtensionRoots } from "../capability/types";
- import { ModelRegistry } from "../config/model-registry";
+@@ -35,6 +35,8 @@ import { formatModelSelectorValue } from "../config/model-selector";
+ import { previewLine, shortenToolArgumentPaths, TRUNCATE_LENGTHS } from "../utils/render-utils";
+ import { replaceTabs } from "../utils/text-width";
+ import { diffStats, type EditMode, getEditInputPaths } from "../tools/details/edit";
 +import { claimIsolationOwner } from "./isolation-ownership";
 +import { resolveIsolationWorkspace } from "./worktree";
- import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
  import {
- 	previewLine,
-@@ -665,8 +667,14 @@ export interface ExecutorOptions {
+ 	formatModelStringWithRouting,
+ 	resolveAgentAdvisorRolePattern,
+@@ -664,8 +666,14 @@ export interface ExecutorOptions {
  	keepAlive?: boolean;
  	/** Internal ownership handoff for cleanup that outlives the visible Task result. */
  	onCleanupDeferred?: (completion: Promise<void>) => void;
@@ -1689,7 +1629,7 @@ index a72081a..45e09c0 100644
  	/**
  	 * Takes over releasing the run's IRC wake hold (see `AgentSession.holdIrcWakes`),
  	 * for a caller that must finish with the agent's workspace before a held
-@@ -3919,7 +3927,8 @@ export async function finalizeSubagentLifecycle(args: {
+@@ -3931,7 +3939,8 @@ export async function finalizeSubagentLifecycle(args: {
  	reviveSession: AgentReviver | null;
  	cleanupDeadlineAt?: number;
  	onCleanupDeferred?: (completion: Promise<void>) => void;
@@ -1699,7 +1639,7 @@ index a72081a..45e09c0 100644
  }): Promise<void> {
  	const registry = AgentRegistry.global();
  	const ref = registry.get(args.id);
-@@ -3952,7 +3961,10 @@ export async function finalizeSubagentLifecycle(args: {
+@@ -3964,7 +3973,10 @@ export async function finalizeSubagentLifecycle(args: {
  	};
  	const releaseOwnedResources = async (): Promise<void> => {
  		try {
@@ -1711,7 +1651,7 @@ index a72081a..45e09c0 100644
  		} catch (error) {
  			logger.warn("Subagent lifecycle resource cleanup failed", { id: args.id, error: String(error) });
  		}
-@@ -3972,7 +3984,10 @@ export async function finalizeSubagentLifecycle(args: {
+@@ -3984,7 +3996,10 @@ export async function finalizeSubagentLifecycle(args: {
  		if (ref && ownsRef) {
  			if (shutdownDispose) {
  				try {
@@ -1723,7 +1663,7 @@ index a72081a..45e09c0 100644
  				} catch (error) {
  					logger.warn("runSubagent: failed to release session during manager shutdown", {
  						id: args.id,
-@@ -4560,6 +4575,28 @@ export async function replayRevivedAgentStart(session: AgentSession): Promise<vo
+@@ -4572,6 +4587,28 @@ export async function replayRevivedAgentStart(session: AgentSession): Promise<vo
  function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
  	return async expectedAgentRef => {
  		const { id } = capture.spec.prompt;
@@ -1752,7 +1692,7 @@ index a72081a..45e09c0 100644
  		const reopened = await SessionManager.open(capture.sessionFile, undefined, undefined, {
  			suppressBreadcrumb: true,
  			throwIfMissing: true,
-@@ -4605,6 +4642,9 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
+@@ -4617,6 +4654,9 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
  					expectedAgentRef,
  					mcpFollower,
  				);
@@ -1762,7 +1702,7 @@ index a72081a..45e09c0 100644
  				({ session: revived } = await createAgentSession({
  					...options,
  					...(sessionLocalModel
-@@ -5333,6 +5373,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
+@@ -5348,6 +5388,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
  			}
  			sessionOpenedAt = performance.now();
  			await refreshSubagentIrcRoot(sessionSpec.prompt, sessionManager, sessionFile);
@@ -1770,7 +1710,7 @@ index a72081a..45e09c0 100644
  
  			const hasExistingModelRole = sessionManager.getLastModelChangeRole() !== undefined;
  			// Subscribe before the builder mints proxies so a manager change during
-@@ -5519,9 +5560,8 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
+@@ -5534,9 +5575,8 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
  				outputSchema,
  				outputSchemaMode: options.outputSchemaMode,
  				restrictToolNames: restrictToolNames || undefined,
@@ -1783,10 +1723,10 @@ index a72081a..45e09c0 100644
  			});
  
 diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src/task/index.ts
-index bc9ef4d..1619b6b 100644
+index 65f34ce..750ef4e 100644
 --- a/packages/coding-agent/src/task/index.ts
 +++ b/packages/coding-agent/src/task/index.ts
-@@ -78,6 +78,7 @@ import {
+@@ -73,6 +73,7 @@ import {
  	cfgTaskDisabledAgents,
  	cfgTaskEnableEffort,
  	cfgTaskIsolationApply,
@@ -1794,7 +1734,7 @@ index bc9ef4d..1619b6b 100644
  	cfgTaskIsolationEnabled,
  	cfgTaskMaxConcurrency,
  	cfgTaskMaxRecursionDepth,
-@@ -148,6 +149,7 @@ interface TaskDescriptionOptions {
+@@ -145,6 +146,7 @@ interface TaskDescriptionOptions {
  	sessionAgents: readonly AgentDefinition[];
  	isolationEnabled: boolean;
  	applyIsolatedChanges: boolean;
@@ -1802,7 +1742,7 @@ index bc9ef4d..1619b6b 100644
  	disabledAgents: string[];
  	batchEnabled: boolean;
  	effortEnabled: boolean;
-@@ -191,6 +193,7 @@ function renderDescription(options: TaskDescriptionOptions): string {
+@@ -188,6 +190,7 @@ function renderDescription(options: TaskDescriptionOptions): string {
  		defaultAgent: spawnPolicy.defaultAgent,
  		isolationEnabled: options.isolationEnabled,
  		applyIsolatedChanges: options.applyIsolatedChanges,
@@ -1810,7 +1750,7 @@ index bc9ef4d..1619b6b 100644
  		batchEnabled: options.batchEnabled,
  		effortEnabled: options.effortEnabled,
  		perCallModelEnabled: options.perCallModelEnabled,
-@@ -865,6 +868,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -856,6 +859,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  			sessionAgents,
  			isolationEnabled: !planMode && isolationEnabled,
  			applyIsolatedChanges: cfgTaskIsolationApply.get(this.session.settings),
@@ -1818,7 +1758,7 @@ index bc9ef4d..1619b6b 100644
  			disabledAgents,
  			batchEnabled: this.#isBatchEnabled(),
  			effortEnabled: cfgTaskEnableEffort.get(this.session.settings),
-@@ -1509,11 +1513,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1500,11 +1504,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  		// its widget has no tool tap to read.
  		let spawnRun: SpawnRun | undefined = run;
  		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
@@ -1834,7 +1774,7 @@ index bc9ef4d..1619b6b 100644
  			const isolated = spawnParams.isolated === true;
  			// A failed or killed run may never have written the transcript a revival
  			// reads, so a resumable-looking ref alone does not make it messageable.
-@@ -1525,6 +1528,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+@@ -1516,6 +1519,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
  				isolated,
  				ircEnabled,
  				resumable: !isolated && transcriptAvailable && (Boolean(ref?.session) || isResumable(ref)),
@@ -2009,7 +1949,7 @@ index 0a42e87..aa8e1fd 100644
 +	});
 +}
 diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/coding-agent/src/task/isolation-runner.ts
-index 5f3c11b..6ef2980 100644
+index b33d604..b3d6f24 100644
 --- a/packages/coding-agent/src/task/isolation-runner.ts
 +++ b/packages/coding-agent/src/task/isolation-runner.ts
 @@ -22,7 +22,7 @@ import * as fs from "node:fs/promises";
@@ -2032,7 +1972,7 @@ index 5f3c11b..6ef2980 100644
 +	withIsolationLease,
 +	writeRetainedBackend,
 +} from "./isolation-ownership";
- import type { NestedRepoPatch, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+ import type { NestedRepoPatch, SingleResult } from "./task-details";
  import {
  	applyNestedPatches,
 +	bindIsolationState,
@@ -2585,7 +2525,7 @@ index 5f3c11b..6ef2980 100644
  		}
  		return { summary, changesApplied, hadAnyChanges, mergedBranchForNestedPatches: false };
 diff --git a/packages/coding-agent/src/task/persisted-revive.ts b/packages/coding-agent/src/task/persisted-revive.ts
-index 961dff0..940e5be 100644
+index 56019bd..fcef596 100644
 --- a/packages/coding-agent/src/task/persisted-revive.ts
 +++ b/packages/coding-agent/src/task/persisted-revive.ts
 @@ -1,6 +1,6 @@
@@ -2768,7 +2708,7 @@ index 961dff0..940e5be 100644
  		...softRequestBudgetFor(persistedAgentName(ref.displayName, init), spec.settings),
  		eventBus: spec.eventBus,
 diff --git a/packages/coding-agent/src/task/result-summary.ts b/packages/coding-agent/src/task/result-summary.ts
-index 26ca0dc..f50339c 100644
+index 8d0bd1f..2b64141 100644
 --- a/packages/coding-agent/src/task/result-summary.ts
 +++ b/packages/coding-agent/src/task/result-summary.ts
 @@ -68,9 +68,10 @@ export function formatTaskResultSummary(
@@ -2786,7 +2726,7 @@ index 26ca0dc..f50339c 100644
  		prompt.render(taskSummaryTemplate, {
  			agentName: result.agent,
 diff --git a/packages/coding-agent/src/task/settings.ts b/packages/coding-agent/src/task/settings.ts
-index ee76777..f9d05db 100644
+index e539dbe..34588f4 100644
 --- a/packages/coding-agent/src/task/settings.ts
 +++ b/packages/coding-agent/src/task/settings.ts
 @@ -170,6 +170,21 @@ export const cfgTaskIsolationApply = register({
@@ -2812,10 +2752,10 @@ index ee76777..f9d05db 100644
  	id: "ovnfs.path",
  	type: "string",
 diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/coding-agent/src/task/structured-subagent.ts
-index 4efc1cd..05d4a95 100644
+index bae850f..f3762d9 100644
 --- a/packages/coding-agent/src/task/structured-subagent.ts
 +++ b/packages/coding-agent/src/task/structured-subagent.ts
-@@ -80,6 +80,8 @@ import {
+@@ -81,6 +81,8 @@ import {
  	cfgTaskAgentServiceTierOverrides,
  	cfgTaskDisabledAgents,
  	cfgTaskIsolationApply,
@@ -2823,7 +2763,7 @@ index 4efc1cd..05d4a95 100644
 +	cfgTaskIsolationDeferIntegration,
  	cfgTaskIsolationEnabled,
  	cfgTaskIsolationMerge,
- 	cfgTaskMaxRecursionDepth,
+ 	cfgTaskPerCallModel,
 @@ -113,6 +115,7 @@ export interface StructuredSubagentIsolationControls {
  	requested?: boolean;
  	merge?: "patch" | "branch";
@@ -2844,7 +2784,7 @@ index 4efc1cd..05d4a95 100644
  	enableLsp: boolean;
  	enableIrc: boolean;
  	/** Caller `effort` hint to apply; dropped when the agent's level comes from the user's `^model:level` tag. */
-@@ -618,6 +626,24 @@ export async function resolveEffectiveSubagentPolicy(
+@@ -609,6 +617,24 @@ export async function resolveEffectiveSubagentPolicy(
  			"Subagent isolated execution requires task.isolation.enabled; it is currently false.",
  		);
  	}
@@ -2869,7 +2809,7 @@ index 4efc1cd..05d4a95 100644
  	return {
  		discovery,
  		agentName,
-@@ -636,10 +662,12 @@ export async function resolveEffectiveSubagentPolicy(
+@@ -627,10 +653,12 @@ export async function resolveEffectiveSubagentPolicy(
  		isIsolated,
  		repoRoot: isIsolated ? request.isolation?.repoRoot : undefined,
  		mergeMode: request.isolation?.merge ?? cfgTaskIsolationMerge.get(request.session.settings),
@@ -2886,7 +2826,7 @@ index 4efc1cd..05d4a95 100644
  		enableIrc:
  			!planMode &&
  			(request.enableIrc ??
-@@ -946,6 +974,23 @@ function describeCapturedChanges(result: SingleResult): string {
+@@ -938,6 +966,23 @@ function describeCapturedChanges(result: SingleResult): string {
  	});
  }
  
@@ -2910,8 +2850,8 @@ index 4efc1cd..05d4a95 100644
  function attachStructuredOutputMetadata(result: SingleResult, schema: StructuredSubagentSchemaResolution): void {
  	if (schema.source === "none") {
  		delete result.structuredOutput;
-@@ -1061,6 +1106,9 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
- 					openWorkspace: openIsolatedWorkspace(request.session.settings),
+@@ -1053,6 +1098,9 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
+ 					openWorkspace: openIsolatedWorkspace(request.session),
  					agentId: id,
  					mergeMode: policy.mergeMode,
 +					deferredIntegration: policy.deferIntegration,
@@ -2920,7 +2860,7 @@ index 4efc1cd..05d4a95 100644
  					artifactsDir: lease.artifactsDir,
  					description: trimToUndefined(request.identity?.label),
  					buildCommitMessage: makeIsolationCommitMessage(request.session),
-@@ -1083,6 +1131,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
+@@ -1075,6 +1123,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
  			policy.isIsolated &&
  			isolationContext &&
  			policy.applyChanges &&
@@ -2928,7 +2868,7 @@ index 4efc1cd..05d4a95 100644
  			result.exitCode === 0 &&
  			!result.error &&
  			!result.aborted
-@@ -1122,6 +1171,16 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
+@@ -1114,6 +1163,16 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
  			});
  		} else if (policy.isIsolated && isolationContext && !policy.applyChanges) {
  			mergeSummary = describeCapturedChanges(result);
@@ -2945,7 +2885,7 @@ index 4efc1cd..05d4a95 100644
  		}
  
  		completedSuccessfully = result.exitCode === 0 && !result.error && !result.aborted;
-@@ -1148,7 +1207,8 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
+@@ -1140,7 +1199,8 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
  			request.detached === true ||
  			retainSalvagedArtifact ||
  			(request.retainArtifacts && (completedSuccessfully || hasValidStructuredOutput)) ||
@@ -2956,11 +2896,11 @@ index 4efc1cd..05d4a95 100644
  		const cleanupArtifacts = async (): Promise<void> => {
  			await fs.rm(lease.artifactsDir, { recursive: true, force: true });
 diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/src/task/worktree.ts
-index dea777e..593afb2 100644
+index 4a64915..a9e1895 100644
 --- a/packages/coding-agent/src/task/worktree.ts
 +++ b/packages/coding-agent/src/task/worktree.ts
 @@ -1,17 +1,26 @@
- import { type NestedRepoPatch } from "@oh-my-pi/pi-tui/tools/task";
+ import { type NestedRepoPatch } from "./task-details";
  import type { Dirent } from "node:fs";
 +import type { FileHandle } from "node:fs/promises";
  import * as fs from "node:fs/promises";
@@ -2969,8 +2909,8 @@ index dea777e..593afb2 100644
  import type { VcsCommitAuthor, VcsGitRepo } from "@oh-my-pi/pi-natives";
  import * as natives from "@oh-my-pi/pi-natives";
  import * as vcs from "@oh-my-pi/pi-natives/vcs";
--import { formatBytes, getWorktreeDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
-+import { formatBytes, getWorktreeDir, getWorktreesDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
+-import { errorMessage, formatBytes, getWorktreeDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
++import { errorMessage, formatBytes, getWorktreeDir, getWorktreesDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
  import type { SettingValueOf } from "../config/registry";
  
  import { patchSectionPaths, splitPatchSections } from "../utils/git-diff-paths";
@@ -3000,9 +2940,9 @@ index dea777e..593afb2 100644
  	} catch (error) {
  		if (vcs.isVcsError(error) && error.code === "OutputTooLarge") {
  			throw new IsolationBaselineTooLargeError(repoRoot, undefined, budgetBytes);
-@@ -632,15 +644,34 @@ function errorMessage(err: unknown): string {
- 	return err instanceof Error ? err.message : String(err);
- }
+@@ -628,15 +640,34 @@ export interface IsolationHandle {
+  * `fallbackReason`.
+  */
  
 +const TASK_ISOLATION_SLOT_RE = new RegExp(`^${TASK_ISOLATION_DIR_PREFIX}[0-9a-f]{${TASK_ISOLATION_DIR_DIGEST_CHARS}}$`);
 +const TASK_ISOLATION_RETAINED_SUFFIX_RE = /^\.retained-[0-9a-z]+-[0-9a-f]+$/;
@@ -3038,7 +2978,7 @@ index dea777e..593afb2 100644
  }
  
  /**
-@@ -689,51 +720,83 @@ export async function ensureIsolation(
+@@ -685,51 +716,83 @@ export async function ensureIsolation(
  ): Promise<IsolationHandle> {
  	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
  	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
@@ -3162,7 +3102,7 @@ index dea777e..593afb2 100644
  /**
   * Tear down a handle returned by {@link ensureIsolation}. When native teardown fails for a mount or
   * subvolume backend, the workspace is kept with a retained-backend sidecar (recursive `rm` would
-@@ -766,6 +829,633 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
+@@ -762,6 +825,633 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
  	await fs.rm(baseDir, { recursive: true, force: true });
  }
  
@@ -3797,7 +3737,7 @@ index dea777e..593afb2 100644
  // Branch-mode isolation
  // ═══════════════════════════════════════════════════════════════════════════
 diff --git a/packages/coding-agent/src/thread/services/agents-remote.ts b/packages/coding-agent/src/thread/services/agents-remote.ts
-index e9d915a..5907c6d 100644
+index 8bfb94d..b37299a 100644
 --- a/packages/coding-agent/src/thread/services/agents-remote.ts
 +++ b/packages/coding-agent/src/thread/services/agents-remote.ts
 @@ -225,6 +225,10 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
@@ -3812,10 +3752,10 @@ index e9d915a..5907c6d 100644
  		return this.#remote.call("ensureLive", id);
  	}
 diff --git a/packages/coding-agent/src/worktree/backend.ts b/packages/coding-agent/src/worktree/backend.ts
-index 88c7570..032db5e 100644
+index 0b1b185..7a6dcad 100644
 --- a/packages/coding-agent/src/worktree/backend.ts
 +++ b/packages/coding-agent/src/worktree/backend.ts
-@@ -44,6 +44,10 @@ export interface ManagedWorktree {
+@@ -46,6 +46,10 @@ export interface ManagedWorktree {
  	parentRepo?: string;
  	branch?: string;
  	orphanReason?: string;
@@ -4895,7 +4835,7 @@ index 0000000..beb559c
 +	});
 +});
 diff --git a/packages/coding-agent/test/task/isolation-release.test.ts b/packages/coding-agent/test/task/isolation-release.test.ts
-index b6c3841..1124b99 100644
+index 432557c..f8792dd 100644
 --- a/packages/coding-agent/test/task/isolation-release.test.ts
 +++ b/packages/coding-agent/test/task/isolation-release.test.ts
 @@ -10,15 +10,19 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -4904,7 +4844,7 @@ index b6c3841..1124b99 100644
  import * as natives from "@oh-my-pi/pi-natives";
 +import { getWorktreesDir, setWorktreesDir } from "@oh-my-pi/pi-utils";
 +import { writeIsolationOwner } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
- import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+ import type { SingleResult } from "@oh-my-pi/pi-coding-agent/task/task-details";
  
  const tempRoots: string[] = [];
 +const originalWorktreesDir = getWorktreesDir();
@@ -5003,7 +4943,7 @@ index b6c3841..1124b99 100644
  		mergeMode: "branch",
 diff --git b/packages/coding-agent/test/task/isolation-retained.test.ts b/packages/coding-agent/test/task/isolation-retained.test.ts
 new file mode 100644
-index 0000000..1da487a
+index 0000000..f919153
 --- /dev/null
 +++ b/packages/coding-agent/test/task/isolation-retained.test.ts
 @@ -0,0 +1,1060 @@
@@ -5047,7 +4987,7 @@ index 0000000..1da487a
 +	type WorktreeBaseline,
 +	writeIsolationState,
 +} from "@oh-my-pi/pi-coding-agent/task/worktree";
-+import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
++import type { SingleResult } from "@oh-my-pi/pi-coding-agent/task/task-details";
 +
 +const tempRoots: string[] = [];
 +
@@ -6068,7 +6008,7 @@ index 0000000..1da487a
 +	});
 +});
 diff --git a/packages/coding-agent/test/task/persisted-revive.test.ts b/packages/coding-agent/test/task/persisted-revive.test.ts
-index 6cd0bfa..cd6f5cb 100644
+index 551298f..fdffc57 100644
 --- a/packages/coding-agent/test/task/persisted-revive.test.ts
 +++ b/packages/coding-agent/test/task/persisted-revive.test.ts
 @@ -16,6 +16,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -6418,7 +6358,7 @@ index 6cd0bfa..cd6f5cb 100644
 +	});
 +});
 diff --git a/packages/coding-agent/test/task/result-summary.test.ts b/packages/coding-agent/test/task/result-summary.test.ts
-index 727adeb..3ee3050 100644
+index 6006c22..265488e 100644
 --- a/packages/coding-agent/test/task/result-summary.test.ts
 +++ b/packages/coding-agent/test/task/result-summary.test.ts
 @@ -1,5 +1,6 @@
@@ -6426,7 +6366,7 @@ index 727adeb..3ee3050 100644
  import { ASYNC_INLINE_RESULT_MAX_CHARS } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 +import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
  import { formatTaskResultSummary, INLINE_OUTPUT_CHARS } from "@oh-my-pi/pi-coding-agent/task/result-summary";
- import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+ import type { SingleResult } from "@oh-my-pi/pi-coding-agent/task/task-details";
  
 @@ -45,6 +46,30 @@ describe("formatTaskResultSummary", () => {
  		expect(preview.length).toBeLessThanOrEqual(5000);
@@ -6530,7 +6470,7 @@ index ce9e286..8db2cf3 100644
  		const schema = getTaskSchema({
  			isolationEnabled: false,
 diff --git a/packages/coding-agent/test/task/task-spawn.test.ts b/packages/coding-agent/test/task/task-spawn.test.ts
-index 56f7f20..af4306c 100644
+index c22cc85..4289bdb 100644
 --- a/packages/coding-agent/test/task/task-spawn.test.ts
 +++ b/packages/coding-agent/test/task/task-spawn.test.ts
 @@ -337,10 +337,10 @@ describe("task spawn routing", () => {
@@ -6547,7 +6487,7 @@ index 56f7f20..af4306c 100644
  			if (expectRetained) {
  				expect(job!.status).toBe("failed");
 diff --git a/packages/coding-agent/test/task/workpool.test.ts b/packages/coding-agent/test/task/workpool.test.ts
-index 7796d7b..73433c0 100644
+index 83287d1..985f953 100644
 --- a/packages/coding-agent/test/task/workpool.test.ts
 +++ b/packages/coding-agent/test/task/workpool.test.ts
 @@ -34,6 +34,7 @@ const POLICY = {
@@ -6558,34 +6498,3 @@ index 7796d7b..73433c0 100644
  } satisfies EffectiveSubagentPolicy;
  
  const managers = new Set<AsyncJobManager>();
-diff --git a/packages/tui/src/overlays/agent-hub-types.ts b/packages/tui/src/overlays/agent-hub-types.ts
-index dfb8821..7d42d1f 100644
---- a/packages/tui/src/overlays/agent-hub-types.ts
-+++ b/packages/tui/src/overlays/agent-hub-types.ts
-@@ -60,6 +60,8 @@ export interface AgentRecordLike {
- 		patchPath?: string;
- 		branchName?: string;
- 		nestedPatchPaths?: string[];
-+		/** Retained isolated workspace; a revived agent runs there until released. */
-+		isolationDir?: string;
- 	};
- 	lifecycle?: { responseAt?: number; acceptedAt?: number; terminalAt?: number };
- }
-diff --git a/packages/tui/src/tools/task.ts b/packages/tui/src/tools/task.ts
-index 66d82d3..7952656 100644
---- a/packages/tui/src/tools/task.ts
-+++ b/packages/tui/src/tools/task.ts
-@@ -2552,9 +2552,10 @@ export interface SingleResult {
- 	/** Output path for the task result */
- 	outputPath?: string;
- 	/**
--	 * Ran inside an isolation worktree. Such agents are parked without a
--	 * reviver once the worktree is torn down, so they are never resumable or
--	 * messageable after the run — summaries must not suggest otherwise.
-+	 * Ran inside an isolation worktree. The workspace is retained until an
-+	 * explicit release: an isolated agent stays revivable from its transcript
-+	 * and resumes in that workspace, never in the parent cwd. Summaries must
-+	 * not claim messaging is impossible.
- 	 */
- 	isolated?: boolean;
- 	/** Patch path for isolated worktree output */

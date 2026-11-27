@@ -38,22 +38,22 @@ There is **one** delivery mechanism: the sequential raw Git patch queue.
 
 `android/scripts/apply-patches.sh` selects `OMP_PATCH_PROFILE=standard` or
 `extended` (default `extended`). It validates the matching manifest
-(`MANIFEST.standard` = 01..04, `MANIFEST` = 01..04+90). It checks each patch
+(`MANIFEST.standard` = 01..05, `MANIFEST` = 01..05+90). It checks each patch
 with `git apply --check`, then applies patches in manifest order. It also
 accepts a tree that already has the patches.
 
 When upstream changes, the queue is ported by per-file three-way merge against
 the new upstream tip: merge upstream into the patched tree, resolve each
 conflict by keeping the upstream refactor and re-expressing the Android delta,
-then regenerate the four port slices independently by pathspec from the same
+then regenerate the five port slices independently by pathspec from the same
 clean pin. `android/scripts/regen-patches.sh` rebuilds those slices against
 `android/UPSTREAM_COMMIT` and leaves `90-isolation-retained.patch` untouched
 because its hunks are written against the port result. The sync workflow
 applies the queue in CI. Release workflows apply it again, idempotently, after
 they check out the immutable release tag.
 
-Current port target: upstream oh-my-pi **19.1.0**, commit
-`e1a9f4b41d24fe223bb71e864bef552f0fae6948`. That release renamed the crate
+Current port target: upstream oh-my-pi **19.2.1**, commit
+`b55cd1bb664d8ab46ddc77f2a34eb47555dbf1ac`. 19.1.0 renamed the crate
 directories (`pi-natives`/`pi-shell`/`pi-builtins`/`pi-vfs` to
 `natives`/`shell`/`builtins`/`vfs`, packages `omp-*`) and moved the published
 installer to `scripts/install.sh`; the queue and the helper scripts resolve the
@@ -67,11 +67,12 @@ auditable on every refresh:
 
 | layer | files | added | removed | new files |
 |---|---|---|---|---|
-| `01-bionic-rust.patch` | 26 | 475 | 172 | 0 |
-| `02-native-ipc.patch` | 7 | 517 | 38 | 0 |
-| `03-termux-api.patch` | 25 | 1555 | 178 | 5 |
-| `04-repo-root.patch` | 7 | 94 | 13 | 1 |
-| `90-isolation-retained.patch` | 40 | 4726 | 172 | 7 |
+| `01-bionic-rust.patch` | 27 | 526 | 183 | 0 |
+| `02-native-ipc.patch` | 7 | 549 | 38 | 0 |
+| `03-termux-api.patch` | 23 | 1735 | 159 | 5 |
+| `04-repo-root.patch` | 6 | 95 | 13 | 1 |
+| `05-android-motion.patch` | 1 | 5 | 1 | 0 |
+| `90-isolation-retained.patch` | 38 | 5026 | 180 | 7 |
 
 `04` is repoRoot only, and `90` is the diff from the standard result to the
 full tree, so the standard profile stays self-contained: no file in `04` may
@@ -250,6 +251,15 @@ target). The dirfd-relative call, `EINTR` retry and errno stay unchanged.
 Bionic declares the `getnameinfo` host length as `size_t`. Thus Android passes
 `buf.len()` as `usize`. Other Unix targets keep `socklen_t`. Address, length
 and behavior do not change.
+
+## Android motion default (patch `05`)
+
+`tui.motion` defaults to `none` on Android: an animated terminal title costs
+frames on a phone, and every OSC 0 write makes Termux redraw the status surface.
+The title still tracks the run state (idle `>`, working `:`, attention `!`), so
+it changes on transitions rather than per animation frame. An explicit
+`tui.motion` or `tui.spinnerInterval` in the config still wins, and the desktop
+defaults are untouched.
 
 ## Fork feature: task isolation workspace lifecycle (patch `90`)
 

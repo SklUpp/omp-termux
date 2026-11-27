@@ -1,5 +1,5 @@
 diff --git a/packages/coding-agent/src/cli/update-cli.ts b/packages/coding-agent/src/cli/update-cli.ts
-index 6b8defd..f15cebe 100644
+index 47af95b..0a6ad7e 100644
 --- a/packages/coding-agent/src/cli/update-cli.ts
 +++ b/packages/coding-agent/src/cli/update-cli.ts
 @@ -2318,6 +2318,54 @@ async function runManagedUpdate(
@@ -69,10 +69,10 @@ index 6b8defd..f15cebe 100644
  	const manager = ompPath ? await managedInstallName(ompPath) : undefined;
  	if (manager) {
 diff --git a/packages/coding-agent/src/main.ts b/packages/coding-agent/src/main.ts
-index 1ce3c23..6d449b2 100644
+index 78d41d3..fc505a8 100644
 --- a/packages/coding-agent/src/main.ts
 +++ b/packages/coding-agent/src/main.ts
-@@ -46,7 +46,7 @@ import { fetchBuild } from "./cli/build-service";
+@@ -48,7 +48,7 @@ import { fetchBuild } from "./cli/build-service";
  import { applyStartupCwd } from "./cli/startup-cwd";
  import { runAutoUpdate } from "./cli/auto-update";
  import { managedInstallName } from "./cli/managed-install";
@@ -81,7 +81,7 @@ index 1ce3c23..6d449b2 100644
  import { findConfigFile } from "./config";
  import { cfgNoJudge, cfgNoSpotlight, cfgOffline } from "./config/auxiliary-model-policy";
  import { ModelRegistry } from "./config/model-registry";
-@@ -279,6 +279,11 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
+@@ -273,6 +273,11 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
  	if (!cfgStartupCheckUpdate.get(settings) && !cfgUpdateAuto.get(settings)) {
  		return;
  	}
@@ -94,10 +94,10 @@ index 1ce3c23..6d449b2 100644
  		// Checkouts update through git and a manager (Tern) updates its omp itself:
  		// "run omp update" would be wrong advice for both.
 diff --git a/packages/coding-agent/src/modes/controllers/command-controller.ts b/packages/coding-agent/src/modes/controllers/command-controller.ts
-index 73eb577..10194f3 100644
+index 5c84636..eb058cf 100644
 --- a/packages/coding-agent/src/modes/controllers/command-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/command-controller.ts
-@@ -463,12 +463,15 @@ export class CommandController {
+@@ -479,12 +479,15 @@ export class CommandController {
  				this.ctx.showError("Advisor has no history yet.");
  				return;
  			}
@@ -119,18 +119,18 @@ index 73eb577..10194f3 100644
  	}
  
 diff --git a/packages/coding-agent/src/modes/controllers/event-controller.ts b/packages/coding-agent/src/modes/controllers/event-controller.ts
-index 754e2b4..3031bd7 100644
+index 9d3673f..3b04269 100644
 --- a/packages/coding-agent/src/modes/controllers/event-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/event-controller.ts
-@@ -59,6 +59,7 @@ import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
+@@ -47,6 +47,7 @@ import type { NotificationRule } from "../../session/transcript/ttsr-notificatio
+ import { PROPOSE_COMMAND_NAME } from "../../tools/details/resolve";
+ import type { TodoPhase } from "../../tools/details/todo";
  import { proposeDispatchDetails } from "../../tools/resolve";
++import { sendAndroidNotification } from "../../utils/android-helpers";
+ import { cfgSpeechEnabled, cfgSpeechMode } from "../../tts/settings";
  import { SpeechEnhancer } from "../../tts/speech-enhancer";
  import { vocalizer } from "../../tts/vocalizer";
-+import { sendAndroidNotification } from "../../utils/android-helpers";
- import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
- import { type RunFlowStatus, setRunStatus } from "../../utils/run-status";
- import {
-@@ -3005,6 +3006,11 @@ export class EventController {
+@@ -2911,6 +2912,11 @@ export class EventController {
  			type: "error",
  			actions: "focus",
  		});
@@ -142,7 +142,7 @@ index 754e2b4..3031bd7 100644
  	}
  
  	sendCompletionNotification(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
-@@ -3030,5 +3036,8 @@ export class EventController {
+@@ -2936,5 +2942,8 @@ export class EventController {
  			type: "completion",
  			actions: "focus",
  		});
@@ -152,10 +152,10 @@ index 754e2b4..3031bd7 100644
  	}
  }
 diff --git a/packages/coding-agent/src/modes/controllers/input-controller.ts b/packages/coding-agent/src/modes/controllers/input-controller.ts
-index 60dc02a..9f18e20 100644
+index c75e54d..9d9246f 100644
 --- a/packages/coding-agent/src/modes/controllers/input-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/input-controller.ts
-@@ -3137,14 +3137,14 @@ export class InputController {
+@@ -3131,14 +3131,14 @@ export class InputController {
  			this.ctx.showStatus("Nothing to copy");
  			return;
  		}
@@ -178,7 +178,7 @@ index 60dc02a..9f18e20 100644
  	}
  
  	/** Copy current prompt text to system clipboard. */
-@@ -3154,14 +3154,12 @@ export class InputController {
+@@ -3148,14 +3148,12 @@ export class InputController {
  			this.ctx.showStatus("Nothing to copy");
  			return;
  		}
@@ -200,27 +200,27 @@ index 60dc02a..9f18e20 100644
  
  	cycleThinkingLevel(): void {
 diff --git a/packages/coding-agent/src/modes/controllers/selector-controller.ts b/packages/coding-agent/src/modes/controllers/selector-controller.ts
-index 8050461..ba3c638 100644
+index 969f4a2..895ad74 100644
 --- a/packages/coding-agent/src/modes/controllers/selector-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/selector-controller.ts
-@@ -1561,8 +1561,10 @@ export class SelectorController {
- 					this.ctx.showStatus("Nothing to copy in that item");
- 					return;
- 				}
--				void copyToClipboard(content);
--				this.ctx.showStatus(`Copied ${label} to clipboard`);
-+				copyToClipboard(content).then(
-+					() => this.ctx.showStatus(`Copied ${label} to clipboard`),
-+					() => this.ctx.showWarning("Failed to copy to clipboard"),
-+				);
- 			},
- 			onOpen: (href, label) => {
- 				done();
+@@ -1660,8 +1660,10 @@ export class SelectorController {
+ 								this.ctx.showStatus("Nothing to copy in that item");
+ 								return;
+ 							}
+-							void copyToClipboard(content);
+-							this.ctx.showStatus(`Copied ${label} to clipboard`);
++							copyToClipboard(content).then(
++								() => this.ctx.showStatus(`Copied ${label} to clipboard`),
++								() => this.ctx.showWarning("Failed to copy to clipboard"),
++							);
+ 						},
+ 						onOpen: (href, label) => {
+ 							done();
 diff --git a/packages/coding-agent/src/modes/controllers/todo-command-controller.ts b/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
-index 29f6546..7321b72 100644
+index ff063dc..7c4e040 100644
 --- a/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
 +++ b/packages/coding-agent/src/modes/controllers/todo-command-controller.ts
-@@ -212,12 +212,10 @@ export class TodoCommandController {
+@@ -134,12 +134,10 @@ export class TodoCommandController {
  			this.ctx.showWarning("No todos to copy.");
  			return;
  		}
@@ -238,10 +238,10 @@ index 29f6546..7321b72 100644
  
  	#resolveTodoPath(rest: string): string {
 diff --git a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
-index 2b64729..cb035ec 100644
+index c868555..e17d0dc 100644
 --- a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
 +++ b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
-@@ -578,59 +578,60 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
+@@ -588,59 +588,60 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
  		description: "Pick text or code from the conversation to copy",
  		allowArgs: true,
  		handleTui: async (command, runtime) => {
@@ -348,10 +348,10 @@ index 2b64729..cb035ec 100644
  	},
  	{
 diff --git a/packages/coding-agent/src/tools/ask.ts b/packages/coding-agent/src/tools/ask.ts
-index 0375d62..98ea030 100644
+index f7af99a..0549112 100644
 --- a/packages/coding-agent/src/tools/ask.ts
 +++ b/packages/coding-agent/src/tools/ask.ts
-@@ -54,6 +54,12 @@ import askResultTemplate from "../prompts/tools/ask-result.md" with { type: "tex
+@@ -47,6 +47,12 @@ import askSplitRadioGroupsTemplate from "../prompts/tools/ask-split-radio-groups
  import { renderAttachmentSourceNotice } from "../session/attachment-source-notice";
  import { cfgSpeechEnabled } from "../tts/settings";
  import { vocalizer } from "../tts/vocalizer";
@@ -364,7 +364,7 @@ index 0375d62..98ea030 100644
  import { describeAttachedImagesForTextModel, shouldDescribeImagesForTextModel } from "../utils/image-vision-fallback";
  import type { ToolSession } from ".";
  import { ToolAbortError } from "./tool-errors";
-@@ -421,8 +427,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+@@ -440,8 +446,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
  		return (session.canPromptUser ?? session.hasUI) || session.advertiseHeadlessAsk ? new AskTool(session) : null;
  	}
  
@@ -379,7 +379,7 @@ index 0375d62..98ea030 100644
  		if (!this.session.hasUI) return;
  		const method = cfgAskNotify.get(this.session.settings);
  		if (method === "off") return;
-@@ -433,6 +443,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+@@ -452,6 +462,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
  			urgency: "normal",
  			actions: "focus",
  		});
@@ -390,7 +390,7 @@ index 0375d62..98ea030 100644
  	}
  
  	async #answerImageBlocks(
-@@ -544,65 +558,81 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+@@ -570,65 +584,81 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
  			throw new ToolAbortError("Ask tool was cancelled by the user");
  		};
  
@@ -438,27 +438,8 @@ index 0375d62..98ea030 100644
 +			// (the vocalizer re-checks the setting and no-ops when disabled).
 +			if (cfgSpeechEnabled.get(this.session.settings)) {
 +				vocalizer.speak(named.map(field => questions.get(field) ?? field.name).join("\n"));
- 			}
--		} catch (error) {
--			if (error instanceof Error && error.name === "AbortError") throw abortError();
--			throw error;
--		}
--		if (!answered) return cancelAsk();
--		// A timeout submits what the form holds; with a required field still empty that is no answer, not data.
--		if (answered.timedOut && named.some(field => fieldError(field, answered.data[field.name!]) !== undefined)) {
--			return {
--				content: [{ type: "text", text: ASK_TIMED_OUT_UNANSWERED }],
--				details: { answers: [], timedOut: true },
--			};
--		}
- 
--		const notes = answered.notes?.length ? answered.notes : undefined;
--		// Each note numbers its markers from 1; shift them so `[Image #N]` indexes all result images.
--		const answerImages: ImageContent[] = [];
--		const resultNotes: OptionNote[] = [];
--		for (const { images, ...note } of notes ?? []) {
--			resultNotes.push({ ...note, text: shiftImageMarkers(note.text, answerImages.length, images?.length ?? 0) });
--			if (images) answerImages.push(...images);
++			}
++
 +			let answered: { data: HtmlFormData; notes?: OptionNote[]; timedOut?: boolean } | undefined;
 +			try {
 +				if (extensionUi.formDialog) {
@@ -487,8 +468,27 @@ index 0375d62..98ea030 100644
 +					content: [{ type: "text", text: ASK_TIMED_OUT_UNANSWERED }],
 +					details: { answers: [], timedOut: true },
 +				};
-+			}
-+
+ 			}
+-		} catch (error) {
+-			if (error instanceof Error && error.name === "AbortError") throw abortError();
+-			throw error;
+-		}
+-		if (!answered) return cancelAsk();
+-		// A timeout submits what the form holds; with a required field still empty that is no answer, not data.
+-		if (answered.timedOut && named.some(field => fieldError(field, answered.data[field.name!]) !== undefined)) {
+-			return {
+-				content: [{ type: "text", text: ASK_TIMED_OUT_UNANSWERED }],
+-				details: { answers: [], timedOut: true },
+-			};
+-		}
+ 
+-		const notes = answered.notes?.length ? answered.notes : undefined;
+-		// Each note numbers its markers from 1; shift them so `[Image #N]` indexes all result images.
+-		const answerImages: ImageContent[] = [];
+-		const resultNotes: OptionNote[] = [];
+-		for (const { images, ...note } of notes ?? []) {
+-			resultNotes.push({ ...note, text: shiftImageMarkers(note.text, answerImages.length, images?.length ?? 0) });
+-			if (images) answerImages.push(...images);
 +			const notes = answered.notes?.length ? answered.notes : undefined;
 +			// Each note numbers its markers from 1; shift them so `[Image #N]` indexes all result images.
 +			const answerImages: ImageContent[] = [];
@@ -527,7 +527,7 @@ index 0375d62..98ea030 100644
  	}
  }
 diff --git a/packages/coding-agent/src/tools/browser/launch.ts b/packages/coding-agent/src/tools/browser/launch.ts
-index 1b367b0..7105e12 100644
+index dc9eac1..18cd6ba 100644
 --- a/packages/coding-agent/src/tools/browser/launch.ts
 +++ b/packages/coding-agent/src/tools/browser/launch.ts
 @@ -343,8 +343,11 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
@@ -628,7 +628,7 @@ index 1b367b0..7105e12 100644
  		case "win32": {
  			const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
  			const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
-diff --git a/packages/coding-agent/src/utils/android-helpers.ts b/packages/coding-agent/src/utils/android-helpers.ts
+diff --git b/packages/coding-agent/src/utils/android-helpers.ts b/packages/coding-agent/src/utils/android-helpers.ts
 new file mode 100644
 index 0000000..db76062
 --- /dev/null
@@ -807,7 +807,7 @@ index 0000000..db76062
 +	return { ok: false, error: "OOM adjust not available or denied" };
 +}
 diff --git a/packages/coding-agent/src/utils/clipboard.ts b/packages/coding-agent/src/utils/clipboard.ts
-index d47389e..edd4268 100644
+index 5c40d66..7b606e5 100644
 --- a/packages/coding-agent/src/utils/clipboard.ts
 +++ b/packages/coding-agent/src/utils/clipboard.ts
 @@ -126,10 +126,24 @@ let macClipboardWrite = Promise.resolve();
@@ -877,7 +877,7 @@ index d47389e..edd4268 100644
  	} finally {
  		releaseWrite?.();
  	}
-diff --git a/packages/coding-agent/test/android-helpers.test.ts b/packages/coding-agent/test/android-helpers.test.ts
+diff --git b/packages/coding-agent/test/android-helpers.test.ts b/packages/coding-agent/test/android-helpers.test.ts
 new file mode 100644
 index 0000000..143a092
 --- /dev/null
@@ -1194,7 +1194,7 @@ index 98ca39a..a2dc6d1 100644
 +		error: error instanceof Error ? error.message : String(error),
 +	});
 +}
-diff --git a/packages/coding-agent/test/generator-android.test.ts b/packages/coding-agent/test/generator-android.test.ts
+diff --git b/packages/coding-agent/test/generator-android.test.ts b/packages/coding-agent/test/generator-android.test.ts
 new file mode 100644
 index 0000000..b27275e
 --- /dev/null
@@ -1410,7 +1410,7 @@ index 0000000..b27275e
 +	});
 +});
 diff --git a/packages/coding-agent/test/slash-commands/copy.test.ts b/packages/coding-agent/test/slash-commands/copy.test.ts
-index 7e55ad8..0647b6d 100644
+index e5f75dc..76ed487 100644
 --- a/packages/coding-agent/test/slash-commands/copy.test.ts
 +++ b/packages/coding-agent/test/slash-commands/copy.test.ts
 @@ -113,6 +113,17 @@ describe("/copy slash command", () => {
@@ -1431,7 +1431,7 @@ index 7e55ad8..0647b6d 100644
  	it("creates and copies the session's local:// directory with /copy local", async () => {
  		const copySpy = spyOn(clipboard, "copyToClipboard").mockResolvedValue(undefined);
  		using tempDir = TempDir.createSync("@pi-copy-local-");
-diff --git a/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
+diff --git b/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
 new file mode 100644
 index 0000000..9b80f42
 --- /dev/null
@@ -1938,7 +1938,7 @@ index 0000000..9b80f42
 +		expect(calls).toEqual([["termux-notification-remove", statusId]]);
 +	});
 +});
-diff --git a/packages/coding-agent/test/tools/browser-android-chromium.test.ts b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
+diff --git b/packages/coding-agent/test/tools/browser-android-chromium.test.ts b/packages/coding-agent/test/tools/browser-android-chromium.test.ts
 new file mode 100644
 index 0000000..7720ed1
 --- /dev/null
@@ -2096,7 +2096,7 @@ index 0000000..7720ed1
 +	});
 +});
 diff --git a/packages/coding-agent/test/utils/clipboard-osc52.test.ts b/packages/coding-agent/test/utils/clipboard-osc52.test.ts
-index 32b5f21..b4fdc3a 100644
+index d97edd1..c01a5a4 100644
 --- a/packages/coding-agent/test/utils/clipboard-osc52.test.ts
 +++ b/packages/coding-agent/test/utils/clipboard-osc52.test.ts
 @@ -56,6 +56,7 @@ describe("copyToClipboard OSC 52 routing", () => {
@@ -2271,105 +2271,39 @@ index 581c2bf..4a835ca 100644
  describe("readMacFileUrlsFromClipboard", () => {
  	it("returns an empty list on non-darwin platforms without spawning osascript", async () => {
  		setPlatform("linux");
-diff --git a/packages/tui/src/active-terminal.ts b/packages/tui/src/active-terminal.ts
-index 6ef0e4c..9501254 100644
---- a/packages/tui/src/active-terminal.ts
-+++ b/packages/tui/src/active-terminal.ts
-@@ -67,14 +67,22 @@ export function writeThroughActiveTerminal(data: string): boolean {
-  * terminal's ordered output path, and goes straight to stdout, best-effort, only
-  * when no terminal owns it. A worker thread cannot reach the main thread's
-  * terminal and would write around its pump, so it writes nothing.
-+ *
-+ * Returns whether the sequence was handed to a real output path (the active
-+ * terminal's ordered pump, or a direct stdout write that did not throw). A
-+ * worker, a terminal that never owned stdout, or a closed stdout returns
-+ * `false`. Even `true` only means "emitted", not that the user's terminal
-+ * honored it: OSC 52 is best-effort by design.
+diff --git a/packages/tui/src/driver/session.ts b/packages/tui/src/driver/session.ts
+index 279a79c..e8ef083 100644
+--- a/packages/tui/src/driver/session.ts
++++ b/packages/tui/src/driver/session.ts
+@@ -67,13 +67,15 @@ export function terminalCapabilities(): TerminalCapabilities {
+  * Write an out-of-band escape sequence: through the running driver, else
+  * straight to stdout (best-effort; a closed stdout never throws into the
+  * caller). A worker thread cannot reach the main thread's driver and would
+- * write around its frames, so off the main thread nothing is written.
++ * write around its frames, so off the main thread nothing is written. Returns
++ * whether the sequence reached an output path: `true` means emitted, not that
++ * the terminal honored it.
   */
 -export function writeTerminalSequence(data: string): void {
 -	if (!Bun.isMainThread) return;
--	if (writeThroughActiveTerminal(data)) return;
 +export function writeTerminalSequence(data: string): boolean {
 +	if (!Bun.isMainThread) return false;
-+	if (writeThroughActiveTerminal(data)) return true;
- 	installStdoutErrorListener();
+ 	if (active) {
+ 		active.writeRaw(data);
+-		return;
++		return true;
+ 	}
+ 	// An `error` listener keeps EPIPE/EIO on a closed stdout from crashing the process.
+ 	if (!stdoutErrorsHandled) {
+@@ -82,8 +84,10 @@ export function writeTerminalSequence(data: string): void {
+ 	}
  	try {
  		process.stdout.write(data);
 +		return true;
  	} catch {
- 		// Best-effort: a closed stdout must not fail the caller.
+-		// Best-effort.
++		// Best-effort: a closed stdout must not fail the caller.
 +		return false;
  	}
  }
-diff --git a/packages/tui/src/apps/debug/log-viewer.ts b/packages/tui/src/apps/debug/log-viewer.ts
-index 04e7361..f3d058c 100644
---- a/packages/tui/src/apps/debug/log-viewer.ts
-+++ b/packages/tui/src/apps/debug/log-viewer.ts
-@@ -1205,15 +1205,19 @@ export class DebugLogViewerComponent implements Component {
- 			return;
- 		}
  
--		try {
--			this.#deps.copyToClipboard(selectedPayload);
--			const message = `Copied ${selected.length} log ${selected.length === 1 ? "entry" : "entries"}`;
--			this.#statusMessage = message;
--			this.#onStatus?.(message);
--		} catch (error) {
--			const message = error instanceof Error ? error.message : String(error);
--			this.#statusMessage = `Copy failed: ${message}`;
--			this.#onError?.(`Failed to copy logs: ${message}`);
--		}
-+		void Promise.resolve()
-+			.then(() => this.#deps.copyToClipboard(selectedPayload))
-+			.then(
-+				() => {
-+					const message = `Copied ${selected.length} log ${selected.length === 1 ? "entry" : "entries"}`;
-+					this.#statusMessage = message;
-+					this.#onStatus?.(message);
-+				},
-+				(error: unknown) => {
-+					const message = error instanceof Error ? error.message : String(error);
-+					this.#statusMessage = `Copy failed: ${message}`;
-+					this.#onError?.(`Failed to copy logs: ${message}`);
-+				},
-+			);
- 	}
- }
-diff --git a/packages/tui/src/apps/debug/raw-sse.ts b/packages/tui/src/apps/debug/raw-sse.ts
-index 14e294a..982c574 100644
---- a/packages/tui/src/apps/debug/raw-sse.ts
-+++ b/packages/tui/src/apps/debug/raw-sse.ts
-@@ -483,17 +483,21 @@ export class RawSseViewerComponent implements Component {
- 			return;
- 		}
- 
--		try {
--			this.#deps.copyToClipboard(payload);
--			const message = "Copied raw SSE stream";
--			this.#statusMessage = message;
--			this.#statusFailed = false;
--			this.#onStatus?.(message);
--		} catch (error) {
--			const message = error instanceof Error ? error.message : String(error);
--			this.#statusMessage = `Copy failed: ${message}`;
--			this.#statusFailed = true;
--		}
--		this.#onUpdate?.();
-+		void Promise.resolve()
-+			.then(() => this.#deps.copyToClipboard(payload))
-+			.then(
-+				() => {
-+					const message = "Copied raw SSE stream";
-+					this.#statusMessage = message;
-+					this.#statusFailed = false;
-+					this.#onStatus?.(message);
-+				},
-+				(error: unknown) => {
-+					const message = error instanceof Error ? error.message : String(error);
-+					this.#statusMessage = `Copy failed: ${message}`;
-+					this.#statusFailed = true;
-+				},
-+			)
-+			.finally(() => this.#onUpdate?.());
- 	}
- }
