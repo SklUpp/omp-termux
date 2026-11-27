@@ -70,9 +70,9 @@ auditable on every refresh:
 | `01-bionic-rust.patch` | 27 | 526 | 183 | 0 |
 | `02-native-ipc.patch` | 7 | 549 | 38 | 0 |
 | `03-termux-api.patch` | 23 | 1735 | 159 | 5 |
-| `04-repo-root.patch` | 6 | 95 | 13 | 1 |
+| `04-repo-root.patch` | 7 | 99 | 13 | 1 |
 | `05-android-motion.patch` | 1 | 5 | 1 | 0 |
-| `90-isolation-retained.patch` | 37 | 5025 | 175 | 7 |
+| `90-isolation-retained.patch` | 37 | 5033 | 175 | 7 |
 
 `04` is repoRoot only, and `90` is the diff from the standard result to the
 full tree, so the standard profile stays self-contained: no file in `04` may

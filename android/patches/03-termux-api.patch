@@ -630,7 +630,7 @@ index dc9eac1..18cd6ba 100644
  			const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
 diff --git b/packages/coding-agent/src/utils/android-helpers.ts b/packages/coding-agent/src/utils/android-helpers.ts
 new file mode 100644
-index 0000000..db76062
+index 0000000..f8636bf
 --- /dev/null
 +++ b/packages/coding-agent/src/utils/android-helpers.ts
 @@ -0,0 +1,172 @@
@@ -641,7 +641,7 @@ index 0000000..db76062
 + */
 +
 +import * as fs from "node:fs/promises";
-+import { isNotificationSuppressed } from "@oh-my-pi/pi-tui";
++import { isNotificationSuppressed } from "@oh-my-pi/pi-tui/driver/notify";
 +
 +export type AndroidOutcome = { ok: boolean; error?: string };
 +
@@ -737,7 +737,7 @@ index 0000000..db76062
 +	body: string,
 +	options?: AndroidNotificationOptions,
 +): Promise<AndroidOutcome> {
-+	if (isNotificationSuppressed()) {
++	if (isNotificationSuppressed(Bun.env)) {
 +		return { ok: false, error: "notifications suppressed" };
 +	}
 +	// Redact before any handling: truncate and strip potential secrets.

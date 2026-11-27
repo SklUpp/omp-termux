@@ -105,6 +105,7 @@ gen 04-repo-root.patch \
 	packages/coding-agent/src/task/index.ts \
 	packages/coding-agent/src/task/isolation-runner.ts \
 	packages/coding-agent/src/task/structured-subagent.ts \
+	packages/coding-agent/src/task/task-details.ts \
 	packages/coding-agent/src/task/types.ts \
 	packages/coding-agent/src/task/worktree.ts \
 	packages/coding-agent/test/repo-root-isolation.test.ts

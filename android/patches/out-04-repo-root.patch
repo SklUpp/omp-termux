@@ -1,0 +1,323 @@
+diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src/task/index.ts
+index 24a4688..65f34ce 100644
+--- a/packages/coding-agent/src/task/index.ts
++++ b/packages/coding-agent/src/task/index.ts
+@@ -357,6 +357,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
+ 	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task };
+ 	if (params.steps !== undefined) item.steps = params.steps;
+ 	if ("solutionSpace" in params) item.solutionSpace = params.solutionSpace;
++	if ("repoRoot" in params) item.repoRoot = params.repoRoot;
+ 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
+ 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
+ 	if ("tools" in params) item.tools = params.tools;
+@@ -381,6 +382,11 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
+ 	if (item.task !== undefined) spawn.task = item.task;
+ 	if (item.steps !== undefined) spawn.steps = item.steps;
+ 	if (item.solutionSpace !== undefined) spawn.solutionSpace = item.solutionSpace;
++	if (item.repoRoot !== undefined) {
++		spawn.repoRoot = item.repoRoot;
++	} else if (params.repoRoot !== undefined) {
++		spawn.repoRoot = params.repoRoot;
++	}
+ 	if (params.context !== undefined) spawn.context = params.context;
+ 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
+ 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
+@@ -1003,7 +1009,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 			...spawnModelFields(params),
+ 			...this.#resultParams(params),
+ 			...this.#effortParams(params),
+-			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
++			...(params.isolated === true ? { isolation: { requested: true, repoRoot: params.repoRoot } } : {}),
+ 			blockedAgent: this.#blockedAgent,
+ 			enableLsp: this.session.enableLsp ?? true,
+ 			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
+@@ -1090,7 +1096,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 				try {
+ 					return { policy: await this.#resolveSpawnPreflight(spawn) };
+ 				} catch (error) {
+-					return { error: error instanceof StructuredSubagentError ? error.message : String(error) };
++					return {
++						error: error instanceof StructuredSubagentError ? error.message : String(error),
++					};
+ 				}
+ 			}),
+ 		);
+@@ -1892,7 +1900,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 				...(onArtifactsRetained ? { onArtifactsRetained } : {}),
+ 				invokedAt: launchTiming?.invokedAt,
+ 				acquiredAt: launchTiming?.acquiredAt,
+-				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
++				...(params.isolated === true ? { isolation: { requested: true, repoRoot: params.repoRoot } } : {}),
+ 				blockedAgent: this.#blockedAgent,
+ 				enableLsp: this.session.enableLsp ?? true,
+ 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
+diff --git a/packages/coding-agent/src/task/isolation-runner.ts b/packages/coding-agent/src/task/isolation-runner.ts
+index bc5512b..b33d604 100644
+--- a/packages/coding-agent/src/task/isolation-runner.ts
++++ b/packages/coding-agent/src/task/isolation-runner.ts
+@@ -145,8 +145,8 @@ export interface IsolationContext {
+  * the error as a task-tool failure. Each spawn captures its own baseline from
+  * its isolation copy (see {@link captureIsolationBaseline}).
+  */
+-export async function prepareIsolationContext(cwd: string): Promise<IsolationContext> {
+-	return { repoRoot: await getRepoRoot(cwd) };
++export async function prepareIsolationContext(cwd: string, explicitRepoRoot?: string): Promise<IsolationContext> {
++	return { repoRoot: await getRepoRoot(cwd, explicitRepoRoot) };
+ }
+ 
+ /** Fingerprint of a captured delta, used to skip re-committing an unchanged workspace on release. */
+diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/coding-agent/src/task/structured-subagent.ts
+index daea3a3..bae850f 100644
+--- a/packages/coding-agent/src/task/structured-subagent.ts
++++ b/packages/coding-agent/src/task/structured-subagent.ts
+@@ -113,6 +113,7 @@ export interface StructuredSubagentIsolationControls {
+ 	requested?: boolean;
+ 	merge?: "patch" | "branch";
+ 	apply?: boolean;
++	repoRoot?: string;
+ }
+ 
+ /** Identity and presentation metadata supplied by the calling surface. */
+@@ -224,6 +225,7 @@ export interface EffectiveSubagentPolicy {
+ 	schema: StructuredSubagentSchemaResolution;
+ 	planMode: boolean;
+ 	isIsolated: boolean;
++	repoRoot?: string;
+ 	mergeMode: "patch" | "branch";
+ 	applyChanges: boolean;
+ 	enableLsp: boolean;
+@@ -337,7 +339,10 @@ function assertPlanControlsAllowed(request: StructuredSubagentRequest, planMode:
+ 	const isolation = request.isolation;
+ 	if (
+ 		isolation &&
+-		(Object.hasOwn(isolation, "requested") || Object.hasOwn(isolation, "apply") || Object.hasOwn(isolation, "merge"))
++		(Object.hasOwn(isolation, "requested") ||
++			Object.hasOwn(isolation, "apply") ||
++			Object.hasOwn(isolation, "merge") ||
++			(isolation.requested === true && Object.hasOwn(isolation, "repoRoot")))
+ 	) {
+ 		throw new StructuredSubagentError(
+ 			"preflight",
+@@ -620,6 +625,7 @@ export async function resolveEffectiveSubagentPolicy(
+ 		schema,
+ 		planMode,
+ 		isIsolated,
++		repoRoot: isIsolated ? request.isolation?.repoRoot : undefined,
+ 		mergeMode: request.isolation?.merge ?? cfgTaskIsolationMerge.get(request.session.settings),
+ 		applyChanges:
+ 			request.isolation?.apply ??
+@@ -1015,7 +1021,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
+ 		let isolationContext: IsolationContext | null = null;
+ 		if (policy.isIsolated) {
+ 			try {
+-				isolationContext = await prepareIsolationContext(request.session.cwd);
++				isolationContext = await prepareIsolationContext(request.session.cwd, policy.repoRoot);
+ 			} catch (error) {
+ 				const message = error instanceof Error ? error.message : String(error);
+ 				throw new StructuredSubagentError(
+diff --git a/packages/coding-agent/src/task/task-details.ts b/packages/coding-agent/src/task/task-details.ts
+index 81ebc47..bcdd3e0 100644
+--- a/packages/coding-agent/src/task/task-details.ts
++++ b/packages/coding-agent/src/task/task-details.ts
+@@ -82,6 +82,8 @@ export interface TaskItem {
+ 	tools?: string[];
+ 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
+ 	isolated?: boolean;
++	/** Repository to isolate: defaults to the current cwd's. Meaningless without `isolated`. */
++	repoRoot?: string;
+ }
+ 
+ /**
+@@ -117,6 +119,8 @@ export interface TaskParams {
+ 	context?: string;
+ 	/** Run in an isolated worktree (flat form; per-item in batch form). */
+ 	isolated?: boolean;
++	/** Repository to isolate: defaults to the current cwd's. Meaningless without `isolated`. */
++	repoRoot?: string;
+ }
+ 
+ /**
+diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src/task/types.ts
+index d18fc21..4ab80f5 100644
+--- a/packages/coding-agent/src/task/types.ts
++++ b/packages/coding-agent/src/task/types.ts
+@@ -61,6 +61,7 @@ export const taskItemSchema = type({
+ 	agent: "string = 'task'",
+ 	task: "string",
+ 	solutionSpace: "string",
++	"repoRoot?": "string",
+ 	"outputSchema?": outputSchemaInputSchema,
+ 	"schemaMode?": '"permissive" | "strict"',
+ 	"tools?": "string[]",
+@@ -71,6 +72,7 @@ const taskItemSchemaIsolated = type({
+ 	agent: "string = 'task'",
+ 	task: "string",
+ 	solutionSpace: "string",
++	"repoRoot?": "string",
+ 	"outputSchema?": outputSchemaInputSchema,
+ 	"schemaMode?": '"permissive" | "strict"',
+ 	"tools?": "string[]",
+@@ -83,6 +85,7 @@ export const taskSchema = type({
+ 	agent: "string = 'task'",
+ 	task: "string",
+ 	solutionSpace: "string",
++	"repoRoot?": "string",
+ 	"outputSchema?": outputSchemaInputSchema,
+ 	"schemaMode?": '"permissive" | "strict"',
+ 	"tools?": "string[]",
+@@ -94,6 +97,7 @@ const taskSchemaNoIsolation = type({
+ 	agent: "string = 'task'",
+ 	task: "string",
+ 	solutionSpace: "string",
++	"repoRoot?": "string",
+ 	"outputSchema?": outputSchemaInputSchema,
+ 	"schemaMode?": '"permissive" | "strict"',
+ 	"tools?": "string[]",
+@@ -155,6 +159,11 @@ function createTaskSchema(options: {
+ }): BaseType {
+ 	const agent = taskAgentSchemaRule(options.defaultAgent);
+ 	const taskFields = options.steps ? { steps: "string[]" } : { task: "string" };
++	// Declared by every return, isolated or not (unused without isolation), to
++	// match the static schemas above: `"+": "delete"` drops any field the shape
++	// omits, so omitting it here erased an explicit root whenever a non-default
++	// option (task.file, structured, …) selected this builder.
++	const repoRootField = { "repoRoot?": "string" };
+ 	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
+ 	const schemaFields = options.structured
+ 		? { "outputSchema?": outputSchemaInputSchema, "schemaMode?": '"permissive" | "strict"' }
+@@ -171,6 +180,7 @@ function createTaskSchema(options: {
+ 				"name?": "string",
+ 				agent,
+ 				...taskFields,
++				...repoRootField,
+ 				solutionSpace: "string",
+ 				...effortField,
+ 				...schemaFields,
+@@ -191,6 +201,7 @@ function createTaskSchema(options: {
+ 			"name?": "string",
+ 			agent,
+ 			...taskFields,
++			...repoRootField,
+ 			solutionSpace: "string",
+ 			...effortField,
+ 			...schemaFields,
+@@ -211,6 +222,7 @@ function createTaskSchema(options: {
+ 			"name?": "string",
+ 			agent,
+ 			...taskFields,
++			...repoRootField,
+ 			solutionSpace: "string",
+ 			...effortField,
+ 			...schemaFields,
+@@ -224,6 +236,7 @@ function createTaskSchema(options: {
+ 		"name?": "string",
+ 		agent,
+ 		...taskFields,
++		...repoRootField,
+ 		solutionSpace: "string",
+ 		...effortField,
+ 		...schemaFields,
+diff --git a/packages/coding-agent/src/task/worktree.ts b/packages/coding-agent/src/task/worktree.ts
+index 9e310f7..4a64915 100644
+--- a/packages/coding-agent/src/task/worktree.ts
++++ b/packages/coding-agent/src/task/worktree.ts
+@@ -52,23 +52,41 @@ export interface WorktreeBaseline {
+  * The root of the git work tree holding `cwd`, which isolated tasks copy and
+  * merge back into.
+  *
+- * Throws when `cwd` is in a pure Jujutsu workspace, outside any git
++ * When `explicitRepoRoot` is set, resolve against that path instead of `cwd`
++ * and require it to land inside the discovered repository.
++ *
++ * Throws when the target is in a pure Jujutsu workspace, outside any git
+  * repository, or in a bare repository's directory — a container whose `.git`
+  * is bare and whose work trees live elsewhere — which has no work tree to copy.
+  */
+-export async function getRepoRoot(cwd: string): Promise<string> {
++export async function getRepoRoot(cwd: string, explicitRepoRoot?: string): Promise<string> {
++	const targetPath = explicitRepoRoot ? path.resolve(cwd, explicitRepoRoot) : cwd;
+ 	// Pure-jj check runs first so a jj workspace nested under an unrelated
+ 	// outer Git checkout is rejected at its own root rather than silently
+ 	// mutating the surrounding Git tree behind jj's back.
+-	if (vcs.isPureJj(cwd)) {
++	if (vcs.isPureJj(targetPath)) {
+ 		throw new Error(
+ 			"Isolated task execution requires a Git checkout, but this workspace is pure Jujutsu (`.jj/` without a colocated `.git/`). Run `jj git init --colocate` to add a Git checkout, or set `task.isolation.enabled: false` to disable task isolation.",
+ 		);
+ 	}
+ 
+-	const repo = vcs.git(cwd);
+-	if (!repo) throw new Error("Git repository not found for isolated task execution.");
++	const repo = vcs.git(targetPath);
++	if (!repo) {
++		if (explicitRepoRoot) {
++			throw new Error(`Explicit repoRoot '${explicitRepoRoot}' is not a valid Git repository.`);
++		}
++		throw new Error("Git repository not found for isolated task execution.");
++	}
+ 	const { repoRoot, gitDir, commonDir } = repo.info();
++	if (explicitRepoRoot) {
++		const canonicalTarget = path.resolve(targetPath);
++		const canonicalResolved = path.resolve(repoRoot);
++		if (canonicalTarget !== canonicalResolved && !canonicalTarget.startsWith(canonicalResolved + path.sep)) {
++			throw new Error(
++				`Explicit repoRoot '${explicitRepoRoot}' does not match resolved git repository '${repoRoot}'.`,
++			);
++		}
++	}
+ 	// A linked work tree's git dir differs from the common dir; git ignores
+ 	// `core.bare` there, so only the main git dir can be bare.
+ 	if (gitDir === commonDir && isGitTrue(await repo.configGet("core.bare"))) {
+@@ -663,8 +681,9 @@ export async function ensureIsolation(
+ 	baseCwd: string,
+ 	id: string,
+ 	preferred?: IsoBackendKind,
++	explicitRepoRoot?: string,
+ ): Promise<IsolationHandle> {
+-	const repoRoot = await getRepoRoot(baseCwd);
++	const repoRoot = await getRepoRoot(baseCwd, explicitRepoRoot);
+ 	const sourceCommonDir = vcs.requireGit(repoRoot).info().commonDir;
+ 	const baseDir = taskIsolationBaseDir(repoRoot, id);
+ 	const mergedDir = path.join(baseDir, TASK_ISOLATION_MOUNT_DIR);
+diff --git b/packages/coding-agent/test/repo-root-isolation.test.ts b/packages/coding-agent/test/repo-root-isolation.test.ts
+new file mode 100644
+index 0000000..c71b3bd
+--- /dev/null
++++ b/packages/coding-agent/test/repo-root-isolation.test.ts
+@@ -0,0 +1,36 @@
++import { describe, expect, it } from "bun:test";
++import * as fs from "node:fs";
++import * as path from "node:path";
++
++describe("repoRoot is only required for isolated runs", () => {
++	const structuredPath = path.resolve(import.meta.dir, "../src/task/structured-subagent.ts");
++	const taskIndexPath = path.resolve(import.meta.dir, "../src/task/index.ts");
++
++	it("does not force isolation when repoRoot is supplied alone", async () => {
++		const content = await fs.promises.readFile(structuredPath, "utf8");
++		expect(content).toContain("const isIsolated = request.isolation?.requested === true;");
++		expect(content).not.toContain("Explicit repoRoot requires isolation");
++	});
++
++	it("task spawn preserves optional repoRoot", async () => {
++		const content = await fs.promises.readFile(taskIndexPath, "utf8");
++		expect(content).toContain("repoRoot");
++		expect(content).toContain("spawn.repoRoot = item.repoRoot");
++	});
++
++	it("accepts repoRoot when isolation is omitted", () => {
++		function isRepoRootShapeValid(requested: boolean | undefined, repoRoot: string | undefined): string | undefined {
++			return requested === false && repoRoot !== undefined ? "invalid" : undefined;
++		}
++		expect(isRepoRootShapeValid(undefined, "/tmp/repo")).toBeUndefined();
++		expect(isRepoRootShapeValid(true, "/tmp/repo")).toBeUndefined();
++		expect(isRepoRootShapeValid(undefined, undefined)).toBeUndefined();
++	});
++
++	it("getRepoRoot validates explicit root for isolated execution", async () => {
++		const worktreePath = path.resolve(import.meta.dir, "../src/task/worktree.ts");
++		const content = await fs.promises.readFile(worktreePath, "utf8");
++		expect(content).toContain("getRepoRoot");
++		expect(content).toContain("Explicit repoRoot");
++	});
++});

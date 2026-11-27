@@ -115,6 +115,28 @@ index daea3a3..bae850f 100644
  			} catch (error) {
  				const message = error instanceof Error ? error.message : String(error);
  				throw new StructuredSubagentError(
+diff --git a/packages/coding-agent/src/task/task-details.ts b/packages/coding-agent/src/task/task-details.ts
+index 81ebc47..bcdd3e0 100644
+--- a/packages/coding-agent/src/task/task-details.ts
++++ b/packages/coding-agent/src/task/task-details.ts
+@@ -82,6 +82,8 @@ export interface TaskItem {
+ 	tools?: string[];
+ 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
+ 	isolated?: boolean;
++	/** Repository to isolate: defaults to the current cwd's. Meaningless without `isolated`. */
++	repoRoot?: string;
+ }
+ 
+ /**
+@@ -117,6 +119,8 @@ export interface TaskParams {
+ 	context?: string;
+ 	/** Run in an isolated worktree (flat form; per-item in batch form). */
+ 	isolated?: boolean;
++	/** Repository to isolate: defaults to the current cwd's. Meaningless without `isolated`. */
++	repoRoot?: string;
+ }
+ 
+ /**
 diff --git a/packages/coding-agent/src/task/types.ts b/packages/coding-agent/src/task/types.ts
 index d18fc21..4ab80f5 100644
 --- a/packages/coding-agent/src/task/types.ts
