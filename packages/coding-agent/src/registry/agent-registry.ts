@@ -57,10 +57,22 @@ export interface AgentHistorySummary {
 	outputPath?: string;
 	/** Captured isolated-worktree patch, when patch capture succeeded. */
 	patchPath?: string;
+	/**
+	 * Deferred-isolation handoff: `pending` until the parent's `/integrate`
+	 * signal lands the workspace changes, then `merged` so a repeat signal is
+	 * answered without re-capturing. Absent for non-deferred runs.
+	 */
+	deferredIntegration?: "pending" | "merged";
 	/** Isolated branch identity, when branch-mode capture succeeded. */
 	branchName?: string;
 	/** Captured nested-repo patches (`<id>.nested-<n>-<path>.patch`), one per nested repository the agent changed. */
 	nestedPatchPaths?: string[];
+	/**
+	 * Isolated workspace whose changes are not released yet, while it still
+	 * exists on disk. Reviving an isolated agent runs it there and releasing it
+	 * captures the remaining delta.
+	 */
+	isolationDir?: string;
 }
 
 export interface AgentRef {

@@ -689,7 +689,11 @@ export const cfgTuiMotion = register({
 	id: "tui.motion",
 	type: "enum",
 	values: MOTION_MODES,
-	default: "full",
+	// Android terminals redraw the whole surface for an animated title, and the
+	// title spinner alone costs frames on a phone; start static. An explicit
+	// `tui.motion` or `tui.spinnerInterval` still wins, and the title still
+	// tracks idle/working/attention transitions.
+	default: process.platform === "android" ? "none" : "full",
 	env: "PI_MOTION",
 	ui: {
 		tab: "appearance",

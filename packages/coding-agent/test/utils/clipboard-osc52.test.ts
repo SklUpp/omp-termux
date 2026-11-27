@@ -56,6 +56,7 @@ describe("copyToClipboard OSC 52 routing", () => {
 		const worker = new Worker(new URL("../fixtures/clipboard-worker-copy.ts", import.meta.url).href, {
 			type: "module",
 		});
+		worker.postMessage("ok");
 		const report = Promise.withResolvers<{ stdout: string[]; nativeCopies: string[] }>();
 		worker.addEventListener("message", event => report.resolve(event.data));
 		worker.addEventListener("error", event => report.reject(event.error ?? new Error(event.message)));
@@ -63,6 +64,26 @@ describe("copyToClipboard OSC 52 routing", () => {
 			const { stdout, nativeCopies } = await report.promise;
 			expect(stdout.join("")).not.toContain("\x1b]52;");
 			expect(nativeCopies).toEqual(["worker probe"]);
+		} finally {
+			worker.terminate();
+		}
+	});
+
+	// The worker fixture forces `stdout.isTTY` true; that must not count as a
+	// delivered OSC 52, or a failed native write would still report success.
+	it("rejects in a worker when the native copy fails because OSC 52 cannot be emitted there", async () => {
+		const worker = new Worker(new URL("../fixtures/clipboard-worker-copy.ts", import.meta.url).href, {
+			type: "module",
+		});
+		worker.postMessage("native-fails");
+		const report = Promise.withResolvers<{ stdout: string[]; nativeCopies: string[]; error?: string }>();
+		worker.addEventListener("message", event => report.resolve(event.data));
+		worker.addEventListener("error", event => report.reject(event.error ?? new Error(event.message)));
+		try {
+			const result = await report.promise;
+			expect(result.stdout.join("")).not.toContain("\x1b]52;");
+			expect(result.nativeCopies).toEqual(["worker probe"]);
+			expect(result.error).toBe("native clipboard unavailable");
 		} finally {
 			worker.terminate();
 		}

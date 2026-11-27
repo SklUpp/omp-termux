@@ -51,7 +51,7 @@ mod unix {
 		(TermFlag::Inlcr, Field::I, libc::INLCR),
 		(TermFlag::Igncr, Field::I, libc::IGNCR),
 		(TermFlag::Icrnl, Field::I, libc::ICRNL),
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		(TermFlag::Iuclc, Field::I, libc::IUCLC),
 		(TermFlag::Ixon, Field::I, libc::IXON),
 		(TermFlag::Ixany, Field::I, libc::IXANY),
@@ -59,7 +59,7 @@ mod unix {
 		(TermFlag::Imaxbel, Field::I, libc::IMAXBEL),
 		(TermFlag::Iutf8, Field::I, IUTF8),
 		(TermFlag::Opost, Field::O, libc::OPOST),
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		(TermFlag::Olcuc, Field::O, libc::OLCUC),
 		(TermFlag::Onlcr, Field::O, libc::ONLCR),
 		(TermFlag::Ocrnl, Field::O, libc::OCRNL),
@@ -74,7 +74,7 @@ mod unix {
 		(TermFlag::Crtscts, Field::C, libc::CRTSCTS),
 		(TermFlag::Isig, Field::L, libc::ISIG),
 		(TermFlag::Icanon, Field::L, libc::ICANON),
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		(TermFlag::Xcase, Field::L, libc::XCASE),
 		(TermFlag::Echo, Field::L, libc::ECHO),
 		(TermFlag::Echoe, Field::L, libc::ECHOE),
@@ -92,9 +92,9 @@ mod unix {
 	];
 
 	/// `IUTF8` (not in every libc target module).
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	const IUTF8: libc::tcflag_t = 0o040000;
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(not(any(target_os = "linux", target_os = "android")))]
 	const IUTF8: libc::tcflag_t = libc::IUTF8;
 
 	/// The platform's `c_cc` index for each [`CtlChar`] it has.
@@ -109,26 +109,26 @@ mod unix {
 		(CtlChar::Start, libc::VSTART),
 		(CtlChar::Stop, libc::VSTOP),
 		(CtlChar::Susp, libc::VSUSP),
-		#[cfg(not(target_os = "linux"))]
+		#[cfg(not(any(target_os = "linux", target_os = "android")))]
 		(CtlChar::Dsusp, libc::VDSUSP),
 		(CtlChar::Lnext, libc::VLNEXT),
 		(CtlChar::Werase, libc::VWERASE),
 		(CtlChar::Reprint, libc::VREPRINT),
 		(CtlChar::Discard, libc::VDISCARD),
-		#[cfg(not(target_os = "linux"))]
+		#[cfg(not(any(target_os = "linux", target_os = "android")))]
 		(CtlChar::Status, libc::VSTATUS),
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		(CtlChar::Swtc, libc::VSWTC),
 	];
 
 	/// `_POSIX_VDISABLE`.
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	const VDISABLE: libc::cc_t = 0;
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(not(any(target_os = "linux", target_os = "android")))]
 	const VDISABLE: libc::cc_t = 0xff;
 
 	/// Linux encodes speeds as `B…` codes; `(code, baud)`.
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	const SPEEDS: &[(libc::speed_t, u32)] = &[
 		(libc::B0, 0),
 		(libc::B50, 50),
@@ -163,22 +163,22 @@ mod unix {
 		(libc::B4000000, 4_000_000),
 	];
 
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	fn baud(code: libc::speed_t) -> u32 {
 		SPEEDS.iter().find(|s| s.0 == code).map_or(0, |s| s.1)
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	fn code(baud: u32) -> Option<libc::speed_t> {
 		SPEEDS.iter().find(|s| s.1 == baud).map(|s| s.0)
 	}
 
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(not(any(target_os = "linux", target_os = "android")))]
 	fn baud(code: libc::speed_t) -> u32 {
 		u32::try_from(code).unwrap_or(u32::MAX)
 	}
 
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(not(any(target_os = "linux", target_os = "android")))]
 	fn code(baud: u32) -> libc::speed_t {
 		libc::speed_t::from(baud)
 	}
@@ -266,9 +266,9 @@ mod unix {
 		os.c_cc[libc::VMIN] = t.min;
 		os.c_cc[libc::VTIME] = t.time;
 		// An unknown speed keeps the encoding's.
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		let (ispeed, ospeed) = (code(t.ispeed), code(t.ospeed));
-		#[cfg(not(target_os = "linux"))]
+		#[cfg(not(any(target_os = "linux", target_os = "android")))]
 		let (ispeed, ospeed) = (Some(code(t.ispeed)), Some(code(t.ospeed)));
 		if let Some(i) = ispeed {
 			// SAFETY: `os` is a valid termios.

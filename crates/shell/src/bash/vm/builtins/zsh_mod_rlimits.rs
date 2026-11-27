@@ -53,7 +53,7 @@ enum Kind {
 	/// `ZLIMTYPE_MICROSECONDS` (Linux's `RLIMIT_RTTIME`).
 	#[cfg_attr(
 		not(target_os = "linux"),
-		allow(dead_code, reason = "RLIMIT_RTTIME exists only on Linux")
+		allow(dead_code, reason = "only the Linux resinfo table maps RLIMIT_RTTIME")
 	)]
 	Micro,
 }
@@ -83,8 +83,8 @@ const fn ri(
 	ResInfo { res, name, kind, unit, opt, descr }
 }
 
-/// zsh's `resinfo[]` on Linux, indexed by `RLIMIT_*` number.
-#[cfg(target_os = "linux")]
+/// zsh's `resinfo[]` on Linux and Android, indexed by `RLIMIT_*` number.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const RESINFO: &[ResInfo] = &[
 	ri(Rlimit::Cpu, "cputime", Kind::Time, 1, b't', "cpu time (seconds)"),
 	ri(Rlimit::Fsize, "filesize", Kind::Memory, 512, b'f', "file size (blocks)"),
@@ -101,12 +101,13 @@ const RESINFO: &[ResInfo] = &[
 	ri(Rlimit::Msgqueue, "msgqueue", Kind::Number, 1, b'q', "bytes in POSIX msg queues"),
 	ri(Rlimit::Nice, "nice", Kind::Number, 1, b'e', "max nice"),
 	ri(Rlimit::Rtprio, "rt_priority", Kind::Number, 1, b'r', "max rt priority"),
+	#[cfg(target_os = "linux")]
 	ri(Rlimit::Rttime, "rt_time", Kind::Micro, 1, b'N', "rt cpu time (microseconds)"),
 ];
 
 /// zsh's `resinfo[]` on macOS (and the BSD layout it shares), indexed by
 /// `RLIMIT_*` number; `RLIMIT_RSS` is `RLIMIT_AS` there.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 const RESINFO: &[ResInfo] = &[
 	ri(Rlimit::Cpu, "cputime", Kind::Time, 1, b't', "cpu time (seconds)"),
 	ri(Rlimit::Fsize, "filesize", Kind::Memory, 512, b'f', "file size (blocks)"),

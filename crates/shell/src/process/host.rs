@@ -580,9 +580,9 @@ pub fn ignored_on_entry() -> crate::bash::SigSet {
 pub fn inherited_fds(embedded: bool) -> Vec<(i32, Box<dyn File>)> {
 	use std::os::fd::FromRawFd;
 
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	let mut fds = open_fds();
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(not(any(target_os = "linux", target_os = "android")))]
 	let mut fds: Vec<i32> = {
 		let Ok(entries) = std::fs::read_dir("/dev/fd") else {
 			return Vec::new();
@@ -625,7 +625,7 @@ pub fn inherited_fds(embedded: bool) -> Vec<(i32, Box<dyn File>)> {
 
 /// Enumerate inherited descriptor candidates without libc's 32 KiB
 /// directory buffer, which otherwise faults in unused startup pages.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn open_fds() -> Vec<i32> {
 	use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -675,7 +675,7 @@ fn open_fds() -> Vec<i32> {
 	fds
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 #[test]
 fn open_fds_spans_directory_batches() {
 	use std::os::fd::AsRawFd;
