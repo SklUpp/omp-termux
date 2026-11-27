@@ -78,7 +78,7 @@ auditable on every refresh:
 full tree, so the standard profile stays self-contained: no file in `04` may
 reference a module that only `90` creates.
 
-- Port work in slices `01`..`03`: 58 files. bionic gaps, dropped native
+- Port work in slices `01`..`03`: 57 files. bionic gaps, dropped native
   backends, IPC relocation, Termux:API surfaces, Android platform gating,
   clipboard and browser adaptations, installer and overlay scripts.
 - Fork feature in slice `04`: 7 files (`repoRoot` plumbing, see the section
