@@ -72,7 +72,7 @@ auditable on every refresh:
 | `03-termux-api.patch` | 23 | 1735 | 159 | 5 |
 | `04-repo-root.patch` | 6 | 95 | 13 | 1 |
 | `05-android-motion.patch` | 1 | 5 | 1 | 0 |
-| `90-isolation-retained.patch` | 38 | 5026 | 180 | 7 |
+| `90-isolation-retained.patch` | 37 | 5025 | 175 | 7 |
 
 `04` is repoRoot only, and `90` is the diff from the standard result to the
 full tree, so the standard profile stays self-contained: no file in `04` may
@@ -262,6 +262,21 @@ it changes on transitions rather than per animation frame. An explicit
 defaults are untouched.
 
 ## Fork feature: task isolation workspace lifecycle (patch `90`)
+
+Upstream 19.2.1 owns the parts of this feature that used to be fork-only:
+managed worktrees, retained-run teardown (`stopRetainedMount`), the release
+fence, and persisted agent scanning. The 19.2.1 rebase therefore drops those
+hunks and keeps only what upstream does not do: the retained-workspace
+lifecycle itself, slot leases, deferred integration, and the `worktree://`
+protocol. Two fork deltas were re-homed rather than re-added: the terminal
+sink now lives in `tui/src/driver/session.ts` and reports emission, and the
+task-tool schema lives in `coding-agent/src/task`.
+
+Known gap from that rebase: a retained workspace's `isolationDir` is no longer
+persisted into cold Agent Hub rows (upstream moved the scan to
+`registry/persisted-scan.ts`, outside slice `90`). Live rows and on-disk
+descriptors keep it, so recovery and release still work; only the Hub hint of
+a restarted session is missing.
 
 This feature is not Android-gated. The port carries it in the same queue
 (`90-isolation-retained.patch`), so releases from this fork keep it.

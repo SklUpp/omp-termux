@@ -442,23 +442,6 @@ index 0000000..429b37c
 +	}
 +	return id;
 +}
-diff --git a/packages/coding-agent/src/modes/settings.ts b/packages/coding-agent/src/modes/settings.ts
-index 2832717..f6779c6 100644
---- a/packages/coding-agent/src/modes/settings.ts
-+++ b/packages/coding-agent/src/modes/settings.ts
-@@ -689,11 +689,7 @@ export const cfgTuiMotion = register({
- 	id: "tui.motion",
- 	type: "enum",
- 	values: MOTION_MODES,
--	// Android terminals redraw the whole surface for an animated title, and the
--	// title spinner alone costs frames on a phone; start static. An explicit
--	// `tui.motion` or `tui.spinnerInterval` still wins, and the title still
--	// tracks idle/working/attention transitions.
--	default: process.platform === "android" ? "none" : "full",
-+	default: "full",
- 	env: "PI_MOTION",
- 	ui: {
- 		tab: "appearance",
 diff --git b/packages/coding-agent/src/prompts/internal-urls/worktree.md b/packages/coding-agent/src/prompts/internal-urls/worktree.md
 new file mode 100644
 index 0000000..c41f9b6
