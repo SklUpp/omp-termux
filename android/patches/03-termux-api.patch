@@ -1433,7 +1433,7 @@ index e5f75dc..76ed487 100644
  		using tempDir = TempDir.createSync("@pi-copy-local-");
 diff --git b/packages/coding-agent/test/termux-notifications.test.ts b/packages/coding-agent/test/termux-notifications.test.ts
 new file mode 100644
-index 0000000..9b80f42
+index 0000000..b56d3da
 --- /dev/null
 +++ b/packages/coding-agent/test/termux-notifications.test.ts
 @@ -0,0 +1,501 @@
@@ -1461,8 +1461,8 @@ index 0000000..9b80f42
 +	clearAndroidNotification,
 +	sendAndroidNotification,
 +} from "@oh-my-pi/pi-coding-agent/utils/android-helpers";
-+import { TERMINAL } from "@oh-my-pi/pi-tui";
-+import { initTheme } from "@oh-my-pi/pi-tui/theme";
++import * as tuiDriver from "@oh-my-pi/pi-tui/driver/session";
++import { initTheme } from "@oh-my-pi/pi-coding-agent/ui/theme/service";
 +
 +import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
 +
@@ -1586,7 +1586,7 @@ index 0000000..9b80f42
 +describe("Termux notifications: completion", () => {
 +	it("posts one Android notification when completion.notify is on", () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgCompletionNotify.override(settings, "on");
 +
 +		new EventController(makeContext("my-session")).sendCompletionNotification(
@@ -1598,7 +1598,7 @@ index 0000000..9b80f42
 +
 +	it("uses the fixed app title, never the conversation-derived session name", () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgCompletionNotify.override(settings, "on");
 +
 +		// Session names are generated from conversation text; a notification
@@ -1614,7 +1614,7 @@ index 0000000..9b80f42
 +
 +	it("never puts assistant message text into the notification", () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgCompletionNotify.override(settings, "on");
 +
 +		new EventController(makeContext("my-session")).sendCompletionNotification(
@@ -1627,7 +1627,7 @@ index 0000000..9b80f42
 +
 +	it("honours completion.notify=off", () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgCompletionNotify.override(settings, "off");
 +
 +		new EventController(makeContext()).sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
@@ -1637,7 +1637,7 @@ index 0000000..9b80f42
 +
 +	it("stays silent for aborted and errored turns", () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgCompletionNotify.override(settings, "on");
 +		const controller = new EventController(makeContext());
 +
@@ -1649,7 +1649,7 @@ index 0000000..9b80f42
 +
 +	it("stays silent when the Warp CLI-agent protocol drives native UX", () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgCompletionNotify.override(settings, "on");
 +		process.env.WARP_CLI_AGENT_PROTOCOL_VERSION = "1";
 +
@@ -1662,7 +1662,7 @@ index 0000000..9b80f42
 +describe("Termux notifications: error", () => {
 +	it("posts one Android notification when error.notify is on and stopReason is error", () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgErrorNotify.override(settings, "on");
 +
 +		new EventController(makeContext("err-session")).sendErrorNotification(
@@ -1676,7 +1676,7 @@ index 0000000..9b80f42
 +
 +	it("honours error.notify=off (schema default)", () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgErrorNotify.override(settings, "off");
 +
 +		new EventController(makeContext()).sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("error")]));
@@ -1686,7 +1686,7 @@ index 0000000..9b80f42
 +
 +	it("stays silent for normal completions and scheduling pauses", async () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgErrorNotify.override(settings, "on");
 +		const controller = new EventController(makeContext());
 +
@@ -1708,7 +1708,7 @@ index 0000000..9b80f42
 +describe("Termux notifications: ask", () => {
 +	it("posts one per-prompt card and removes it after the dialog is answered", async () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgAskNotify.override(settings, "on");
 +
 +		await new AskTool(makeAskSession()).execute(
@@ -1733,7 +1733,7 @@ index 0000000..9b80f42
 +
 +	it("clears the card on the plain (non-rich-dialog) path", async () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgAskNotify.override(settings, "on");
 +
 +		await new AskTool(makeAskSession()).execute(
@@ -1752,7 +1752,7 @@ index 0000000..9b80f42
 +
 +	it("clears the card when the dialog throws", async () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgAskNotify.override(settings, "on");
 +
 +		await expect(
@@ -1774,7 +1774,7 @@ index 0000000..9b80f42
 +
 +	it("clears the card when the ask is aborted before the dialog settles", async () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgAskNotify.override(settings, "on");
 +		const controller = new AbortController();
 +		controller.abort();
@@ -1796,7 +1796,7 @@ index 0000000..9b80f42
 +
 +	it("posts and removes nothing when notifications are globally suppressed", async () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgAskNotify.override(settings, "on");
 +		process.env.PI_NOTIFICATIONS = "off";
 +
@@ -1813,7 +1813,7 @@ index 0000000..9b80f42
 +
 +	it("honours ask.notify=off", async () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgAskNotify.override(settings, "off");
 +
 +		await new AskTool(makeAskSession()).execute(
@@ -1829,7 +1829,7 @@ index 0000000..9b80f42
 +
 +	it("stays silent when the session has no UI", async () => {
 +		const calls = captureAndroidSpawns();
-+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
++		vi.spyOn(tuiDriver, "notifyTerminal").mockImplementation(() => {});
 +		cfgAskNotify.override(settings, "on");
 +
 +		await new AskTool(makeAskSession({ hasUI: false })).execute(
