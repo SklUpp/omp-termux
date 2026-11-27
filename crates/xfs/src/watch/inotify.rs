@@ -45,6 +45,21 @@ const ACCESSES: u32 = libc::IN_ACCESS | libc::IN_OPEN | libc::IN_CLOSE_NOWRITE;
 const BUFFER_BYTES: usize = 64 * 1024;
 const HEADER_BYTES: usize = mem::size_of::<libc::inotify_event>();
 
+/// bionic declares the watch descriptor as `u32` while the other Linux-like
+/// targets take `i32`; the kernel reads an `int` either way.
+#[cfg(target_os = "android")]
+fn rm_watch(fd: libc::c_int, wd: i32) -> libc::c_int {
+	// SAFETY: the descriptor comes from `inotify_add_watch` and is never
+	// negative, so the unsigned widening is lossless.
+	unsafe { libc::inotify_rm_watch(fd, wd.cast_unsigned()) }
+}
+
+#[cfg(not(target_os = "android"))]
+fn rm_watch(fd: libc::c_int, wd: i32) -> libc::c_int {
+	// SAFETY: plain syscall on a live descriptor.
+	unsafe { libc::inotify_rm_watch(fd, wd) }
+}
+
 /// The inotify mask as [`Flags`], without the path's type.
 fn translate(mask: u32) -> Flags {
 	const TRANSLATION: [(u32, Flags); 10] = [
@@ -258,8 +273,7 @@ impl State {
 					Some(&next) => next == b'/',
 				});
 			if gone {
-				// SAFETY: plain syscall on a live descriptor.
-				unsafe { libc::inotify_rm_watch(inotify, wd) };
+				rm_watch(inotify, wd);
 			}
 			!gone
 		});
@@ -368,8 +382,7 @@ impl State {
 			// kernel confirms.
 			let path = watch.path.clone();
 			self.forget_below(&path, false);
-			// SAFETY: plain syscall on a live descriptor.
-			unsafe { libc::inotify_rm_watch(self.inotify.as_raw_fd(), wd) };
+			rm_watch(self.inotify.as_raw_fd(), wd);
 		}
 		Ok(())
 	}

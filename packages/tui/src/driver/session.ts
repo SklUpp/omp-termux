@@ -67,13 +67,15 @@ export function terminalCapabilities(): TerminalCapabilities {
  * Write an out-of-band escape sequence: through the running driver, else
  * straight to stdout (best-effort; a closed stdout never throws into the
  * caller). A worker thread cannot reach the main thread's driver and would
- * write around its frames, so off the main thread nothing is written.
+ * write around its frames, so off the main thread nothing is written. Returns
+ * whether the sequence reached an output path: `true` means emitted, not that
+ * the terminal honored it.
  */
-export function writeTerminalSequence(data: string): void {
-	if (!Bun.isMainThread) return;
+export function writeTerminalSequence(data: string): boolean {
+	if (!Bun.isMainThread) return false;
 	if (active) {
 		active.writeRaw(data);
-		return;
+		return true;
 	}
 	// An `error` listener keeps EPIPE/EIO on a closed stdout from crashing the process.
 	if (!stdoutErrorsHandled) {
@@ -82,8 +84,10 @@ export function writeTerminalSequence(data: string): void {
 	}
 	try {
 		process.stdout.write(data);
+		return true;
 	} catch {
-		// Best-effort.
+		// Best-effort: a closed stdout must not fail the caller.
+		return false;
 	}
 }
 

@@ -1660,8 +1660,10 @@ export class SelectorController {
 								this.ctx.showStatus("Nothing to copy in that item");
 								return;
 							}
-							void copyToClipboard(content);
-							this.ctx.showStatus(`Copied ${label} to clipboard`);
+							copyToClipboard(content).then(
+								() => this.ctx.showStatus(`Copied ${label} to clipboard`),
+								() => this.ctx.showWarning("Failed to copy to clipboard"),
+							);
 						},
 						onOpen: (href, label) => {
 							done();

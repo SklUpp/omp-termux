@@ -378,6 +378,11 @@ fn lookup(host: &str, family: IpFamily) -> io::Result<Vec<IpAddr>> {
 fn reverse(addr: IpAddr) -> Option<BString> {
 	let (ss, len) = to_c(&SockAddr::Inet(SocketAddr::new(addr, 0)));
 	let mut host = [0 as libc::c_char; 1025];
+	// bionic takes `size_t` lengths where glibc takes `socklen_t`.
+	#[cfg(target_os = "android")]
+	let host_len = host.len();
+	#[cfg(not(target_os = "android"))]
+	let host_len = host.len() as libc::socklen_t;
 	// SAFETY: a valid address of `len` bytes and a host buffer of its
 	// stated size; no service buffer.
 	let rc = unsafe {
@@ -385,7 +390,7 @@ fn reverse(addr: IpAddr) -> Option<BString> {
 			(&raw const ss).cast(),
 			len,
 			host.as_mut_ptr(),
-			host.len() as libc::socklen_t,
+			host_len,
 			std::ptr::null_mut(),
 			0,
 			libc::NI_NAMEREQD,

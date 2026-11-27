@@ -47,6 +47,7 @@ import type { NotificationRule } from "../../session/transcript/ttsr-notificatio
 import { PROPOSE_COMMAND_NAME } from "../../tools/details/resolve";
 import type { TodoPhase } from "../../tools/details/todo";
 import { proposeDispatchDetails } from "../../tools/resolve";
+import { sendAndroidNotification } from "../../utils/android-helpers";
 import { cfgSpeechEnabled, cfgSpeechMode } from "../../tts/settings";
 import { SpeechEnhancer } from "../../tts/speech-enhancer";
 import { vocalizer } from "../../tts/vocalizer";
@@ -2911,6 +2912,11 @@ export class EventController {
 			type: "error",
 			actions: "focus",
 		});
+		// Android has no OSC terminal chrome: mirror the same gated card into the
+		// system shade with a fixed title. The session name is auto-generated from
+		// conversation text, so it must not persist into a notification-listener
+		// readable card. Best-effort and silent when Termux:API is absent.
+		void sendAndroidNotification("omp", "Stopped with error").catch(() => {});
 	}
 
 	sendCompletionNotification(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
@@ -2936,5 +2942,8 @@ export class EventController {
 			type: "completion",
 			actions: "focus",
 		});
+		// Same gated completion card in the Android shade, fixed title (see error
+		// above for why the conversation-derived session name is not used).
+		void sendAndroidNotification("omp", "Complete").catch(() => {});
 	}
 }
